@@ -16,7 +16,7 @@ const APP_VERSION = '5.8.4';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
-const APP_REPO_URL = 'https://github.com/rheps/teacher-task-manager-skill';
+const APP_REPO_URL = 'https://github.com/rheps/teacher-manager';
 const CONFIG_SHEET_NAME = '설정';
 const DEFAULT_MONTH_SHEETS = ['3월','4월','5월','6월','7월','8월','9월','10월','11월','12월','1월','2월'];
 

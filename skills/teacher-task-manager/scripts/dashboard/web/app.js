@@ -1117,7 +1117,7 @@ function newWorkbookSectionHtml() {
     </div>`;
 }
 /* ---------- 연결 3탭: AI 비서 ---------- */
-const AI_SKILL_COMMAND = "npx skills add rheps/teacher-task-manager-skill -g --all";
+const AI_SKILL_COMMAND = "npx skills add rheps/teacher-manager -g --all";
 function aiTabHtml() {
   if (!S.info?.features?.ai_skill_install_enabled) {
     return `<div class="attendance-head"><div>

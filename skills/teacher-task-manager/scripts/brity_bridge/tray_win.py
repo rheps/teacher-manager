@@ -171,6 +171,7 @@ class TrayApp:
         self._dashboard_click_guard = 0.0
         self._close_pending = False  # 캡처 저장을 기다리는 닫기 대기자 존재 여부
         self._close_forced = False  # 대기 상한 초과 — 다음 WM_CLOSE는 그대로 진행
+        self._taskbar_created_message = 0  # 탐색기 재시작 알림 — 아이콘을 다시 등록해야 한다
 
     # --- 알림 ---
 
@@ -321,7 +322,7 @@ class TrayApp:
 
     # --- 창·아이콘·메시지 루프 ---
 
-    def run(self) -> None:
+    def _setup_window_and_icon(self) -> None:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         # 64비트 핸들 잘림 방지
@@ -342,6 +343,11 @@ class TrayApp:
             0, window_class.lpszClassName, "Brity 연결 도우미", 0, 0, 0, 0, 0, None, None, instance, None
         )
 
+        # 탐색기(explorer.exe)가 다시 시작되면 등록된 트레이 아이콘이 전부 지워지고
+        # 이 메시지가 뿌려진다. 받아서 다시 등록하지 않으면 도우미는 살아 있는데
+        # 파란 체크 아이콘과 그 우클릭 메뉴만 영영 사라진다.
+        self._taskbar_created_message = user32.RegisterWindowMessageW("TaskbarCreated")
+
         self._icon_data = NOTIFYICONDATAW()
         self._icon_data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._icon_data.hWnd = self.hwnd
@@ -355,6 +361,18 @@ class TrayApp:
         self._icon_data.hIcon = app_icon.load_hicon(16) or app_icon.default_hicon()
         self._icon_data.szTip = "Teacher Manager"
         ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._icon_data))
+
+    def _readd_tray_icon(self) -> None:
+        """탐색기 재시작 뒤 아이콘을 다시 등록한다 — 실패해도 도우미는 계속 돈다."""
+        with self._icon_lock:
+            try:
+                ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._icon_data))
+            except Exception:  # noqa: BLE001 - 재등록 실패가 캡처를 막으면 안 된다
+                pass
+
+    def run(self) -> None:
+        user32 = ctypes.windll.user32
+        self._setup_window_and_icon()
 
         # 도우미 창이 이미 있으므로, 여기서 뜨는 대시보드가 도우미를 또 띄우지 않는다.
         if self.on_ready is not None:
@@ -393,6 +411,9 @@ class TrayApp:
 
     def _window_proc(self, hwnd, message_id, wparam, lparam):
         user32 = ctypes.windll.user32
+        if self._taskbar_created_message and message_id == self._taskbar_created_message:
+            self._readd_tray_icon()  # 탐색기가 다시 켜졌다 — 아이콘을 되살린다
+            return 0
         if message_id == WM_HOTKEY and wparam == HOTKEY_ID:
             self._dispatch_hotkey()
             return 0

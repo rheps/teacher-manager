@@ -1308,7 +1308,9 @@ AI_TOOLS = [
     {"key": "gemini", "name": "제미나이 (Gemini CLI·Antigravity)", "folder": ".gemini",
      "agents": ["gemini-cli", "antigravity"]},
 ]
-AI_SKILL_REPO = "rheps/teacher-task-manager-skill"
+# 공개 저장소 — 선생님 컴퓨터에서 로그인 없이 받을 수 있어야 한다.
+# 작업용 저장소(비공개)에는 점검 보고서·서버 소스가 함께 있어 공개하지 않는다.
+AI_SKILL_REPO = "rheps/teacher-manager"
 
 
 def ai_skill_install_enabled() -> bool:
