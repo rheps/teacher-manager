@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from brity_bridge import atomic_io
+
+# 리치 기록(등록 항목 제목 포함)과 진행 상태는 설정폴더 로컬 파일에만 남는다. 외부 전송 없음.
+MAX_CAPTURES = 200
+PROGRESS_STEPS = ("capture", "analyze", "register", "done", "fail")
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+ACTIVE_MAX_AGE = timedelta(minutes=3)
+FINISHED_LINGER = timedelta(seconds=10)
+
+
+def captures_path(state_dir: Path) -> Path:
+    return Path(state_dir) / "captures.jsonl"
+
+
+def progress_path(state_dir: Path) -> Path:
+    return Path(state_dir) / "progress.json"
+
+
+def _tail_missing_newline(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            if handle.tell() == 0:
+                return False
+            handle.seek(-1, 2)
+            return handle.read(1) != b"\n"
+    except OSError:
+        return False
+
+
+def append_capture(state_dir: Path, entry: dict, keep: int = MAX_CAPTURES) -> Path:
+    path = captures_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 크래시로 잘린 꼬리(개행 없음)에 새 기록이 한 줄로 병합되면 새 기록이
+    # 파싱 불가로 조용히 사라진다 — 개행을 보정하고 이어 쓴다.
+    lead = "\n" if _tail_missing_newline(path) else ""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(lead + json.dumps(entry, ensure_ascii=False) + "\n")
+    # 절단이 한글 문자 중간(다중바이트)에 걸렸을 수 있다 — strict 디코드면
+    # 이 지점부터 모든 캡처·기록 화면이 영구 오류가 된다.
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) > keep:
+        atomic_io.atomic_write_text(path, "\n".join(lines[-keep:]) + "\n")
+    return path
+
+
+def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
+    try:
+        lines = captures_path(state_dir).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in reversed(lines):
+        if len(rows) >= max(0, int(limit)):
+            break
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue  # 깨진 줄은 그 줄만 건너뛴다
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+class ProgressWriter:
+    """캡처 1회의 진행 단계를 progress.json에 남긴다. 쓰기 실패가 캡처를 막으면 안 된다.
+
+    run_id는 시작 시각 기반이다 — 스펙의 source_hash 접두어는 캡처 시작 시점에 해시가
+    아직 없어 쓸 수 없고, 캡처는 busy 락으로 한 번에 하나만 돌아 시각으로 충분하다.
+    """
+
+    def __init__(self, state_dir: Path, now: datetime | None = None):
+        self.state_dir = Path(state_dir)
+        started = now or datetime.now()
+        self.run_id = f"cap-{int(started.timestamp())}"
+
+    def emit(self, step: str, message: str = "", now: datetime | None = None) -> None:
+        if step not in PROGRESS_STEPS:
+            raise ValueError(f"unknown step: {step}")
+        body = {
+            "run_id": self.run_id,
+            "step": step,
+            "when": (now or datetime.now()).strftime(TIME_FORMAT),
+        }
+        if message:
+            body["message"] = message
+        try:
+            # 대시보드가 캡처 중 0.4초 간격으로 읽는다 — 제자리 쓰기면
+            # truncate~write 사이 읽기가 빈 파일을 보고 진행 카드를 지운다.
+            atomic_io.atomic_write_text(
+                progress_path(self.state_dir), json.dumps(body, ensure_ascii=False) + "\n"
+            )
+        except OSError:
+            pass
+
+
+def read_progress(state_dir: Path, now: datetime | None = None) -> dict:
+    inactive = {"active": False}
+    try:
+        raw = json.loads(progress_path(state_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return inactive
+    if not isinstance(raw, dict):
+        return inactive
+    try:
+        written = datetime.strptime(str(raw.get("when", "")), TIME_FORMAT)
+    except ValueError:
+        return inactive
+    age = (now or datetime.now()) - written
+    if age > ACTIVE_MAX_AGE:
+        return inactive  # 헬퍼 강제 종료 등으로 오래 남은 상태
+    if raw.get("step") in ("done", "fail") and age > FINISHED_LINGER:
+        return inactive
+    return {
+        "active": True,
+        "run_id": str(raw.get("run_id", "")),
+        "step": str(raw.get("step", "")),
+        "when": str(raw.get("when", "")),
+        "message": str(raw.get("message", "")),
+    }

@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import base64
+import json
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from brity_bridge import attach_read, process_win
+from brity_bridge.message_parse import MessageRecord, compute_source_hash
+
+_LIST_ITEM_RE = re.compile(r"^\d+_\d+_\d+$")
+_SIZE_RE = re.compile(r"^\d[\d.,]*\s?(KB|MB|GB)$", re.IGNORECASE)
+_LINE_TOLERANCE = 5     # 같은 줄로 볼 y 오차(px)
+_BOUNDARY_MARGIN = 10   # 목록 오른끝에서 본문까지 여유(px)
+
+
+@dataclass
+class ScreenElement:
+    text: str
+    ctrl: str
+    x: int
+    y: int
+    w: int
+    h: int
+    aid: str
+
+
+def parse_elements(raw: str) -> list[ScreenElement]:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    elements: list[ScreenElement] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        numbers = {}
+        for key in ("x", "y", "w", "h"):
+            value = item.get(key)
+            numbers[key] = int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else -1
+        elements.append(ScreenElement(
+            text=text, ctrl=str(item.get("ctrl") or ""),
+            x=numbers["x"], y=numbers["y"], w=max(numbers["w"], 0), h=max(numbers["h"], 0),
+            aid=str(item.get("aid") or ""),
+        ))
+    return elements
+
+
+def _group_lines(texts: list[ScreenElement]) -> list[list[ScreenElement]]:
+    lines: list[list[ScreenElement]] = []
+    for element in sorted(texts, key=lambda e: (e.y, e.x)):
+        if lines and abs(element.y - lines[-1][0].y) <= _LINE_TOLERANCE:
+            lines[-1].append(element)
+        else:
+            lines.append([element])
+    return lines
+
+
+def assemble_message(elements: list[ScreenElement]) -> tuple[str, list[str]]:
+    """요소 덤프에서 (본문 텍스트, 첨부파일명 목록)을 만든다. 순수 함수 — 시험 대상."""
+    list_edges = [e.x + e.w for e in elements if e.ctrl == "Button" and _LIST_ITEM_RE.match(e.aid)]
+    texts = [e for e in elements if e.ctrl == "Text" and e.text.strip()]
+    if list_edges:
+        boundary = max(list_edges) + _BOUNDARY_MARGIN
+        content = [e for e in texts if e.x >= boundary]
+        if not content:
+            content = texts   # 경계 판정이 어긋나면 전체로 폴백
+    else:
+        content = texts
+    lines = _group_lines(content)
+    body = "\n".join(" ".join(el.text.strip() for el in line) for line in lines).strip()
+    names: list[str] = []
+    for line in lines:
+        sizes = [el for el in line if _SIZE_RE.match(el.text.strip())]
+        if not sizes:
+            continue
+        size_x = min(el.x for el in sizes)
+        candidates = [
+            el.text.strip() for el in line
+            if el.x < size_x and not _SIZE_RE.match(el.text.strip()) and el.text.strip() != "첨부파일"
+        ]
+        if candidates:
+            names.append(max(candidates, key=len))
+    return body, names
+
+
+_PS_SCRIPT = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+Add-Type -Namespace Native -Name Win -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+'@
+$procName = "__PROC__"
+$target = [IntPtr]::Zero
+$fg = [Native.Win]::GetForegroundWindow()
+if ($fg -ne [IntPtr]::Zero) {
+  $fgPid = [uint32]0
+  [Native.Win]::GetWindowThreadProcessId($fg, [ref]$fgPid) | Out-Null
+  $p = Get-Process -Id $fgPid -ErrorAction SilentlyContinue
+  if ($p -and $p.ProcessName -ieq $procName) { $target = $fg }
+}
+if ($target -eq [IntPtr]::Zero) {
+  $p = Get-Process -Name $procName -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -ne "" -and $_.MainWindowTitle -ne "Log in" } |
+    Select-Object -First 1
+  if ($p) { $target = $p.MainWindowHandle }
+}
+if ($target -eq [IntPtr]::Zero) { Write-Output "[]"; exit 3 }
+[Native.Win]::SendMessage($target, 0x003D, [IntPtr]::Zero, [IntPtr](-4)) | Out-Null
+[Native.Win]::SendMessage($target, 0x003D, [IntPtr]::Zero, [IntPtr](-25)) | Out-Null
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($target)
+$found = $null
+for ($i = 0; $i -lt 6; $i++) {
+  Start-Sleep -Milliseconds 700
+  $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  if ($found.Count -gt 30) { break }
+}
+$out = New-Object System.Collections.ArrayList
+foreach ($e in $found) {
+  $n = $e.Current.Name
+  if (-not $n) { continue }
+  $x = -1; $y = -1; $w = 0; $h = 0
+  try {
+    $r = $e.Current.BoundingRectangle
+    if (-not [double]::IsInfinity($r.X)) { $x = [int]$r.X; $y = [int]$r.Y; $w = [int]$r.Width; $h = [int]$r.Height }
+  } catch {}
+  [void]$out.Add(@{ text = $n; ctrl = ($e.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''); x = $x; y = $y; w = $w; h = $h; aid = [string]$e.Current.AutomationId })
+}
+Write-Output (ConvertTo-Json -InputObject @($out) -Compress -Depth 3)
+"""
+
+_MIN_BODY_CHARS = 10
+_BRITY_PROCESS_NAME = "BrityMessenger"
+
+
+@dataclass
+class ScreenCapture:
+    ok: bool
+    reason: str
+    body: str
+    attachments: list[str]
+
+
+def _default_ps_runner(script: str, timeout: float) -> tuple[int, str]:
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return process_win.run_captured(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-EncodedCommand", encoded],
+        timeout=timeout,
+    )
+
+
+def capture_brity_text(runner=None, timeout: float = 20.0) -> ScreenCapture:
+    runner = runner or _default_ps_runner
+    script = _PS_SCRIPT.replace("__PROC__", _BRITY_PROCESS_NAME)
+    try:
+        code, output = runner(script, timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return ScreenCapture(False, f"화면 읽기 실행 실패: {error}", "", [])
+    if code == 3:
+        return ScreenCapture(False, "로그인된 Brity 창을 찾지 못했습니다", "", [])
+    if code != 0:
+        return ScreenCapture(False, f"화면 읽기 도구가 실패했습니다(코드 {code})", "", [])
+    start, end = output.find("["), output.rfind("]")
+    if start == -1 or end <= start:
+        return ScreenCapture(False, "화면 요소를 받지 못했습니다", "", [])
+    body, names = assemble_message(parse_elements(output[start : end + 1]))
+    if len(body) < _MIN_BODY_CHARS:
+        return ScreenCapture(False, "읽은 내용이 너무 짧습니다", "", [])
+    return ScreenCapture(True, "", body, names)
+
+
+def capture_failure_message(reason: str) -> str:
+    """실패 이유에 맞춰 사용자가 바로 다시 시도할 수 있게 안내한다."""
+    if "찾지 못" in reason:
+        return "브리티 메신저를 열고 읽을 대화방을 띄운 뒤 단축키를 다시 눌러 주세요."
+    if "너무 짧" in reason or "요소를 받지 못" in reason:
+        return "읽을 메시지가 화면에 보이게 한 뒤 단축키를 다시 눌러 주세요."
+    return (
+        "브리티 대화방과 메시지를 바꾸지 말고 단축키를 다시 눌러 주세요. "
+        "다른 프로그램을 앞으로 띄우는 것은 괜찮아요."
+    )
+
+
+def build_screen_record(capture: ScreenCapture, download_dir: Path) -> tuple[MessageRecord, str]:
+    """캡처 결과를 본문과 완전한 첨부 묶음이 포함된 기록으로 만든다."""
+    bundle = attach_read.prepare_attachment_bundle(Path(download_dir), capture.attachments)
+    plain = capture.body if not bundle.block else capture.body + "\n\n" + bundle.block
+    identity_text = "\n".join([capture.body, *bundle.fingerprints])
+    record = MessageRecord(
+        source="brity-screen",
+        sender="",
+        sent_at="",
+        plain_text=plain,
+        html="",
+        source_hash=compute_source_hash("", "", identity_text),
+        attachment_count=bundle.count,
+        attachment_names=bundle.names,
+        media_parts=bundle.media_parts,
+    )
+    return record, ""

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Teacher Task Manager"
+  short_description: "Set up and run Korean teacher Google automation: first setup, Calendar/Tasks work registration, and attendance-report automation."
+  default_prompt: "Set up or run my teacher Google automation."
+
+policy:
+  allow_implicit_invocation: true
