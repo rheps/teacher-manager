@@ -19,6 +19,10 @@ from urllib.parse import unquote, urlsplit
 
 import install_attendance_automation
 import parse_settings
+from attendance_install_record import (
+    AttendanceInstallRecordError,
+    load_attendance_install_record,
+)
 from brity_bridge import autostart_win, bundle_paths, hotkey_win, paths, process_win
 from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, _extract_email, run_doctor_checks
 from brity_bridge.gemini_analyze import check_gemini_key
@@ -280,6 +284,64 @@ def choose_attachment_folder(current_path: str = "") -> str:
         root.destroy()
 
 
+def _attendance_sheet_for_gemini_key(config_dir: Path) -> str:
+    """Gemini 키를 넣을 시트를 고른다. AI 출결 입력을 실제로 쓰는 곳은 사본이다."""
+    config_dir = Path(config_dir)
+
+    def _sheet_id_in(path: Path, key: str) -> str:
+        # 파일이 없거나 깨진 것만 넘어간다. 그 밖의 잘못은 감추지 않고 드러낸다.
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        try:
+            saved = _json.loads(text)
+        except ValueError:
+            return ""
+        if not isinstance(saved, dict):
+            return ""
+        return str(saved.get(key, "") or "").strip()
+
+    import prepare_attendance_copy
+
+    copy_id = _sheet_id_in(
+        prepare_attendance_copy.attendance_copy_status_path(config_dir),
+        "copy_spreadsheet_id",
+    )
+    if copy_id:
+        return copy_id
+    return _sheet_id_in(
+        paths.attendance_install_record_path(config_dir), "spreadsheet_id"
+    )
+
+
+def push_gemini_key_to_attendance_sheet(config_dir: Path, run_command=None) -> dict:
+    """이 컴퓨터에 저장된 Gemini 키를 출결 시트 `설정` 탭에 적어 둔다.
+
+    시트 안 Apps Script는 이 컴퓨터의 settings.json을 읽지 못한다. 여기서 넣어 두지 않으면
+    선생님이 시트에서 같은 키를 또 붙여넣게 된다. 넣지 못해도 오류를 밖으로 던지지 않는다 —
+    저장 버튼 하나가 인터넷 사정 때문에 실패한 것처럼 보이면 안 된다.
+    """
+    from dashboard import central_chat
+
+    config_dir = Path(config_dir)
+    key = str(load_settings(paths.settings_path(config_dir)).gemini_api_key or "").strip()
+    if not key:
+        return {"state": "skipped", "detail": "아직 Gemini API key를 넣지 않았어요."}
+    spreadsheet_id = _attendance_sheet_for_gemini_key(config_dir)
+    if not spreadsheet_id:
+        return {"state": "skipped", "detail": "아직 출결 시트를 만들지 않았어요."}
+    runner = run_command or central_chat._default_run_command
+    try:
+        rows = central_chat._read_settings_rows(spreadsheet_id, runner)
+        central_chat._upsert_settings_value(
+            spreadsheet_id, rows, "GEMINI_API_KEY", key, runner
+        )
+    except Exception as error:  # noqa: BLE001 - 화면에는 한국어 한 문장만 보인다
+        return {"state": "failed", "detail": f"출결 시트에 넣지 못했어요: {error}"[:200]}
+    return {"state": "ok", "detail": "출결 시트 설정 탭에도 넣었어요."}
+
+
 def save_messenger_settings(
     config_dir: Path,
     updates: dict,
@@ -291,6 +353,7 @@ def save_messenger_settings(
     autostart_checker=None,
     autostart_enable=None,
     autostart_disable=None,
+    push_key=None,
 ) -> dict:
     """메신저 화면의 네 가지 선택을 한 번에 저장하고 실패하면 모두 되돌린다."""
     if not isinstance(updates, dict):
@@ -368,11 +431,20 @@ def save_messenger_settings(
 
     restarter = restart or restart_helper
     if restarter():
+        # 저장이 확정된 뒤에만 시트로 보낸다. 되돌릴 저장이 남아 있으면 보내지 않는다.
+        sheet_push = {"state": "skipped", "detail": ""}
+        if "gemini_api_key" in updates:
+            pusher = push_key or push_gemini_key_to_attendance_sheet
+            try:
+                sheet_push = pusher(Path(config_dir))
+            except Exception as error:  # noqa: BLE001 - 저장 자체는 이미 끝났다
+                sheet_push = {"state": "failed", "detail": str(error)[:200]}
         return {
             "saved": True,
             "hotkey": candidate.hotkey,
             "restarted": True,
             "reason": "",
+            "sheet_push": sheet_push,
         }
 
     save_settings(settings_path, previous)
@@ -535,10 +607,15 @@ ATTENDANCE_PROFILE_MESSAGE = "내 정보와 하루 일과를 먼저 입력해 �
 ATTENDANCE_ACCOUNT_MESSAGE = "처음 준비하던 Google 계정으로 다시 로그인해 주세요."
 ATTENDANCE_RECORD_BROKEN_MESSAGE = "출결 설치 기록을 읽지 못했어요. 이전에 만든 출결 시트를 확인해 주세요."
 ATTENDANCE_NOT_READY_MESSAGE = "출결 준비 시작하기를 누르면 로그인한 계정에 자동으로 준비해요."
+ATTENDANCE_DETAIL_LIMIT = 800  # 화면에 보여줄 실패 안내 길이 상한
 
 
 def friendly_attendance_error(error) -> tuple[str, str]:
     """설치 실패를 (실패한 서비스, 화면에 보여줄 쉬운 문장)으로 바꾼다."""
+    # 쓰던 시트 때문에 멈춘 경우는 이유가 시트마다 다르다. 뭉뚱그린 문장으로 바꾸면
+    # 무엇을 고쳐야 할지 알 수 없으므로 적어 둔 문장을 그대로 보여준다.
+    if isinstance(error, install_attendance_automation.ExistingAttendanceSheetError):
+        return "sheet", str(error)
     service = "setup"
     cmd = getattr(error, "cmd", None) or []
     tokens = [str(part) for part in cmd]
@@ -614,24 +691,31 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command) -
         return AttendanceStatus(state="login-required", account=account, detail=ATTENDANCE_LOGIN_MESSAGE)
     record_path = paths.attendance_install_record_path(config_dir)
     if record_path.exists():
-        record = _read_json_dict(record_path)
-        spreadsheet_url = str((record or {}).get("spreadsheet_url", "") or "")
+        if account and current_user and account != current_user:
+            return AttendanceStatus(
+                state="failed", account=account, current_user=current_user,
+                failed_service="setup", detail=ATTENDANCE_ACCOUNT_MESSAGE,
+            )
+        try:
+            record = load_attendance_install_record(record_path)
+        except AttendanceInstallRecordError:
+            return AttendanceStatus(
+                state="failed", account=account, current_user=current_user,
+                failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
+            )
+        spreadsheet_url = str(record.get("spreadsheet_url", "") or "")
         valid_sheet_url = spreadsheet_url.startswith(
             "https://docs.google.com/spreadsheets/d/"
         )
-        if record is not None and valid_sheet_url:
-            if account and current_user and account != current_user:
-                return AttendanceStatus(
-                    state="failed", account=account, current_user=current_user,
-                    failed_service="setup", detail=ATTENDANCE_ACCOUNT_MESSAGE,
-                )
+        if valid_sheet_url:
             return AttendanceStatus(
                 state="ready", account=account or current_user, current_user=current_user,
                 spreadsheet_url=spreadsheet_url,
             )
         return AttendanceStatus(
             state="failed", account=account, current_user=current_user,
-            failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
+            spreadsheet_url=spreadsheet_url, failed_service="setup",
+            detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
         )
     profile_error = _attendance_profile_error(config_dir)
     if profile_error:
@@ -1549,16 +1633,20 @@ def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> Attendanc
             profile_json, runner=deps.attendance_runner, resume=progress, progress=record_progress,
             attendance_task_list_id=homeroom_tasks_id,
             attendance_task_list_title="조종례시 담임학급 안내사항",
+            gemini_api_key=install_attendance_automation.local_gemini_api_key(config_dir),
         )
     except Exception as error:  # noqa: BLE001 - 설치 실패는 쉬운 문장으로 바꿔 화면에 보여준다
         failed_service, message = friendly_attendance_error(error)
+        # 쓰던 시트를 찾았을 때의 안내는 시트 주소와 비어 있는 값 이름까지 담기므로
+        # 200자에서 자르면 정작 필요한 뒷부분이 잘려 나간다.
+        detail = message[:ATTENDANCE_DETAIL_LIMIT]
         _write_setup_status(config_dir, {
             "state": "failed", "account": current_user, "failed_service": failed_service,
-            "detail": message[:200], "progress": saved_progress,
+            "detail": detail, "progress": saved_progress,
         })
         return AttendanceStatus(
             state="failed", account=current_user, current_user=current_user,
-            failed_service=failed_service, detail=message[:200],
+            failed_service=failed_service, detail=detail,
         )
     deps.write_record(profile_json, result)
     _write_setup_status(config_dir, {"state": "ready", "account": current_user})

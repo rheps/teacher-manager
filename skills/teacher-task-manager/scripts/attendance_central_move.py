@@ -1,0 +1,337 @@
+"""중앙 Google Chat 발송 연결을 새 출결 사본으로 한 번만 옮긴다.
+
+옮길 실제 연결이 없으면 서버 자료를 만들지도 바꾸지도 않고 `등록 없음`으로 끝낸다.
+결과가 불명확하면 같은 요청을 자동으로 다시 보내지 않는다.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+
+SHEET_ID_KEY = "CENTRAL_CHAT_SHEET_ID"
+SHEET_SECRET_KEY = "CENTRAL_CHAT_SHEET_SECRET"
+MOVE_PATH = "/v1/sheet/move"
+STATUS_PATH = "/v1/status"
+ALLOWED_OUTCOMES = {"not_registered", "moved"}
+SPREADSHEET_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+# 이동은 한 번뿐인 요청이라 서버가 깨어나는 시간까지 기다린다.
+HTTP_TIMEOUT_SECONDS = 30
+
+
+class AttendanceCentralMoveHold(ValueError):
+    """중앙 연결 상태를 확실히 모를 때 자동으로 고치지 않고 멈춘다."""
+
+    code = "ATTENDANCE_CENTRAL_MOVE_HOLD"
+
+
+@dataclass(frozen=True)
+class CentralMoveResult:
+    outcome: str
+    account: str
+    source_spreadsheet_id: str
+    copy_spreadsheet_id: str
+    new_sheet_id: str = ""
+
+
+def _hold(message: str, *, cause: Exception | None = None):
+    error = AttendanceCentralMoveHold(
+        "ATTENDANCE_CENTRAL_MOVE_HOLD: "
+        + str(message).strip()
+        + " 같은 요청을 자동으로 다시 보내지 않았습니다."
+    )
+    if cause is not None:
+        error.__cause__ = cause
+    raise error
+
+
+def _need(condition: Any, message: str) -> None:
+    if not condition:
+        _hold(message)
+
+
+def _text(value: Any, label: str) -> str:
+    _need(isinstance(value, str), f"{label}이 글자가 아닙니다.")
+    clean = value.strip()
+    _need(bool(clean) and clean == value, f"{label}이 비었거나 앞뒤가 흐립니다.")
+    return clean
+
+
+def _spreadsheet_id(value: Any, label: str) -> str:
+    text = _text(value, label)
+    _need(
+        SPREADSHEET_ID_PATTERN.fullmatch(text) is not None,
+        f"{label}의 모양이 Google Sheet ID가 아닙니다.",
+    )
+    return text
+
+
+def _email(value: Any, label: str) -> str:
+    text = _text(value, label)
+    _need(
+        text.count("@") == 1 and not text.startswith("@") and not text.endswith("@"),
+        f"{label}의 이메일 모양이 다릅니다.",
+    )
+    return text.casefold()
+
+
+def _split_sheet_identity(sheet_id: str, source_spreadsheet_id: str) -> str:
+    """`<스프레드시트ID>:<uuid>`에서 뒤쪽 구분값만 떼어 낸다."""
+
+    marker = source_spreadsheet_id + ":"
+    _need(
+        sheet_id.startswith(marker),
+        "설정의 중앙 발송 시트 번호가 이번 원본 Sheet로 시작하지 않습니다.",
+    )
+    suffix = sheet_id[len(marker):]
+    _need(
+        bool(suffix) and ":" not in suffix,
+        "설정의 중앙 발송 시트 번호 뒤쪽 구분값을 읽지 못했습니다.",
+    )
+    return suffix
+
+
+def _default_read_config(config_dir: Path) -> dict[str, Any]:
+    from dashboard import central_chat
+
+    return central_chat.read_central_config(Path(config_dir))
+
+
+def _default_read_rows(spreadsheet_id: str) -> list:
+    from dashboard import central_chat
+
+    return central_chat._read_settings_rows(
+        spreadsheet_id,
+        central_chat._default_run_command,
+    )
+
+
+def _default_update_setting(
+    spreadsheet_id: str,
+    rows: list,
+    key: str,
+    value: str,
+) -> None:
+    from dashboard import central_chat
+
+    central_chat._update_settings_value(
+        spreadsheet_id,
+        rows,
+        key,
+        value,
+        central_chat._default_run_command,
+    )
+
+
+def _default_http_post(url: str, path: str, payload: dict) -> dict:
+    """출결 탭의 3초 주기 호출보다 넉넉히 기다린다.
+
+    이동 요청 하나는 서버가 깨어나는 시간, 저장된 Google 연결로 새 Sheet를 열어 보는
+    시간, 두 문서를 한 거래로 바꾸는 시간을 모두 포함한다. 여기서 일찍 끊으면 서버가
+    이미 옮긴 뒤에도 결과를 못 받은 상태가 되고, 그때는 사람이 직접 확인해야 한다.
+    """
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url.rstrip("/") + path,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8") or "{}")
+
+
+def _settings_value(rows: Any, key: str) -> str:
+    """설정 시트에서 같은 이름이 정확히 한 번 나오는 값만 읽는다."""
+
+    _need(isinstance(rows, list), "사본 설정 시트 내용을 읽지 못했습니다.")
+    found: list[str] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        if str(row[0]).strip() == key:
+            found.append(str(row[1]).strip())
+    _need(len(found) == 1, f"사본 설정 시트에서 {key} 값을 하나만 찾지 못했습니다.")
+    return found[0]
+
+
+def _reply(value: Any, label: str) -> dict[str, Any]:
+    _need(isinstance(value, dict), f"{label} 응답이 JSON 객체가 아닙니다.")
+    return value
+
+
+def _point_copy_at_new_sheet_id(
+    copy_spreadsheet_id: str,
+    *,
+    new_sheet_id: str,
+    sheet_secret: str,
+    read_rows: Callable[[str], list],
+    update_setting: Callable[[str, list, str, str], Any],
+) -> None:
+    """사본 설정 시트의 중앙 발송 시트 번호 한 칸만 새 값으로 맞춘다."""
+
+    try:
+        rows = read_rows(copy_spreadsheet_id)
+    except Exception as exc:
+        _hold("사본 설정 시트를 읽지 못했습니다.", cause=exc)
+    _need(
+        _settings_value(rows, SHEET_SECRET_KEY) == sheet_secret,
+        "사본 설정 시트의 발송 확인값이 기존 시트와 다릅니다.",
+    )
+    current = _settings_value(rows, SHEET_ID_KEY)
+    if current == new_sheet_id:
+        return
+    try:
+        update_setting(copy_spreadsheet_id, rows, SHEET_ID_KEY, new_sheet_id)
+    except Exception as exc:
+        _hold("사본 설정 시트의 중앙 발송 시트 번호를 바꾸지 못했습니다.", cause=exc)
+    try:
+        rechecked = read_rows(copy_spreadsheet_id)
+    except Exception as exc:
+        _hold("사본 설정 시트를 다시 읽지 못했습니다.", cause=exc)
+    _need(
+        _settings_value(rechecked, SHEET_ID_KEY) == new_sheet_id,
+        "사본 설정 시트를 다시 읽은 중앙 발송 시트 번호가 다릅니다.",
+    )
+    _need(
+        _settings_value(rechecked, SHEET_SECRET_KEY) == sheet_secret,
+        "사본 설정 시트를 다시 읽은 발송 확인값이 달라졌습니다.",
+    )
+
+
+def move_central_chat_connection(
+    config_dir: Path,
+    *,
+    account: str,
+    source_spreadsheet_id: str,
+    copy_spreadsheet_id: str,
+    read_config: Callable[[Path], dict] | None = None,
+    read_rows: Callable[[str], list] | None = None,
+    update_setting: Callable[[str, list, str, str], Any] | None = None,
+    http_post: Callable[[str, str, dict], dict] | None = None,
+) -> CentralMoveResult:
+    """등록과 연결이 실제로 있는 사용자만 기존 발송 연결을 사본으로 옮긴다."""
+
+    config_dir = Path(config_dir)
+    account = _email(account, "현재 Google 계정")
+    source_id = _spreadsheet_id(source_spreadsheet_id, "원본 Sheet ID")
+    copy_id = _spreadsheet_id(copy_spreadsheet_id, "사본 Sheet ID")
+    _need(source_id != copy_id, "원본과 사본 Sheet ID가 같습니다.")
+
+    read_config = read_config or _default_read_config
+    read_rows = read_rows or _default_read_rows
+    update_setting = update_setting or _default_update_setting
+    http_post = http_post or _default_http_post
+
+    try:
+        config = read_config(config_dir)
+    except Exception as exc:
+        _hold("중앙 발송 설정을 읽지 못했습니다.", cause=exc)
+    _need(isinstance(config, dict), "중앙 발송 설정의 모양이 다릅니다.")
+    _need(
+        _spreadsheet_id(config.get("spreadsheet_id"), "설정을 읽은 Sheet ID")
+        == source_id,
+        "중앙 발송 설정을 읽은 Sheet가 이번 원본과 다릅니다.",
+    )
+    url = _text(config.get("url"), "중앙 발송소 주소")
+    _need(url.startswith("https://"), "중앙 발송소 주소가 https가 아닙니다.")
+    sheet_id = _text(config.get("sheet_id"), "중앙 발송 시트 번호")
+    sheet_secret = _text(config.get("sheet_secret"), "중앙 발송 확인값")
+    suffix = _split_sheet_identity(sheet_id, source_id)
+    new_sheet_id = f"{copy_id}:{suffix}"
+
+    def _not_registered() -> CentralMoveResult:
+        return CentralMoveResult(
+            outcome="not_registered",
+            account=account,
+            source_spreadsheet_id=source_id,
+            copy_spreadsheet_id=copy_id,
+        )
+
+    try:
+        status = _reply(
+            http_post(
+                url,
+                STATUS_PATH,
+                {"sheetId": sheet_id, "sheetSecret": sheet_secret},
+            ),
+            "중앙 발송 상태",
+        )
+    except AttendanceCentralMoveHold:
+        raise
+    except Exception as exc:
+        _hold("중앙 발송 등록 상태를 확인하지 못했습니다.", cause=exc)
+
+    # 사본은 옛 시트의 중앙 발송 번호를 그대로 들고 있으면 안 된다.
+    # 등록이 없어도 사본이 자기 번호를 갖도록 이 한 칸은 항상 맞춘다.
+    _point_copy_at_new_sheet_id(
+        copy_id,
+        new_sheet_id=new_sheet_id,
+        sheet_secret=sheet_secret,
+        read_rows=read_rows,
+        update_setting=update_setting,
+    )
+
+    if status.get("registered") is not True or status.get("connected") is not True:
+        return _not_registered()
+    _need(
+        _email(status.get("account"), "중앙 발송에 등록된 계정") == account,
+        "중앙 발송에 등록된 계정이 현재 Google 계정과 다릅니다.",
+    )
+
+    try:
+        moved = _reply(
+            http_post(
+                url,
+                MOVE_PATH,
+                {
+                    "sheetId": sheet_id,
+                    "sheetSecret": sheet_secret,
+                    "newSheetId": new_sheet_id,
+                },
+            ),
+            "중앙 발송 연결 이동",
+        )
+    except AttendanceCentralMoveHold:
+        raise
+    except Exception as exc:
+        _hold("중앙 발송 연결 이동 결과를 받지 못했습니다.", cause=exc)
+
+    _need(moved.get("ok") is True, "중앙 발송 연결 이동이 성공으로 확인되지 않았습니다.")
+    outcome = _text(moved.get("outcome"), "중앙 발송 연결 이동 결과")
+    _need(
+        outcome in ALLOWED_OUTCOMES,
+        "중앙 발송 연결 이동 결과가 확실한 두 상태 중 하나가 아닙니다.",
+    )
+    if outcome == "not_registered":
+        return _not_registered()
+    _need(
+        _text(moved.get("newSheetId"), "옮긴 뒤 시트 번호") == new_sheet_id,
+        "옮긴 뒤 시트 번호가 이번 사본 번호와 다릅니다.",
+    )
+    return CentralMoveResult(
+        outcome="moved",
+        account=account,
+        source_spreadsheet_id=source_id,
+        copy_spreadsheet_id=copy_id,
+        new_sheet_id=new_sheet_id,
+    )
+
+
+__all__ = [
+    "AttendanceCentralMoveHold",
+    "CentralMoveResult",
+    "move_central_chat_connection",
+]

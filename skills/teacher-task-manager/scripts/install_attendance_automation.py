@@ -16,19 +16,18 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from brity_bridge import bundle_paths, process_win
+import apps_script_version
+from brity_bridge import bundle_paths, gws_env, process_win
 
 
 CommandRunner = Callable[[Sequence[str], Path], str]
 
+# 월 탭의 Google Chat 제목 네 개는 Code.gs가 직접 쓴다(ensureMonthlyChatResultColumns_).
+# 파이썬 쪽 사본은 attendance_chat_marker.CHAT_RESULT_HEADERS 한 벌만 둔다 —
+# 두 벌을 두었더니 한쪽만 세 개인 채로 남아 재발송 표식 자리가 사라졌다(2026-07-25).
+
 # assets/Code.gs의 시트 이름·헤더 상수와 반드시 같아야 한다.
 # (tests/test_attendance_installer.py가 Code.gs 원본과 대조해서 검증한다.)
-MONTHLY_CHAT_RESULT_HEADERS = [
-    "Google Chat 발송상태",
-    "Google Chat 시도시각",
-    "Google Chat 결과",
-]
-
 MESSAGE_LEDGER_HEADERS = {
     "메신저 개인톡 내용": ["보낼 날짜", "번호", "이름", "쪽지 종류", "쪽지 내용", "들어온 곳", "상태", "연결 표시", "보낸 시각", "결과"],
     "메신저 단체톡 내용": ["보낼 날짜", "안내 종류", "안내 내용", "들어온 곳", "상태", "보낸 시각", "결과"],
@@ -56,8 +55,13 @@ def resolve_command(args: Sequence[str]) -> list[str]:
 
 
 def default_runner(args: Sequence[str], cwd: Path) -> str:
+    # gws 열쇠를 파일에 두게 고정한다. 앱과 스크립트가 서로 다른 곳을 보면
+    # 한쪽 로그인이 다른 쪽에서 안 보이고, 자격 증명 관리자 읽기가 실패하면
+    # gws가 토큰을 스스로 지운다. 이 명령에만 넘기고 파이썬 환경은 그대로 둔다.
     resolved = resolve_command(args)
-    code, output = process_win.run_captured(resolved, cwd=cwd)
+    code, output = process_win.run_captured(
+        resolved, cwd=cwd, env=gws_env.gws_environ()
+    )
     if code != 0:
         raise subprocess.CalledProcessError(code, resolved, output=output, stderr=output)
     return output
@@ -104,11 +108,29 @@ def build_central_chat_defaults(
     }
 
 
+def local_gemini_api_key(config_dir: Path | None = None) -> str:
+    """이 컴퓨터에 저장된 Gemini 키를 읽는다. 못 읽으면 빈 값으로 본다.
+
+    시트 안 Apps Script는 이 컴퓨터의 settings.json을 읽지 못한다. 설치할 때 설정 탭에
+    실어 보내지 않으면 선생님이 시트에서 같은 키를 또 붙여넣게 된다.
+    """
+    from brity_bridge import paths as bridge_paths
+    from brity_bridge import settings as bridge_settings
+
+    try:
+        root = Path(config_dir) if config_dir else bridge_paths.default_config_dir()
+        loaded = bridge_settings.load_settings(bridge_paths.settings_path(root))
+        return str(loaded.gemini_api_key or "").strip()
+    except Exception:
+        return ""
+
+
 def build_config_rows(
     profile: dict,
     ids: dict,
     task_list_title: str,
     central_chat: dict[str, str],
+    gemini_api_key: str = "",
 ) -> list[list[str]]:
     teacher = profile.get("teacher", {})
     school = profile.get("school", {})
@@ -186,6 +208,12 @@ def build_config_rows(
             "Apps Script API 실행용 배포 ID입니다. 설치 도우미가 자동으로 입력합니다.",
             "자동 입력",
         ],
+        [
+            "GEMINI_API_KEY",
+            str(gemini_api_key or "").strip(),
+            "AI 출결 입력이 쓰는 Gemini API 키입니다. 티처 매니저 연결 화면에 넣은 값이 자동으로 들어옵니다.",
+            "자동 입력",
+        ],
     ]
 
 
@@ -205,6 +233,235 @@ def run_json(runner: CommandRunner, args: Sequence[str], cwd: Path) -> Any:
         return process_win.parse_first_json(output)
     except ValueError as error:
         raise CommandOutputError(args, output) from error
+
+
+ATTENDANCE_SHEET_NAME = "출결신고서 자동화"
+SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
+
+
+class ExistingAttendanceSheetError(RuntimeError):
+    """내 드라이브에 이미 출결 시트가 있어 새로 만들지 않고 멈춘다."""
+
+
+def _sheet_lines(files: Sequence[dict]) -> list[str]:
+    lines = []
+    for item in files:
+        link = str(item.get("webViewLink") or "").strip()
+        if not link:
+            link = f"https://docs.google.com/spreadsheets/d/{item.get('id')}/edit"
+        lines.append(f"- {item.get('id')} {link}")
+    return lines
+
+
+def _too_many_sheets_message(files: Sequence[dict]) -> str:
+    return "\n".join(
+        [
+            "내 드라이브에 "
+            + ATTENDANCE_SHEET_NAME
+            + " 시트가 여러 개 있습니다. 어느 것을 쓰실지 알 수 없어 멈췄습니다.",
+            "",
+        ]
+        + _sheet_lines(files)
+        + [
+            "",
+            "쓰시는 시트 하나만 남기고 나머지 이름을 바꾸거나 휴지통으로 옮긴 뒤 "
+            "다시 실행해 주세요.",
+        ]
+    )
+
+
+def _cannot_reuse_message(sheet: dict, missing: Sequence[str]) -> str:
+    return "\n".join(
+        [
+            "쓰시던 " + ATTENDANCE_SHEET_NAME + " 시트를 찾았지만 연결값이 비어 있어 "
+            "이어서 쓸 수 없습니다.",
+            "",
+        ]
+        + _sheet_lines([sheet])
+        + [
+            "",
+            "`설정` 탭에서 비어 있는 값: " + ", ".join(missing),
+            "",
+            "새로 만들면 시트가 두 개가 되고 프로그램이 빈 시트를 보게 되므로 "
+            "만들지 않았습니다.",
+        ]
+    )
+
+
+def _read_existing_settings(
+    runner: CommandRunner,
+    workdir: Path,
+    spreadsheet_id: str,
+) -> dict[str, str]:
+    reply = run_json(
+        runner,
+        [
+            "gws",
+            "sheets",
+            "spreadsheets",
+            "values",
+            "get",
+            "--params",
+            json.dumps(
+                {"spreadsheetId": spreadsheet_id, "range": "설정!A1:D200"},
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    rows = reply.get("values") if isinstance(reply, dict) else None
+    settings: dict[str, str] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 2:
+                key = str(row[0]).strip()
+                if key and key not in settings:
+                    settings[key] = str(row[1]).strip()
+    return settings
+
+
+def _require_new_enough_script(
+    runner: CommandRunner,
+    workdir: Path,
+    sheet: dict,
+    script_id: str,
+) -> str:
+    """쓰던 시트의 Apps Script가 동봉 배포 정보의 하한선 이상인지 본다."""
+
+    reply = run_json(
+        runner,
+        [
+            "gws",
+            "script",
+            "projects",
+            "getContent",
+            "--params",
+            json.dumps({"scriptId": script_id}, ensure_ascii=False),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    found = None
+    for item in reply.get("files") or []:
+        if isinstance(item, dict):
+            found = apps_script_version.app_version_in_source(item.get("source"))
+            if found:
+                break
+    minimum = apps_script_version.minimum_apps_script_version(
+        bundle_paths.bundle_root()
+    )
+    if not apps_script_version.is_at_least(found, minimum):
+        raise ExistingAttendanceSheetError(
+            "\n".join(
+                [
+                    "쓰시던 "
+                    + ATTENDANCE_SHEET_NAME
+                    + " 시트를 찾았지만, 그 시트에 붙은 Apps Script가 "
+                    + (f"{found} 판이라" if found else "판 번호를 읽을 수 없어")
+                    + f" 최소 {minimum} 판에 못 미칩니다.",
+                    "",
+                ]
+                + _sheet_lines([sheet])
+                + [
+                    "",
+                    "그대로 이어 쓰면 새 프로그램과 시트 모양이 어긋납니다. "
+                    "이 시트를 계속 쓰시려면 먼저 스크립트를 올려 주세요.",
+                ]
+            )
+        )
+    return found
+
+
+def reuse_existing_attendance_sheet(
+    runner: CommandRunner,
+    workdir: Path,
+    sheet: dict,
+) -> AttendanceInstallResult:
+    """쓰던 시트의 `설정` 탭을 읽어 연결값만 돌려준다. 시트에는 쓰지 않는다.
+
+    `설정`을 덮어쓰면 거기 든 Google Chat 발송 등록이 끊어지므로 읽기만 한다.
+    """
+
+    spreadsheet_id = str(sheet.get("id") or "").strip()
+    settings = _read_existing_settings(runner, workdir, spreadsheet_id)
+    wanted = {
+        "template_doc_id": "TEMPLATE_DOC_ID",
+        "folder_id": "DEST_FOLDER_ID",
+        "task_list_id": "TASK_LIST_ID",
+        "script_id": "SCRIPT_ID",
+        "deployment_id": "DEPLOYMENT_ID",
+    }
+    missing = sorted(name for name in wanted.values() if not settings.get(name))
+    if missing:
+        raise ExistingAttendanceSheetError(_cannot_reuse_message(sheet, missing))
+    _require_new_enough_script(runner, workdir, sheet, settings[wanted["script_id"]])
+    link = str(sheet.get("webViewLink") or "").strip()
+    return AttendanceInstallResult(
+        spreadsheet_id=spreadsheet_id,
+        spreadsheet_url=link
+        or f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        template_doc_id=settings[wanted["template_doc_id"]],
+        template_doc_url=(
+            "https://docs.google.com/document/d/"
+            + settings[wanted["template_doc_id"]]
+            + "/edit"
+        ),
+        script_id=settings[wanted["script_id"]],
+        deployment_id=settings[wanted["deployment_id"]],
+        folder_id=settings[wanted["folder_id"]],
+        task_list_id=settings[wanted["task_list_id"]],
+    )
+
+
+def find_existing_attendance_sheets(
+    runner: CommandRunner,
+    workdir: Path,
+    dry_run: bool = False,
+) -> list[dict]:
+    """내 드라이브에서 같은 이름의 출결 시트를 찾는다. 읽기만 한다."""
+
+    if dry_run:
+        return []
+    query = (
+        f"name = '{ATTENDANCE_SHEET_NAME}' and "
+        f"mimeType = '{SPREADSHEET_MIME}' and "
+        "trashed = false and 'me' in owners"
+    )
+    reply = run_json(
+        runner,
+        [
+            "gws",
+            "drive",
+            "files",
+            "list",
+            "--params",
+            json.dumps(
+                {
+                    "q": query,
+                    "fields": "files(id,name,webViewLink)",
+                    "pageSize": 20,
+                    "supportsAllDrives": True,
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    files = reply.get("files") if isinstance(reply, dict) else None
+    if not isinstance(files, list):
+        return []
+    return [
+        item
+        for item in files
+        if isinstance(item, dict)
+        and str(item.get("name", "")).strip() == ATTENDANCE_SHEET_NAME
+        and str(item.get("id", "")).strip()
+    ]
 
 
 def with_dry_run_fallback(response: dict, fallback: dict, dry_run: bool) -> dict:
@@ -314,6 +571,7 @@ def install_attendance_automation(
     central_chat_sender_url: str = "",
     resume: dict | None = None,
     progress: Callable[[dict], None] | None = None,
+    gemini_api_key: str = "",
 ) -> AttendanceInstallResult:
     profile_json = Path(profile_json)
     asset_root = bundle_paths.bundle_root() / "assets"
@@ -332,6 +590,30 @@ def install_attendance_automation(
         workdir = Path(temp_name)
         copy_assets_to_workdir(asset_root, workdir)
         dry = ["--dry-run"] if dry_run else []
+
+        # 아무것도 만들기 전에 쓰던 시트가 있는지 먼저 본다. 설치 기록이 사라졌다고
+        # 같은 이름의 시트를 또 만들면, 선생님은 쓰던 시트를 그대로 두고
+        # 프로그램만 빈 시트를 보게 된다. 하나면 그 시트에 연결하고, 여럿이면 멈춘다.
+        if not created_ids.get("spreadsheet_id"):
+            existing = find_existing_attendance_sheets(runner, workdir, dry_run)
+            if len(existing) > 1:
+                raise ExistingAttendanceSheetError(_too_many_sheets_message(existing))
+            if len(existing) == 1:
+                reused = reuse_existing_attendance_sheet(runner, workdir, existing[0])
+                created_ids.update(
+                    {
+                        "spreadsheet_id": reused.spreadsheet_id,
+                        "spreadsheet_url": reused.spreadsheet_url,
+                        "template_doc_id": reused.template_doc_id,
+                        "template_doc_url": reused.template_doc_url,
+                        "script_id": reused.script_id,
+                        "deployment_id": reused.deployment_id,
+                        "folder_id": reused.folder_id,
+                        "task_list_id": reused.task_list_id,
+                    }
+                )
+                report_progress()
+                return reused
 
         if not created_ids.get("template_doc_id"):
             template = run_json(
@@ -388,8 +670,8 @@ def install_attendance_automation(
                     "--json",
                     json.dumps(
                         {
-                            "name": "출결신고서 자동화",
-                            "mimeType": "application/vnd.google-apps.spreadsheet",
+                            "name": ATTENDANCE_SHEET_NAME,
+                            "mimeType": SPREADSHEET_MIME,
                         },
                         ensure_ascii=False,
                     ),
@@ -603,7 +885,13 @@ def install_attendance_automation(
             "deployment_id": created_ids["deployment_id"],
         }
         central_chat = build_central_chat_defaults(created_ids["spreadsheet_id"], central_chat_sender_url)
-        config_rows = build_config_rows(profile, ids, str(task_list["title"]), central_chat)
+        config_rows = build_config_rows(
+            profile,
+            ids,
+            str(task_list["title"]),
+            central_chat,
+            gemini_api_key=gemini_api_key,
+        )
         values_body = {
             "majorDimension": "ROWS",
             "values": config_rows,
@@ -795,6 +1083,7 @@ def main() -> int:
         attendance_task_list_title=args.attendance_task_list_title,
         attendance_task_list_id=args.attendance_task_list_id,
         central_chat_sender_url=args.central_chat_sender_url,
+        gemini_api_key=local_gemini_api_key(),
     )
     print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
     if args.dry_run:

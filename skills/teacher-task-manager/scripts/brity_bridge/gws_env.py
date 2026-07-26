@@ -37,6 +37,11 @@ def prepare_gws_env(environ=os.environ, client_file_candidates=None) -> None:
     """gws 키 보관을 파일 방식으로 고정하고, 놓여 있는 OAuth 클라이언트를 물린다.
 
     사용자가 직접 정한 환경 변수 값은 존중한다.
+
+    이 함수는 건네준 환경을 **그 자리에서 바꾼다**. 프로그램이 시작할 때 딱 한 번
+    부르는 자리(brity_bridge/__main__.py, dashboard/__main__.py)에서만 쓴다.
+    명령을 하나 실행할 때마다 컴퓨터 전체 환경을 다시 건드리지 않으려면
+    `gws_environ()`으로 사본을 만들어 그 명령에만 넘긴다.
     """
     environ.setdefault("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND", "file")
     if environ.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"):
@@ -48,3 +53,11 @@ def prepare_gws_env(environ=os.environ, client_file_candidates=None) -> None:
         if path.is_file():
             environ["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(path)
             return
+
+
+def gws_environ(base=None, client_file_candidates=None) -> dict:
+    """gws 한 번 실행에 넘길 환경 **사본**을 만든다. 원본은 건드리지 않는다."""
+
+    made = dict(os.environ if base is None else base)
+    prepare_gws_env(made, client_file_candidates=client_file_candidates)
+    return made

@@ -215,10 +215,7 @@ class Api:
     @guarded
     def attendance_chat_status(self):
         from dashboard import central_chat
-        try:
-            central_chat.sync_task_list(self._config_dir)
-        except central_chat.CentralChatError:
-            pass  # 통합은 다음 기회에 — 상태 표시는 계속한다
+        # 상태 조회는 화면에 보여 줄 값만 읽고, Google 시트는 바꾸지 않는다.
         return central_chat.chat_status(self._config_dir)
 
     @guarded

@@ -330,6 +330,41 @@ python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config
 - `assets/appsscript.json`
 - `scripts/install_attendance_automation.py`
 
+### 이미 쓰던 출결 시트가 있을 때
+
+설치 도우미는 **아무것도 만들기 전에** 내 드라이브에서 `출결신고서 자동화`라는 이름의
+시트를 먼저 찾는다. 그다음은 찾은 개수에 따라 갈린다.
+
+| 찾은 개수 | 설치 도우미가 하는 일 |
+| --- | --- |
+| 0개 | 지금까지처럼 새로 만든다 |
+| 1개 | 그 시트를 **그대로 이어 쓴다**. 아무것도 만들지 않고 시트에도 쓰지 않는다 |
+| 2개 이상 | 어느 것인지 알 수 없으므로 멈추고 찾은 시트를 링크와 함께 보여준다 |
+
+1개일 때 이어 쓰는 절차는 시트의 `설정` 탭에 이미 들어 있는
+`TEMPLATE_DOC_ID`, `DEST_FOLDER_ID`, `TASK_LIST_ID`, `SCRIPT_ID`, `DEPLOYMENT_ID`를 읽어
+로컬 설치 기록만 만드는 것이다. 다섯 값 중 하나라도 비어 있으면 멈추고 어느 값이
+비었는지 이름을 알려 준다.
+
+그 시트에 붙어 있는 Apps Script가 `release.json`의 `minimumAppsScriptVersion`보다
+오래된 판이면 이어 쓰지 않고 멈춘다. 옛 판 스크립트를 그대로 몰고 가면 시트 모양이
+어긋난다.
+
+`설정` 탭을 덮어쓰지 않는 이유가 있다. 거기에 `CENTRAL_CHAT_SHEET_ID`와
+`CENTRAL_CHAT_SHEET_SECRET`이 들어 있어서, 덮어쓰면 Google Chat 발송 등록이 끊어진다.
+
+시트가 여러 개 나와 멈췄을 때는 어느 것이 쓰던 시트인지 사용자에게 물어본다. 마지막
+수정 시각과 자료가 들어 있는지를 함께 보여주면 고르기 쉽다. 쓰지 않는 시트의 이름을
+바꾸거나 휴지통으로 옮겨 하나만 남기면, 다시 실행했을 때 그 시트로 이어진다.
+
+시트 ID를 직접 지정해서 연결해야 할 때만 아래를 쓴다. 이 절차도 시트에는 한 글자도
+쓰지 않으며, 바꾸기 전 설치 기록을
+`attendance-install.before-connect.generated.json`으로 한 번 남긴다.
+
+```powershell
+python -c "import sys; sys.path.insert(0, r'<이 스킬 폴더>\scripts'); from connect_existing_attendance_sheet import connect_existing_attendance_sheet; print(connect_existing_attendance_sheet(r'C:\Users\<사용자이름>\TeacherTaskManager', '<쓰던 시트 ID>', account='<gws auth status로 읽은 계정>'))"
+```
+
 ### Apps Script ID 확인과 사본 시트 복구
 
 Code.gs 반영, 버전 확인, Apps Script API 실행에 필요한 스크립트 ID는 이 순서로 찾는다. 사용자에게 ID를 먼저 물어보지 않는다.
@@ -341,7 +376,131 @@ Code.gs 반영, 버전 확인, Apps Script API 실행에 필요한 스크립트 
 
 시트를 사본으로 복사하면 Apps Script도 새 ID로 함께 복사되지만 설치 기록 파일은 남지 않는다. 위 3~4번이 그 복구 절차다. 설치 도우미와 `기본 시트/설정 점검`은 스크립트 ID를 `설정` 시트에 자동 기록한다.
 
-사본 시트는 새 시트로 본다. 원본 시트의 Google Chat 발송 연결이나 학급 단톡방 선택을 이어받은 것으로 안내하지 않는다. 원본 시트의 연결 상태를 이어받았다고 안내하지 않는다. 사본에서는 `Google Chat 최초 발송 연결하기`로 새 발송 연결을 마치고, 학급 단톡방도 다시 고른다.
+선생님이 Drive에서 직접 복사해 만든 사본 시트는 새 시트로 본다. 원본 시트의 Google Chat 발송 연결이나 학급 단톡방 선택을 이어받은 것으로 안내하지 않는다. 원본 시트의 연결 상태를 이어받았다고 안내하지 않는다. 그런 사본에서는 `Google Chat 최초 발송 연결하기`로 새 발송 연결을 마치고, 학급 단톡방도 다시 고른다.
+
+아래 `출결 사본으로 바꾸고 1행 AI 입력 켜기` 절차로 만든 사본은 예외다. 그 절차는 발송 연결을 사본으로 옮기는 단계를 포함한다.
+
+### 출결 사본으로 바꾸고 1행 AI 입력 켜기
+
+사용자가 `1행 AI 입력`, `문장으로 출결 입력`, `출결 사본으로 바꾸기`, `AI 출결 입력 켜기`를 말하면 이 절차를 따른다.
+
+먼저 안전선을 지킨다.
+
+- 원본 Google Sheet에는 쓰지 않는다. 쓰는 대상은 사본과 로컬 설치 기록뿐이다.
+- Google이나 중앙 발송 서버의 답이 불분명하면 같은 요청을 자동으로 다시 보내지 않는다. 멈추고 사용자에게 지금 상태를 그대로 알린다.
+- 어느 단계에서 멈춰도 기존 설치 기록과 원본 시트는 그대로 남는다.
+
+시작 전에 `attendance-install.generated.json`이 있어야 하고, gws는 선생님 본인 학교 계정으로 로그인돼 있어야 한다. 현재 계정은 `gws auth status`로 확인한다.
+
+**1단계 — 비공개 사본 하나 만들기**
+
+```python
+import sys
+sys.path.insert(0, r"<이 스킬 폴더>\scripts")
+from attendance_install_record import load_attendance_install_record
+from prepare_attendance_copy import prepare_attendance_copy
+
+config_dir = r"C:\Users\<사용자이름>\TeacherTaskManager"
+record = load_attendance_install_record(config_dir + r"\attendance-install.generated.json")
+result = prepare_attendance_copy(config_dir, record, current_account="<gws auth status로 읽은 계정>")
+print(result.state, result.copy_spreadsheet_id, result.copy_spreadsheet_url)
+```
+
+사본 이름은 `<원본 이름> - AI 입력 준비 사본 (연-월-일 시분초)`가 된다. 이 이름은 나중에 AI 입력을 켤 수 있는 파일인지 판단하는 기준이므로 사용자에게 바꾸지 말라고 안내한다.
+
+**시작하기 전에 사용자에게 반드시 알린다.** 이 절차가 끝나면 앞으로 쓰는 파일이 사본으로 바뀌고, 원본 시트에서는 Google Chat 발송이 막힌다. 즐겨찾기나 다른 곳에 걸어 둔 출결 시트 링크를 사본 주소로 바꿔야 한다.
+
+**사본에서 `Google Chat 연결` 메뉴는 누르지 않게 안내한다.** 연결 바꾸기가 끝나기 전에 그 메뉴를 누르면 사본이 자기 발송 번호와 확인값을 새로 만들어 버려서, 4단계 연결 옮기기가 `사본 설정 시트의 발송 확인값이 기존 시트와 다릅니다`로 막힌다. 자동으로 고치지 않는다. 사본을 열어 보거나 `확장 프로그램 -> Apps Script`를 누르는 것은 안전하다.
+
+이 절차가 정상으로 받아들이는 실제 시트 모양이다. 아래는 멈추는 이유가 아니다.
+
+- 설정의 `MONTH_SHEET_NAMES`에 적혀 있지만 **선생님이 지운 지난 달 탭**은 건너뛴다. 같은 이름이 두 개면 멈춘다.
+- `Google Chat 시도시각` 칸은 글자로 써도 Google이 날짜로 알아보고 숫자로 담는다. **날짜 서식이 입혀진 숫자**는 정상으로 본다. 서식 없는 숫자는 멈춘다.
+- 예전에 보낸 줄의 `Google Chat 내용기준` 칸이 **완전히 비어 있으면** 그 줄의 값으로 계산한 표식을 채운다. 그때는 프로그램이 그 칸을 적지 않았기 때문이다. 값이 들어 있는데 다르면 멈춘다.
+
+`Google Chat 내용기준` 제목이 일부 월 탭에만 있고 나머지에는 없으면 멈춘다. 그 칸은 재발송을 막는 표식이 들어가는 자리라, 빠진 탭의 `L1`에 그 제목을 채운 뒤 다시 실행한다. 채우기 전에 그 칸과 아래 줄이 비어 있는지 먼저 읽어 확인한다.
+
+`state`가 `complete`가 아니면 다음 단계로 넘어가지 않는다. `copy_check_required`, `layout_check_required`, `ui_check_required`는 사본이나 행 삽입 결과가 불분명하다는 뜻이다. 사용자에게 사본을 직접 열어 확인해 달라고 안내하고, 같은 명령을 다시 실행하지 않는다.
+
+**2단계 — 사본의 Apps Script에 새 코드 올리기**
+
+사본의 스크립트 ID는 사본 시트에서 `확장 프로그램 -> Apps Script`를 열어 주소에서 읽는다. 원본의 `script_id`를 쓰면 안 된다.
+
+먼저 아무것도 쓰지 않는 확인 실행을 한다.
+
+```powershell
+python "<이 스킬 폴더>\scripts\prepare_attendance_copy_script.py" --copied-spreadsheet-id "<사본 Sheet ID>" --copied-script-id "<사본 Script ID>"
+```
+
+`state`가 `ready_for_apply`면 사용자 승인을 받고 `--apply`를 붙여 한 번 실행한다. 성공하면 `version_number`, `deployment_id`, `bundle_sha256`이 나온다. 이 세 값을 3단계에 그대로 쓴다.
+
+`hold`가 나오면 다시 실행하지 않는다. 사본 스크립트에 정식 파일 두 개(`Code`, `appsscript`) 외의 파일이 있거나 부모 시트가 다르다는 뜻이다.
+
+**3단계 — 올린 코드를 다시 읽어 확인하고 기록하기**
+
+```python
+from switch_attendance_connection import record_prepared_copy_script
+
+record_prepared_copy_script(
+    config_dir,
+    copy_spreadsheet_id="<사본 Sheet ID>",
+    copy_script_id="<사본 Script ID>",
+    version_number=<2단계 version_number>,
+    deployment_id="<2단계 deployment_id>",
+    bundle_sha256="<2단계 bundle_sha256>",
+)
+```
+
+이 호출은 사본의 현재 코드, 지정한 버전, 지정한 배포판을 각각 다시 읽어 정식 `Code.gs`와 정확히 같은지 확인한다. 모두 맞을 때만 사본 진행 기록에 남기고 옛 코드 보류를 푼다. 하나라도 다르면 `ATTENDANCE_CONNECTION_SWITCH_HOLD`로 멈추고 아무것도 기록하지 않는다.
+
+**4단계 — 연결을 사본으로 바꾸기**
+
+```python
+from switch_attendance_connection import switch_attendance_connection
+
+switch_attendance_connection(
+    config_dir,
+    new_script_id="<사본 Script ID>",
+    new_deployment_id="<2단계 deployment_id>",
+)
+```
+
+이 호출 하나가 같은 출결 잠금 안에서 아래를 순서대로 한다.
+
+1. 현재 Google 계정, 원본·사본 소유자, 공유 사용자, 댓글을 읽어 확인한다.
+2. 3단계에 기록한 값으로 사본 Apps Script를 다시 확인한다.
+3. 사본 설정 시트의 `CENTRAL_CHAT_SHEET_ID`를 사본 자기 번호로 맞춘다.
+4. 중앙 발송 서버에 등록과 연결이 있으면 발송 연결을 사본으로 한 번 옮기고, 옛 시트에서는 더 이상 발송되지 않게 막는다. 등록이나 연결이 없으면 서버 자료를 만들지도 바꾸지도 않고 `등록 없음`으로 넘어간다.
+5. 로컬 설치 기록에서 `spreadsheet_id`, `spreadsheet_url`, `script_id`, `deployment_id` 네 값만 바꾼다. 나머지 설정과 알 수 없는 값은 그대로 둔다. 바꾸기 전 원본은 `attendance-install.before-copy-switch.generated.json`으로 한 번만 남는다.
+
+중앙 서버의 답을 받지 못했거나 결과가 애매하면 로컬 연결도 바꾸지 않고 멈춘다. 이때 다시 실행하면 `앞선 중앙 확인 결과가 불명확해 사람이 먼저 확인해야 합니다`로 멈춘다. 이 상태에서는 자동으로 이어가지 말고, 중앙 발송 상태를 사람이 확인한 뒤 어떻게 할지 사용자에게 묻는다.
+
+**5단계 — 사본 시트에서 AI 입력 켜기**
+
+여기부터는 선생님이 직접 한다.
+
+1. 사본 시트를 연다.
+2. 상단 `출결 업무 자동화` 메뉴를 누른다. 네 번째 줄에 `AI 출결 입력 켜기`가 보인다. 안 보이면 4단계가 끝나지 않은 것이다.
+3. 그 항목을 누르면 바로 켜진다. **시트에서는 Gemini API 키를 묻지 않는다.** 컴퓨터의 티처 매니저 `연결` 화면에 넣은 키가 `설정` 탭 `GEMINI_API_KEY` 줄에 들어와 있고, 시트는 그 값을 읽는다. 처음 한 번은 Google 권한 승인 화면이 뜬다.
+4. 키가 없거나 모양이 아니면 `컴퓨터의 티처 매니저를 열고 [연결] 화면에서 Gemini API key를 넣어 저장한 다음 이 메뉴를 다시 눌러 주세요`라고 알리고 아무것도 켜지 않는다.
+5. 월 시트 1행 B열부터 K열까지가 한 칸으로 합쳐진 입력칸이다. 거기에 `7월 25일 홍길동 감기로 병결`처럼 적고 Enter를 누르면 맨 아래에 출결행이 하나 생기고, 그 줄 M열에 `AI`라고 적힌다. A열에는 `AI 출결 입력`이라는 이름표가 있다.
+
+월 시트 1행 모양은 이렇다.
+
+| 자리 | 들어가는 것 | 색 |
+| --- | --- | --- |
+| A1 | `AI 출결 입력` 이름표 | 연한 파랑 `#E8F2FF` |
+| B1~K1 (한 칸) | 문장을 적는 칸. 비어 있으면 회색 안내 문구가 들어 있다 | 흰 바탕 + 회색 테두리 |
+| L1~P1 | 아무것도 없다 | 색 없음 |
+| 2행 A~M | 제목 12개 + `AI 입력` | 진한 파랑 `#1F4E79` |
+| M열 3행 아래 | AI가 넣은 줄에만 `AI` | 날짜 줄무늬 그대로 |
+| N~P 열 전체 | 아무 자료도 안 들어간다 | 색 없음 |
+
+Enter를 누른 뒤 그 칸은 회색 안내 문구로 되돌아간다. 출결행이 생겼는지는 맨 아래 줄 M열의 `AI` 표시로 확인한다. 이름을 못 찾거나 날짜·구분을 해석하지 못하거나 통신이 실패하면 아무 줄도 만들지 않고, 실패를 시트에 표시하지도 않는다. 다른 처리가 돌고 있어 아무 일도 못 했을 때만 적은 문장을 그대로 남긴다. 같은 메뉴를 다시 눌러도 두 번째 감지기를 만들지 않는다.
+
+원본 시트와 4단계가 끝나지 않은 사본에는 `AI 출결 입력 켜기` 항목이 아예 만들어지지 않는다. 사용자에게 원본 시트에서 켜는 방법을 안내하지 않는다.
+
+이 절차는 시트 스크립트 `5.10.0`부터 이 모양이다. 감지기를 만들고 정리하는 데 `https://www.googleapis.com/auth/script.scriptapp` 권한이 필요해서, 이미 쓰던 선생님도 처음 한 번 다시 승인해야 한다. `5.9.0` 이전 판에서 시트 메뉴로 직접 키를 넣어 둔 선생님은 그 값이 그대로 쓰인다.
 
 ## Google Chat 쪽지 발송
 
@@ -620,3 +779,8 @@ gws tasks tasks insert \
 - 스킬 문서에는 개인 이름, 학교, 캘린더 ID를 고정해서 두지 않는다. 실제 실행에서는 사용자 설정 JSON이 항상 우선한다.
 - 비담임이면 담임 안내 Tasks 관련 판단과 생성은 하지 않는다.
 - 학사일정 캘린더는 월~금만 사용한다. 주말 날짜가 들어오면 예외 처리 규칙을 따른다.
+
+AI가 넣은 줄에 배경색을 칠하지 않는다. 배경은 날짜 줄무늬가 쓰는 자리다 — 같은 날짜끼리 묶어
+회색·흰색을 번갈아 칠해 나이스에 날짜별로 옮겨 적을 때 덩어리 경계를 보여 준다. 거기에 색을
+덮으면 한 날짜 덩어리가 쪼개져 보인다. 그래서 표시는 M열 글자로 하고, 넣은 직후 줄무늬를 다시
+입혀 새 줄도 제 날짜 덩어리의 색을 갖게 한다.

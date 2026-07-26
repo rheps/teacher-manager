@@ -37,6 +37,24 @@ def attendance_install_record_path(config_dir: Path) -> Path:
     return Path(config_dir) / "attendance-install.generated.json"
 
 
+def attendance_install_backup_path(config_dir: Path) -> Path:
+    return (
+        Path(config_dir)
+        / "attendance-install.before-copy-switch.generated.json"
+    )
+
+
+def attendance_connect_backup_path(config_dir: Path) -> Path:
+    return (
+        Path(config_dir)
+        / "attendance-install.before-connect.generated.json"
+    )
+
+
+def attendance_copy_status_path(config_dir: Path) -> Path:
+    return Path(config_dir) / "attendance-copy-status.generated.json"
+
+
 def attendance_setup_status_path(config_dir: Path) -> Path:
     return Path(config_dir) / "attendance-setup-status.generated.json"
 

@@ -12,9 +12,15 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from brity_bridge import paths, process_win
+from brity_bridge import gws_env, paths, process_win
 
 SETTINGS_RANGE = "설정!A1:D200"
+
+# 새 설정 줄을 붙일 때 C열에 함께 적을 설명이다.
+# install_attendance_automation.build_config_rows의 같은 이름 설명과 맞춰 둔다.
+SETTINGS_DESCRIPTIONS = {
+    "GEMINI_API_KEY": "AI 출결 입력이 쓰는 Gemini API 키입니다. 티처 매니저 연결 화면에 넣은 값이 자동으로 들어옵니다.",
+}
 TIMEOUT_SECONDS = 6
 NOT_PREPARED_MESSAGE = "출결 준비가 아직 안 됐어요. 먼저 출결 준비 시작하기를 눌러 주세요."
 CONFIG_BROKEN_MESSAGE = "출결 시트의 설정 값을 읽지 못했어요. 시트가 열리는지 확인해 주세요."
@@ -44,9 +50,11 @@ def _resolve_command(args, which=shutil.which):
 
 
 def _default_run_command(args, cwd=None):
+    # 앱과 같은 곳에 gws 열쇠를 두게 고정한다 — 이 명령에만 넘긴다.
     # 출결 탭이 3초 간격으로 부르는 경로 — 창 숨김이 빠지면 검은 창이 계속 뜬다.
     result = subprocess.run(_resolve_command(args), capture_output=True, text=True,
                             encoding="utf-8", errors="replace", cwd=cwd, shell=False,
+                            env=gws_env.gws_environ(),
                             **process_win.hidden_process_kwargs())
     if result.returncode != 0:
         raise CentralChatError(CONFIG_BROKEN_MESSAGE)
@@ -157,6 +165,44 @@ def _update_settings_value(spreadsheet_id: str, rows: list, key: str, value: str
             ])
             return
     raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+
+
+def _upsert_settings_value(spreadsheet_id: str, rows: list, key: str, value: str, run_command) -> None:
+    """설정 탭 값을 고치되, 그 이름 줄이 없으면 표 맨 아래에 새로 붙인다.
+
+    이미 설치를 끝낸 시트에는 나중에 생긴 설정 이름이 아예 없다. 그럴 때 오류를 내면
+    선생님이 시트를 열어 손으로 줄을 만들어야 하므로, 없으면 만들어 준다.
+    같은 이름이 둘 이상이면 어느 줄이 진짜인지 알 수 없으므로 손대지 않는다.
+    """
+    matched = [
+        index
+        for index, row in enumerate(rows)
+        if isinstance(row, list) and row and str(row[0]).strip() == key
+    ]
+    if len(matched) > 1:
+        raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+    if matched:
+        row_number = matched[0] + 1  # A1 표기 — values get 결과의 줄 번호 그대로
+        params = {
+            "spreadsheetId": spreadsheet_id,
+            "range": f"설정!B{row_number}",
+            "valueInputOption": "RAW",
+        }
+        values = [[value]]
+    else:
+        row_number = len(rows) + 1
+        params = {
+            "spreadsheetId": spreadsheet_id,
+            "range": f"설정!A{row_number}:D{row_number}",
+            "valueInputOption": "RAW",
+        }
+        values = [[key, value, SETTINGS_DESCRIPTIONS.get(key, ""), "자동 입력"]]
+    run_command([
+        "gws", "sheets", "spreadsheets", "values", "update",
+        "--params", json.dumps(params, ensure_ascii=False),
+        "--json", json.dumps({"majorDimension": "ROWS", "values": values}, ensure_ascii=False),
+        "--format", "json",
+    ])
 
 
 def set_class_space(config_dir: Path, space_name: str, display_name: str,

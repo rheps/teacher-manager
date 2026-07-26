@@ -1,18 +1,18 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.8.4
+ * 버전: 5.10.0
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
  * 핵심 원칙:
- * - 월별 입력표 A:P 구조 유지
+ * - 월별 입력표는 A:L이 실제 표다. M~P는 값도 제목도 없고 색도 칠하지 않는다.
  * - 신고서 양식은 이미 만들어 둔 Google Docs 템플릿을 그대로 복사해서 사용
  * - 새 템플릿 문서 생성 기능은 넣지 않음
  * - 학생명단은 A열 번호, B열 이름을 적으면 C열 '번호+이름'이 자동 생성되고, 월별 시트 B열 드롭다운으로 연결
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.8.4';
+const APP_VERSION = '5.10.0';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -25,11 +25,49 @@ const FALLBACK_TASK_LIST_ID = '';      // 설정 시트 TASK_LIST_ID 우선.
 const FALLBACK_CLASS_LABEL = '';
 const FALLBACK_HOLIDAY_SHEET_NAME = '휴일';
 
-/***** 날짜 줄무늬 설정 *****/
-const STRIPE_START_ROW = 2;      // 헤더 1행, 데이터는 2행부터
-const STRIPE_END_COL  = 16;      // A(1)~P(16)
+/***** 월별 출결표 행 구조와 날짜 줄무늬 설정 *****/
+const MONTHLY_ATTENDANCE_INPUT_ROW = 1;
+const MONTHLY_ATTENDANCE_HEADER_ROW = 2;
+const MONTHLY_ATTENDANCE_DATA_START_ROW = 3;
+// 예전 판이 A1에 넣던 문구다. 이미 만들어진 사본을 새 1행 모양으로 갈아입힐 때 알아보는 데 쓴다.
+const MONTHLY_ATTENDANCE_AI_INPUT_PLACEHOLDER = 'AI 출결 입력 (준비 중)';
+// 1행 A열은 무엇을 하는 자리인지 알려 주는 이름표, B~K열은 한 칸으로 합친 입력칸이다.
+const MONTHLY_ATTENDANCE_AI_INPUT_LABEL = 'AI 출결 입력';
+const MONTHLY_ATTENDANCE_AI_INPUT_HINT =
+  '여기에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르세요';
+const MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR = '#9AA0A6';
+const MONTHLY_ATTENDANCE_AI_INPUT_COL = 2;        // B
+const MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL = 11;  // K (그 다음 L열은 숨긴 열이다)
+// 제목이 실제로 있는 마지막 열이다. M~P에는 아무 자료도 들어가지 않는다.
+const MONTHLY_ATTENDANCE_LAST_DATA_COL = 13;      // M (AI 입력 표시까지가 표다)
+const STRIPE_END_COL  = 13;      // A(1)~M(13)
 const STRIPE_COLOR_WHITE = '#ffffff';
 const STRIPE_COLOR_GRAY  = '#bdbdbd'; // 구글 시트 팔레트 '회색' 중앙 톤 근사값
+const ATTENDANCE_AI_INTERACTIONS_URL =
+  'https://generativelanguage.googleapis.com/v1beta/interactions';
+const ATTENDANCE_AI_MODEL = 'gemini-3.5-flash-lite';
+// AI가 넣은 줄은 배경색으로 칠하지 않는다. 배경은 날짜 줄무늬가 쓰는 자리라,
+// 초록을 덮으면 한 날짜 덩어리가 회색과 초록으로 쪼개져 보인다.
+// 대신 M열에 글자로 적는다.
+const MONTHLY_ATTENDANCE_AI_MARK_COL = 13;          // M
+const MONTHLY_ATTENDANCE_AI_MARK_HEADER = 'AI 입력';
+const MONTHLY_ATTENDANCE_AI_MARK_TEXT = 'AI';
+const ATTENDANCE_AI_CATEGORIES = Object.freeze(['질병','미인정','기타','출석인정']);
+const ATTENDANCE_AI_KINDS = Object.freeze(['결석함','지각함','조퇴함','결과함']);
+const ATTENDANCE_AI_PERIODS = Object.freeze(
+  ['','1교시','2교시','3교시','4교시','5교시','6교시','7교시','조회','종례']
+);
+const ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY =
+  'ATTENDANCE_AI_TARGET_SPREADSHEET_ID';
+const ATTENDANCE_AI_GEMINI_API_KEY_PROPERTY = 'ATTENDANCE_AI_GEMINI_API_KEY';
+// 컴퓨터의 티처 매니저 연결 화면에 넣은 키가 설정 탭 이 이름으로 들어온다.
+// install_attendance_automation.build_config_rows / central_chat._upsert_settings_value와 같은 이름이어야 한다.
+const ATTENDANCE_AI_GEMINI_API_KEY_SETTING = 'GEMINI_API_KEY';
+// 출결 준비 프로그램이 만드는 사본 이름 조각이다.
+// prepare_attendance_copy.py의 copy_name과 항상 같아야 한다 — 테스트가 대조 검사함.
+const ATTENDANCE_AI_COPY_NAME_MARKER = ' - AI 입력 준비 사본 (';
+const ATTENDANCE_AI_EDIT_TRIGGER_HANDLER = 'onAttendanceAiEdit';
+const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 켜기';
 
 const DEFAULT_CONFIG = Object.freeze({
   SCHOOL_NAME: '',
@@ -86,10 +124,24 @@ function onOpen() {
     .addItem('Google Chat 학급 단톡방 고르기', 'connectClassChatSpace')
     .addToUi();
 
-  ui.createMenu('출결 업무 자동화')
+  const attendanceMenu = ui.createMenu('출결 업무 자동화')
     .addItem('선택 행 출결신고서 Google Docs에 만들기', 'createDocFromTemplate')
     .addItem('선택 행 미제출 서류 Google Tasks에 추가하기', 'addSelectedRowToTasks')
-    .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow')
+    .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow');
+
+  // 1행 AI 입력 켜기는 출결 준비 프로그램이 만들고 연결까지 바꾼 사본에서만 보여 준다.
+  // 원래 쓰던 출결 시트와 아직 연결을 바꾸지 않은 사본에는 항목 자체를 두지 않는다.
+  let aiWorkbook = null;
+  try {
+    aiWorkbook = attendanceAiWorkbookState_();
+  } catch (err) {
+    aiWorkbook = null;
+  }
+  if (aiWorkbook && aiWorkbook.ok === true) {
+    attendanceMenu.addItem(ATTENDANCE_AI_MENU_ITEM, 'enableAttendanceAiInput');
+  }
+
+  attendanceMenu
     .addSeparator()
     .addSubMenu(ui.createMenu('고급 설정')
       .addItem('기본 시트/설정 점검', 'setupAttendanceWorkbook')
@@ -154,7 +206,9 @@ function setupAttendanceWorkbookCore_() {
   const cfg = getConfig_();
   const monthNames = getMonthSheetNames_(cfg);
 
-  monthNames.forEach(name => ensureMonthSheet_(ss, name));
+  // 견본 그대로인지는 첫 탭을 바꾸기 전에 한 번만 판단한다.
+  const moveTemplateRows = isPristineTemplateWorkbook_(ss, monthNames);
+  monthNames.forEach(name => ensureMonthSheet_(ss, name, moveTemplateRows));
   ensureRosterSheet_(ss);
   ensureHolidaySheet_(ss);
   ensureDropdownSheet_(ss);
@@ -253,55 +307,960 @@ function ensureConfigSheet_(ss) {
   sh.getDataRange().setWrap(true).setVerticalAlignment('middle');
 }
 
-function ensureMonthSheet_(ss, name) {
+/**
+ * 월 탭 하나를 준비한다.
+ *
+ * 모양은 탭 하나가 아니라 시트 전체를 보고 정한다. 자료가 있는 달은 그대로 두고
+ * 빈 달만 내리면 같은 파일에서 달마다 줄 위치가 달라지고, 자료가 있는 달에서
+ * 맨 윗줄 학생이 말없이 빠진다. 쓰던 시트는 사본 절차로만 새 모양이 된다.
+ *
+ * 그 판단은 첫 탭을 바꾸는 순간 달라지므로 부르는 쪽에서 한 번만 하고
+ * 그 결과를 `moveTemplateRows`로 넘긴다.
+ */
+function ensureMonthSheet_(ss, name, moveTemplateRows) {
   let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  const firstRow = sh.getRange(1, 1, 1, 8).getValues()[0];
-  const empty = firstRow.every(v => String(v || '').trim() === '');
-  if (empty) sh.getRange(1, 1, 1, 8).setValues([INPUT_HEADERS]);
+  const created = !sh;
+  if (created) sh = ss.insertSheet(name);
+  const moveThisTab = moveTemplateRows === true
+    && isPristineTemplateMonthSheet_(sh);
+  if (created || moveThisTab) {
+    if (!created) sh.insertRowBefore(MONTHLY_ATTENDANCE_INPUT_ROW);
+    // A열은 이름표, B열은 합친 입력칸의 첫 칸이다. 나머지는 비워 둔다.
+    sh.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, INPUT_HEADERS.length)
+      .setValues([[
+        MONTHLY_ATTENDANCE_AI_INPUT_LABEL,
+        MONTHLY_ATTENDANCE_AI_INPUT_HINT
+      ].concat(new Array(INPUT_HEADERS.length - 2).fill(''))]);
+    sh.getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, INPUT_HEADERS.length)
+      .setValues([INPUT_HEADERS]);
+  }
   applyInputSheetFormatting_(sh);
   return sh;
+}
+
+/**
+ * 시트 전체가 설치 견본 그대로인지 본다.
+ * 있는 월 탭이 하나도 빠짐없이 견본 모양이어야 참이다.
+ * 한 달이라도 자료가 있으면 거짓이다 — 쓰던 시트이므로 손대지 않는다.
+ */
+function isPristineTemplateWorkbook_(ss, monthNames) {
+  if (!ss || typeof ss.getSheetByName !== 'function') return false;
+  const names = (monthNames && monthNames.length)
+    ? monthNames
+    : getMonthSheetNames_(getConfig_());
+  let seen = 0;
+  for (let index = 0; index < names.length; index++) {
+    const sheet = ss.getSheetByName(names[index]);
+    if (!sheet) continue;  // 지운 지난 달은 판단에 넣지 않는다
+    if (!isPristineTemplateMonthSheet_(sheet)) return false;
+    seen++;
+  }
+  return seen > 0;
+}
+
+/**
+ * 설치 견본 그대로인 월 탭인지 본다.
+ * 1행이 정확한 제목 줄이고 그 아래에는 아무 자료도 없어야 참이다.
+ */
+function isPristineTemplateMonthSheet_(sheet) {
+  if (!sheet || typeof sheet.getRange !== 'function') return false;
+  if (typeof sheet.getLastRow !== 'function') return false;
+  if (sheet.getLastRow() !== MONTHLY_ATTENDANCE_INPUT_ROW) return false;
+  const firstRow = sheet
+    .getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, INPUT_HEADERS.length)
+    .getValues()[0];
+  return INPUT_HEADERS.every(
+    (name, index) => String(firstRow[index] || '').trim() === name
+  );
+}
+
+/**
+ * 월 시트 1행을 이름표 한 칸과 입력칸 한 칸으로 만든다.
+ *
+ * A열에는 여기가 무엇을 하는 자리인지 적어 두고, B열부터 K열까지는 한 칸으로 합쳐
+ * 흰 바탕에 테두리를 둘러 글을 적는 자리로 보이게 한다. 오른쪽 L~P는 색을 지운다 —
+ * 1행은 아래 제목 줄 위에 끼워 넣은 줄이라 진한 파랑을 그대로 물려받는다.
+ *
+ * 선생님이 적어 둔 문장이 입력칸에 남아 있으면 지우지 않는다.
+ */
+function applyAttendanceAiInputRow_(sh) {
+  const boxWidth =
+    MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL - MONTHLY_ATTENDANCE_AI_INPUT_COL + 1;
+  const labelCell = sh.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, 1);
+  const box = sh.getRange(
+    MONTHLY_ATTENDANCE_INPUT_ROW, MONTHLY_ATTENDANCE_AI_INPUT_COL, 1, boxWidth
+  );
+  box.merge();
+
+  // 우리가 써 둔 문구가 아니면 선생님이 적어 둔 문장이다. 어느 칸에 있든 지우지 않는다.
+  const ourWords = [
+    '',
+    MONTHLY_ATTENDANCE_AI_INPUT_LABEL,
+    MONTHLY_ATTENDANCE_AI_INPUT_HINT,
+    MONTHLY_ATTENDANCE_AI_INPUT_PLACEHOLDER
+  ];
+  const inLabelCell = String(labelCell.getValue() || '').trim();
+  const inBox = String(box.getValue() || '').trim();
+  const labelCellIsOurs = ourWords.indexOf(inLabelCell) >= 0;
+  const boxIsOurs = ourWords.indexOf(inBox) >= 0;
+
+  if (labelCellIsOurs) {
+    if (inLabelCell !== MONTHLY_ATTENDANCE_AI_INPUT_LABEL) {
+      labelCell.setValue(MONTHLY_ATTENDANCE_AI_INPUT_LABEL);
+    }
+    if (boxIsOurs && inBox !== MONTHLY_ATTENDANCE_AI_INPUT_HINT) {
+      box.setValue(MONTHLY_ATTENDANCE_AI_INPUT_HINT);
+    }
+  } else if (boxIsOurs) {
+    // 옛 판에서 A칸에 적어 두신 문장이다. 새 입력칸으로 옮기고 이름표를 세운다.
+    box.setValue(inLabelCell);
+    labelCell.setValue(MONTHLY_ATTENDANCE_AI_INPUT_LABEL);
+  }
+  // 두 칸에 다 적혀 있으면 어느 쪽도 버릴 수 없으므로 값은 그대로 두고 색만 입힌다.
+
+  labelCell
+    .setBackground('#E8F2FF')
+    .setFontColor('#000000')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle');
+  box
+    .setBackground('#FFFFFF')
+    .setFontColor(MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR)
+    .setFontWeight('normal')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
+    .setBorder(true, true, true, true, false, false, '#C7C7C7', SpreadsheetApp.BorderStyle.SOLID);
+
+  const tailStart = MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL + 1;
+  const tailWidth = sh.getMaxColumns() - MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL;
+  if (tailWidth > 0) {
+    sh.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, tailStart, 1, tailWidth).setBackground(null);
+  }
+  sh.setRowHeight(MONTHLY_ATTENDANCE_INPUT_ROW, 34);
 }
 
 function applyInputSheetFormatting_(sh) {
   if (sh.getMaxRows() < 250) sh.insertRowsAfter(sh.getMaxRows(), 250 - sh.getMaxRows());
   if (sh.getMaxColumns() < 16) sh.insertColumnsAfter(sh.getMaxColumns(), 16 - sh.getMaxColumns());
 
-  sh.getRange(1, 1, 1, 16)
+  applyAttendanceAiInputRow_(sh);
+
+  sh.getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, MONTHLY_ATTENDANCE_LAST_DATA_COL)
     .setBackground('#1F4E79')
     .setFontColor('#ffffff')
     .setFontWeight('bold')
     .setHorizontalAlignment('center')
     .setVerticalAlignment('middle');
 
-  sh.getRange(1, 1, 1, 8).setValues([INPUT_HEADERS]);
-  sh.setFrozenRows(1);
+  // M열 제목. 선생님이 직접 적어 두신 제목이 있으면 손대지 않는다.
+  const markHeaderCell = sh.getRange(
+    MONTHLY_ATTENDANCE_HEADER_ROW, MONTHLY_ATTENDANCE_AI_MARK_COL, 1, 1
+  );
+  const markHeader = String(markHeaderCell.getValue() || '').trim();
+  if (!markHeader) {
+    markHeaderCell.setValue(MONTHLY_ATTENDANCE_AI_MARK_HEADER);
+  }
+
+  // M열부터 오른쪽은 제목도 자료도 없는 빈 열이다. 물려받은 색이 남지 않도록 지운다.
+  const unusedColumns = sh.getMaxColumns() - MONTHLY_ATTENDANCE_LAST_DATA_COL;
+  if (unusedColumns > 0) {
+    sh.getRange(1, MONTHLY_ATTENDANCE_LAST_DATA_COL + 1, sh.getMaxRows(), unusedColumns)
+      .setBackground(null);
+  }
+
+  sh.setFrozenRows(MONTHLY_ATTENDANCE_HEADER_ROW);
   sh.setColumnWidths(1, 1, 90);
   sh.setColumnWidths(2, 1, 120);
   sh.setColumnWidths(3, 2, 90);
   sh.setColumnWidths(5, 1, 220);
   sh.setColumnWidths(6, 3, 90);
-  sh.setColumnWidths(9, 8, 70);
+  sh.setColumnWidths(9, 4, 70);
 
-  const n = sh.getMaxRows() - 1;
+  const n = sh.getMaxRows() - MONTHLY_ATTENDANCE_HEADER_ROW;
   if (n > 0) {
-    sh.getRange(2, 1, n, 1).setNumberFormat('yyyy-mm-dd');
-    sh.getRange(2, 2, n, 1).setBackground('#EAF4FF');
-    sh.getRange(2, 3, n, 2).setBackground('#FFF7E6');
-    sh.getRange(2, 6, n, 3).setBackground('#F3F4F6');
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 1, n, 1).setNumberFormat('yyyy-mm-dd');
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 2, n, 1).setBackground('#EAF4FF');
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 3, n, 2).setBackground('#FFF7E6');
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 6, n, 3).setBackground('#F3F4F6');
 
     const categoryRule = SpreadsheetApp.newDataValidation().requireValueInList(['질병','미인정','기타','출석인정'], true).setAllowInvalid(false).build();
     const kindRule = SpreadsheetApp.newDataValidation().requireValueInList(['결석함','지각함','조퇴함','결과함'], true).setAllowInvalid(false).build();
     const periodRule = SpreadsheetApp.newDataValidation().requireValueInList(['','1교시','2교시','3교시','4교시','5교시','6교시','7교시','조회','종례'], true).setAllowInvalid(true).build();
     const statusRule = SpreadsheetApp.newDataValidation().requireValueInList(['','제출','미제출','해당없음'], true).setAllowInvalid(true).build();
 
-    sh.getRange(2, 3, n, 1).setDataValidation(categoryRule);
-    sh.getRange(2, 4, n, 1).setDataValidation(kindRule);
-    sh.getRange(2, 6, n, 1).setDataValidation(periodRule);
-    sh.getRange(2, 7, n, 2).setDataValidation(statusRule);
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 3, n, 1).setDataValidation(categoryRule);
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 4, n, 1).setDataValidation(kindRule);
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 6, n, 1).setDataValidation(periodRule);
+    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 7, n, 2).setDataValidation(statusRule);
   }
 
-  sh.getRange(1, 1, sh.getMaxRows(), 16).setVerticalAlignment('middle').setWrap(true);
+  sh.getRange(1, 1, sh.getMaxRows(), MONTHLY_ATTENDANCE_LAST_DATA_COL)
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+}
+
+function getAttendanceAiCalendarYear_(schoolYear, month) {
+  const schoolYearText = String(
+    schoolYear === null || schoolYear === undefined ? '' : schoolYear
+  ).trim();
+  const monthNumber = Number(month);
+  if (
+    !/^\d{4}$/.test(schoolYearText)
+    || !Number.isInteger(monthNumber)
+    || monthNumber < 1
+    || monthNumber > 12
+  ) {
+    return null;
+  }
+  return Number(schoolYearText) + (monthNumber <= 2 ? 1 : 0);
+}
+
+function buildAttendanceAiGeminiRequest_(sentence, context) {
+  const recordProperties = {
+    date: { type: 'string', format: 'date' },
+    student: { type: 'string', minLength: 1 },
+    category: { type: 'string', enum: ATTENDANCE_AI_CATEGORIES.slice() },
+    kind: { type: 'string', enum: ATTENDANCE_AI_KINDS.slice() },
+    reason: { type: 'string', minLength: 1 },
+    period: { type: 'string', enum: ATTENDANCE_AI_PERIODS.slice() }
+  };
+  return {
+    model: ATTENDANCE_AI_MODEL,
+    input: JSON.stringify({
+      instruction: '출결 문장에서 요청한 학생별 출결 자료만 JSON으로 추출하세요.',
+      sentence: sentence,
+      school_year: String(context.schoolYear),
+      calendar_year: getAttendanceAiCalendarYear_(context.schoolYear, context.month),
+      month: Number(context.month),
+      allowed_values: {
+        category: ATTENDANCE_AI_CATEGORIES.slice(),
+        kind: ATTENDANCE_AI_KINDS.slice(),
+        period: ATTENDANCE_AI_PERIODS.slice()
+      }
+    }),
+    store: false,
+    response_format: {
+      type: 'text',
+      mime_type: 'application/json',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          requested_student_count: { type: 'integer', minimum: 1 },
+          records: {
+            type: 'array',
+            minItems: 1,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: recordProperties,
+              required: ['date','student','category','kind','reason','period']
+            }
+          }
+        },
+        required: ['requested_student_count','records']
+      }
+    }
+  };
+}
+
+function extractAttendanceAiGeminiPayload_(interactionResponse) {
+  if (
+    !interactionResponse
+    || typeof interactionResponse !== 'object'
+    || Array.isArray(interactionResponse)
+    || interactionResponse.status !== 'completed'
+    || !Array.isArray(interactionResponse.steps)
+  ) {
+    return null;
+  }
+  const outputs = interactionResponse.steps.filter(
+    step => step && step.type === 'model_output'
+  );
+  if (outputs.length !== 1 || !Array.isArray(outputs[0].content)) return null;
+  const content = outputs[0].content;
+  if (
+    content.length !== 1
+    || !content[0]
+    || content[0].type !== 'text'
+    || typeof content[0].text !== 'string'
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(content[0].text);
+  } catch (err) {
+    return null;
+  }
+}
+
+function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
+  const isPlainObject = value => (
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+  );
+  const hasExactKeys = (value, expected) => {
+    if (!isPlainObject(value)) return false;
+    const actual = Object.keys(value).sort();
+    const wanted = expected.slice().sort();
+    return actual.length === wanted.length
+      && actual.every((key, index) => key === wanted[index]);
+  };
+  const topKeys = ['requested_student_count','records'];
+  const recordKeys = ['date','student','category','kind','reason','period'];
+  if (!hasExactKeys(payload, topKeys)) return null;
+  if (
+    typeof payload.requested_student_count !== 'number'
+    || !Number.isSafeInteger(payload.requested_student_count)
+    || payload.requested_student_count < 1
+    || !Array.isArray(payload.records)
+    || payload.records.length < 1
+    || payload.records.length !== payload.requested_student_count
+    || !Array.isArray(rosterRows)
+    || !isPlainObject(sheetContext)
+    || typeof sheetContext.sentence !== 'string'
+  ) {
+    return null;
+  }
+
+  const schoolYear = String(sheetContext.schoolYear === undefined
+    ? ''
+    : sheetContext.schoolYear).trim();
+  const month = Number(sheetContext.month);
+  const calendarYear = getAttendanceAiCalendarYear_(schoolYear, month);
+  if (calendarYear === null) return null;
+
+  const roster = rosterRows.map(row => {
+    if (!Array.isArray(row)) return null;
+    return {
+      number: String(row[0] === null || row[0] === undefined ? '' : row[0]).trim(),
+      name: String(row[1] === null || row[1] === undefined ? '' : row[1]).trim(),
+      combined: String(row[2] === null || row[2] === undefined ? '' : row[2]).trim()
+    };
+  }).filter(row => row && row.number && row.name && row.combined);
+  const sentence = sheetContext.sentence;
+  const particles = [
+    '에게서','한테서','께서','으로','에게','한테','부터','까지',
+    '은','는','이','가','을','를','와','과','의','께','도','만','로'
+  ];
+  const isIdentityCharacter = character => (
+    !!character && /[0-9A-Za-z가-힣]/.test(character)
+  );
+  const hasExactIdentityMention = (identity, blockedSuffixes) => {
+    let searchFrom = 0;
+    while (searchFrom <= sentence.length - identity.length) {
+      const foundAt = sentence.indexOf(identity, searchFrom);
+      if (foundAt < 0) return false;
+      searchFrom = foundAt + 1;
+      if (isIdentityCharacter(sentence.charAt(foundAt - 1))) continue;
+
+      const tail = sentence.slice(foundAt + identity.length);
+      if (blockedSuffixes.some(suffix => tail.indexOf(suffix) === 0)) continue;
+      if (!isIdentityCharacter(tail.charAt(0))) return true;
+      if (particles.some(particle => (
+        tail.indexOf(particle) === 0
+        && !isIdentityCharacter(tail.charAt(particle.length))
+      ))) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const studentAppearsInSentence = student => {
+    const longerRosterNameSuffixes = roster
+      .filter(other => (
+        other.combined !== student.combined
+        && other.name.indexOf(student.name) === 0
+      ))
+      .map(other => other.name.slice(student.name.length));
+    const numberPattern = new RegExp(
+      '(^|[^0-9])' + student.number.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '번([^0-9]|$)'
+    );
+    return hasExactIdentityMention(student.name, longerRosterNameSuffixes)
+      || hasExactIdentityMention(student.combined, [])
+      || numberPattern.test(sentence);
+  };
+
+  const seenStudents = new Set();
+  const validated = [];
+  for (let index = 0; index < payload.records.length; index++) {
+    const record = payload.records[index];
+    if (!hasExactKeys(record, recordKeys)) return null;
+    if (recordKeys.some(key => typeof record[key] !== 'string')) return null;
+
+    const dateText = record.date;
+    const studentText = record.student.trim();
+    const reason = record.reason.trim();
+    if (!studentText || !reason) {
+      return null;
+    }
+    const matches = roster.filter(student => (
+      studentText === student.combined
+      || studentText === student.name
+      || studentText === student.number
+      || studentText === student.number + '번'
+    ));
+    if (
+      matches.length !== 1
+      || !studentAppearsInSentence(matches[0])
+      || seenStudents.has(matches[0].combined)
+    ) {
+      return null;
+    }
+    if (
+      ATTENDANCE_AI_CATEGORIES.indexOf(record.category) < 0
+      || ATTENDANCE_AI_KINDS.indexOf(record.kind) < 0
+      || ATTENDANCE_AI_PERIODS.indexOf(record.period) < 0
+    ) {
+      return null;
+    }
+
+    const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);
+    if (!dateMatch) return null;
+    const year = Number(dateMatch[1]);
+    const dateMonth = Number(dateMatch[2]);
+    const day = Number(dateMatch[3]);
+    const parsedDate = new Date(Date.UTC(year, dateMonth - 1, day));
+    if (
+      year !== calendarYear
+      || dateMonth !== month
+      || parsedDate.getUTCFullYear() !== year
+      || parsedDate.getUTCMonth() + 1 !== dateMonth
+      || parsedDate.getUTCDate() !== day
+    ) {
+      return null;
+    }
+
+    seenStudents.add(matches[0].combined);
+    validated.push({
+      date: dateText,
+      rosterCombined: matches[0].combined,
+      category: record.category,
+      kind: record.kind,
+      reason: reason,
+      period: record.period
+    });
+  }
+  return validated;
+}
+
+function buildAttendanceAiBatchUpdate_(records, writeContext) {
+  if (!Array.isArray(records) || !records.length || !writeContext) return null;
+  const rows = records.map(record => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(record.date);
+    if (!match) return null;
+    const serial = Math.floor(
+      Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) / 86400000
+    ) + 25569;
+    const values = [
+      { numberValue: serial },
+      { stringValue: record.rosterCombined },
+      { stringValue: record.category },
+      { stringValue: record.kind },
+      { stringValue: record.reason },
+      { stringValue: record.period }
+    ].map(userEnteredValue => ({ userEnteredValue: userEnteredValue }));
+    // G~L은 비워 두고, M열에만 AI가 넣은 줄이라고 적는다.
+    // 배경색은 건드리지 않는다 — 그 자리는 날짜 줄무늬가 쓴다.
+    const betweenCount = MONTHLY_ATTENDANCE_AI_MARK_COL - values.length - 1;
+    const between = [];
+    for (let index = 0; index < betweenCount; index++) between.push({});
+    return {
+      values: values.concat(between).concat([
+        { userEnteredValue: { stringValue: MONTHLY_ATTENDANCE_AI_MARK_TEXT } }
+      ])
+    };
+  });
+  if (rows.some(row => !row)) return null;
+  return {
+    requests: [{
+      appendCells: {
+        sheetId: writeContext.sheetId,
+        rows: rows,
+        fields: 'userEnteredValue,userEnteredFormat.backgroundColor'
+      }
+    }]
+  };
+}
+
+/**
+ * 1행에서 고친 자리가 AI 입력칸인지 본다.
+ *
+ * A열 이름표에 그대로 적는 분도 있고, B~K열 합친 칸을 고치면 구글이 편집 범위를
+ * B1:K1 전체로 알려 주기도 한다. 두 가지를 모두 받는다.
+ */
+function isAttendanceAiInputRange_(column, numColumns) {
+  if (column === 1) return numColumns === 1;
+  if (column !== MONTHLY_ATTENDANCE_AI_INPUT_COL) return false;
+  const boxWidth =
+    MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL - MONTHLY_ATTENDANCE_AI_INPUT_COL + 1;
+  return numColumns >= 1 && numColumns <= boxWidth;
+}
+
+/** 1행을 이름표와 회색 안내 문구로 되돌린다. 적었던 문장은 사라진다. */
+function resetAttendanceAiInputRow_(sheet) {
+  sheet.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, 1)
+    .setValue(MONTHLY_ATTENDANCE_AI_INPUT_LABEL);
+  sheet.getRange(
+    MONTHLY_ATTENDANCE_INPUT_ROW,
+    MONTHLY_ATTENDANCE_AI_INPUT_COL,
+    1,
+    MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL - MONTHLY_ATTENDANCE_AI_INPUT_COL + 1
+  ).setValue(MONTHLY_ATTENDANCE_AI_INPUT_HINT);
+}
+
+function handleAttendanceAiEdit(e, testPorts) {
+  if (
+    !e
+    || !e.source
+    || typeof e.source.getId !== 'function'
+    || !e.range
+    || typeof e.range.getSheet !== 'function'
+    || typeof e.range.getRow !== 'function'
+    || typeof e.range.getColumn !== 'function'
+    || typeof e.range.getNumRows !== 'function'
+    || typeof e.range.getNumColumns !== 'function'
+    || e.range.getRow() !== MONTHLY_ATTENDANCE_INPUT_ROW
+    || e.range.getNumRows() !== 1
+    || !isAttendanceAiInputRange_(e.range.getColumn(), e.range.getNumColumns())
+  ) {
+    return { status: 'ignored' };
+  }
+
+  // 한 칸짜리 편집이면 구글이 알려 준 값만 쓴다. 감지기가 도는 사이 그 칸이 다시
+  // 바뀌었을 수 있어 나중 값을 읽으면 엉뚱한 문장을 처리하게 된다.
+  // 합친 칸 전체로 알려 온 편집(붙여넣기 등)에는 값을 함께 주지 않으므로 그때만 직접 읽는다.
+  let sentence = typeof e.value === 'string' ? e.value : '';
+  if (!sentence.trim() && e.range.getNumColumns() > 1) {
+    try {
+      const inBox = e.range.getValue();
+      sentence = String(inBox === null || inBox === undefined ? '' : inBox);
+    } catch (err) {
+      sentence = '';
+    }
+  }
+  if (!sentence.trim()) return { status: 'ignored' };
+
+  const sheet = e.range.getSheet();
+  if (!sheet || typeof sheet.getName !== 'function') return { status: 'ignored' };
+  const source = e.source;
+  const ports = testPorts || {
+    getTargetSpreadsheetId: () => PropertiesService.getScriptProperties()
+      .getProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY),
+    getGeminiApiKey: () => attendanceAiGeminiApiKey_(source),
+    tryDocumentLock: () => {
+      const lock = LockService.getDocumentLock();
+      return lock && lock.tryLock(5000) ? lock : null;
+    },
+    readHeaderRow: targetSheet => targetSheet
+      .getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, 12)
+      .getValues()[0],
+    resetInputRow: targetSheet => resetAttendanceAiInputRow_(targetSheet),
+    reStripe: targetSheet => reStripeSheet_(targetSheet),
+    readRosterRows: (spreadsheet, context) => {
+      const rosterSheet = spreadsheet.getSheetByName(context.rosterSheetName);
+      if (!rosterSheet || rosterSheet.getLastRow() < 2) return [];
+      return rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 4).getValues();
+    },
+    callGemini: (request, apiKey) => {
+      const response = UrlFetchApp.fetch(ATTENDANCE_AI_INTERACTIONS_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        headers: { 'x-goog-api-key': apiKey },
+        payload: JSON.stringify(request),
+        muteHttpExceptions: true
+      });
+      const responseCode = response.getResponseCode();
+      if (responseCode < 200 || responseCode >= 300) {
+        throw new Error('Gemini HTTP ' + responseCode);
+      }
+      return JSON.parse(response.getContentText());
+    },
+    readWriteState: targetSheet => ({
+      headerRow: targetSheet
+        .getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, 12)
+        .getValues()[0],
+      lastDataRow: targetSheet.getLastRow(),
+      rowCount: targetSheet.getMaxRows(),
+      sheetId: targetSheet.getSheetId()
+    }),
+    batchUpdate: (spreadsheetId, request) => (
+      Sheets.Spreadsheets.batchUpdate(request, spreadsheetId)
+    )
+  };
+
+  let targetSpreadsheetId;
+  let apiKey;
+  try {
+    targetSpreadsheetId = String(ports.getTargetSpreadsheetId() || '').trim();
+    apiKey = String(ports.getGeminiApiKey() || '').trim();
+  } catch (err) {
+    return { status: 'check_required' };
+  }
+  if (!targetSpreadsheetId || !apiKey) return { status: 'disabled' };
+  if (String(source.getId()) !== targetSpreadsheetId) return { status: 'ignored' };
+
+  let sheetContext = testPorts && testPorts.context ? testPorts.context : null;
+  if (!sheetContext) {
+    try {
+      const configSheet = source.getSheetByName(CONFIG_SHEET_NAME);
+      if (!configSheet) return { status: 'ignored' };
+      const configRows = configSheet.getDataRange().getValues();
+      const config = {};
+      configRows.forEach(row => {
+        const key = String(row[0] || '').trim();
+        if (key) config[key] = row[1];
+      });
+      const configuredMonthNames = String(config.MONTH_SHEET_NAMES || '')
+        .split(',')
+        .map(name => name.trim())
+        .filter(Boolean);
+      const monthMatch = /^(\d{1,2})월$/.exec(sheet.getName());
+      if (!monthMatch) return { status: 'ignored' };
+      sheetContext = {
+        schoolYear: String(config.SCHOOL_YEAR || '').trim(),
+        month: Number(monthMatch[1]),
+        configuredMonthNames: configuredMonthNames,
+        rosterSheetName: String(config.ROSTER_SHEET_NAME || '학생명단').trim()
+      };
+    } catch (err) {
+      return { status: 'ignored' };
+    }
+  }
+
+  const monthName = sheet.getName();
+  if (
+    !sheetContext
+    || !Array.isArray(sheetContext.configuredMonthNames)
+    || sheetContext.configuredMonthNames.indexOf(monthName) < 0
+    || monthName !== String(Number(sheetContext.month)) + '월'
+  ) {
+    return { status: 'ignored' };
+  }
+  if (
+    getAttendanceAiCalendarYear_(sheetContext.schoolYear, sheetContext.month) === null
+  ) {
+    return { status: 'check_required' };
+  }
+  const expectedHeaders = INPUT_HEADERS.concat(MONTHLY_CHAT_RESULT_HEADERS);
+  const headersMatch = values => (
+    Array.isArray(values)
+    && values.length === expectedHeaders.length
+    && values.every((value, index) => value === expectedHeaders[index])
+  );
+  try {
+    if (!headersMatch(ports.readHeaderRow(sheet))) return { status: 'ignored' };
+  } catch (err) {
+    return { status: 'ignored' };
+  }
+
+  let lock = null;
+  try {
+    lock = ports.tryDocumentLock();
+    if (!lock) return { status: 'busy' };
+    const requestContext = {
+      schoolYear: sheetContext.schoolYear,
+      month: sheetContext.month,
+      sentence: sentence
+    };
+    const request = buildAttendanceAiGeminiRequest_(sentence, requestContext);
+    const interaction = ports.callGemini(request, apiKey);
+    const payload = extractAttendanceAiGeminiPayload_(interaction);
+    const rosterRows = ports.readRosterRows(source, sheetContext);
+    const records = validateAttendanceAiRecords_(payload, rosterRows, requestContext);
+    if (!records) return { status: 'check_required' };
+
+    const writeState = ports.readWriteState(sheet);
+    if (
+      !writeState
+      || !headersMatch(writeState.headerRow)
+      || typeof writeState.lastDataRow !== 'number'
+      || !Number.isSafeInteger(writeState.lastDataRow)
+      || typeof writeState.sheetId !== 'number'
+      || !Number.isSafeInteger(writeState.sheetId)
+    ) {
+      return { status: 'check_required' };
+    }
+    const batchRequest = buildAttendanceAiBatchUpdate_(records, writeState);
+    if (!batchRequest) return { status: 'check_required' };
+    const response = ports.batchUpdate(targetSpreadsheetId, batchRequest);
+    if (
+      !response
+      || typeof response !== 'object'
+      || response.spreadsheetId !== targetSpreadsheetId
+    ) {
+      return { status: 'check_required' };
+    }
+    // 새 줄도 제 날짜 덩어리의 줄무늬 색을 갖게 한다. 칠하지 못해도 이미 넣은 줄은 그대로 둔다.
+    try {
+      ports.reStripe(sheet);
+    } catch (err) {
+      // 색은 다음에 A열을 고칠 때 다시 입혀진다.
+    }
+    return {
+      status: 'applied',
+      rows: records.length,
+      startRow: Math.max(MONTHLY_ATTENDANCE_HEADER_ROW, writeState.lastDataRow) + 1
+    };
+  } catch (err) {
+    return { status: 'check_required' };
+  } finally {
+    if (lock && typeof lock.releaseLock === 'function') {
+      try {
+        lock.releaseLock();
+      } catch (err) {
+        // 이미 끝난 요청을 다시 보내거나 Sheet에 실패 표시를 쓰지 않는다.
+      }
+    }
+    // 자물쇠를 잡고 실제로 처리한 편집만 되돌린다. 적었던 문장을 치우고 안내 문구를
+    // 돌려놓아, 다음에 쓸 때 직접 지우지 않아도 되게 한다.
+    // 다른 처리가 돌고 있어 잡지 못했으면(busy) 적은 문장을 그대로 남긴다 —
+    // 아무 일도 일어나지 않았는데 글만 사라지면 다시 적어야 한다.
+    if (lock) {
+      try {
+        ports.resetInputRow(sheet);
+      } catch (err) {
+        // 되돌리지 못해도 이미 만든 출결행은 그대로 둔다.
+      }
+    }
+  }
+}
+
+/*************************************************
+ * 새 출결 사본에서만 1행 AI 입력 켜기
+ *************************************************/
+
+/** 설정 시트를 새로 만들지 않고 값 하나만 읽는다. 읽지 못하면 빈 값으로 본다. */
+function readConfigValueReadOnly_(key) {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG_SHEET_NAME);
+    if (!sheet) return '';
+    const value = readConfigMapFromSheet_(sheet)[key];
+    return String(value === undefined || value === null ? '' : value).trim();
+  } catch (err) {
+    return '';
+  }
+}
+
+/**
+ * 지금 열려 있는 파일이 1행 AI 입력을 켤 수 있는 사본인지 확인한다.
+ * 확인하지 못하면 켤 수 없다고 본다.
+ */
+function attendanceAiWorkbookState_() {
+  let spreadsheetId = '';
+  let name = '';
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    spreadsheetId = String(ss.getId() || '').trim();
+    name = String(ss.getName() || '');
+  } catch (err) {
+    return {
+      ok: false,
+      spreadsheetId: '',
+      message: '지금 열려 있는 파일 정보를 읽지 못했습니다. 시트를 다시 열고 눌러 주세요.'
+    };
+  }
+  if (!spreadsheetId) {
+    return {
+      ok: false,
+      spreadsheetId: '',
+      message: '지금 열려 있는 파일 번호를 읽지 못했습니다. 시트를 다시 열고 눌러 주세요.'
+    };
+  }
+  // 이 시트에서 이미 켠 적이 있으면 이름과 상관없이 통과시킨다.
+  // 사본이 매일 쓰는 시트가 되면 이름을 다듬는 것이 자연스러운데,
+  // 이름으로만 판단하면 그 순간 켜기 메뉴가 사라져 키를 다시 넣을 수 없다.
+  let alreadyEnabledHere = '';
+  try {
+    alreadyEnabledHere = String(
+      PropertiesService.getScriptProperties()
+        .getProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY) || ''
+    ).trim();
+  } catch (err) {
+    alreadyEnabledHere = '';
+  }
+  if (alreadyEnabledHere === spreadsheetId) {
+    return { ok: true, spreadsheetId: spreadsheetId, message: '' };
+  }
+  if (name.indexOf(ATTENDANCE_AI_COPY_NAME_MARKER) < 0) {
+    return {
+      ok: false,
+      spreadsheetId: spreadsheetId,
+      message:
+        'AI 출결 입력은 티처 매니저가 만든 출결 사본에서만 켤 수 있습니다.\n\n' +
+        '지금 열려 있는 파일: ' + name + '\n' +
+        '사본 파일 이름에는 "' + ATTENDANCE_AI_COPY_NAME_MARKER.trim() + '"가 들어 있습니다.\n\n' +
+        '원래 쓰던 출결 시트에서는 켜지 않습니다.'
+    };
+  }
+  const centralSheetId = readConfigValueReadOnly_('CENTRAL_CHAT_SHEET_ID');
+  if (!centralSheetId || centralSheetId.indexOf(spreadsheetId + ':') !== 0) {
+    return {
+      ok: false,
+      spreadsheetId: spreadsheetId,
+      message:
+        '이 사본은 아직 출결 연결 바꾸기가 끝나지 않았습니다.\n\n' +
+        '컴퓨터의 티처 매니저에서 출결 연결 바꾸기를 끝낸 다음 이 메뉴를 다시 눌러 주세요.'
+    };
+  }
+  return { ok: true, spreadsheetId: spreadsheetId, message: '' };
+}
+
+/**
+ * 이 시트에서 쓸 Gemini 키를 찾는다.
+ *
+ * 설정 탭 GEMINI_API_KEY가 먼저다 — 컴퓨터의 티처 매니저 연결 화면에 한 번 넣으면
+ * 그 값이 여기로 들어오므로 선생님이 시트에서 다시 붙여넣지 않아도 된다.
+ * 예전 판에서 시트 메뉴로 직접 넣어 둔 분은 계정에 저장된 값을 그대로 쓴다.
+ */
+function attendanceAiGeminiApiKey_(spreadsheet) {
+  let fromSettings = '';
+  try {
+    const sheet = spreadsheet && typeof spreadsheet.getSheetByName === 'function'
+      ? spreadsheet.getSheetByName(CONFIG_SHEET_NAME)
+      : null;
+    if (sheet) {
+      const value = readConfigMapFromSheet_(sheet)[ATTENDANCE_AI_GEMINI_API_KEY_SETTING];
+      fromSettings = String(value === undefined || value === null ? '' : value).trim();
+    }
+  } catch (err) {
+    fromSettings = '';
+  }
+  if (fromSettings) return fromSettings;
+  try {
+    return String(
+      PropertiesService.getUserProperties()
+        .getProperty(ATTENDANCE_AI_GEMINI_API_KEY_PROPERTY) || ''
+    ).trim();
+  } catch (err) {
+    return '';
+  }
+}
+
+/** 붙여넣은 값이 Gemini API 키 모양인지만 본다. 실제 통신은 하지 않는다. */
+function isAttendanceAiApiKeyShape_(value) {
+  const key = String(value === undefined || value === null ? '' : value).trim();
+  if (key.length < 20 || key.length > 200) return false;
+  return /^[A-Za-z0-9_-]+$/.test(key);
+}
+
+/** 이 사본의 1행 편집을 받는 설치형 감지기만 골라낸다. */
+function attendanceAiEditTriggersFor_(triggers, spreadsheetId) {
+  const wanted = String(spreadsheetId || '').trim();
+  if (!wanted) return [];
+  return (triggers || []).filter(trigger => {
+    try {
+      return Boolean(trigger)
+        && typeof trigger.getHandlerFunction === 'function'
+        && trigger.getHandlerFunction() === ATTENDANCE_AI_EDIT_TRIGGER_HANDLER
+        && typeof trigger.getEventType === 'function'
+        && trigger.getEventType() === ScriptApp.EventType.ON_EDIT
+        && typeof trigger.getTriggerSourceId === 'function'
+        && String(trigger.getTriggerSourceId() || '').trim() === wanted;
+    } catch (err) {
+      return false;
+    }
+  });
+}
+
+/** 같은 감지기를 두 번 만들지 않는다. 이미 여러 개면 하나만 남긴다. */
+function ensureAttendanceAiEditTrigger_(spreadsheetId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const activeId = String(ss.getId() || '').trim();
+  const wanted = String(spreadsheetId || '').trim();
+  if (!wanted || !activeId || wanted !== activeId) {
+    throw new Error('AI 입력 감지기를 만들 파일을 확인하지 못했습니다.');
+  }
+  const existing = attendanceAiEditTriggersFor_(ScriptApp.getProjectTriggers(), wanted);
+  if (existing.length > 1) {
+    // 감지기가 여러 개면 같은 문장으로 출결행이 여러 번 써진다. 첫 하나만 남긴다.
+    for (let i = 1; i < existing.length; i++) ScriptApp.deleteTrigger(existing[i]);
+    return { created: false, removed: existing.length - 1, count: 1 };
+  }
+  if (existing.length === 1) {
+    return { created: false, removed: 0, count: 1 };
+  }
+  ScriptApp.newTrigger(ATTENDANCE_AI_EDIT_TRIGGER_HANDLER)
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+  const after = attendanceAiEditTriggersFor_(ScriptApp.getProjectTriggers(), wanted);
+  if (after.length !== 1) {
+    throw new Error('AI 입력 감지기가 정확히 하나인지 확인하지 못했습니다.');
+  }
+  return { created: true, removed: 0, count: 1 };
+}
+
+/** 메뉴: 이 사본에서만 1행 AI 입력을 켠다. */
+function enableAttendanceAiInput() {
+  const ui = SpreadsheetApp.getUi();
+  const state = attendanceAiWorkbookState_();
+  if (!state || state.ok !== true) {
+    ui.alert(ATTENDANCE_AI_MENU_ITEM, String(state && state.message || '이 파일에서는 켤 수 없습니다.'), ui.ButtonSet.OK);
+    return;
+  }
+
+  // 키는 컴퓨터의 티처 매니저에서 이미 받아 설정 탭에 들어와 있다. 여기서 다시 묻지 않는다.
+  const apiKey = attendanceAiGeminiApiKey_(SpreadsheetApp.getActiveSpreadsheet());
+  if (!isAttendanceAiApiKeyShape_(apiKey)) {
+    ui.alert(
+      ATTENDANCE_AI_MENU_ITEM,
+      '이 시트에 쓸 Gemini API key를 찾지 못했습니다.\n\n' +
+      '컴퓨터의 티처 매니저를 열고 [연결] 화면에서 Gemini API key를 넣어 저장한 다음\n' +
+      '이 메뉴를 다시 눌러 주세요.\n\n' +
+      'AI 입력은 아직 켜지지 않았습니다.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY, state.spreadsheetId);
+  } catch (err) {
+    ui.alert(
+      ATTENDANCE_AI_MENU_ITEM,
+      '이 사본을 AI 입력 대상으로 기록하지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
+      'AI 입력은 켜지지 않았습니다.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  let trigger;
+  try {
+    trigger = ensureAttendanceAiEditTrigger_(state.spreadsheetId);
+  } catch (err) {
+    ui.alert(
+      ATTENDANCE_AI_MENU_ITEM,
+      '1행 편집을 받는 감지기를 만들지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
+      '권한 승인 화면이 나오면 허용한 뒤 같은 메뉴를 다시 눌러 주세요.\n' +
+      'AI 입력은 아직 켜지지 않았습니다.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  ui.alert(
+    ATTENDANCE_AI_MENU_ITEM,
+    'AI 출결 입력을 켰습니다.\n\n' +
+    (trigger.created ? '1행 편집을 받는 감지기를 새로 하나 만들었습니다.\n' : '이미 있던 감지기 하나를 그대로 씁니다.\n') +
+    '\n월 시트 1행에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르면\n' +
+    '맨 아래에 연한 초록색 출결행이 생깁니다.\n\n' +
+    '이름을 못 찾거나 날짜·구분을 해석하지 못하면 아무 줄도 만들지 않습니다.',
+    ui.ButtonSet.OK
+  );
+}
+
+/** 설치형 감지기가 부르는 함수 — 실패해도 시트에 아무 표시를 남기지 않는다. */
+function onAttendanceAiEdit(e) {
+  try {
+    return handleAttendanceAiEdit(e);
+  } catch (err) {
+    console.log('onAttendanceAiEdit error:', err);
+    return { status: 'check_required' };
+  }
 }
 
 function ensureRosterSheet_(ss) {
@@ -447,8 +1406,11 @@ function applyStudentDropdowns_(ss, cfg) {
     .build();
 
   getInputSheets_(ss, cfg).forEach(sh => {
-    const n = sh.getMaxRows() - 1;
-    if (n > 0) sh.getRange(2, 2, n, 1).setDataValidation(rule);
+    const n = sh.getMaxRows() - MONTHLY_ATTENDANCE_HEADER_ROW;
+    if (n > 0) {
+      sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 2, n, 1)
+        .setDataValidation(rule);
+    }
   });
 }
 
@@ -844,6 +1806,87 @@ function isInputMonthSheet_(sheet) {
   return names.has(sheet.getName());
 }
 
+function isConfiguredMonthlyAttendanceSheetReadOnly_(sheet) {
+  try {
+    if (!sheet || typeof sheet.getParent !== 'function') return false;
+    const spreadsheet = sheet.getParent();
+    if (!spreadsheet || typeof spreadsheet.getSheetByName !== 'function') return false;
+    const configSheet = spreadsheet.getSheetByName(CONFIG_SHEET_NAME);
+    if (!configSheet) return false;
+    const config = readConfigMapFromSheet_(configSheet);
+    if (!Object.prototype.hasOwnProperty.call(config, 'MONTH_SHEET_NAMES')) return false;
+    const configuredNames = config.MONTH_SHEET_NAMES;
+    if (typeof configuredNames !== 'string' || !configuredNames.trim()) return false;
+    const rawNames = configuredNames.split(',').map(name => name.trim());
+    if (!rawNames.length || rawNames.some(name => !name)) return false;
+    const names = getMonthSheetNames_(config);
+    const uniqueNames = new Set(names);
+    if (names.length !== rawNames.length || uniqueNames.size !== names.length) return false;
+    return uniqueNames.has(sheet.getName());
+  } catch (err) {
+    return false;
+  }
+}
+
+function validateMonthlyAttendanceSortRange_(sheet, range) {
+  if (!isConfiguredMonthlyAttendanceSheetReadOnly_(sheet)) return false;
+  if (sheet.getFrozenRows() !== 2 || sheet.getFilter()) return false;
+
+  const firstRow = sheet.getRange(1, 1, 1, 12).getValues()[0]
+    .map(value => String(value === null || value === undefined ? '' : value).trim());
+  const headerRow = sheet.getRange(2, 1, 1, 12).getValues()[0]
+    .map(value => String(value === null || value === undefined ? '' : value));
+  const inputHeadersMatch = INPUT_HEADERS.every((header, index) => headerRow[index] === header);
+  const oldHeaderStillOnFirstRow = INPUT_HEADERS.every((header, index) => firstRow[index] === header);
+  const chatHeaders = headerRow.slice(8, 12);
+  const chatHeadersMatch = MONTHLY_CHAT_RESULT_HEADERS.every(
+    (header, index) => chatHeaders[index] === header
+  );
+  const chatHeadersAreBlank = chatHeaders.every(value => value === '');
+  if (!inputHeadersMatch || oldHeaderStillOnFirstRow || (!chatHeadersMatch && !chatHeadersAreBlank)) {
+    return false;
+  }
+
+  const lastRow = sheet.getLastRow();
+  const lastColumn = Math.max(12, sheet.getLastColumn());
+  if (lastRow <= 2) return range === null || range === undefined;
+  if (!range) return false;
+
+  return range.getRow() === 3
+    && range.getColumn() === 1
+    && range.getNumRows() === lastRow - 2
+    && range.getNumColumns() === lastColumn
+    && range.getLastRow() === lastRow
+    && range.getLastColumn() === lastColumn;
+}
+
+function sortMonthlyAttendanceRows_(sheet, mode) {
+  let sortSpec;
+  if (mode === 'date') {
+    sortSpec = [
+      { column: 1, ascending: true },
+      { column: 2, ascending: true }
+    ];
+  } else if (mode === 'student') {
+    sortSpec = [
+      { column: 2, ascending: true },
+      { column: 1, ascending: true }
+    ];
+  } else {
+    return false;
+  }
+
+  if (!sheet) return false;
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 2) return validateMonthlyAttendanceSortRange_(sheet, null);
+
+  const lastColumn = Math.max(12, sheet.getLastColumn());
+  const range = sheet.getRange(3, 1, lastRow - 2, lastColumn);
+  if (!validateMonthlyAttendanceSortRange_(sheet, range)) return false;
+  range.sort(sortSpec);
+  return true;
+}
+
 function getHolidaySheetName_() {
   const cfg = getConfig_();
   return String(cfg.HOLIDAY_SHEET_NAME || FALLBACK_HOLIDAY_SHEET_NAME).trim();
@@ -1054,8 +2097,25 @@ function sendCentralClassChat_(spaceName, text, meta) {
   });
 }
 
+// 발송을 새 사본으로 옮긴 뒤 옛 시트에서 연결하거나 보내려 할 때 서버가 주는 답.
+// 코드 글자를 그대로 보여주면 선생님은 고장 난 줄 알게 된다.
+const CENTRAL_SHEET_MOVED_CODE = 'SHEET_MOVED';
+const CENTRAL_SHEET_MOVED_MESSAGE =
+  '이 시트의 Google Chat 발송은 새 출결 사본으로 옮겼습니다.\n\n' +
+  '보내실 때는 사본 시트를 열어서 보내 주세요.\n' +
+  '사본 이름에는 "AI 입력 준비 사본"이 들어 있습니다.\n\n' +
+  '이 시트에서는 더 이상 보내지지 않습니다.';
+
+/** 중앙 발송소 오류를 선생님이 읽을 문장으로 바꾼다. 모르는 오류는 그대로 둔다. */
+function centralChatErrorMessage_(err) {
+  const code = String(err && err.centralCode || '').trim();
+  if (code === CENTRAL_SHEET_MOVED_CODE) return CENTRAL_SHEET_MOVED_MESSAGE;
+  return errorMessage_(err);
+}
+
 function isCentralChatConnectionError_(err) {
   const code = String(err && err.centralCode || '').trim();
+  if (code === CENTRAL_SHEET_MOVED_CODE) return true;
   if (['CHAT_NOT_CONNECTED', 'SHEET_AUTH_REQUIRED', 'AUTH_STATE_EXPIRED'].indexOf(code) !== -1) return true;
   const message = String(err && err.message ? err.message : err || '');
   return message.indexOf('최초 발송 연결') !== -1 ||
@@ -1202,10 +2262,15 @@ function buildAttendanceChatLinesForRow_(sheetName, rowIdx, row, sendDateKey) {
 }
 
 function buildAttendanceChatGroupsForSelectedRows_(sheet, selectedRows) {
+  const dataRows = (selectedRows || [])
+    .map(rowIdx => Number(rowIdx))
+    .filter(rowIdx => Number.isInteger(rowIdx) && rowIdx >= MONTHLY_ATTENDANCE_DATA_START_ROW);
+  if (!dataRows.length) return [];
   const resultCols = ensureMonthlyChatResultColumns_(sheet);
+  if (!resultCols) return [];
   const rosterMap = loadStudentRosterForDm_();
   const values = sheet.getDataRange().getValues();
-  return (selectedRows || []).map(rowIdx => {
+  return dataRows.map(rowIdx => {
     const row = values[Number(rowIdx) - 1] || [];
     const status = resultCols ? String(row[resultCols.statusCol - 1] || '').trim() : '';
     const currentSignature = attendanceChatSignature_(sheet.getName(), rowIdx, row);
@@ -1234,7 +2299,7 @@ function formatQueueDateKey_(value, fallback) {
   return match[1] + '-' + ('0' + match[2]).slice(-2) + '-' + ('0' + match[3]).slice(-2);
 }
 
-function attendanceChatSignature_(sheetName, rowIdx, row) {
+function attendanceChatLegacySignatureV1_(sheetName, rowIdx, row) {
   const values = row || [];
   return stableChatRequestId_([
     sheetName,
@@ -1244,6 +2309,31 @@ function attendanceChatSignature_(sheetName, rowIdx, row) {
     values[6],
     values[7]
   ]);
+}
+
+function attendanceChatSignatureV2_(row) {
+  const values = row || [];
+  return stableChatRequestId_([JSON.stringify([
+    'attendance-chat-v2',
+    formatQueueDateKey_(values[0], ''),
+    String(values[1] || '').trim(),
+    String(values[6] || '').trim(),
+    String(values[7] || '').trim()
+  ])]);
+}
+
+function attendanceChatSignature_(sheetName, rowIdx, row) {
+  return attendanceChatSignatureV2_(row);
+}
+
+function attendanceChatRequestId_(sheetIdentity, email, signature, text) {
+  return stableChatRequestId_([JSON.stringify([
+    'attendance-chat-send-v2',
+    String(sheetIdentity || '').trim(),
+    String(email || '').trim(),
+    String(signature || '').trim(),
+    String(text || '')
+  ])]);
 }
 
 function groupPersonalMessageQueueRows_(rows, targetDateKey) {
@@ -1539,25 +2629,50 @@ function ensureSheetHasColumns_(sheet, minColumns) {
 
 function ensureMonthlyChatResultColumns_(sheet) {
   if (!sheet || !isInputMonthSheet_(sheet)) return null;
-  const headerRow = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0].map(v => String(v || '').trim());
-  let startCol = headerRow.indexOf(MONTHLY_CHAT_RESULT_HEADERS[0]) + 1;
+  const startCol = INPUT_HEADERS.length + 1;
+  const requiredLastCol = startCol + MONTHLY_CHAT_RESULT_HEADERS.length - 1;
+  const headerWidth = Math.max(Math.min(sheet.getMaxColumns(), requiredLastCol), 1);
+  const headerRow = sheet.getRange(
+    MONTHLY_ATTENDANCE_HEADER_ROW,
+    1,
+    1,
+    headerWidth
+  ).getValues()[0].map(v => String(v || '').trim());
+  // 제목이 1행에 있는 옛 시트에서는 2행이 첫 학생 기록이다.
+  // 그 줄을 제목 줄로 보고 글자를 쓰면 학생 기록을 덮어쓴다.
+  // 2행 앞부분이 정확한 제목이 아니면 아무것도 하지 않는다.
+  const inputHeadersMatch = INPUT_HEADERS.every(
+    (name, index) => String(headerRow[index] || '').trim() === name
+  );
+  if (!inputHeadersMatch) return null;
+  const currentHeaders = MONTHLY_CHAT_RESULT_HEADERS.map(
+    (_, index) => String(headerRow[startCol - 1 + index] || '').trim()
+  );
+  // 비었거나 제 이름인 칸만 있으면 손대도 된다. 다른 글자가 하나라도 있으면
+  // 선생님이 직접 쓰신 제목이므로 아무것도 하지 않는다.
+  const onlyOursOrEmpty = currentHeaders.every(
+    (value, index) => !value || value === MONTHLY_CHAT_RESULT_HEADERS[index]
+  );
+  if (!onlyOursOrEmpty) return null;
+
+  ensureSheetHasColumns_(sheet, requiredLastCol);
+  // 빈 칸만 채운다. 예전 판으로 만든 시트에는 앞의 세 칸만 있고 네 번째
+  // `Google Chat 내용기준`이 비어 있다. 그 한 칸 때문에 그 달 전체를
+  // 건너뛰면 발송이 조용히 멈춘다.
   let headerChanged = false;
-  if (!startCol) {
-    startCol = sheet.getLastColumn() + 1;
-    ensureSheetHasColumns_(sheet, startCol + MONTHLY_CHAT_RESULT_HEADERS.length - 1);
-    sheet.getRange(1, startCol, 1, MONTHLY_CHAT_RESULT_HEADERS.length).setValues([MONTHLY_CHAT_RESULT_HEADERS]);
+  currentHeaders.forEach((value, index) => {
+    if (value) return;
+    sheet.getRange(MONTHLY_ATTENDANCE_HEADER_ROW, startCol + index, 1, 1)
+      .setValues([[MONTHLY_CHAT_RESULT_HEADERS[index]]]);
     headerChanged = true;
-  } else {
-    const signatureCol = startCol + 3;
-    ensureSheetHasColumns_(sheet, signatureCol);
-    const signatureHeader = String(headerRow[signatureCol - 1] || '').trim();
-    if (signatureHeader !== MONTHLY_CHAT_RESULT_HEADERS[3]) {
-      sheet.getRange(1, signatureCol).setValue(MONTHLY_CHAT_RESULT_HEADERS[3]);
-      headerChanged = true;
-    }
-  }
+  });
   if (headerChanged) {
-    const range = sheet.getRange(1, startCol, Math.max(sheet.getMaxRows(), 1), MONTHLY_CHAT_RESULT_HEADERS.length);
+    const range = sheet.getRange(
+      MONTHLY_ATTENDANCE_HEADER_ROW,
+      startCol,
+      Math.max(sheet.getMaxRows() - MONTHLY_ATTENDANCE_INPUT_ROW, 1),
+      MONTHLY_CHAT_RESULT_HEADERS.length
+    );
     range.setWrap(true).setVerticalAlignment('middle');
     sheet.setColumnWidths(startCol, 1, 130);
     sheet.setColumnWidths(startCol + 1, 1, 150);
@@ -1573,9 +2688,20 @@ function ensureMonthlyChatResultColumns_(sheet) {
 }
 
 function setMonthlyChatResult_(sheet, rowIdx, status, result, signature) {
+  const rowIdxAllowed = (
+    (typeof rowIdx === 'number' && Number.isSafeInteger(rowIdx))
+    || (
+      typeof rowIdx === 'string'
+      && /^\d+$/.test(rowIdx)
+      && Number.isSafeInteger(Number(rowIdx))
+    )
+  );
+  if (!rowIdxAllowed) return;
+  const safeRowIdx = Number(rowIdx);
+  if (safeRowIdx < MONTHLY_ATTENDANCE_DATA_START_ROW) return;
   const cols = ensureMonthlyChatResultColumns_(sheet);
-  if (!cols || !rowIdx || rowIdx < 2) return;
-  sheet.getRange(rowIdx, cols.statusCol, 1, 4).setValues([[
+  if (!cols) return;
+  sheet.getRange(safeRowIdx, cols.statusCol, 1, 4).setValues([[
     status || '',
     timestampKey_(),
     result || '',
@@ -1584,9 +2710,31 @@ function setMonthlyChatResult_(sheet, rowIdx, status, result, signature) {
 }
 
 function clearMonthlyChatResultForRows_(sheet, startRow, endRow) {
+  const startRowAllowed = (
+    (typeof startRow === 'number' && Number.isSafeInteger(startRow))
+    || (
+      typeof startRow === 'string'
+      && /^\d+$/.test(startRow)
+      && Number.isSafeInteger(Number(startRow))
+    )
+  );
+  const endRowAllowed = (
+    (typeof endRow === 'number' && Number.isSafeInteger(endRow))
+    || (
+      typeof endRow === 'string'
+      && /^\d+$/.test(endRow)
+      && Number.isSafeInteger(Number(endRow))
+    )
+  );
+  if (!startRowAllowed || !endRowAllowed) return;
+  const numericStartRow = Number(startRow);
+  const numericEndRow = Number(endRow);
+  if (numericStartRow < 1 || numericEndRow < 1) return;
+  const safeStartRow = Math.max(MONTHLY_ATTENDANCE_DATA_START_ROW, numericStartRow);
+  if (numericEndRow < safeStartRow) return;
   const cols = ensureMonthlyChatResultColumns_(sheet);
-  if (!cols || startRow < 2 || endRow < startRow) return;
-  sheet.getRange(startRow, cols.statusCol, endRow - startRow + 1, 4).clearContent();
+  if (!cols) return;
+  sheet.getRange(safeStartRow, cols.statusCol, numericEndRow - safeStartRow + 1, 4).clearContent();
 }
 
 function timestampKey_() {
@@ -1931,7 +3079,7 @@ function startCentralChatConnection() {
     const result = callCentralChatSender_('/v1/auth/start', {});
     showLinkDialog_('Google Chat 최초 발송 연결하기', result.authUrl, '연결을 마친 뒤 시트로 돌아오세요.');
   } catch (err) {
-    ui.alert('Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + errorMessage_(err));
+    ui.alert('Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + centralChatErrorMessage_(err));
   }
 }
 
@@ -1951,7 +3099,7 @@ function checkCentralChatStatus() {
       '단체톡: ' + (status.classEnabled ? '가능' : '학급 단톡방 고르기 필요')
     );
   } catch (err) {
-    ui.alert('Google Chat 연결 상태를 확인하지 못했습니다.\n\n' + (err && err.message ? err.message : err));
+    ui.alert('Google Chat 연결 상태를 확인하지 못했습니다.\n\n' + centralChatErrorMessage_(err));
   }
 }
 
@@ -1984,7 +3132,7 @@ function getSelectedDataRows_(sheet) {
                            : (sheet.getActiveRange() ? [sheet.getActiveRange()] : []);
   const rows = new Set();
   ranges.forEach(r => {
-    const startRow = Math.max(STRIPE_START_ROW, r.getRow());
+    const startRow = Math.max(MONTHLY_ATTENDANCE_DATA_START_ROW, r.getRow());
     for (let rowIdx = startRow; rowIdx <= r.getLastRow(); rowIdx++) rows.add(rowIdx);
   });
   return Array.from(rows).sort((a, b) => a - b);
@@ -2009,7 +3157,7 @@ function createDocFromTemplate() {
 
     const selectedRows = getSelectedDataRows_(sheet);
     if (selectedRows.length === 0) {
-      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 2행 이하의 대상 행(들)을 선택한 후 실행하세요.');
+      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 3행 이후의 대상 행(들)을 선택한 후 실행하세요.');
       return;
     }
 
@@ -2032,13 +3180,17 @@ function createDocsFromRows_(sheet, selectedRows) {
   if (!sheet || !isInputMonthSheet_(sheet)) {
     throw new Error('월별 입력 시트에서만 신고서를 만들 수 있습니다.');
   }
+  const dataRows = (selectedRows || [])
+    .map(rowIdx => Number(rowIdx))
+    .filter(rowIdx => Number.isInteger(rowIdx) && rowIdx >= MONTHLY_ATTENDANCE_DATA_START_ROW);
+  if (!dataRows.length) return { created: 0, fails: [] };
   const ss = sheet.getParent ? sheet.getParent() : SpreadsheetApp.getActiveSpreadsheet();
   const holidaySet = loadHolidaySet_(ss);
   const absIndex = buildAbsenceIndex_(sheet); // 현재 월 시트 기준
   const issuedSpanKeys = new Set();           // 연속결석 묶음 중복 생성 방지
 
   let created = 0, fails = [];
-  selectedRows.forEach(rowIdx => {
+  dataRows.forEach(rowIdx => {
     try {
       const ok = processRowToDoc_(sheet, Number(rowIdx), absIndex, holidaySet, issuedSpanKeys);
       if (ok) created++;
@@ -2182,7 +3334,7 @@ function addSelectedRowToTasks() {
     // 선택 범위(연속·비연속 모두) — 행 번호는 중복 제거
     const selectedRows = getSelectedDataRows_(sheet);
     if (!selectedRows.length) {
-      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 2행 이하의 대상 행(들)을 선택한 후 실행하세요.');
+      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 3행 이후의 대상 행(들)을 선택한 후 실행하세요.');
       return;
     }
 
@@ -2207,6 +3359,10 @@ function addRowsToTasks_(sheet, selectedRows) {
   if (!sheet || !isInputMonthSheet_(sheet)) {
     throw new Error('월별 입력 시트에서만 Tasks를 추가합니다.');
   }
+  const dataRows = (selectedRows || [])
+    .map(rowIdx => Number(rowIdx))
+    .filter(rowIdx => Number.isInteger(rowIdx) && rowIdx >= MONTHLY_ATTENDANCE_DATA_START_ROW);
+  if (!dataRows.length) return { created: 0, titles: [] };
   const taskListId = getTaskListId_();
 
   // 기존 미완료 Task 제목들 수집 (페이지네이션)
@@ -2232,7 +3388,7 @@ function addRowsToTasks_(sheet, selectedRows) {
   const titlesToCreate = new Set();
   const lastCol = sheet.getLastColumn();
 
-  for (const rowIdx of selectedRows) {
+  for (const rowIdx of dataRows) {
     const row = sheet.getRange(rowIdx, 1, 1, lastCol).getValues()[0];
 
     // A열 날짜 태그(없으면 행번호로 대체)
@@ -2289,7 +3445,7 @@ function sendSelectedRowsChatNow() {
 
     const selectedRows = getSelectedDataRows_(sheet);
     if (!selectedRows.length) {
-      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 2행 이하의 대상 행(들)을 선택한 후 실행하세요.');
+      SpreadsheetApp.getUi().alert('선택된 데이터 행이 없습니다. 3행 이후의 대상 행(들)을 선택한 후 실행하세요.');
       return;
     }
 
@@ -2360,8 +3516,6 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
   if (!sheet || !isInputMonthSheet_(sheet)) {
     throw new Error('월별 입력 시트에서만 개인톡을 보냅니다.');
   }
-  ensureMonthlyChatResultColumns_(sheet);
-  const groups = buildAttendanceChatGroupsForSelectedRows_(sheet, selectedRows);
   const result = {
     sent: 0,
     failed: 0,
@@ -2369,6 +3523,12 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
     failures: [],
     chatApiSetupBlocked: false
   };
+  const dataRows = (selectedRows || [])
+    .map(rowIdx => Number(rowIdx))
+    .filter(rowIdx => Number.isInteger(rowIdx) && rowIdx >= MONTHLY_ATTENDANCE_DATA_START_ROW);
+  if (!dataRows.length) return result;
+  if (!ensureMonthlyChatResultColumns_(sheet)) return result;
+  const groups = buildAttendanceChatGroupsForSelectedRows_(sheet, dataRows);
   if (!groups.length) return result;
 
   const rosterMap = loadStudentRosterForDm_();
@@ -2393,13 +3553,12 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
       continue;
     }
 
-    const requestId = stableChatRequestId_([
+    const requestId = attendanceChatRequestId_(
       centralSheetIdentityForRequest_(),
-      group.sheetName,
-      group.rowIdx,
       group.email,
+      group.signature,
       text
-    ]);
+    );
     let sendResult;
     try {
       sendResult = sendCentralPersonalChat_(group.email, text, {
@@ -2998,12 +4157,18 @@ function onEdit(e) {
     if (isInputMonthSheet_(sheet)) {
       const editsMessageFields = (startCol <= 2 && endCol >= 1) || (startCol <= 8 && endCol >= 7);
       if (editsMessageFields) {
-        clearMonthlyChatResultForRows_(sheet, Math.max(2, range.getRow()), Math.max(2, range.getLastRow()));
+        const startRow = Math.max(MONTHLY_ATTENDANCE_DATA_START_ROW, range.getRow());
+        const endRow = range.getLastRow();
+        if (endRow >= startRow) clearMonthlyChatResultForRows_(sheet, startRow, endRow);
       }
     }
 
     // A열을 포함한 편집/붙여넣기 때만 실행 → 성능 최적화
-    if (startCol <= 1 && endCol >= 1) {
+    if (
+      startCol <= 1
+      && endCol >= 1
+      && range.getLastRow() >= MONTHLY_ATTENDANCE_DATA_START_ROW
+    ) {
       reStripeSheet_(sheet);
     }
   } catch (err) {
@@ -3022,18 +4187,24 @@ function reStripeAllSheets() {
   ss.getSheets().forEach(sh => reStripeSheet_(sh));
 }
 
-/** 핵심: A열의 '같은 날짜 블록'마다 교대로 색을 칠함 (A:P) */
+/** 핵심: A열의 '같은 날짜 블록'마다 교대로 색을 칠함 (A:L) */
 function reStripeSheet_(sheet) {
   if (shouldSkipSheet_(sheet)) return;
 
   const lastRow = sheet.getLastRow();
-  if (lastRow < STRIPE_START_ROW) return;
+  if (lastRow < MONTHLY_ATTENDANCE_DATA_START_ROW) return;
 
   const endCol = Math.min(STRIPE_END_COL, sheet.getMaxColumns());
   if (endCol < 1) return;
 
-  const numRows = lastRow - STRIPE_START_ROW + 1;
-  const vals = sheet.getRange(STRIPE_START_ROW, 1, numRows, endCol).getValues();
+  const numRows = lastRow - MONTHLY_ATTENDANCE_DATA_START_ROW + 1;
+  const stripeRange = sheet.getRange(
+    MONTHLY_ATTENDANCE_DATA_START_ROW,
+    1,
+    numRows,
+    endCol
+  );
+  const vals = stripeRange.getValues();
   const bgs  = new Array(numRows);
 
   let currentDate = null; // 현재 블록 기준 날짜
@@ -3061,7 +4232,7 @@ function reStripeSheet_(sheet) {
     }
   }
 
-  sheet.getRange(STRIPE_START_ROW, 1, numRows, endCol).setBackgrounds(bgs);
+  stripeRange.setBackgrounds(bgs);
 }
 
 /** 날짜(연-월-일) 동일성 비교 */

@@ -41,7 +41,7 @@ def _as_text(value) -> str:
 
 
 def run_captured(
-    args: Sequence[str], *, cwd=None, timeout=None, runner=subprocess.run
+    args: Sequence[str], *, cwd=None, timeout=None, env=None, runner=subprocess.run
 ) -> tuple[int, str]:
     options = {
         "capture_output": True,
@@ -53,6 +53,8 @@ def run_captured(
         options["cwd"] = str(cwd)
     if timeout is not None:
         options["timeout"] = timeout
+    if env is not None:
+        options["env"] = dict(env)
     try:
         completed = runner(list(args), **_hidden_options(options))
     except subprocess.TimeoutExpired as error:

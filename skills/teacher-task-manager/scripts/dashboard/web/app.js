@@ -2251,6 +2251,12 @@ bindActions({
     }
     S.fieldIssues = {};
     S.mode = "home"; S.checks = []; S.profileCache = null; S.listsLoaded = false; render();
+    // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지 않는다.
+    const push = messengerResult.sheet_push;
+    if (push && push.state === "failed") {
+      setBanner("warn", "저장했어요. 다만 " + push.detail);
+      return;
+    }
     showToast("저장했어요");
   },
   "open-logs": () => call("open_logs"),

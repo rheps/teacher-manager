@@ -252,7 +252,11 @@ def prepare_for_start(config_dir: Path, app_version: str, *, installed: bool) ->
 
 
 def maybe_fresh_start(config_dir: Path, app_version: str, now: datetime | None = None,
-                      logout=_default_logout, stop_helper=_default_stop_helper) -> Path | None:
+                      logout=None, stop_helper=None) -> Path | None:
+    # 기본 동작은 부를 때 찾는다. 정의 때 묶어 두면 시험이 가짜로 바꿔 끼울 수 없어
+    # 실제 `gws auth logout`과 실제 도우미 정지가 개발 컴퓨터에서 그대로 돌아 버린다.
+    logout = logout or _default_logout
+    stop_helper = stop_helper or _default_stop_helper
     config_dir = Path(config_dir)
     flag = paths.fresh_start_flag_path(config_dir)
     version_file = paths.last_run_version_path(config_dir)
