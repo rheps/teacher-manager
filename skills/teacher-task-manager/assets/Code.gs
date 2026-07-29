@@ -36,8 +36,12 @@ const MONTHLY_ATTENDANCE_AI_INPUT_LABEL = 'AI 출결 입력';
 const MONTHLY_ATTENDANCE_AI_INPUT_HINT =
   '여기에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르세요';
 const MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR = '#9AA0A6';
+// 선생님이 적는 글은 회색 예시와 눈에 띄게 갈라 보이도록 검정으로 쓴다.
+const MONTHLY_ATTENDANCE_AI_INPUT_TEXT_COLOR = '#000000';
 const MONTHLY_ATTENDANCE_AI_INPUT_COL = 2;        // B
-const MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL = 11;  // K (그 다음 L열은 숨긴 열이다)
+// 입력칸은 M열까지 이어 붙인다. K에서 끊으면 오른쪽에 짜투리 칸이 남아
+// 글 적는 자리처럼 보이지 않는다. 가운데 L열은 숨긴 열이라 화면에는 안 보인다.
+const MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL = 13;  // M
 // 제목이 실제로 있는 마지막 열이다. M~P에는 아무 자료도 들어가지 않는다.
 const MONTHLY_ATTENDANCE_LAST_DATA_COL = 13;      // M (AI 입력 표시까지가 표다)
 const STRIPE_END_COL  = 13;      // A(1)~M(13)
@@ -117,39 +121,27 @@ const CHAT_MESSAGE_LIMIT_BYTES = 30000;
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
-  // 연결 관련 3항목은 전용 메뉴 하나로 모은다 — 다른 메뉴와 중복 배치하지 않는다.
-  ui.createMenu('Google Chat 연결')
-    .addItem('Google Chat 최초 발송 연결하기', 'startCentralChatConnection')
-    .addItem('Google Chat 연결 상태 확인', 'checkCentralChatStatus')
-    .addItem('Google Chat 학급 단톡방 고르기', 'connectClassChatSpace')
+  // 메뉴는 '사전 세팅'과 '교사가 직접 실행하는 일'로 가른다.
+  // Chat 연결은 출결뿐 아니라 교육청 메신저 발송의 사전 세팅이기도 해서 어느 한쪽 실행
+  // 메뉴 밑에 둘 수 없다. 그래서 최상위에 따로 세우고, 사전 세팅은 항목 하나로 합친다.
+  ui.createMenu('처음 한 번 설정하기')
+    .addItem('처음 설정 한 번에 끝내기', 'runFirstTimeSetup')
+    .addItem('연결 상태 확인', 'checkCentralChatStatus')
     .addToUi();
 
+  // 아래 두 메뉴는 계열이 다르지만 둘 다 실행 전용이다 — 사전 세팅 항목을 넣지 않는다.
   const attendanceMenu = ui.createMenu('출결 업무 자동화')
     .addItem('선택 행 출결신고서 Google Docs에 만들기', 'createDocFromTemplate')
     .addItem('선택 행 미제출 서류 Google Tasks에 추가하기', 'addSelectedRowToTasks')
     .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow');
 
-  // 1행 AI 입력 켜기는 출결 준비 프로그램이 만들고 연결까지 바꾼 사본에서만 보여 준다.
-  // 원래 쓰던 출결 시트와 아직 연결을 바꾸지 않은 사본에는 항목 자체를 두지 않는다.
-  let aiWorkbook = null;
-  try {
-    aiWorkbook = attendanceAiWorkbookState_();
-  } catch (err) {
-    aiWorkbook = null;
-  }
-  if (aiWorkbook && aiWorkbook.ok === true) {
-    attendanceMenu.addItem(ATTENDANCE_AI_MENU_ITEM, 'enableAttendanceAiInput');
-  }
-
   attendanceMenu
     .addSeparator()
-    .addSubMenu(ui.createMenu('고급 설정')
-      .addItem('기본 시트/설정 점검', 'setupAttendanceWorkbook')
+    .addSubMenu(ui.createMenu('문제가 생겼을 때')
       .addItem('입력 색/드롭다운 다시 적용', 'refreshInputFormattingAndDropdowns')
       .addItem('기존 템플릿 ID/접근 점검', 'checkExistingTemplateDoc')
       .addItem('출력 폴더 만들기/연결', 'connectDestinationFolder')
       .addItem('Tasks 목록 만들기/연결', 'connectTasksList')
-      .addItem('Chat 발송 연결 점검', 'checkCentralChatStatus')
       .addSeparator()
       .addItem('날짜 줄무늬: 현재 월 시트', 'reStripeActiveSheet')
       .addItem('날짜 줄무늬: 모든 월 시트', 'reStripeAllSheets'))
@@ -165,6 +157,130 @@ function onOpen() {
     .addItem('Google Chat 발송 기록 보기', 'openChatLogSheet')
     .addItem('Google Chat 발송 연결 끊기', 'disconnectCentralChatSender')
     .addToUi();
+}
+
+/*************************************************
+ * 처음 한 번 설정하기 — 사전 세팅 네 가지를 한 번에
+ *************************************************/
+
+/**
+ * 사전 세팅 네 가지를 순서대로 돌리고 결과를 마지막에 한 화면으로 보여 준다.
+ *
+ * 1행 편집을 알아차리는 설치형 감지기는 시트 안에서 승인된 실행이 있어야 만들어진다.
+ * 컴퓨터에서 대신 실행하면 권한 오류가 나고, 시트를 열 때 도는 onOpen은 권한이 제한돼
+ * 감지기를 만들 수 없다. 그래서 선생님이 시트에서 누르는 한 번은 구글이 요구하는 것이라
+ * 없앨 수 없다. 없앨 수 없다면 그 한 번에 나머지를 모두 태워, 메뉴 세 군데를 돌아다니지
+ * 않게 하는 것이 이 함수의 목적이다.
+ *
+ * 네 단계는 모두 여러 번 눌러도 안전하다. 이미 된 것은 건너뛰고, 하나가 실패해도
+ * 나머지는 계속 진행한 뒤 실패한 것만 결과 화면에 적는다.
+ */
+function runFirstTimeSetup() {
+  const ui = SpreadsheetApp.getUi();
+  const steps = [
+    { title: '기본 시트/설정 점검', run: firstTimeSetupWorkbookStep_ },
+    { title: 'AI 출결 입력 켜기', run: firstTimeSetupAiStep_ },
+    { title: 'Google Chat 최초 발송 연결', run: firstTimeSetupChatStep_ },
+    { title: 'Google Chat 학급 단톡방 고르기', run: firstTimeSetupClassSpaceStep_ }
+  ];
+
+  // 뒤 단계가 앞 단계의 결과를 알아야 하는 곳이 있다 — 연결이 끝나야 단톡방 목록을 받는다.
+  const context = { chatReady: false };
+  const lines = [];
+  const leftovers = [];
+
+  steps.forEach(function (step) {
+    let result;
+    try {
+      result = step.run(context);
+    } catch (err) {
+      // 한 단계가 무너져도 나머지는 이어서 한다.
+      result = { ok: false, message: errorMessage_(err) };
+    }
+    result = result || { ok: false, message: '결과를 확인하지 못했습니다.' };
+    const mark = result.ok === true ? (result.skipped === true ? '[이미]' : '[됨]') : '[못 함]';
+    lines.push(mark + ' ' + step.title + (result.message ? ' — ' + firstTimeSetupOneLine_(result.message) : ''));
+    if (result.ok !== true) leftovers.push(step.title + '\n' + String(result.message || ''));
+  });
+
+  const closing = leftovers.length
+    ? '아직 남은 것\n\n' + leftovers.join('\n\n') + '\n\n' +
+      '위 안내대로 마친 뒤 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 다시 누르면 됩니다.\n' +
+      '이미 끝난 것은 건너뛰니 여러 번 눌러도 안전합니다.'
+    : '네 가지가 모두 준비됐습니다. 이 메뉴는 다시 누르지 않아도 됩니다.';
+
+  ui.alert('처음 한 번 설정하기', lines.join('\n') + '\n\n' + closing, ui.ButtonSet.OK);
+}
+
+/** 결과 목록 한 줄에는 첫 문장만 싣는다 — 자세한 안내는 아래 '아직 남은 것'에 그대로 나온다. */
+function firstTimeSetupOneLine_(message) {
+  const first = String(message || '').split('\n')[0].trim();
+  return first.length > 60 ? first.slice(0, 60) + '…' : first;
+}
+
+/** 1단계 — 기본 시트·드롭다운 정리. 여러 번 돌려도 같은 상태가 되므로 건너뛰기 판단을 두지 않는다. */
+function firstTimeSetupWorkbookStep_() {
+  setupAttendanceWorkbookCore_();
+  return { ok: true, message: '월별 시트·학생명단·설정 시트를 확인했습니다.' };
+}
+
+/** 2단계 — 1행 AI 입력 켜기(편집 감지기 만들기). */
+function firstTimeSetupAiStep_() {
+  // 켤 수 있는 사본인지 먼저 본다. 아닌 시트에서는 이 단계만 건너뛰고 나머지는 그대로 한다.
+  let state = null;
+  try {
+    state = attendanceAiWorkbookState_();
+  } catch (err) {
+    state = null;
+  }
+  if (!state || state.ok !== true) {
+    return {
+      ok: true,
+      skipped: true,
+      message: state && state.message ? state.message : 'AI 입력을 켤 수 있는 사본이 아닙니다.'
+    };
+  }
+  const result = enableAttendanceAiInput({ quiet: true }) || { ok: false, message: '결과를 확인하지 못했습니다.' };
+  // 이미 있던 감지기를 그대로 쓴 경우는 새로 만든 것과 구분해 보여 준다.
+  if (result.ok === true && result.created !== true) result.skipped = true;
+  return result;
+}
+
+/** 3단계 — Google Chat 최초 발송 연결. 권한 허용 화면은 사람이 눌러야 끝난다. */
+function firstTimeSetupChatStep_(context) {
+  let status = null;
+  try {
+    status = callCentralChatSender_('/v1/status', {});
+  } catch (err) {
+    // 상태를 못 읽었다고 건너뛰면 첫 연결이 영영 시작되지 않는다. 연결부터 시도한다.
+    status = null;
+  }
+  if (status && status.connected) {
+    if (context) context.chatReady = true;
+    return {
+      ok: true,
+      skipped: true,
+      message: '이미 연결되어 있습니다' + (status.account ? ': ' + status.account : '.')
+    };
+  }
+  return startCentralChatConnection({ quiet: true }) || { ok: false, message: '결과를 확인하지 못했습니다.' };
+}
+
+/** 4단계 — 학급 단톡방 고르기. 목록에서 고르는 화면은 사람이 눌러야 끝난다. */
+function firstTimeSetupClassSpaceStep_(context) {
+  if (context && context.chatReady !== true) {
+    // 연결 전에는 단톡방 목록 자체를 받아올 수 없어, 물어봐야 실패만 한다.
+    return {
+      ok: false,
+      message: 'Google Chat 최초 발송 연결을 먼저 마쳐야 단톡방 목록을 받아올 수 있습니다.'
+    };
+  }
+  const spaceId = readConfigValueReadOnly_('CLASS_CHAT_SPACE_ID');
+  if (spaceId) {
+    const spaceName = readConfigValueReadOnly_('CLASS_CHAT_SPACE_NAME');
+    return { ok: true, skipped: true, message: '이미 고른 단톡방이 있습니다: ' + (spaceName || spaceId) };
+  }
+  return connectClassChatSpace({ quiet: true }) || { ok: false, message: '결과를 확인하지 못했습니다.' };
 }
 
 function showAbout() {
@@ -480,9 +596,10 @@ function applyInputSheetFormatting_(sh) {
   const n = sh.getMaxRows() - MONTHLY_ATTENDANCE_HEADER_ROW;
   if (n > 0) {
     sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 1, n, 1).setNumberFormat('yyyy-mm-dd');
-    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 2, n, 1).setBackground('#EAF4FF');
-    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 3, n, 2).setBackground('#FFF7E6');
-    sh.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 6, n, 3).setBackground('#F3F4F6');
+    // 3행 아래 배경은 날짜 줄무늬만 쓴다. 예전에는 입력하는 칸임을 알리려고
+    // B열·C~D열·F~H열에 옅은 색을 따로 칠했는데, 그 칸에서 줄무늬가 지워져
+    // 한 날짜 덩어리가 A열부터 M열까지 이어지지 않고 구멍이 뚫렸다(2026-07-27).
+    // 어느 칸에 적는지는 그 칸을 누를 때 나오는 드롭다운 화살표로 알 수 있다.
 
     const categoryRule = SpreadsheetApp.newDataValidation().requireValueInList(['질병','미인정','기타','출석인정'], true).setAllowInvalid(false).build();
     const kindRule = SpreadsheetApp.newDataValidation().requireValueInList(['결석함','지각함','조퇴함','결과함'], true).setAllowInvalid(false).build();
@@ -798,6 +915,62 @@ function isAttendanceAiInputRange_(column, numColumns) {
   return numColumns >= 1 && numColumns <= boxWidth;
 }
 
+/**
+ * 월 시트 1행 입력칸 하나를 집어 온다. 월 시트가 아니면 아무것도 돌려주지 않는다.
+ *
+ * 이름만 보고 판단한다. 칸을 고를 때마다 도는 자리라서, 설정 탭을 읽는 무거운 검사를
+ * 걸어 두면 클릭 한 번마다 시트가 느려지고 그 검사가 걸리는 순간 조용히 아무 일도
+ * 일어나지 않는다(2026-07-27).
+ */
+function attendanceAiInputBoxFor_(sheet) {
+  if (!sheet || typeof sheet.getRange !== 'function') return null;
+  if (typeof sheet.getName !== 'function') return null;
+  if (!/^\d{1,2}월$/.test(String(sheet.getName() || '').trim())) return null;
+  return sheet.getRange(
+    MONTHLY_ATTENDANCE_INPUT_ROW,
+    MONTHLY_ATTENDANCE_AI_INPUT_COL,
+    1,
+    MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL - MONTHLY_ATTENDANCE_AI_INPUT_COL + 1
+  );
+}
+
+/**
+ * 칸을 고를 때마다 도는 장치.
+ *
+ * 입력칸에 들어가면 회색 예시를 지워 빈 칸으로 만들고 글자색을 검정으로 바꾼다.
+ * 예시가 글자로 남아 있으면 선생님이 그걸 먼저 지우고 써야 하기 때문이다.
+ * 비운 채 다른 데를 누르면 예시를 되돌려 무엇을 적는 자리인지 다시 알려 준다.
+ *
+ * 휴대전화 구글 시트 앱에서는 이 장치가 돌지 않는다. 그때는 예시가 글자로 남아 있고,
+ * 칸을 눌러 적으면 그 글자가 통째로 바뀐다 — 지금까지와 같다.
+ */
+function onSelectionChange(e) {
+  try {
+    if (!e || !e.range || typeof e.range.getSheet !== 'function') return;
+    const sheet = e.range.getSheet();
+    const box = attendanceAiInputBoxFor_(sheet);
+    if (!box) return;
+    const inBox = e.range.getRow() === MONTHLY_ATTENDANCE_INPUT_ROW
+      && e.range.getColumn() === MONTHLY_ATTENDANCE_AI_INPUT_COL;
+    const shown = String(box.getValue() || '').trim();
+    if (inBox) {
+      if (shown === MONTHLY_ATTENDANCE_AI_INPUT_HINT) box.setValue('');
+      box.setFontColor(MONTHLY_ATTENDANCE_AI_INPUT_TEXT_COLOR);
+      return;
+    }
+    if (shown) return;
+    // 빈 칸이라고 아무 데나 예시를 써 넣지 않는다. 1행이 우리 모양인 시트에서만 되돌린다.
+    const label = String(
+      sheet.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, 1).getValue() || ''
+    ).trim();
+    if (label !== MONTHLY_ATTENDANCE_AI_INPUT_LABEL) return;
+    box.setValue(MONTHLY_ATTENDANCE_AI_INPUT_HINT);
+    box.setFontColor(MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR);
+  } catch (err) {
+    // 칸을 고를 때마다 도는 자리다 — 무슨 일이 있어도 시트에 오류를 띄우지 않는다.
+  }
+}
+
 /** 1행을 이름표와 회색 안내 문구로 되돌린다. 적었던 문장은 사라진다. */
 function resetAttendanceAiInputRow_(sheet) {
   sheet.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, 1)
@@ -807,7 +980,10 @@ function resetAttendanceAiInputRow_(sheet) {
     MONTHLY_ATTENDANCE_AI_INPUT_COL,
     1,
     MONTHLY_ATTENDANCE_AI_INPUT_LAST_COL - MONTHLY_ATTENDANCE_AI_INPUT_COL + 1
-  ).setValue(MONTHLY_ATTENDANCE_AI_INPUT_HINT);
+  )
+    .setValue(MONTHLY_ATTENDANCE_AI_INPUT_HINT)
+    // 적을 때 검정으로 바꿔 뒀으므로 예시를 되돌릴 때 회색도 함께 돌려놓는다.
+    .setFontColor(MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR);
 }
 
 function handleAttendanceAiEdit(e, testPorts) {
@@ -1142,7 +1318,11 @@ function attendanceAiGeminiApiKey_(spreadsheet) {
 function isAttendanceAiApiKeyShape_(value) {
   const key = String(value === undefined || value === null ? '' : value).trim();
   if (key.length < 20 || key.length > 200) return false;
-  return /^[A-Za-z0-9_-]+$/.test(key);
+  // 마침표를 받는다 — 요즘 구글이 내주는 키는 `AQ.`로 시작하고 가운데 마침표가 있다.
+  // 옛 `AIzaSy…` 모양만 생각하고 막았더니, 키가 설정 탭에 제대로 들어와 있는데도
+  // "키를 찾지 못했습니다"만 뜨는 일이 있었다(2026-07-27).
+  // 붙여넣은 문장을 걸러내는 목적은 그대로다 — 띄어쓰기와 한글은 여전히 거부한다.
+  return /^[A-Za-z0-9._-]+$/.test(key);
 }
 
 /** 이 사본의 1행 편집을 받는 설치형 감지기만 골라낸다. */
@@ -1193,63 +1373,63 @@ function ensureAttendanceAiEditTrigger_(spreadsheetId) {
 }
 
 /** 메뉴: 이 사본에서만 1행 AI 입력을 켠다. */
-function enableAttendanceAiInput() {
+function enableAttendanceAiInput(options) {
   const ui = SpreadsheetApp.getUi();
+  // 통합 설정이 부를 때는 단계마다 창을 띄우지 않고 결과만 돌려준다 — 화면은 마지막에 한 번만 뜬다.
+  const quiet = !!(options && options.quiet === true);
+  function finish_(ok, message, created) {
+    if (!quiet) ui.alert(ATTENDANCE_AI_MENU_ITEM, message, ui.ButtonSet.OK);
+    return { ok: ok, created: created === true, message: message };
+  }
+
   const state = attendanceAiWorkbookState_();
   if (!state || state.ok !== true) {
-    ui.alert(ATTENDANCE_AI_MENU_ITEM, String(state && state.message || '이 파일에서는 켤 수 없습니다.'), ui.ButtonSet.OK);
-    return;
+    return finish_(false, String(state && state.message || '이 파일에서는 켤 수 없습니다.'));
   }
 
   // 키는 컴퓨터의 티처 매니저에서 이미 받아 설정 탭에 들어와 있다. 여기서 다시 묻지 않는다.
   const apiKey = attendanceAiGeminiApiKey_(SpreadsheetApp.getActiveSpreadsheet());
   if (!isAttendanceAiApiKeyShape_(apiKey)) {
-    ui.alert(
-      ATTENDANCE_AI_MENU_ITEM,
+    return finish_(
+      false,
       '이 시트에 쓸 Gemini API key를 찾지 못했습니다.\n\n' +
       '컴퓨터의 티처 매니저를 열고 [연결] 화면에서 Gemini API key를 넣어 저장한 다음\n' +
       '이 메뉴를 다시 눌러 주세요.\n\n' +
-      'AI 입력은 아직 켜지지 않았습니다.',
-      ui.ButtonSet.OK
+      'AI 입력은 아직 켜지지 않았습니다.'
     );
-    return;
   }
 
   try {
     PropertiesService.getScriptProperties()
       .setProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY, state.spreadsheetId);
   } catch (err) {
-    ui.alert(
-      ATTENDANCE_AI_MENU_ITEM,
+    return finish_(
+      false,
       '이 사본을 AI 입력 대상으로 기록하지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
-      'AI 입력은 켜지지 않았습니다.',
-      ui.ButtonSet.OK
+      'AI 입력은 켜지지 않았습니다.'
     );
-    return;
   }
 
   let trigger;
   try {
     trigger = ensureAttendanceAiEditTrigger_(state.spreadsheetId);
   } catch (err) {
-    ui.alert(
-      ATTENDANCE_AI_MENU_ITEM,
+    return finish_(
+      false,
       '1행 편집을 받는 감지기를 만들지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
       '권한 승인 화면이 나오면 허용한 뒤 같은 메뉴를 다시 눌러 주세요.\n' +
-      'AI 입력은 아직 켜지지 않았습니다.',
-      ui.ButtonSet.OK
+      'AI 입력은 아직 켜지지 않았습니다.'
     );
-    return;
   }
 
-  ui.alert(
-    ATTENDANCE_AI_MENU_ITEM,
+  return finish_(
+    true,
     'AI 출결 입력을 켰습니다.\n\n' +
     (trigger.created ? '1행 편집을 받는 감지기를 새로 하나 만들었습니다.\n' : '이미 있던 감지기 하나를 그대로 씁니다.\n') +
     '\n월 시트 1행에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르면\n' +
     '맨 아래에 연한 초록색 출결행이 생깁니다.\n\n' +
     '이름을 못 찾거나 날짜·구분을 해석하지 못하면 아무 줄도 만들지 않습니다.',
-    ui.ButtonSet.OK
+    trigger.created
   );
 }
 
@@ -2134,14 +2314,21 @@ function showChatApiSetupRequired_(ui) {
   );
 }
 
-function connectClassChatSpace() {
+function connectClassChatSpace(options) {
   const ui = SpreadsheetApp.getUi();
+  // 통합 설정이 부를 때는 결과 창을 띄우지 않고 결과만 돌려준다.
+  // 단톡방 목록에서 고르는 화면은 조용해도 그대로 뜬다 — 사람만 고를 수 있는 일이다.
+  const quiet = !!(options && options.quiet === true);
+  function finish_(ok, message) {
+    if (!quiet) ui.alert(message);
+    return { ok: ok, message: message };
+  }
+
   try {
     const response = callCentralChatSender_('/v1/spaces', {});
     const spaces = response.spaces || [];
     if (!spaces.length) {
-      ui.alert('선생님이 들어가 있는 Google Chat 단톡방을 찾지 못했습니다.');
-      return;
+      return finish_(false, '선생님이 들어가 있는 Google Chat 단톡방을 찾지 못했습니다.');
     }
     const choices = spaces.slice(0, 20).map((space, index) => `${index + 1}. ${space.displayName} (${space.name})`).join('\n');
     const answer = ui.prompt(
@@ -2149,11 +2336,13 @@ function connectClassChatSpace() {
       '학급 쪽지를 보낼 Google Chat 단톡방 번호를 입력하세요.\n\n' + choices,
       ui.ButtonSet.OK_CANCEL
     );
-    if (answer.getSelectedButton() !== ui.Button.OK) return;
+    // 취소는 선생님이 고른 결과이므로 창을 하나 더 띄우지 않는다.
+    if (answer.getSelectedButton() !== ui.Button.OK) {
+      return { ok: false, message: '학급 단톡방을 아직 고르지 않았습니다.' };
+    }
     const index = Number(String(answer.getResponseText() || '').trim()) - 1;
     if (!Number.isInteger(index) || index < 0 || index >= Math.min(spaces.length, 20)) {
-      ui.alert('번호를 확인할 수 없습니다. 목록에 보이는 번호를 입력해 주세요.');
-      return;
+      return finish_(false, '번호를 확인할 수 없습니다. 목록에 보이는 번호를 입력해 주세요.');
     }
     const selected = spaces[index];
     callCentralChatSender_('/v1/class-space', {
@@ -2162,9 +2351,9 @@ function connectClassChatSpace() {
     });
     setConfigValue_('CLASS_CHAT_SPACE_ID', selected.name);
     setConfigValue_('CLASS_CHAT_SPACE_NAME', selected.displayName);
-    ui.alert('Google Chat 학급 단톡방을 골랐습니다.\n\n' + selected.displayName);
+    return finish_(true, 'Google Chat 학급 단톡방을 골랐습니다.\n\n' + selected.displayName);
   } catch (err) {
-    ui.alert('Google Chat 학급 단톡방을 고르지 못했습니다.\n\n' + (err && err.message ? err.message : err));
+    return finish_(false, 'Google Chat 학급 단톡방을 고르지 못했습니다.\n\n' + (err && err.message ? err.message : err));
   }
 }
 
@@ -3065,8 +3254,11 @@ function sendMessengerAllMessages() {
   return sendTodayDismissalMessages();
 }
 
-function startCentralChatConnection() {
+function startCentralChatConnection(options) {
   const ui = SpreadsheetApp.getUi();
+  // 통합 설정이 부를 때는 실패 창을 띄우지 않고 결과만 돌려준다.
+  // 권한 허용·연결 화면은 조용해도 그대로 띄운다 — 사람이 눌러야 끝나는 일이라 없앨 수 없다.
+  const quiet = !!(options && options.quiet === true);
   try {
     const info = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL);
     const authorizationUrl = info.getAuthorizationStatus() === ScriptApp.AuthorizationStatus.REQUIRED
@@ -3074,12 +3266,16 @@ function startCentralChatConnection() {
       : '';
     if (authorizationUrl) {
       showLinkDialog_('Google 권한 연결', authorizationUrl, '권한 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.');
-      return;
+      return { ok: false, message: '권한 허용 화면을 열었습니다. 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.' };
     }
     const result = callCentralChatSender_('/v1/auth/start', {});
     showLinkDialog_('Google Chat 최초 발송 연결하기', result.authUrl, '연결을 마친 뒤 시트로 돌아오세요.');
+    // 브라우저에서 연결을 마쳐야 끝나므로 이 자리에서는 아직 됐다고 하지 않는다.
+    return { ok: false, message: '연결 화면을 열었습니다. 브라우저에서 연결을 마친 뒤 이 메뉴를 다시 눌러 주세요.' };
   } catch (err) {
-    ui.alert('Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + centralChatErrorMessage_(err));
+    const message = 'Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + centralChatErrorMessage_(err);
+    if (!quiet) ui.alert(message);
+    return { ok: false, message: message };
   }
 }
 

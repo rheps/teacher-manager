@@ -125,7 +125,10 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .btn-tonal { background:var(--tm-blue-soft); color:var(--tm-blue); font-weight:600; font-size:14px; border:none; border-radius:9px; padding:9px 15px; font-family:inherit; cursor:pointer; }
 .btn-tonal:disabled { opacity:.55; cursor:default; }
 .btn-quiet { background:var(--tm-fill); color:#333D4B; font-weight:600; font-size:14px; border:1px solid var(--tm-line); border-radius:11px; padding:11px 17px; font-family:inherit; cursor:pointer; }
-.btn-back { background:none; border:none; color:var(--tm-faint); font-size:14.5px; font-weight:500; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:4px; }
+/* [< 홈] 줄 — 제목과 한 줄 띄운다. 붙어 있으면 제목의 일부처럼 보인다. */
+.backbar { display:flex; align-items:center; gap:12px; margin-bottom:20px; }
+.btn-back { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
+.save-state { font-size:13.5px; color:var(--tm-faint); }
 .foot { display:flex; align-items:center; margin-top:28px; }
 .foot .btn { margin-left:auto; }
 
@@ -167,7 +170,7 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .check input { width:17px; height:17px; accent-color:var(--tm-blue); }
 
 /* 시간표 격자 */
-.grid-table { border-collapse:collapse; }
+.grid-table { border-collapse:collapse; margin-inline:auto; }  /* 창 가운데로 */
 .grid-table th { font-size:13px; color:var(--tm-sub); font-weight:600; padding:6px; }
 .grid-table td input { width:86px; border:1.5px solid var(--tm-line); border-radius:9px; padding:9px 10px; font-size:14px; font-family:inherit; text-align:center; outline:none; }
 .grid-table td input:focus { border-color:var(--tm-blue); }

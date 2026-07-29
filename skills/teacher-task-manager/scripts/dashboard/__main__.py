@@ -100,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int:
+    from brity_bridge import app_identity
+
+    app_identity.apply_app_identity()  # 트레이와 같은 이름표를 써야 한 프로그램으로 보인다
+
     from brity_bridge import gws_env
 
     gws_env.prepare_gws_env()  # gws 로그인이 수시로 풀리지 않게 키 보관 방식을 고정한다

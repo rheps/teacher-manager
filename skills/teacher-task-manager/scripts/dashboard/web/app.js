@@ -26,6 +26,7 @@ const S = {
   updateInfo: null,           // get_update_info 결과 (새 버전 있을 때만 채움)
   updateCheck: null,          // 업데이트 확인 결과 (null | "latest" | "available" | "failed")
   updating: false,            // 지금 업데이트 진행 중 (중복 클릭·재실행 방지)
+  updateOffer: null,          // update_offer 결과 — 켤 때 한 번 묻는 자리에서 씀
   aiTools: null,              // AI 비서 탭 — 도구 감지 결과 (null=미조회, "loading"=조회 중)
   aiInstall: null,            // AI 비서 탭 — 연결 실행 결과
   maxStep: 1,                 // 마법사에서 한 번이라도 도달한 가장 먼 단계
@@ -1348,6 +1349,13 @@ async function validateConnect() {
     S.focusTarget = (messengerIssue || blocking[0]).target;
     return firstIssueMessage(blocking);
   }
+  await provisionConnectTargets();
+  return "";
+}
+/* '새로 만들기'를 고른 캘린더·Tasks 목록을 구글에 실제로 만들고 그 ID를 프로필에 채운다.
+   구글에 무언가를 만드는 일이라 타자 한 자마다 돌면 안 된다 — 마법사에서 [다음]을 누를 때와
+   연결 화면에서 [< 홈]으로 나갈 때만 부른다. */
+async function provisionConnectTargets() {
   const p = S.draft.profile;
   const homeroom = p["담임여부"] === "예";
   const modes = linkModes();
@@ -1365,7 +1373,6 @@ async function validateConnect() {
       p["담임안내Tasks목록ID"] = homeTasks.id;
     }
   }
-  return "";
 }
 
 /* ---------- 6단계: 설정 ---------- */
@@ -2057,7 +2064,21 @@ function renderHome() {
 
 /* ---------- 편집 화면 ---------- */
 function backBarHtml() {
-  return `<button class="btn-back" data-action="back-home">${icon("chevron-left", "small")} 홈</button>`;
+  return `<div class="backbar">
+    <button class="btn-back" data-action="back-home">${icon("chevron-left", "small")} 홈</button>
+    <span class="save-state" id="save-state"></span>
+  </div>`;
+}
+/* 저장 상태 한 줄 — [< 홈] 오른쪽에 잠깐 나타난다.
+   render()를 부르지 않고 글자만 갈아 끼운다. 다시 그리면 입력 중이던 칸에서
+   커서가 튕겨 나가고 쓰던 글자가 끊긴다. */
+let saveStateTimer = null;
+function showSaveState(text, fadeAfter) {
+  const el = document.getElementById("save-state");
+  if (!el) return;
+  el.textContent = text;
+  clearTimeout(saveStateTimer);
+  if (fadeAfter) saveStateTimer = setTimeout(() => { el.textContent = ""; }, fadeAfter);
 }
 /* 설정 화면 자동 저장 — 저장 버튼 없이, 값을 바꾸는 즉시 저장하고 도우미에 적용한다.
    저장(도우미 재시작)이 도는 사이의 새 변경은 버리지 않고 끝난 뒤 한 번 더 저장한다. */
@@ -2103,6 +2124,90 @@ document.addEventListener("change", (event) => {
     autoSaveSettings().catch((error) => setBanner("error", error.message));
   }
 });
+
+/* 내 정보·시간표·연결 자동 저장 — 저장 버튼 없이, 값을 바꾸면 잠깐 뒤 저장한다.
+   마법사(S.mode === "wizard")는 마지막에 한꺼번에 적용하므로 여기서 건드리지 않는다. */
+const AUTO_SAVE_SCREENS = ["identity", "timetable", "connect"];
+const AUTO_SAVE_DELAY_MS = 700;  // 타자를 치는 중간중간 저장하지 않을 만큼만 기다린다
+let editAutoSaveTimer = null;
+let editAutoSaveBusy = false;
+let editAutoSavePending = false;
+/* 사람이 실제로 손댄 적이 있는지. 화면을 열어 보기만 하고 나오는 것은 저장할 일이 아니다 —
+   그때도 저장하면 홈 점검 결과를 버리게 되어, 되돌아갈 때마다 홈이 처음부터 다시 점검한다. */
+let editDirty = false;
+function autoSaveScreen() {
+  return S.mode === "edit" && AUTO_SAVE_SCREENS.includes(S.edit) ? S.edit : null;
+}
+async function autoSaveEdit(options) {
+  const leaving = !!(options && options.leaving);
+  const key = autoSaveScreen();
+  if (!key) return true;
+  if (!editDirty) return true;  // 고친 게 없다
+  if (editAutoSaveBusy) { editAutoSavePending = true; return true; }
+  // 여기서 미리 내린다 — 저장하는 동안 들어온 수정은 다시 올라가서 한 번 더 저장된다.
+  // 저장이 끝난 뒤에 내리면 그 사이의 수정을 놓친다.
+  editDirty = false;
+  editAutoSaveBusy = true;
+  showSaveState("저장 중…");
+  try {
+    do {
+      editAutoSavePending = false;
+      syncEditFields(key);
+      await ensureGridLoaded();
+      // 연결 화면은 링크가 다 차 있는지까지 보고(require_links), Gemini 값도 함께 저장한다.
+      await call("save_profile_grid", S.draft.profile, S.draft.grid, key === "connect");
+      if (key === "connect") {
+        const messenger = await call("save_messenger", {
+          gemini_api_key: S.draft.bridge.gemini_api_key || "",
+          gemini_model: S.draft.bridge.gemini_model || "gemini-3.5-flash",
+        });
+        if (!messenger.saved) { setBanner("warn", messenger.reason); return false; }
+        // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지
+        // 않는다. 타자를 칠 때마다 경고를 띄우면 쓰던 것이 끊기므로 나갈 때만 알린다.
+        const push = messenger.sheet_push;
+        if (leaving && push && push.state === "failed") setBanner("warn", "저장했어요. 다만 " + push.detail);
+      }
+      // 홈 점검과 프로필 사본은 다음에 홈으로 갈 때 새로 읽는다.
+      S.checks = [];
+      S.profileCache = null;
+    } while (editAutoSavePending);
+    showSaveState("저장됨", 2500);
+    return true;
+  } finally {
+    editAutoSaveBusy = false;
+  }
+}
+function scheduleEditAutoSave() {
+  if (!autoSaveScreen()) return;
+  clearTimeout(editAutoSaveTimer);
+  editAutoSaveTimer = setTimeout(() => {
+    autoSaveEdit().catch((error) => setBanner("error", error.message));
+  }, AUTO_SAVE_DELAY_MS);
+}
+/* [< 홈]을 누르면 기다리던 저장을 지금 끝내고, 끝난 뒤에 홈으로 간다. */
+/* 저장까지 마쳤으면 true. 저장이 실패했으면 false — 그때는 홈으로 보내지 않는다.
+   이유가 적힌 배너를 못 보고 지나치면 무엇이 안 됐는지 알 길이 없다. */
+async function flushEditSave() {
+  clearTimeout(editAutoSaveTimer);
+  if (S.mode !== "edit") return true;
+  if (S.edit === "settings") { await autoSaveSettings(); return true; }
+  if (!autoSaveScreen()) return true;
+  if (!editDirty) return true;  // 열어 보기만 하고 나온다 — 저장할 것도, 만들 것도 없다
+  if (S.edit === "connect") {
+    // '새로 만들기'를 고른 캘린더·Tasks 목록은 여기서 실제로 만들어 ID를 채운다.
+    // 타자를 칠 때마다 만들면 안 되므로 나갈 때 한 번만 한다. 실패해도 입력한 값은
+    // 그대로 저장하고 홈으로 보낸다 — 남은 문제는 홈 점검이 알려 준다.
+    try { await provisionConnectTargets(); } catch (error) { /* 홈 점검이 알려 준다 */ }
+  }
+  return await autoSaveEdit({ leaving: true });
+}
+for (const eventName of ["input", "change"]) {
+  document.addEventListener(eventName, () => {
+    if (!autoSaveScreen()) return;
+    editDirty = true;
+    scheduleEditAutoSave();
+  });
+}
 function settingsEditBody() {
   const helper = S.checks.find((c) => c.key === "settings.helper");
   const helperRow = helper
@@ -2137,22 +2242,14 @@ function updateControls() {
 }
 function renderEdit(key) {
   let body = "";
-  let foot = "";
   if (key === "connect") body = stepConnect();
   else if (key === "identity") body = stepBodies[2]() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepBodies[3]().replace(/^[\s\S]*?<\/p>/, "");
   else if (key === "timetable") body = stepBodies[4]();
   else if (key === "settings") body = settingsEditBody();
-  if (["identity", "timetable"].includes(key)) {
-    foot = `<div class="foot"><button class="btn" data-action="save-profile-part" data-busy-text="저장 중…">저장하기</button></div>`;
-  } else if (key === "connect") {
-    // 저장 버튼은 메신저 탭에만 — 출결·AI 탭은 탭 안 버튼으로 끝난다.
-    foot = S.connectTab === "messenger"
-      ? `<div class="foot"><button class="btn" data-action="save-connect" data-busy-text="저장 중…">저장하기</button></div>`
-      : "";
-  }
-  // 설정(key === "settings")은 자동 저장이라 저장 버튼을 두지 않는다.
+  // 편집 화면에는 저장 버튼이 없다 — 네 화면 모두 바꾸는 즉시 저장하고,
+  // [< 홈]을 누르면 기다리던 저장을 끝낸 뒤에 홈으로 간다(flushEditSave).
   root().innerHTML = `<div class="body"><div class="body-inner"><div class="page">
-    ${backBarHtml()}${bannerHtml()}${body}</div></div>${foot}</div>` + toastHtml();
+    ${backBarHtml()}${bannerHtml()}${body}</div></div></div>` + toastHtml();
 }
 function syncEditFields(key) {
   if (key === "identity") { syncProfileFields(); syncDayFields(); }
@@ -2208,12 +2305,16 @@ async function openCard(key) {
   uniqueChecks(S.checks)
     .filter((c) => c.card === key && c.ok === false)
     .forEach((c) => { S.fieldIssues[c.target] = issue(c.key, c.target, c.fix || c.detail || c.label, c.tab); });
-  S.mode = "edit"; S.edit = key; render();
+  S.mode = "edit"; S.edit = key; editDirty = false; render();
 }
 bindActions({
   "open-card": (el) => openCard(el.dataset.card),
   "back-home": async () => {
     await stopHotkeyRecording();
+    // 저장이 끝난 뒤에 홈으로 간다 — 나가는 도중에 저장이 잘리면 방금 쓴 것이 사라진다.
+    let saved = false;
+    try { saved = await flushEditSave(); } catch (error) { setBanner("error", error.message); return; }
+    if (!saved) return;  // 배너에 이유가 적혀 있다
     stopChatConnectPoll();
     S.fieldIssues = {};
     S.chatStatus = null;
@@ -2222,43 +2323,6 @@ bindActions({
     S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
   },
   "open-about": () => { S.mode = "about"; render(); },
-  "save-profile-part": async () => {
-    syncEditFields(S.edit);
-    const rows = S.edit === "identity" ? identityIssues().concat(dayIssues()) : [];
-    replaceEditableIssues(rows);
-    if (rows.length) { render(); setBanner("warn", firstIssueMessage(rows)); return; }
-    await ensureGridLoaded();
-    const result = await call("save_profile_grid", S.draft.profile, S.draft.grid, false);
-    if (!result.parsed) { setBanner("warn", "저장은 했지만 설정이 아직 부족해요: " + result.detail); return; }
-    S.fieldIssues = {};
-    S.mode = "home"; S.checks = []; S.profileCache = null; render();
-    showToast("저장했어요");
-  },
-  "save-connect": async () => {
-    const problem = await validateConnect();
-    if (problem) { setBanner("warn", problem); return; }
-    await ensureGridLoaded();
-    const result = await call("save_profile_grid", S.draft.profile, S.draft.grid, true);
-    if (!result.parsed) { setBanner("warn", "저장은 했지만 설정이 아직 부족해요: " + result.detail); return; }
-    // 메신저 탭 저장은 Gemini 두 값만 보낸다 — 단축키·자동 실행·첨부 폴더·출결은 건드리지 않는다.
-    const messengerResult = await call("save_messenger", {
-      gemini_api_key: S.draft.bridge.gemini_api_key || "",
-      gemini_model: S.draft.bridge.gemini_model || "gemini-3.5-flash",
-    });
-    if (!messengerResult.saved) {
-      setBanner("warn", messengerResult.reason);
-      return;
-    }
-    S.fieldIssues = {};
-    S.mode = "home"; S.checks = []; S.profileCache = null; S.listsLoaded = false; render();
-    // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지 않는다.
-    const push = messengerResult.sheet_push;
-    if (push && push.state === "failed") {
-      setBanner("warn", "저장했어요. 다만 " + push.detail);
-      return;
-    }
-    showToast("저장했어요");
-  },
   "open-logs": () => call("open_logs"),
 });
 
@@ -2300,6 +2364,52 @@ function render() {
 }
 
 /* ---------- 부팅 ---------- */
+// 프로그램을 켤 때 한 번만 묻는다. 쓰는 중에는 창을 띄우지 않는다 — 일이 끊긴다.
+// 마법사를 도는 중에는 아예 확인하러 나가지도 않는다 — 그 사이 "다음"을 누르기 전
+// 입력은 아직 저장 전이라, 확인창에서 "확인"을 누르면 적던 내용이 그대로 사라지고
+// 설치 파일이 창을 강제로 닫아 마법사가 설명 없이 꺼진 것처럼 보인다. 마법사를
+// 마치고 홈에 온 뒤, 다음에 켤 때 물으면 된다.
+async function askUpdateOnStart() {
+  if (S.mode === "wizard") return;
+  let offer = null;
+  try { offer = await call("update_offer"); } catch (_) { return; }
+  // '버전 및 제작 정보' 배너·상태도 이 응답 하나로 채운다 — get_update_info를 따로
+  // 부르면 부팅할 때마다 같은 배포 정보를 인터넷에서 두 번 받아 오게 된다.
+  if (offer && offer.available) S.updateInfo = offer;
+  if (offer && offer.status && offer.status !== "failed") S.updateCheck = offer.status;
+  render();
+  if (!offer || !offer.ask) return;
+  const lines = (offer.notes || "").split("\n").filter(Boolean).slice(0, 3);
+  const body = `새 버전 ${offer.latest}이 나왔습니다.\n지금 설치할까요?`
+    + (lines.length ? "\n\n" + lines.map(l => "· " + l).join("\n") : "");
+  if (window.confirm(body)) {
+    // 설정의 '지금 업데이트'(update-now)와 같은 마무리여야 한다 — 설치가 시작되면
+    // 프로그램이 스스로 닫혀야 파일 잠금 때문에 설치가 되돌려지지 않는다. 되돌려져도
+    // /SUPPRESSMSGBOXES라 아무 말 없이 끝나서 선생님은 이유를 알 수 없다.
+    S.updating = true; render();
+    try {
+      const result = await call("start_update", offer.url, offer.latest, offer.sha256);
+      if (!result.started) {
+        S.updating = false;
+        showToast(result.reason || "업데이트를 시작하지 못했어요");
+        render();
+        return;
+      }
+      setTimeout(() => { call("quit_app").catch(() => {}); }, 300);
+      showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
+    } catch (error) {
+      // call()은 실패하면 던진다 — 감싸지 않으면 화면이 '받는 중…'에 멈춘 채 남는다.
+      S.updating = false; showToast("업데이트를 시작하지 못했어요"); render();
+    }
+    return;
+  }
+  try {
+    await call("decline_update", offer.latest);
+  } catch (error) {
+    // 오늘 그만 묻겠다는 기록을 못 남겨도 쓰던 일은 계속돼야 한다. 다음에 켤 때 다시 묻는다.
+  }
+}
+
 async function boot() {
   try {
     const info = await call("get_app_info");
@@ -2311,14 +2421,8 @@ async function boot() {
       S.draft = Object.assign({ profile: {}, grid: null, bridge: {} }, info.draft);
     }
     render();
+    askUpdateOnStart();
     startLoginWatch();
-    call("get_update_info")
-      .then((update) => {
-        if (update && update.available) S.updateInfo = update;
-        if (update && update.status && update.status !== "failed") S.updateCheck = update.status;
-        render();
-      })
-      .catch(() => {});
   } catch (error) {
     root().innerHTML = `<div class="boot">${esc(error.message)}</div>`;
   }

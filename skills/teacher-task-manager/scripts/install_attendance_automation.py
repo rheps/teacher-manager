@@ -1042,8 +1042,8 @@ def install_attendance_automation(
             print(
                 "서식/드롭다운 자동 적용(apiSetupAttendanceWorkbook)이 계정 정책으로 막혔습니다. "
                 "시트는 모두 만들어져 있어 바로 쓸 수 있고, 서식은 첫 사용 때 자동 적용됩니다. "
-                "지금 바로 정리하려면 Google Sheet에서 출결 업무 자동화 -> 고급 설정 -> "
-                "기본 시트/설정 점검을 한 번 실행해 주세요."
+                "지금 바로 정리하려면 Google Sheet에서 처음 한 번 설정하기 -> "
+                "처음 설정 한 번에 끝내기를 한 번 실행해 주세요."
             )
 
         result = AttendanceInstallResult(

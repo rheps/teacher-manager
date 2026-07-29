@@ -37,9 +37,9 @@ def _fail(error):
 
 def guarded(method):
     @functools.wraps(method)
-    def wrapper(self, *args):
+    def wrapper(self, *args, **kwargs):
         try:
-            return _ok(method(self, *args))
+            return _ok(method(self, *args, **kwargs))
         except Exception as error:  # noqa: BLE001 - JS에는 한국어 한 문장만 보낸다
             return _fail(error)
 
@@ -128,6 +128,55 @@ class Api:
     @guarded
     def get_update_info(self):
         return engine.check_update(version.APP_VERSION)
+
+    @guarded
+    def update_offer(self, fetch=None, today=None):
+        """켤 때 한 번 묻기 위한 정보. 물을 일이 없으면 ask=False.
+
+        '버전 및 제작 정보' 화면의 배너·상태도 이 결과 하나로 채운다 — 부팅할 때
+        get_update_info를 따로 또 부르면 같은 배포 정보를 인터넷에서 두 번 받아 오게
+        된다. status/available/latest/notes/url/sha256은 오늘 이미 취소했든 아니든
+        실제 확인 결과를 그대로 담고, ask만 "지금 확인창을 띄워도 되는지"를 가른다.
+        """
+        import datetime as _dt
+
+        day = str(today or _dt.date.today().isoformat())
+        info = engine.check_update(version.APP_VERSION, fetch=fetch)
+        # 확인 자체가 실패(인터넷 끊김 등)했으면 '오늘 확인함'으로 남기지 않는다 —
+        # 남기면 와이파이가 돌아온 뒤에도 그날 하루는 다시 확인할 길이 없어진다.
+        if info.get("status") != "failed":
+            engine.remember_update_checked(self._config_dir, day)
+        base = {
+            "status": info.get("status", "failed"),
+            "available": bool(info.get("available")),
+            "latest": str(info.get("latest", "") or ""),
+            "notes": str(info.get("notes", "") or ""),
+            "url": info.get("url", "") or "",
+            "sha256": info.get("sha256", "") or "",
+            "reason": info.get("reason", "") or "",
+        }
+        if not info.get("available"):
+            return {**base, "ask": False}
+        if not engine.should_ask_update(self._config_dir, base["latest"], day):
+            return {**base, "ask": False}
+        return {**base, "ask": True}
+
+    @guarded
+    def decline_update(self, latest="", today=""):
+        """오늘은 그만 물어 달라는 뜻. latest가 비어 있으면 기록에 아무것도 남기지 않는다 —
+        빈 문자열이 declined_version으로 저장되면 다음 확인 때 헷갈릴 수 있다.
+
+        today는 update_offer와 같은 뜻이고 같은 자리에서 온다. 화면은 안 넘기고
+        오늘 날짜를 그대로 쓰지만, 시험이 update_offer에만 날짜를 넣고 여기엔 못 넣으면
+        두 날짜가 어긋나서 그날그날 결과가 달라진다.
+        """
+        import datetime as _dt
+
+        latest = str(latest or "").strip()
+        if latest:
+            when = str(today or "").strip() or _dt.date.today().isoformat()
+            engine.remember_update_declined(self._config_dir, latest, when)
+        return {"ok": True}
 
     @guarded
     def start_update(self, url="", latest="", sha256=""):

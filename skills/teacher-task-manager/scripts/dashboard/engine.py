@@ -648,8 +648,16 @@ def _read_setup_status(config_dir: Path) -> dict:
     return _read_json_dict(paths.attendance_setup_status_path(Path(config_dir))) or {}
 
 
-def _write_setup_status(config_dir: Path, data: dict) -> None:
-    path = paths.attendance_setup_status_path(Path(config_dir))
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """JSON 기록을 원자 교체로 쓴다 — 임시 이름은 쓸 때마다 새로 만든다.
+
+    brity_bridge.atomic_io는 파일 이름 뒤에 .tmp-write를 붙인 고정 이름을 쓴다.
+    작성자가 하나뿐인 파일에는 그걸로 충분하지만, 여기서 쓰는 기록들은 도우미와
+    대시보드가 몇 초 사이에 둘 다 쓴다(update-state.json은 로그인 직후 양쪽이 쓴다).
+    고정 이름이면 두 프로세스가 같은 임시 파일을 열어 내용을 섞어 쓰고, 먼저 끝낸
+    쪽이 그 파일을 옮겨 버려 나중 쪽의 교체가 '파일 없음'으로 터진다.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
@@ -664,6 +672,10 @@ def _write_setup_status(config_dir: Path, data: dict) -> None:
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+
+def _write_setup_status(config_dir: Path, data: dict) -> None:
+    _atomic_write_json(paths.attendance_setup_status_path(Path(config_dir)), data)
 
 
 def _attendance_profile_error(config_dir: Path) -> str:
@@ -1278,6 +1290,65 @@ def update_run_lock(config_dir: Path | None = None):
             local_lock.release()
 
 
+# 설치 파일에게 "마법사 없이 돌아라"라고 알리는 표시.
+# /SILENT은 진행 창 하나만 남기고 마법사 화면을 전부 없앤다(/VERYSILENT은 그 창까지 감춘다).
+# /CLOSEAPPLICATIONS은 켜져 있는 프로그램을 설치 프로그램이 닫게 하고,
+# /NORESTART은 컴퓨터를 다시 켜라는 창이 뜨지 않게 한다.
+SILENT_UPDATE_ARGS = ["/SILENT", "/NORESTART", "/CLOSEAPPLICATIONS", "/SUPPRESSMSGBOXES"]
+
+
+def update_launch_command(path) -> list[str]:
+    """업데이트용 설치 파일 실행 명령을 만든다."""
+    return [str(path), *SILENT_UPDATE_ARGS]
+
+
+def read_update_state(config_dir) -> dict:
+    """업데이트 확인 기록을 읽는다. 없거나 망가졌으면 빈 기록으로 본다."""
+    return _read_json_dict(paths.update_state_path(Path(config_dir))) or {}
+
+
+def _write_update_state(config_dir, changes: dict) -> None:
+    # 이 기록은 작성자가 둘이다 — 도우미(tray_win)와 대시보드(bridge)가 로그인 직후
+    # 몇 초 안에 둘 다 쓴다. 그래서 고정 임시 이름을 쓰는 atomic_io 대신 쓸 때마다
+    # 새 임시 이름을 만드는 _atomic_write_json을 쓴다.
+    state = read_update_state(config_dir)
+    state.update(changes)
+    _atomic_write_json(paths.update_state_path(Path(config_dir)), state)
+
+
+def remember_update_checked(config_dir, today: str) -> None:
+    _write_update_state(config_dir, {"last_checked": str(today)})
+
+
+def remember_update_declined(config_dir, latest: str, today: str) -> None:
+    """오늘은 그만 물으라는 뜻이다. 어느 버전을 언제 취소했는지 함께 적는다."""
+    _write_update_state(
+        config_dir, {"declined_version": str(latest), "declined_on": str(today)}
+    )
+
+
+def should_check_update(config_dir, today: str) -> bool:
+    """하루에 한 번만 확인하러 나간다."""
+    return read_update_state(config_dir).get("last_checked") != str(today)
+
+
+def should_ask_update(config_dir, latest: str, today: str) -> bool:
+    """오늘 취소한 그 버전만 안 묻는다. 날짜가 바뀌거나 더 새 버전이면 다시 묻는다."""
+    state = read_update_state(config_dir)
+    if state.get("declined_on") != str(today):
+        return True
+    declined = str(state.get("declined_version") or "")
+    if declined == str(latest):
+        return False
+    try:
+        return _is_newer(str(latest), declined)
+    except ValueError:
+        # declined_version이 없거나 숫자 모양이 아니면 기록을 못 믿는다는 뜻이다.
+        # read_update_state가 망가진 파일을 빈 기록으로 보는 것과 같은 철학 —
+        # 못 믿을 땐 "다시 묻는다" 쪽으로 기운다.
+        return True
+
+
 def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=None,
                  url: str = "", latest: str = "", sha256: str = "",
                  stop_before_launch=None, config_dir=None,
@@ -1365,8 +1436,11 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
             }
 
         try:
-            # 설치 창은 눈에 보여야 하므로 숨김 실행을 쓰지 않는다
-            run = launch or (lambda file: subprocess.Popen([str(file)], close_fds=True))
+            # 설치 창은 눈에 보여야 하므로 숨김 실행을 쓰지 않는다.
+            # 마법사만 없앤다 — 진행 창 하나는 그대로 뜬다.
+            run = launch or (
+                lambda file: subprocess.Popen(update_launch_command(file), close_fds=True)
+            )
             run(path)
         except Exception:  # noqa: BLE001
             # 설치기 창을 열지 못했다면, 원래 켜져 있던 도우미만 되살린다.

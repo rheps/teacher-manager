@@ -33,6 +33,10 @@ def profile_path(config_dir: Path) -> Path:
     return Path(config_dir) / "profile.generated.json"
 
 
+def update_state_path(config_dir: Path) -> Path:
+    return Path(config_dir) / "update-state.json"
+
+
 def attendance_install_record_path(config_dir: Path) -> Path:
     return Path(config_dir) / "attendance-install.generated.json"
 
