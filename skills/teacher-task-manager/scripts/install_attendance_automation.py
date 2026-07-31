@@ -45,6 +45,7 @@ class AttendanceInstallResult:
     deployment_id: str
     folder_id: str
     task_list_id: str
+    workbook_name: str = ""
 
 
 def resolve_command(args: Sequence[str]) -> list[str]:
@@ -139,14 +140,19 @@ def build_config_rows(
     grade = str(homeroom.get("grade", "") or "")
     class_number = str(homeroom.get("class", "") or "")
     class_label = f"{grade}-{class_number}" if grade and class_number else ""
+    school_year_value = (
+        str(profile.get("school_year", "") or "").strip()
+        or str(school.get("year", "") or "").strip()
+        or current_school_year()
+    )
     return [
         ["설정키", "값", "설명", "예시/필수"],
         ["SCHOOL_NAME", str(school.get("name", "") or ""), "학교명입니다.", "예: ○○고등학교"],
         [
             "SCHOOL_YEAR",
-            str(profile.get("school_year", "") or school.get("year", "") or "2026"),
-            "학년도 표기용 기본값입니다.",
-            "예: 2026",
+            school_year_value,
+            "이 출석부의 학년도입니다. 티처 매니저 내 정보의 학년도와 맞아야 합니다.",
+            "자동 입력",
         ],
         ["GRADE", grade, "담임 학년입니다.", "예: 2"],
         ["CLASS_NUMBER", class_number, "담임 반입니다.", "예: 3"],
@@ -235,7 +241,32 @@ def run_json(runner: CommandRunner, args: Sequence[str], cwd: Path) -> Any:
         raise CommandOutputError(args, output) from error
 
 
-ATTENDANCE_SHEET_NAME = "출결신고서 자동화"
+# 옛 고정 이름 — 학년도 도입(2026-07-31) 전에 만든 시트가 이 이름을 갖고 있다.
+# 새로 만드는 시트는 attendance_workbook_name()이 학년도 이름을 만든다. 이름이 해마다
+# 다르므로, 기록을 잃고 이름으로 되찾을 때 작년 것을 조용히 붙잡는 일이 없다.
+ATTENDANCE_LEGACY_SHEET_NAME = "출결신고서 자동화"
+
+
+def current_school_year(today=None) -> str:
+    """한국 학년도 — 3월 1일에 새 학년도가 시작한다."""
+    import datetime
+
+    day = today or datetime.date.today()
+    return str(day.year if day.month >= 3 else day.year - 1)
+
+
+def attendance_workbook_name(profile: dict, today=None) -> str:
+    """프로필로 시트 이름을 만든다 — 학년도가 제목에 새겨져 연결 근거가 된다."""
+    school = profile.get("school") or {}
+    year = str(school.get("year", "") or "").strip() or current_school_year(today)
+    homeroom = profile.get("homeroom") or {}
+    grade = str(homeroom.get("grade", "") or "").strip()
+    klass = str(homeroom.get("class", "") or "").strip()
+    if homeroom.get("enabled") and grade and klass:
+        return f"{year}학년도 {grade}학년 {klass}반 출석부"
+    return f"{year}학년도 출석부"
+
+
 SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 
@@ -253,11 +284,11 @@ def _sheet_lines(files: Sequence[dict]) -> list[str]:
     return lines
 
 
-def _too_many_sheets_message(files: Sequence[dict]) -> str:
+def _too_many_sheets_message(files: Sequence[dict], name: str) -> str:
     return "\n".join(
         [
             "내 드라이브에 "
-            + ATTENDANCE_SHEET_NAME
+            + name
             + " 시트가 여러 개 있습니다. 어느 것을 쓰실지 알 수 없어 멈췄습니다.",
             "",
         ]
@@ -270,10 +301,10 @@ def _too_many_sheets_message(files: Sequence[dict]) -> str:
     )
 
 
-def _cannot_reuse_message(sheet: dict, missing: Sequence[str]) -> str:
+def _cannot_reuse_message(sheet: dict, missing: Sequence[str], name: str) -> str:
     return "\n".join(
         [
-            "쓰시던 " + ATTENDANCE_SHEET_NAME + " 시트를 찾았지만 연결값이 비어 있어 "
+            "쓰시던 " + name + " 시트를 찾았지만 연결값이 비어 있어 "
             "이어서 쓸 수 없습니다.",
             "",
         ]
@@ -327,6 +358,7 @@ def _require_new_enough_script(
     workdir: Path,
     sheet: dict,
     script_id: str,
+    name: str,
 ) -> str:
     """쓰던 시트의 Apps Script가 동봉 배포 정보의 하한선 이상인지 본다."""
 
@@ -358,7 +390,7 @@ def _require_new_enough_script(
             "\n".join(
                 [
                     "쓰시던 "
-                    + ATTENDANCE_SHEET_NAME
+                    + name
                     + " 시트를 찾았지만, 그 시트에 붙은 Apps Script가 "
                     + (f"{found} 판이라" if found else "판 번호를 읽을 수 없어")
                     + f" 최소 {minimum} 판에 못 미칩니다.",
@@ -379,6 +411,7 @@ def reuse_existing_attendance_sheet(
     runner: CommandRunner,
     workdir: Path,
     sheet: dict,
+    name: str,
 ) -> AttendanceInstallResult:
     """쓰던 시트의 `설정` 탭을 읽어 연결값만 돌려준다. 시트에는 쓰지 않는다.
 
@@ -394,10 +427,10 @@ def reuse_existing_attendance_sheet(
         "script_id": "SCRIPT_ID",
         "deployment_id": "DEPLOYMENT_ID",
     }
-    missing = sorted(name for name in wanted.values() if not settings.get(name))
+    missing = sorted(key for key in wanted.values() if not settings.get(key))
     if missing:
-        raise ExistingAttendanceSheetError(_cannot_reuse_message(sheet, missing))
-    _require_new_enough_script(runner, workdir, sheet, settings[wanted["script_id"]])
+        raise ExistingAttendanceSheetError(_cannot_reuse_message(sheet, missing, name))
+    _require_new_enough_script(runner, workdir, sheet, settings[wanted["script_id"]], name)
     link = str(sheet.get("webViewLink") or "").strip()
     return AttendanceInstallResult(
         spreadsheet_id=spreadsheet_id,
@@ -413,20 +446,22 @@ def reuse_existing_attendance_sheet(
         deployment_id=settings[wanted["deployment_id"]],
         folder_id=settings[wanted["folder_id"]],
         task_list_id=settings[wanted["task_list_id"]],
+        workbook_name=str(sheet.get("name", "") or name),
     )
 
 
 def find_existing_attendance_sheets(
     runner: CommandRunner,
     workdir: Path,
-    dry_run: bool = False,
+    dry_run: bool,
+    name: str,
 ) -> list[dict]:
     """내 드라이브에서 같은 이름의 출결 시트를 찾는다. 읽기만 한다."""
 
     if dry_run:
         return []
     query = (
-        f"name = '{ATTENDANCE_SHEET_NAME}' and "
+        f"name = '{name}' and "
         f"mimeType = '{SPREADSHEET_MIME}' and "
         "trashed = false and 'me' in owners"
     )
@@ -459,7 +494,7 @@ def find_existing_attendance_sheets(
         item
         for item in files
         if isinstance(item, dict)
-        and str(item.get("name", "")).strip() == ATTENDANCE_SHEET_NAME
+        and str(item.get("name", "")).strip() == name
         and str(item.get("id", "")).strip()
     ]
 
@@ -517,6 +552,9 @@ def validate_appsscript_manifest(manifest_path: Path) -> None:
 
 def write_install_record(profile_json: Path, result: AttendanceInstallResult) -> Path:
     record_path = profile_json.parent / "attendance-install.generated.json"
+    profile = load_profile(profile_json)
+    school = profile.get("school") or {}
+    homeroom = profile.get("homeroom") or {}
     record = {
         "spreadsheet_id": result.spreadsheet_id,
         "spreadsheet_url": result.spreadsheet_url,
@@ -526,6 +564,10 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
         "deployment_id": result.deployment_id,
         "folder_id": result.folder_id,
         "task_list_id": result.task_list_id,
+        "school_year": str(school.get("year", "") or "").strip() or current_school_year(),
+        "homeroom_grade": str(homeroom.get("grade", "") or "").strip(),
+        "homeroom_class": str(homeroom.get("class", "") or "").strip(),
+        "workbook_name": result.workbook_name,
     }
     descriptor, temp_name = tempfile.mkstemp(
         prefix=".attendance-install-", suffix=".tmp", dir=str(record_path.parent)
@@ -576,6 +618,7 @@ def install_attendance_automation(
     profile_json = Path(profile_json)
     asset_root = bundle_paths.bundle_root() / "assets"
     profile = load_profile(profile_json)
+    workbook_name = attendance_workbook_name(profile)
 
     # 지난 시도에서 이미 만든 Google 자료 ID — 있으면 생성 명령을 건너뛴다.
     created_ids: dict[str, str] = {
@@ -595,11 +638,11 @@ def install_attendance_automation(
         # 같은 이름의 시트를 또 만들면, 선생님은 쓰던 시트를 그대로 두고
         # 프로그램만 빈 시트를 보게 된다. 하나면 그 시트에 연결하고, 여럿이면 멈춘다.
         if not created_ids.get("spreadsheet_id"):
-            existing = find_existing_attendance_sheets(runner, workdir, dry_run)
+            existing = find_existing_attendance_sheets(runner, workdir, dry_run, workbook_name)
             if len(existing) > 1:
-                raise ExistingAttendanceSheetError(_too_many_sheets_message(existing))
+                raise ExistingAttendanceSheetError(_too_many_sheets_message(existing, workbook_name))
             if len(existing) == 1:
-                reused = reuse_existing_attendance_sheet(runner, workdir, existing[0])
+                reused = reuse_existing_attendance_sheet(runner, workdir, existing[0], workbook_name)
                 created_ids.update(
                     {
                         "spreadsheet_id": reused.spreadsheet_id,
@@ -670,7 +713,7 @@ def install_attendance_automation(
                     "--json",
                     json.dumps(
                         {
-                            "name": ATTENDANCE_SHEET_NAME,
+                            "name": workbook_name,
                             "mimeType": SPREADSHEET_MIME,
                         },
                         ensure_ascii=False,
@@ -1055,6 +1098,7 @@ def install_attendance_automation(
             deployment_id=created_ids["deployment_id"],
             folder_id=created_ids["folder_id"],
             task_list_id=created_ids["task_list_id"],
+            workbook_name=workbook_name,
         )
         if not dry_run:
             write_install_record(profile_json, result)

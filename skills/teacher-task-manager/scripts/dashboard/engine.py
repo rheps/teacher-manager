@@ -315,6 +315,28 @@ def _attendance_sheet_for_gemini_key(config_dir: Path) -> str:
     )
 
 
+def _attendance_copy_url(config_dir: Path, record_spreadsheet_id: str = "") -> str:
+    """사본 전환이 끝났으면 사본 시트 주소를 돌려준다. 아니면 빈 문자열.
+
+    사본은 **지금 기록의 사본일 때만** 따라간다. 새 출석부로 바뀐 뒤에도 옛 사본
+    상태 파일이 남아 있을 수 있는데, 그때 [열기]가 옛 사본을 열면 안 된다(2026-07-30).
+    """
+    import prepare_attendance_copy
+
+    path = prepare_attendance_copy.attendance_copy_status_path(Path(config_dir))
+    try:
+        saved = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(saved, dict) or saved.get("state") != "complete":
+        return ""  # 만들다 만 사본은 아직 쓰는 시트가 아니다
+    source = str(saved.get("source_spreadsheet_id", "") or "").strip()
+    if record_spreadsheet_id and source and source != str(record_spreadsheet_id):
+        return ""  # 다른 출석부의 사본이다
+    url = str(saved.get("copy_spreadsheet_url", "") or "").strip()
+    return url if url.startswith("https://docs.google.com/spreadsheets/d/") else ""
+
+
 def push_gemini_key_to_attendance_sheet(config_dir: Path, run_command=None) -> dict:
     """이 컴퓨터에 저장된 Gemini 키를 출결 시트 `설정` 탭에 적어 둔다.
 
@@ -590,9 +612,13 @@ class AttendanceStatus:
     account: str = ""      # 처음 준비할 때 사용한 계정
     current_user: str = ""  # 지금 로그인한 계정
     spreadsheet_url: str = ""
+    template_doc_url: str = ""  # 결석 신고서 서식 — 화면 Docs 칸의 [서식 열기]가 쓴다
     detail: str = ""
     failed_service: str = ""  # sheet | docs | tasks | setup | 빈 문자열
     created: bool = False  # 이번 호출에서 새로 만들었는지
+    school_year: str = ""  # 기록에 새긴 학년도 — 도장이 없으면 지금 학년도로 본다
+    workbook_name: str = ""  # 화면에 보여줄 출석부 이름 — 없으면 옛 고정 이름
+    year_mismatch: bool = False  # 프로필 학년도와 기록 학년도가 다르면 새 출석부 단추가 풀린다
 
 
 ATTENDANCE_ERROR_MESSAGES = {
@@ -690,6 +716,37 @@ def _attendance_profile_error(config_dir: Path) -> str:
     return ""
 
 
+ATTENDANCE_STATUS_CACHE_NAME = "attendance-status-cache.generated.json"
+
+
+def save_attendance_status_cache(config_dir: Path, status: dict) -> None:
+    """마지막으로 확인한 출결 상태를 저장한다 — 켠 직후 화면이 이것부터 보여준다.
+
+    "확인하는 중이에요…"를 프로그램을 켤 때마다 보여주지 않기 위한 것(2026-07-30).
+    저장이 실패해도 확인 자체를 막지 않는다.
+    """
+    try:
+        _atomic_write_json(Path(config_dir) / ATTENDANCE_STATUS_CACHE_NAME, dict(status))
+    except OSError:
+        pass
+
+
+def load_attendance_status_cache(config_dir: Path) -> dict | None:
+    try:
+        saved = _json.loads((Path(config_dir) / ATTENDANCE_STATUS_CACHE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return saved if isinstance(saved, dict) and saved.get("state") else None
+
+
+def _profile_school_year(config_dir: Path) -> str:
+    """profile.generated.json의 school.year — 없거나 빈 값이면 지금 학년도로 본다."""
+    profile = _read_json_dict(paths.profile_path(Path(config_dir))) or {}
+    school = profile.get("school")
+    year = str((school or {}).get("year", "") or "").strip() if isinstance(school, dict) else ""
+    return year or install_attendance_automation.current_school_year()
+
+
 def read_attendance_status(config_dir: Path, run_command=_default_run_command) -> AttendanceStatus:
     config_dir = Path(config_dir)
     setup_status = _read_setup_status(config_dir)
@@ -716,18 +773,38 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command) -
                 failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
             )
         spreadsheet_url = str(record.get("spreadsheet_url", "") or "")
+        # 사본 전환이 끝났으면 실제로 쓰는 시트는 사본이다. 원본 주소를 그대로 열면
+        # 더 이상 쓰지 않는 옛 시트가 열린다(central_chat._spreadsheet_in_use와 같은 규칙).
+        copy_url = _attendance_copy_url(config_dir, str(record.get("spreadsheet_id", "") or ""))
+        if copy_url:
+            spreadsheet_url = copy_url
+        template_doc_url = str(record.get("template_doc_url", "") or "")
         valid_sheet_url = spreadsheet_url.startswith(
             "https://docs.google.com/spreadsheets/d/"
         )
+        # 학년도 판정 — 기록에 도장이 없으면(옛 기록) 지금 학년도로 본다. bridge가 그 도장을
+        # 한 번 채워 적지만, 여기서는 파일을 고치지 않고 비교값만 판정한다.
+        profile_year = _profile_school_year(config_dir)
+        record_year = (
+            str(record.get("school_year", "") or "")
+            or install_attendance_automation.current_school_year()
+        )
+        workbook_name = (
+            str(record.get("workbook_name", "") or "")
+            or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
+        )
+        year_mismatch = profile_year != record_year
         if valid_sheet_url:
             return AttendanceStatus(
                 state="ready", account=account or current_user, current_user=current_user,
-                spreadsheet_url=spreadsheet_url,
+                spreadsheet_url=spreadsheet_url, template_doc_url=template_doc_url,
+                school_year=record_year, workbook_name=workbook_name, year_mismatch=year_mismatch,
             )
         return AttendanceStatus(
             state="failed", account=account, current_user=current_user,
-            spreadsheet_url=spreadsheet_url, failed_service="setup",
-            detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
+            spreadsheet_url=spreadsheet_url, template_doc_url=template_doc_url,
+            failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
+            school_year=record_year, workbook_name=workbook_name, year_mismatch=year_mismatch,
         )
     profile_error = _attendance_profile_error(config_dir)
     if profile_error:
@@ -741,9 +818,35 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command) -
     return AttendanceStatus(state="not-ready", current_user=current_user, detail=ATTENDANCE_NOT_READY_MESSAGE)
 
 
+def backfill_attendance_record_stamp(config_dir: Path) -> bool:
+    """옛 출결 기록에 학년도 도장이 없으면 한 번만 채워 적는다.
+
+    read_attendance_status는 판정만 하고 파일을 고치지 않는다 — 기록을 실제로
+    고치는 자리는 여기 하나뿐이다(bridge.attendance_status가 부른다).
+    이미 school_year가 있으면 아무것도 하지 않는다(덮어쓰지 않는다).
+    """
+    config_dir = Path(config_dir)
+    record_path = paths.attendance_install_record_path(config_dir)
+    if not record_path.exists():
+        return False
+    record = _read_json_dict(record_path)
+    if record is None:
+        return False  # 깨진 기록은 여기서 고치지 않는다 — read_attendance_status가 이미 failed로 알린다
+    if str(record.get("school_year", "") or "").strip():
+        return False
+    profile = _read_json_dict(paths.profile_path(config_dir)) or {}
+    homeroom = profile.get("homeroom")
+    homeroom = homeroom if isinstance(homeroom, dict) else {}
+    record["school_year"] = install_attendance_automation.current_school_year()
+    record["homeroom_grade"] = str(homeroom.get("grade", "") or "")
+    record["homeroom_class"] = str(homeroom.get("class", "") or "")
+    _atomic_write_json(record_path, record)
+    return True
+
+
 # 파서가 읽는 기존 항목명이 정본 — 대시보드가 새 이름을 만들지 않는다.
 PROFILE_FIELD_ORDER = [
-    "선생님이름", "학교명", "학교급", "담임여부", "담임학년", "담임반",
+    "선생님이름", "학년도", "학교명", "학교급", "담임여부", "담임학년", "담임반",
     "출근시간", "퇴근시간", "조회시작", "1교시시작", "점심종료시간",
     "월요일마지막교시", "화요일마지막교시", "수요일마지막교시", "목요일마지막교시", "금요일마지막교시",
     "업무캘린더ID", "업무캘린더이름", "학사일정캘린더ID", "학사일정캘린더이름",
@@ -1685,6 +1788,7 @@ def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> Attendanc
         return AttendanceStatus(
             state="failed", account=account, current_user=current_user,
             failed_service="setup", detail=ATTENDANCE_ACCOUNT_MESSAGE,
+            school_year=_profile_school_year(config_dir),
         )
 
     saved_progress = dict(progress or {})
@@ -1726,14 +1830,18 @@ def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> Attendanc
     _write_setup_status(config_dir, {"state": "ready", "account": current_user})
     return AttendanceStatus(
         state="ready", account=current_user, current_user=current_user,
-        spreadsheet_url=result.spreadsheet_url, created=True,
+        spreadsheet_url=result.spreadsheet_url, template_doc_url=result.template_doc_url,
+        created=True,
+        school_year=_profile_school_year(config_dir),
+        workbook_name=getattr(result, "workbook_name", "") or "",
+        year_mismatch=False,
     )
 
 
 def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
-    """새 학년도용 새 출결부 — 기존 기록은 지우지 않고 보관한 뒤 처음부터 다시 만든다.
+    """새 학년도용 새 출석부 — 기존 기록은 지우지 않고 보관한 뒤 처음부터 다시 만든다.
 
-    기존 출결부(시트·문서·폴더)는 Drive에 그대로 남는다. 로그인·프로필 준비가
+    기존 출석부(시트·문서·폴더)는 Drive에 그대로 남는다. 로그인·프로필 준비가
     안 됐으면 아무것도 옮기지 않고 그 상태만 알려준다. 기록이 이미 없으면
     (직전 시도 실패 등) 보관 없이 이어서 설치한다 — 진행 기록으로 재개된다.
     """
@@ -1745,6 +1853,8 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
             return status
         record_path = paths.attendance_install_record_path(config_dir)
         if record_path.exists():
+            # 새로 만드는 출석부 이름에는 학년도가 새겨진다(attendance_workbook_name) —
+            # 옛 기록의 이름을 바꿔 둘 필요 없이, 쓰던 기록만 보관하면 이름이 저절로 갈린다.
             _archive_attendance_files(
                 config_dir,
                 (record_path, paths.attendance_setup_status_path(config_dir)),

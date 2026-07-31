@@ -27,8 +27,8 @@ const S = {
   updateCheck: null,          // 업데이트 확인 결과 (null | "latest" | "available" | "failed")
   updating: false,            // 지금 업데이트 진행 중 (중복 클릭·재실행 방지)
   updateOffer: null,          // update_offer 결과 — 켤 때 한 번 묻는 자리에서 씀
-  aiTools: null,              // AI 비서 탭 — 도구 감지 결과 (null=미조회, "loading"=조회 중)
-  aiInstall: null,            // AI 비서 탭 — 연결 실행 결과
+  aiTools: null,              // AI 에이전트 탭 — 도구 감지 결과 (null=미조회, "loading"=조회 중)
+  aiInstall: null,            // AI 에이전트 탭 — 연결 실행 결과
   maxStep: 1,                 // 마법사에서 한 번이라도 도달한 가장 먼 단계
   login: null,
   progress: null,            // capture_progress 스냅샷 (active일 때만)
@@ -42,6 +42,9 @@ const S = {
   attendance: null,          // attendance_status/ensure_attendance 응답
   attendanceSaving: false,   // 탭을 오가며 다시 그려도 출결 준비 중복 클릭을 막는다
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
+  spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
+  spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
+  chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
 };
 
 const WIZARD_STEPS = [
@@ -77,10 +80,9 @@ function showToast(text) {
   setTimeout(() => { S.toast = null; render(); }, 2200);
 }
 function bannerHtml() {
-  if (!S.banner) return "";
-  const logs = S.banner.kind === "error"
-    ? `<button class="btn-quiet" data-action="open-logs">기록 폴더 열기</button>` : "";
-  return `<div class="banner ${S.banner.kind}"><span>${esc(S.banner.text)}</span>${logs}</div>`;
+  // 기록 폴더를 여는 단추는 두지 않는다. 폴더만 열릴 뿐 거기서 뭘 하라는 안내가 없고,
+  // 그 폴더에 보이는 파일은 Gemini API key가 든 settings.json이다 (2026-07-30 사용자 결정).
+  return S.banner ? `<div class="banner ${S.banner.kind}"><span>${esc(S.banner.text)}</span></div>` : "";
 }
 function toastHtml() { return S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ""; }
 
@@ -162,7 +164,11 @@ function fieldInner(name, value, opts) {
   const disabled = o.disabled ? " disabled" : "";
   const input = `<input name="${esc(name)}" type="${esc(type)}" value="${esc(value == null ? "" : value)}"${placeholder}${invalid}${disabled}>`;
   const note = error ? `<span class="field-error">${esc(error)}</span>` : hint;
-  return `<div class="field${error ? " has-error" : ""}">${input}${note}</div>`;
+  // 가려진 칸에는 눈 단추를 붙인다 — 붙여넣은 값이 맞는지 눈으로 확인할 방법이 있어야 한다.
+  const box = type === "password"
+    ? `<div class="field-with-eye">${input}<button type="button" class="field-eye" data-action="field-eye" data-field="${esc(name)}" aria-label="입력한 값 보기" title="보기">${icon("eye", "small")}</button></div>`
+    : input;
+  return `<div class="field${error ? " has-error" : ""}">${box}${note}</div>`;
 }
 function fieldRow(name, label, value, opts) {
   return `<tr><th scope="row">${esc(label)}</th><td>${fieldInner(name, value, opts)}</td></tr>`;
@@ -312,7 +318,7 @@ async function goNextAsync() {
   const problem = validate ? await validate() : "";
   if (problem) { setBanner("warn", problem); return; }
   if (S.step === 6 && S.connectTab === "messenger") {
-    // 연결은 메신저 → 출결 → AI 비서 세 탭을 차례로 지난 뒤에 마무리로 간다.
+    // 연결은 메신저 → 출결 → AI 에이전트 세 탭을 차례로 지난 뒤에 마무리로 간다.
     S.connectTab = "attendance";
     S.chatStatus = null;
     S.attendance = null;  // 탭 클릭 경로와 동일하게 새로 확인 — 오래된 상태 재사용 방지
@@ -515,11 +521,15 @@ stepBodies[2] = function stepIdentity() {
       ${fieldInner("담임반", locked ? "" : p["담임반"], { placeholder: "3", disabled: locked })}<span class="suffix">반</span>
       ${locked ? `<span class="cell-hint">담임일 때만 입력해요</span>` : ""}
     </span>`);
+  const year = p["학년도"] || currentSchoolYearJs();
+  const yearOptions = schoolYearChoices().map((y) =>
+    `<option value="${y}" ${y === year ? "selected" : ""}>${y}학년도</option>`).join("");
   return `
     <h1>선생님을 알려주세요</h1>
     <p class="sub">캘린더 제목과 안내 문구에 쓰여요</p>
     ${formTable(
       fieldRow("선생님이름", "이름", p["선생님이름"]) +
+      rawRow("학년도", `<div class="field"><select name="학년도">${yearOptions}</select></div>`) +
       fieldRow("학교명", "학교 이름", p["학교명"], { placeholder: "예: OO고등학교" }) +
       rawRow("학교급 (수업 시간을 자동 계산해요)",
         choiceCell("학교급", [["초", "초등 (40분)"], ["중", "중학 (45분)"], ["고", "고등 (50분)"]])) +
@@ -527,6 +537,15 @@ stepBodies[2] = function stepIdentity() {
       homeroomRow
     )}`;
 };
+/* 한국 학년도 — 3월 1일에 새 학년도가 시작한다. getMonth()는 0부터라 3월이 2다. */
+function currentSchoolYearJs() {
+  const now = new Date();
+  return String(now.getMonth() >= 2 ? now.getFullYear() : now.getFullYear() - 1);
+}
+function schoolYearChoices() {
+  const base = Number(currentSchoolYearJs());
+  return [String(base - 1), String(base), String(base + 1)];
+}
 function syncProfileFields() {
   Object.assign(S.draft.profile, readFields(IDENTITY_FIELDS));
   S.draft.profile["학교급"] = readRadio("학교급");
@@ -534,6 +553,8 @@ function syncProfileFields() {
   if (S.draft.profile["담임여부"] === "예") {
     Object.assign(S.draft.profile, readFields(["담임학년", "담임반"]));
   }
+  const yearSelect = document.querySelector('select[name="학년도"]');
+  if (yearSelect) S.draft.profile["학년도"] = yearSelect.value;
 }
 validators[2] = function validateIdentity() {
   syncProfileFields();
@@ -913,11 +934,13 @@ function listsErrorNoticeHtml() {
     <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
 }
 
-/* ---------- 연결 세 탭 — 폭은 글자 길이대로, 한 줄 유지 ---------- */
+/* ---------- 연결 세 탭 — 이름은 짧게, 설명은 아랫줄로 ----------
+   전에는 이름 자리에 서비스 나열을 통째로 넣어 12.5px 한 줄에 셋을 늘어놓았고,
+   자리가 모자라 끝이 잘렸다 (사용자 결정 2026-07-30). */
 const CONNECT_TABS = [
-  { tab: "messenger", line1: "Brity 메신저 ↔ Google Calendar & Tasks ↔ Chat" },
-  { tab: "attendance", line1: "출결 Google Sheet ↔ Docs, Tasks, Chat" },
-  { tab: "ai", line1: "AI ← MCP, Skill → Google" },
+  { tab: "messenger", title: "Brity 메신저", detail: "Calendar · Tasks · Chat" },
+  { tab: "attendance", title: "출결", detail: "Sheet · Docs · Tasks" },
+  { tab: "ai", title: "AI 에이전트", detail: "MCP · Skill" },
 ];
 function tabProblemCount(tab) {
   return checkSummary(checksForTab(tab)).bad;
@@ -928,7 +951,8 @@ function connectTabsHtml() {
     const count = tabProblemCount(entry.tab);
     const countHtml = `<span class="tab-count" data-tab-count="${entry.tab}"${count ? "" : ' style="display:none"'}>${count || ""}</span>`;
     return `<button class="connect-tab${active}" data-action="connect-tab" data-tab="${entry.tab}">
-      <span class="tab-label"><span class="tab-line1">${esc(entry.line1)}</span></span>${countHtml}</button>`;
+      <b class="tab-title">${esc(entry.title)}${countHtml}</b>
+      <small class="tab-detail">${esc(entry.detail)}</small></button>`;
   }).join("");
   return `<div class="connect-tabs">${buttons}</div>`;
 }
@@ -987,70 +1011,198 @@ function startChatConnectPoll() {
   };
   chatPollTimer = setTimeout(tick, 3000);
 }
-function classSpaceRowHtml(a) {
+/* 방 이름 기본값 — 내 정보의 학교명·담임학년·담임반으로 만든다. 선생님이 고칠 수 있다. */
+function defaultClassSpaceName() {
+  const saved = S.profileCache || {};
+  const draft = S.draft.profile || {};
+  const pick = (key) => String(draft[key] || saved[key] || "").trim();
+  const room = pick("담임학년") && pick("담임반") ? `${pick("담임학년")}-${pick("담임반")}` : "";
+  return [pick("학교명"), room].filter(Boolean).join(" ");
+}
+function classSpaceSubrowHtml(a) {
   const cs = S.chatStatus;
   if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return "";
   if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
   if (S.chatSpaces === undefined) {
     S.chatSpaces = null;
+    S.chatSpacesError = false;
     call("attendance_chat_spaces")
       .then((rows) => { S.chatSpaces = rows; })
-      .catch(() => { S.chatSpaces = []; })
+      .catch(() => { S.chatSpaces = []; S.chatSpacesError = true; })
       .finally(render);
   }
   const current = S.chatSpaceName !== undefined ? S.chatSpaceName : (cs.class_space_name || "");
-  let control;
-  if (S.chatSpaces === null) {
-    control = `<span class="st">방 목록을 가져오는 중이에요…</span>`;
-  } else if (!S.chatSpaces.length) {
-    control = `<span class="st">들어가 있는 Google Chat 방을 찾지 못했어요</span>`;
-  } else {
-    const options = S.chatSpaces.map((s) =>
-      `<option value="${esc(s.name)}" ${s.displayName === current ? "selected" : ""}>${esc(s.displayName)}</option>`
-    ).join("");
-    control = `<select data-action-change="class-space-pick">
-      <option value="">${current ? esc(current) : "학급 단톡방을 골라 주세요"}</option>${options}</select>`;
+  const openChat = `<button class="btn-tonal" data-action="link-open" data-url="https://chat.google.com/">${
+    icon("external-link", "small")} Google Chat 열기</button>`;
+
+  // ㄷ. 학교가 막아 두었다 — 손으로 만드는 순서를 보여준다.
+  if (S.spaceCreate === "blocked") {
+    return `<div class="svc-subrow">
+      <span class="nameblock"><b>학급 단톡방</b><small>이 학교 계정으로는 프로그램이 방을 만들 수 없어요.
+        Google Chat에서 직접 만들어 주세요.<br>
+        1. Google Chat을 엽니다<br>
+        2. 왼쪽 위 + → 스페이스 만들기 를 누릅니다<br>
+        3. 방 이름을 "${esc(S.spaceDraftName || defaultClassSpaceName())}"으로 적습니다<br>
+        4. 우리 반 학생을 goedu.kr 아이디로 초대합니다<br>
+        5. 이 화면으로 돌아와 [다시 불러오기]를 누릅니다</small></span>
+      ${openChat}
+      <button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…">다시 불러오기</button>
+    </div>`;
   }
-  return `<div class="class-space-row">
-    <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>${control}</div>`;
+
+  // 방금 만들었다 — 학생 초대 안내를 그 자리에 이어 붙인다.
+  const madeNote = S.spaceCreate === "ok"
+    ? `<div class="svc-subrow">
+        <span class="nameblock"><small>학생의 goedu.kr 아이디로 직접 친구등록 및 초대해야 합니다.<br>
+          (Teacher Manager에서 단체 톡방 인원 초대는 불가능합니다. 직접 진행해 주세요.)</small></span>
+        ${openChat}</div>`
+    : "";
+
+  if (S.chatSpaces === null) {
+    return `<div class="svc-subrow">
+      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오는 중이에요…</small></span></div>`;
+  }
+
+  // 목록을 못 읽었다 — "방이 없다"와 다르다. 못 읽은 것을 없는 것으로 보고 만들기를 권하면,
+  // 이미 있는 방을 두고 같은 이름으로 또 만들려다 SPACE_NAME_TAKEN을 만난다.
+  if (S.chatSpacesError) {
+    return `<div class="svc-subrow">
+      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오지 못했어요.
+        인터넷 연결을 확인한 뒤 다시 불러와 주세요</small></span>
+      <button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…">다시 불러오기</button>
+    </div>`;
+  }
+
+  // ㄴ. 방이 하나도 없다 — 이름칸 + 만들기.
+  if (!S.chatSpaces.length) {
+    const name = S.spaceDraftName !== undefined ? S.spaceDraftName : defaultClassSpaceName();
+    const problem = S.spaceCreate && S.spaceCreate !== "ok" && S.spaceCreate !== "blocked"
+      ? `<span class="field-error">${esc(S.spaceCreate)}</span>` : "";
+    return `<div class="svc-subrow">
+      <span class="nameblock"><b>학급 단톡방</b><small>아직 만든 방이 없어요.
+        이름을 정하고 만들면 바로 골라 둡니다</small>${problem}</span>
+      <input name="class-space-name" value="${esc(name)}" placeholder="${esc(defaultClassSpaceName())}">
+      <button class="btn-tonal" data-action="class-space-create" data-busy-text="만드는 중…">방 만들기</button>
+    </div>${madeNote}`;
+  }
+
+  // ㄱ. 방이 있다 — 골라 둔다.
+  const options = S.chatSpaces.map((s) =>
+    `<option value="${esc(s.name)}" ${s.displayName === current ? "selected" : ""}>${esc(s.displayName)}</option>`
+  ).join("");
+  // 고른 방이 목록에 있으면 맨 위 자리표시 줄을 뺀다 — 같은 이름이 두 줄로 보여
+  // 방이 두 개인 줄 알게 된다(사용자 지적 2026-07-30). 자리표시 줄은 아직 안 골랐거나,
+  // 골라 둔 방이 목록에서 사라졌을 때(이름 바뀜·나감)만 남긴다.
+  const hasCurrent = !!current && S.chatSpaces.some((s) => s.displayName === current);
+  const placeholder = hasCurrent ? "" :
+    `<option value="">${current ? esc(current) : "학급 단톡방을 골라 주세요"}</option>`;
+  return `<div class="svc-subrow">
+    <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>
+    <select data-action-change="class-space-pick">
+      ${placeholder}${options}</select>
+  </div>${madeNote}`;
 }
-function attendanceServiceRow(entry, a) {
-  let state;
-  let note = "";
+/* 서비스 줄 오른쪽 단추 묶음(.svc-acts) — 그 서비스에서 선생님이 누를 수 있는 일을 모은다.
+   Tasks는 특정 목록으로 가는 브라우저 주소가 없어 [열기]를 넣지 않는다. */
+function serviceOpenButtonHtml(entry, a) {
+  if (a.state !== "ready") return "";
+  if (entry.service === "sheet") {
+    const open = a.spreadsheet_url
+      ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 열기</button>`
+      : "";
+    // 처음 설정(마법사) 중에는 안 보인다 — 연 단위 관리 단추다.
+    // 보일 때도 학년도가 같으면 잠긴다 — 학년도를 바꾼 뒤에만 눌리는 단추다(설계 2026-07-31).
+    const make = S.mode === "edit"
+      ? `<button class="btn-tonal" data-action="new-attendance-go"
+      data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch ? "" : "disabled"}>새 시트에 출석부 만들기</button>`
+      : "";
+    return make + open;  // [새 시트에 출석부 만들기] [열기] 순서 (2026-07-31)
+  }
+  if (entry.service === "docs" && a.template_doc_url) {
+    return `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.template_doc_url)}">${icon("external-link", "small")} 서식 열기</button>`;
+  }
+  return "";
+}
+/* 서비스 칸 안 딸림 줄 — 학급 단톡방(Chat)만 남는다. Sheet의 "새 출석부 만들기"는
+   서비스 줄 단추로 옮겼다(설계 2026-07-31 — serviceOpenButtonHtml 참고). */
+function serviceSubrowsHtml(entry, a) {
+  if (entry.service === "chat") {
+    return classSpaceSubrowHtml(a);
+  }
+  return "";
+}
+/* 서비스 줄 맨 오른쪽 상태 칸 — 글자 색만, 모든 줄 같은 폭(.svc-status, 설계 2026-07-31).
+   배경·테두리·둥근 모서리는 칠하지 않는다 — 알약 모양은 2026-07-30에 질책받았다. */
+function serviceStatusHtml(entry, a) {
   if (entry.service === "chat") {
     const cs = S.chatStatus;
-    let stateHtml;
-    if (a.state !== "ready") {
-      stateHtml = `<span class="attendance-state muted">준비 뒤 연결할 수 있어요</span>`;
-    } else if (!cs || cs === "loading") {
-      stateHtml = `<span class="attendance-state muted">확인 중…</span>`;
-    } else if (cs.connected) {
-      stateHtml = `<span class="attendance-state">연결됨</span>`;
-    } else {
-      stateHtml = `<span class="attendance-state chat">처음 한 번 연결이 필요해요</span>` +
-        `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…">연결하기</button>`;
+    if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
+      return `<span class="svc-status ok">연결됨</span>`;
     }
-    const guide = `<button class="btn-tonal youtube" data-action="chat-guide">${icon("youtube", "small")} 연결방법</button>`;
-    state = stateHtml + guide;
-  } else if (a.state === "ready") {
-    state = `<span class="attendance-state">${entry.service === "sheet" ? "준비됨" : "연결됨"}</span>`;
-  } else if (a.state === "failed" && a.failed_service === entry.service) {
-    state = `<span class="attendance-state bad">준비 실패</span>`;
-    note = `<span class="field-error">${esc(a.detail || "")}</span>`;
-  } else if (a.state === "failed") {
-    state = `<span class="attendance-state muted">준비되지 않음</span>`;
-  } else {
-    // not-ready·login-required 등 준비 전 상태 — "준비 완료"로 보이면 안 된다.
-    state = `<span class="attendance-state muted">준비 전이에요</span>`;
+    if (a.state === "ready" && (!cs || cs === "loading")) {
+      return `<span class="svc-status muted">확인 중…</span>`;
+    }
+    if (a.state === "ready") {
+      return `<span class="svc-status warn">연결 필요</span>`;
+    }
+    return `<span class="svc-status muted">준비 전</span>`;
   }
-  return `<div class="attendance-service">
-    <img class="service-logo" src="${entry.logo}" alt="${esc(entry.name)} 로고">
-    <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(entry.name)}</small>${note}</span>
-    ${state}</div>`;
+  if (entry.service === "sheet") {
+    if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
+    if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
+    if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
+    return `<span class="svc-status muted">준비 전</span>`;
+  }
+  // docs · tasks
+  if (a.state === "ready") return `<span class="svc-status ok">연결됨</span>`;
+  if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
+  return `<span class="svc-status muted">준비 전</span>`;
+}
+function attendanceServiceRow(entry, a) {
+  let chatActs = "";
+  if (entry.service === "chat") {
+    const cs = S.chatStatus;
+    const needsConnect = a.state === "ready" && cs && cs !== "loading" && !cs.connected;
+    const connect = needsConnect
+      ? `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…">연결하기</button>` : "";
+    const guide = `<button class="btn-tonal youtube" data-action="chat-guide">${icon("youtube", "small")} 연결방법</button>`;
+    chatActs = connect + guide;
+  }
+  const note = a.state === "failed" && a.failed_service === entry.service
+    ? `<span class="field-error">${esc(a.detail || "")}</span>` : "";
+  return `<div class="svc-group">
+    <div class="attendance-service">
+      <img class="service-logo" src="${entry.logo}" alt="${esc(entry.name)} 로고">
+      <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(
+        entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${note}</span>
+      <span class="svc-acts">${serviceOpenButtonHtml(entry, a)}${chatActs}</span>
+      ${serviceStatusHtml(entry, a)}</div>
+    ${serviceSubrowsHtml(entry, a)}</div>`;
+}
+function refreshAttendanceStatus() {
+  // 화면에 이미 있는 내용은 그대로 두고 다시 읽는다. 결과가 오면 그때 갈아 끼운다.
+  if (S.attendanceLoading) return;
+  S.attendanceLoading = true;
+  call("attendance_status")
+    .then((data) => { S.attendance = data; })
+    .catch(() => { /* 앞서 읽은 상태를 그대로 둔다 — 잠깐 못 읽었다고 화면을 지우지 않는다 */ })
+    .finally(() => {
+      S.attendanceLoading = false;
+      S.chatStatus = null;  // 출석부가 바뀌었을 수 있으니 Chat 상태도 다시 읽게 한다
+      render();
+    });
 }
 function loadAttendanceStatus() {
   if (S.attendance || S.attendanceLoading) return;
   S.attendanceLoading = true;
+  // 켠 직후에는 마지막으로 확인해 둔 상태부터 즉시 보여준다 — "확인하는 중이에요…"를
+  // 프로그램을 켤 때마다 보여주지 않는다(사용자 결정 2026-07-30). 저장본을 보여준 뒤에도
+  // 실제 확인은 반드시 다시 한다 — 로그인이 풀린 것을 저장본은 모른다.
+  call("attendance_status_cached")
+    .then((saved) => {
+      if (saved && !S.attendance) { S.attendance = saved; render(); }
+    })
+    .catch(() => {});
   call("attendance_status")
     .then((data) => { S.attendance = data; })
     .catch((error) => {
@@ -1088,41 +1240,22 @@ function attendanceTabHtml() {
   return `${statusArea}
     <div class="attendance-head">
       <div><h2>출결 업무에 필요한 Google 항목</h2>${ready ? "" : `<p>${pendingGuide}</p>`}</div>
-      <span class="attendance-head-right">${chip}${ready && a.spreadsheet_url
-        ? `<button class="btn-quiet" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 출결 시트 열기</button>`
-        : ""}</span>
+      <span class="attendance-head-right">${chip}</span>
     </div>
     <div class="promise">
       ${rows}
     </div>
-    ${classSpaceRowHtml(a)}
     ${ready
-      ? `<div class="ready-hero"><span class="check">✓</span>
-          <span><b>출결 업무 준비가 끝났어요</b>${esc(account)} 계정에서 바로 사용할 수 있어요.</span></div>${newWorkbookSectionHtml()}`
+      ? ""
       : S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}`;
 }
-function newWorkbookSectionHtml() {
-  // 새 학년도 경로 — 처음 설정(마법사) 중에는 보이지 않는다.
-  if (S.mode !== "edit") return "";
-  if (!S.newWorkbookConfirm) {
-    return `<div class="attendance-action" style="margin-top:6px">
-      <button class="btn-quiet" data-action="new-attendance-ask">새 출결부 만들기 (새 학년도)</button></div>`;
-  }
-  return `<div class="banner warn" style="margin-top:12px"><span>기존 출결부는 구글 드라이브에 그대로 남아요.
-      새 출결부를 만들면 이후 출결 기록은 새 출결부에 쌓이고,
-      Chat 발송 연결과 학급 단톡방은 새 출결부에서 다시 연결해요.</span></div>
-    <div class="attendance-action">
-      <button class="btn" data-action="new-attendance-go" data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)">새로 만들기</button>
-      <button class="btn-quiet" data-action="new-attendance-cancel">취소</button>
-    </div>`;
-}
-/* ---------- 연결 3탭: AI 비서 ---------- */
+/* ---------- 연결 3탭: AI 에이전트 ---------- */
 const AI_SKILL_COMMAND = "npx skills add rheps/teacher-manager -g --all";
 function aiTabHtml() {
   if (!S.info?.features?.ai_skill_install_enabled) {
     return `<div class="attendance-head"><div>
-      <h2>AI 비서 연결 <span class="tab-optional">(선택)</span></h2>
+      <h2>AI 에이전트 연결 <span class="tab-optional">(선택)</span></h2>
       <p>AI 연결 기능은 공개 준비 중이에요. 준비가 끝나면 업데이트로 알려드릴게요.</p>
     </div></div>`;
   }
@@ -1147,14 +1280,14 @@ function aiTabHtml() {
   if (S.aiInstall) {
     result = S.aiInstall.success
       ? `<div class="ready-hero"><span class="check">✓</span>
-          <span><b>AI 비서와 연결했어요.</b> 이제 AI에게 말로 학교 업무를 시킬 수 있어요.</span></div>`
+          <span><b>AI 에이전트와 연결했어요.</b> 이제 AI에게 말로 학교 업무를 시킬 수 있어요.</span></div>`
       : `<div class="banner warn" style="margin-top:12px"><span>자동 연결이 안 됐어요. 아래 명령을 복사해 AI 도구의 터미널에 붙여넣으면 돼요.</span></div>
         <div class="ai-cmd"><code>${esc(AI_SKILL_COMMAND)}</code>
           <button class="btn-quiet" data-action="link-copy" data-url="${esc(AI_SKILL_COMMAND)}">복사</button></div>
         ${S.aiInstall.detail ? `<p class="hint">${esc(S.aiInstall.detail)}</p>` : ""}`;
   }
   return `<div class="attendance-head"><div>
-      <h2>AI 비서와 연결할까요? <span class="tab-optional">(선택)</span></h2>
+      <h2>AI 에이전트와 Google을 연결할까요? <span class="tab-optional">(선택)</span></h2>
       <p>연결하면 AI에게 말로 학교 업무(일정·결석·신고서·문자)를 시킬 수 있어요. 안 써도 프로그램 사용에는 지장 없어요.</p>
     </div></div>
     <div class="ai-rows">${rows}</div>
@@ -1170,9 +1303,10 @@ bindActions({
     if (editingCard() === "connect" && S.connectTab === "messenger") syncConnectFields();
     S.connectTab = tab;
     if (tab === "attendance") {
-      // 탭을 열 때마다 다시 확인 — 로그인·준비 상태가 바뀌었을 수 있다.
-      S.chatStatus = null;
-      S.attendance = null;
+      // 다시 확인은 하되 화면을 비우지는 않는다. 비우면 탭을 누를 때마다
+      // "출결 준비 상태를 확인하는 중이에요…"가 뜨면서 방금 보던 내용이 사라진다.
+      // 앞서 읽은 상태를 그대로 두고 조용히 새로 읽어 바뀐 것만 갈아 끼운다.
+      refreshAttendanceStatus();
     } else {
       stopChatConnectPoll();
     }
@@ -1239,25 +1373,58 @@ bindActions({
       render();
     }
   },
-  "new-attendance-ask": () => { S.newWorkbookConfirm = true; render(); },
-  "new-attendance-cancel": () => { S.newWorkbookConfirm = false; render(); },
   "new-attendance-go": async () => {
     const data = await call("start_new_attendance");
-    S.newWorkbookConfirm = false;
     S.attendance = data;
-    // 새 출결부는 발송 연결·단톡방이 새로 시작된다 — 상태를 다시 확인한다.
+    // 새 출석부는 발송 연결·단톡방이 새로 시작된다 — 상태를 다시 확인한다.
     S.chatStatus = null;
     S.chatSpaces = undefined;
     S.chatSpaceName = undefined;
     stopChatConnectPoll();
-    if (data.state === "ready") showToast("새 출결부를 만들었어요");
-    else setBanner("warn", data.detail || "새 출결부를 만들지 못했어요. 다시 시도해 주세요.");
+    if (data.state === "ready") {
+      showToast("새 출석부를 만들었어요");
+      // 만들었다는 말로 끝내지 않는다 — 새 시트를 바로 열어 눈으로 확인하게 한다(2026-07-30).
+      if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
+    } else {
+      setBanner("warn", data.detail || "새 출석부를 만들지 못했어요. 다시 시도해 주세요.");
+    }
     render();
   },
   "chat-connect": async () => {
     await call("attendance_chat_connect");
     showToast("브라우저에서 구글 허용을 마쳐 주세요");
     startChatConnectPoll();
+  },
+  "class-space-create": async () => {
+    const box = document.querySelector('input[name="class-space-name"]');
+    const name = (box ? box.value : "").trim() || defaultClassSpaceName();
+    S.spaceDraftName = name;
+    const data = await call("attendance_chat_create_space", name);
+    if (data.state === "ok") {
+      S.spaceCreate = "ok";
+      S.chatSpaceName = data.display_name;
+      S.chatSpaces = undefined;   // 방금 만든 방이 목록에 잡히게 다시 읽는다
+      S.chatStatus = null;
+      showToast("학급 단톡방을 만들고 골라 뒀어요");
+    } else if (data.state === "blocked") {
+      S.spaceCreate = "blocked";
+    } else {
+      S.spaceCreate = data.detail || "방을 만들지 못했어요. 다시 시도해 주세요.";
+      // 만들기는 됐고 고르기만 실패했으면 목록에 그 방이 있다 — 다시 읽어 고를 수 있게.
+      // 목록이 오면 곧 고르기 모습으로 바뀌어 사유가 안 보이니, 배너로도 남긴다(배너는 다시 그려도 남는다).
+      if (data.space_name) {
+        S.chatSpaces = undefined;
+        setBanner("warn", data.detail || "방은 만들었어요. 목록에서 골라 주세요.");
+      }
+    }
+    render();
+  },
+  "class-space-reload": async () => {
+    S.spaceCreate = null;
+    S.chatSpacesError = false;
+    S.chatSpaces = undefined;
+    S.chatStatus = null;
+    render();
   },
   "chat-guide": () => {
     if (ATTENDANCE_CHAT_GUIDE_URL) { call("open_url", ATTENDANCE_CHAT_GUIDE_URL); return; }
@@ -1329,7 +1496,7 @@ function stepConnect() {
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
     <h1>연결</h1>
-    <p class="sub">메신저 내용 정리와 출결 시트를 각각 설정해요.</p>
+    <p class="sub">Google Workspace 안에서 각 서비스를 연결하여 학교 업무를 자동화해요.</p>
     ${connectTabsHtml()}
     ${body}`;
 }
@@ -1813,6 +1980,11 @@ document.addEventListener("input", (event) => {
   const name = target && target.name;
   if (!name || !EDITABLE_TARGETS.has(name)) return;
   liveRevalidate();
+});
+document.addEventListener("input", (event) => {
+  if (event.target && event.target.name === "class-space-name") {
+    S.spaceDraftName = event.target.value;
+  }
 });
 
 /* ---------- 처리 관측: 방금 작업 카드 + 처리한 메시지 목록 ---------- */
@@ -2308,6 +2480,16 @@ async function openCard(key) {
   S.mode = "edit"; S.edit = key; editDirty = false; render();
 }
 bindActions({
+  "field-eye": (el) => {
+    // 가려진 값을 잠깐 보여준다. 다시 누르면 도로 가린다.
+    const input = document.querySelector(`input[name="${el.dataset.field}"]`);
+    if (!input) return;
+    const showing = input.type === "text";
+    input.type = showing ? "password" : "text";
+    el.title = showing ? "보기" : "숨기기";
+    el.setAttribute("aria-label", showing ? "입력한 값 보기" : "입력한 값 가리기");
+    el.innerHTML = icon(showing ? "eye" : "eye-off", "small");
+  },
   "open-card": (el) => openCard(el.dataset.card),
   "back-home": async () => {
     await stopHotkeyRecording();
@@ -2323,7 +2505,6 @@ bindActions({
     S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
   },
   "open-about": () => { S.mode = "about"; render(); },
-  "open-logs": () => call("open_logs"),
 });
 
 /* ---------- 라우터 ---------- */

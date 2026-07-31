@@ -129,6 +129,13 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .backbar { display:flex; align-items:center; gap:12px; margin-bottom:20px; }
 .btn-back { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
 .save-state { font-size:13.5px; color:var(--tm-faint); }
+/* 가려진 칸의 눈 단추 — 칸 안 오른쪽 끝에 겹쳐 놓는다 */
+.field-with-eye { position:relative; display:block; }
+.field-with-eye input { padding-right:40px; width:100%; box-sizing:border-box; }
+.field-eye { position:absolute; right:6px; top:50%; transform:translateY(-50%);
+  background:none; border:none; cursor:pointer; padding:5px; line-height:0;
+  color:var(--tm-faint); border-radius:7px; }
+.field-eye:hover { color:var(--tm-ink); background:var(--tm-fill); }
 .foot { display:flex; align-items:center; margin-top:28px; }
 .foot .btn { margin-left:auto; }
 
@@ -286,34 +293,58 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 
 /* 연결 두 탭 (시안: 밑줄형 두 칸 탭) */
 /* 탭 세 개 — 폭은 글자 길이대로, 무조건 한 줄 (셋째 탭이 아랫줄로 떨어지면 안 된다) */
-.connect-tabs { display:flex; flex-wrap:nowrap; gap:4px; margin:3px 0 20px; padding-bottom:1px; border-bottom:1px solid var(--tm-line); }
-.connect-tab { position:relative; display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:48px; padding:10px 12px; border:0; background:transparent; color:var(--tm-sub); font-family:inherit; cursor:pointer; font-size:12.5px; font-weight:700; line-height:1.35; text-align:center; white-space:nowrap; flex:0 1 auto; min-width:0; }
-.connect-tab .tab-label { display:block; overflow:hidden; text-overflow:ellipsis; }
-.connect-tab .tab-line1 { display:block; }
-.connect-tab.active { color:var(--tm-blue); }
-.connect-tab.active::after { content:""; position:absolute; left:0; right:0; bottom:-2px; height:3px; border-radius:3px 3px 0 0; background:var(--tm-blue); }
-.connect-tab .tab-count { min-width:20px; height:20px; border-radius:999px; background:var(--tm-red); color:#fff; font-size:11px; font-weight:800; display:inline-flex; align-items:center; justify-content:center; padding:0 6px; flex:none; }
+/* 연결 세 탭 — 테두리 있는 단추 셋. 글자는 가운데, 제목 아래 설명 한 줄.
+   전에는 테두리도 바탕도 없는 12.5px 글자에 파란 밑줄만 있어서, 누르는 것인지
+   설명인지 구분되지 않았다 (사용자 결정 2026-07-30). */
+.connect-tabs { display:flex; gap:9px; margin:3px 0 20px; }
+.connect-tab { flex:1; min-width:0; border:1.5px solid var(--tm-line); background:#fff;
+  border-radius:13px; padding:13px 12px; font-family:inherit; cursor:pointer; color:var(--tm-sub);
+  text-align:center; line-height:1.3; }
+.connect-tab .tab-title { display:block; font-size:15.5px; font-weight:700; color:var(--tm-ink); }
+.connect-tab .tab-detail { display:block; font-size:12px; color:var(--tm-faint); margin-top:3px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.connect-tab.active { border-color:var(--tm-blue); background:var(--tm-blue-soft); }
+.connect-tab.active .tab-title, .connect-tab.active .tab-detail { color:var(--tm-blue); }
+.connect-tab:hover:not(.active) { border-color:var(--tm-frame); background:var(--tm-fill); }
+.connect-tab .tab-count { min-width:20px; height:20px; border-radius:999px; background:var(--tm-red); color:#fff; font-size:11px; font-weight:800; display:inline-flex; align-items:center; justify-content:center; padding:0 6px; flex:none; margin-left:5px; vertical-align:1px; }
 .connect-section + .connect-section { margin-top:32px; }
 .btn-tonal.youtube { background:var(--tm-red-soft); color:var(--tm-red); }
 .btn-tonal.youtube .ic { stroke:var(--tm-red); }
 
-/* 출결 탭 (시안 promise 목록·ready-hero) */
 .attendance-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
 .attendance-head h2 { margin:0 0 4px; font-size:17px; }
 .attendance-head p { margin:0; color:var(--tm-sub); font-size:12.5px; line-height:1.5; }
 .attendance-head-right { display:flex; align-items:center; gap:8px; flex:none; }
 .account-chip { display:inline-flex; align-items:center; padding:7px 10px; border-radius:9px; color:var(--tm-blue); background:var(--tm-blue-soft); font-size:11.5px; font-weight:700; white-space:nowrap; }
 .settings-check-note { margin:8px 0 0; color:var(--tm-faint); font-size:11.5px; text-align:right; }
-.promise { overflow:hidden; border:1px solid var(--tm-line); border-radius:17px; background:#fff; }
-.promise-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 17px; color:var(--tm-blue); background:var(--tm-blue-soft); font-size:12.5px; font-weight:700; }
+/* 출결 탭 — 서비스마다 테두리 한 칸, 딸린 것은 그 안에 들여쓰기로 (2026-07-30) */
+.promise { display:flex; flex-direction:column; gap:9px; }
+.svc-group { border:1px solid var(--tm-line); border-radius:15px; background:#fff; overflow:hidden; }
 .attendance-service { flex-wrap:wrap; display:flex; align-items:center; gap:11px; padding:13px 17px; }
-.attendance-service + .attendance-service { border-top:1px solid var(--tm-line); }
+.svc-subrow { display:flex; align-items:center; flex-wrap:wrap; gap:10px;
+  padding-top:11px; padding-right:17px; padding-bottom:11px; padding-left:54px;
+  border-top:1px solid var(--tm-line); }
+.svc-subrow .nameblock { flex:1; min-width:0; }
+.svc-subrow .nameblock b { display:block; font-size:13.5px; font-weight:700; color:var(--tm-ink); }
+.svc-subrow .nameblock small { display:block; font-size:12px; color:var(--tm-faint); line-height:1.5; }
+.svc-subrow input[name="class-space-name"] { width:180px; border:1.5px solid var(--tm-line);
+  border-radius:9px; padding:7px 10px; font-size:13px; font-family:inherit; outline:none; }
+.svc-subrow input[name="class-space-name"]:focus { border-color:var(--tm-blue); }
+.svc-subrow select { font-family:inherit; font-size:13px; padding:6px 9px;
+  border:1.5px solid var(--tm-line); border-radius:9px; }
 .service-logo { width:24px; height:24px; flex:none; object-fit:contain; }
 .attendance-service .nameblock { flex:1; min-width:0; }
-.attendance-state { margin-left:auto; color:var(--tm-green); font-size:11.5px; font-weight:700; white-space:nowrap; }
-.attendance-state.chat { color:var(--tm-amber); }
-.attendance-state.muted { color:var(--tm-faint); }
-.attendance-state.bad { color:var(--tm-red); }
+/* 출결 탭 상태 셀 — 글자 색만, 모든 줄 같은 폭, 맨 오른쪽 (2026-07-31 설계) */
+/* 폭은 가장 긴 낱말(준비 필요)에 맞춘다 — 넓으면 단추와 상태 사이가 벌어진다(2026-07-31) */
+.svc-status { flex:none; width:64px; text-align:right; font-size:12.5px; font-weight:700; }
+.svc-status.ok { color:var(--tm-green); }
+.svc-status.warn { color:var(--tm-amber); }
+.svc-status.bad { color:var(--tm-red); }
+.svc-status.muted { color:var(--tm-faint); }
+/* 기능 단추 묶음 — 상태 셀의 왼쪽 모서리에 붙어 오른쪽 정렬 */
+.svc-acts { display:flex; gap:6px; flex:none; align-items:center; margin-left:auto; justify-content:flex-end; }
+.svc-acts .btn-tonal:disabled { opacity:.42; cursor:default; }
+/* AI 에이전트 탭의 연결 성공 배너가 쓴다 — 출결 탭은 더 이상 안 쓴다 */
 .ready-hero { display:flex; align-items:center; gap:13px; margin:12px 0 13px; padding:15px 17px; border:1px solid var(--tm-green-soft); border-radius:15px; color:var(--tm-green); background:var(--tm-green-soft); }
 .ready-hero .check { width:32px; height:32px; display:flex; align-items:center; justify-content:center; flex:none; border-radius:10px; color:#fff; background:var(--tm-green); font-weight:900; }
 .ready-hero b { display:block; margin-bottom:2px; font-size:14px; }
@@ -330,10 +361,6 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .tab-optional { font-size:12px; color:var(--tm-faint); font-weight:600; }
 .ai-cmd { display:flex; align-items:center; gap:10px; margin-top:10px; padding:11px 14px; border:1px solid var(--tm-line); border-radius:11px; background:var(--tm-surface); }
 .ai-cmd code { font-size:12px; color:var(--tm-ink); overflow-x:auto; white-space:nowrap; flex:1; }
-.class-space-row { display:flex; align-items:center; gap:12px; margin-top:12px; padding:12px 15px; border:1px solid var(--tm-line); border-radius:13px; background:var(--tm-surface); }
-.class-space-row .nameblock b { display:block; font-size:14px; }
-.class-space-row .nameblock small { color:var(--tm-sub); font-size:12px; }
-.class-space-row select { margin-left:auto; border:1.5px solid var(--tm-frame); border-radius:10px; padding:9px 12px; font-size:14px; font-family:inherit; background:#fff; }
 .attendance-notice { margin-top:13px; padding:12px 14px; border-radius:11px; color:var(--tm-blue); background:var(--tm-blue-soft); font-size:12px; line-height:1.55; }
 
 /* 직접 누르는 단축키 기록 */

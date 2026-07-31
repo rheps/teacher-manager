@@ -249,17 +249,34 @@ class Api:
 
     @guarded
     def attendance_status(self):
-        return asdict(engine.read_attendance_status(self._config_dir, self._run()))
+        # 옛 기록에 학년도 도장이 없으면 여기서 한 번 채워 적는다 — read_attendance_status는
+        # 판정만 하고 파일을 고치지 않는다.
+        engine.backfill_attendance_record_stamp(self._config_dir)
+        status = asdict(engine.read_attendance_status(self._config_dir, self._run()))
+        # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다.
+        engine.save_attendance_status_cache(self._config_dir, status)
+        return status
+
+    @guarded
+    def attendance_status_cached(self):
+        """켠 직후 화면이 먼저 집는 저장본 — 없으면 None(화면이 확인 문구를 보인다)."""
+        return engine.load_attendance_status_cache(self._config_dir)
 
     @guarded
     def ensure_attendance(self):
         deps = self._deps.attendance_deps or engine.AttendanceDeps(run_command=self._run())
-        return asdict(engine.ensure_attendance(self._config_dir, deps=deps))
+        status = asdict(engine.ensure_attendance(self._config_dir, deps=deps))
+        # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
+        engine.save_attendance_status_cache(self._config_dir, status)
+        return status
 
     @guarded
     def start_new_attendance(self):
         deps = self._deps.attendance_deps or engine.AttendanceDeps(run_command=self._run())
-        return asdict(engine.start_new_attendance(self._config_dir, deps=deps))
+        status = asdict(engine.start_new_attendance(self._config_dir, deps=deps))
+        # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
+        engine.save_attendance_status_cache(self._config_dir, status)
+        return status
 
     @guarded
     def attendance_chat_status(self):
@@ -284,6 +301,11 @@ class Api:
     def attendance_chat_set_space(self, space_name, display_name):
         from dashboard import central_chat
         return central_chat.set_class_space(self._config_dir, str(space_name), str(display_name))
+
+    @guarded
+    def attendance_chat_create_space(self, display_name=""):
+        from dashboard import central_chat
+        return central_chat.create_class_space(self._config_dir, str(display_name))
 
     @guarded
     def computer_status(self):

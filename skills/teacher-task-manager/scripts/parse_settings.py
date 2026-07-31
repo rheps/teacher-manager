@@ -77,6 +77,7 @@ def parse_config_dir(config_dir: str | Path, *, require_links: bool = True) -> P
         },
         "school": {
             "name": profile["학교명"],
+            "year": profile.get("학년도", "").strip(),
             "level": profile["학교급"],
             "class_minutes": class_minutes,
             "break_minutes": 10,
