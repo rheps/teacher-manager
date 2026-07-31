@@ -125,9 +125,8 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .btn-tonal { background:var(--tm-blue-soft); color:var(--tm-blue); font-weight:600; font-size:14px; border:none; border-radius:9px; padding:9px 15px; font-family:inherit; cursor:pointer; }
 .btn-tonal:disabled { opacity:.55; cursor:default; }
 .btn-quiet { background:var(--tm-fill); color:#333D4B; font-weight:600; font-size:14px; border:1px solid var(--tm-line); border-radius:11px; padding:11px 17px; font-family:inherit; cursor:pointer; }
-/* [< 홈] 줄 — 제목과 한 줄 띄운다. 붙어 있으면 제목의 일부처럼 보인다. */
-.backbar { display:flex; align-items:center; gap:12px; margin-bottom:20px; }
-.btn-back { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
+/* 마법사 [이전] 버튼 전용 — 카드 창에는 이 자리에 [< 홈]이 없다 (2026-07-31). */
+.btn-prev { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
 .save-state { font-size:13.5px; color:var(--tm-faint); }
 /* 가려진 칸의 눈 단추 — 칸 안 오른쪽 끝에 겹쳐 놓는다 */
 .field-with-eye { position:relative; display:block; }
@@ -194,7 +193,7 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .banner { display:flex; gap:10px; align-items:flex-start; border-radius:12px; padding:13px 16px; font-size:14px; margin:0 0 18px; }
 .banner.warn { background:var(--tm-amber-soft); color:#8a5a10; }
 .banner.error { background:var(--tm-red-soft); color:#a03325; }
-.toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--tm-ink); color:#fff; font-size:14px; border-radius:12px; padding:12px 22px; box-shadow:0 8px 22px rgba(25,31,40,.25); }
+.toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--tm-ink); color:#fff; font-size:14px; border-radius:12px; padding:12px 22px; box-shadow:0 8px 22px rgba(25,31,40,.25); z-index:60; }
 
 /* 홈 카드 */
 .hero { display:flex; align-items:center; margin-bottom:20px; }
@@ -316,7 +315,6 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .attendance-head p { margin:0; color:var(--tm-sub); font-size:12.5px; line-height:1.5; }
 .attendance-head-right { display:flex; align-items:center; gap:8px; flex:none; }
 .account-chip { display:inline-flex; align-items:center; padding:7px 10px; border-radius:9px; color:var(--tm-blue); background:var(--tm-blue-soft); font-size:11.5px; font-weight:700; white-space:nowrap; }
-.settings-check-note { margin:8px 0 0; color:var(--tm-faint); font-size:11.5px; text-align:right; }
 /* 출결 탭 — 서비스마다 테두리 한 칸, 딸린 것은 그 안에 들여쓰기로 (2026-07-30) */
 .promise { display:flex; flex-direction:column; gap:9px; }
 .svc-group { border:1px solid var(--tm-line); border-radius:15px; background:#fff; overflow:hidden; }
@@ -364,10 +362,30 @@ h1 { font-size:26px; font-weight:700; letter-spacing:-0.3px; margin:0 0 8px; }
 .attendance-notice { margin-top:13px; padding:12px 14px; border-radius:11px; color:var(--tm-blue); background:var(--tm-blue-soft); font-size:12px; line-height:1.55; }
 
 /* 직접 누르는 단축키 기록 */
-.hk-actions { display:flex; align-items:center; justify-content:flex-start; gap:10px; flex-wrap:wrap; }
+/* 단축키 줄 — 전부 오른쪽 정렬 (사용자 결정 2026-07-31) */
+.hk-actions { display:flex; align-items:center; justify-content:flex-end; gap:10px; flex-wrap:wrap; }
+.hk-hint { display:block; text-align:right; }
 .hk-msg { font-size:13.5px; font-weight:600; }
 .hk-msg.ok { color:var(--tm-green); }
 .hk-msg.bad { color:var(--tm-red); }
 /* 현재 조합 칩 — 버튼과 같은 줄에 붙는다 */
 .now-hk { display:inline-flex; align-items:center; white-space:nowrap; color:var(--tm-ink); background:var(--tm-fill); border:1px solid var(--tm-line); border-radius:7px; padding:4px 10px; font-size:13px; font-weight:700; }
 .hint { font-size:12.5px; color:var(--tm-faint); margin-top:10px; }
+
+/* 카드 창 — 홈 위에 뜨는 창. 홈은 뒤에 어둡게 깔린 채 그대로 있다 (2026-07-31). */
+.win-overlay { position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:40;
+  display:flex; align-items:center; justify-content:center; padding:24px; }
+.win-modal { background:#fff; border:1px solid var(--tm-line); border-radius:16px;
+  box-shadow:0 24px 64px rgba(15,23,42,.28); width:min(92%, 720px); max-height:88%;
+  display:flex; flex-direction:column; min-height:0; }
+.win-modal.big { width:min(96%, 920px); height:90%; }
+.win-head { display:flex; align-items:center; gap:12px; padding:14px 20px 13px;
+  border-bottom:1px solid var(--tm-line); flex:none; }
+.win-title { flex:1; font-size:17px; font-weight:700; margin:0; }
+.win-x { background:none; border:none; cursor:pointer; font-size:15px; color:var(--tm-faint);
+  padding:6px 9px; border-radius:8px; line-height:1; }
+.win-x:hover { background:var(--tm-fill); color:var(--tm-ink); }
+.win-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding:20px 24px 28px; }
+.win-body .page { max-width:100%; }
+.about-brand { font-size:21px; font-weight:800; margin:2px 0 4px; }
+body.win-open { overflow:hidden; }

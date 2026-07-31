@@ -286,7 +286,7 @@ function stepStub(n) {
 }
 
 function wizardFootHtml() {
-  const back = S.step > 1 ? `<button class="btn-back" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>` : "<span></span>";
+  const back = S.step > 1 ? `<button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>` : "<span></span>";
   const nextLabel = S.step === WIZARD_STEPS.length ? "" : "다음";
   const next = nextLabel ? `<button class="btn" data-action="go-next" data-busy-text="확인 중…">${nextLabel}</button>` : "";
   return `<div class="foot">${back}${next}</div>`;
@@ -697,7 +697,7 @@ function hotkeyRow(d) {
   return rawRow("메신저 단축키", `<div class="field">
     <div class="hk-actions"><b class="now-hk">${esc(prettyHotkey(S.hk.current))}</b>
       <button class="btn-tonal" data-action="hk-record" data-busy-text="준비 중…">${S.hk.recording ? "원하는 조합을 눌러 주세요…" : "다른 조합 직접 누르기"}</button>${msg}</div>
-    <span class="hint">Ctrl·Alt·Shift·Win 중 두 개 이상만 눌러도 되고, 문자나 숫자를 함께 눌러도 돼요. Esc를 누르면 취소해요.</span>
+    <span class="hint hk-hint">Ctrl·Alt·Shift·Win 중 두 개 이상만 눌러도 되고, 문자나 숫자를 함께 눌러도 돼요. Esc를 누르면 취소해요.</span>
   </div>`);
 }
 
@@ -1521,7 +1521,7 @@ async function validateConnect() {
 }
 /* '새로 만들기'를 고른 캘린더·Tasks 목록을 구글에 실제로 만들고 그 ID를 프로필에 채운다.
    구글에 무언가를 만드는 일이라 타자 한 자마다 돌면 안 된다 — 마법사에서 [다음]을 누를 때와
-   연결 화면에서 [< 홈]으로 나갈 때만 부른다. */
+   연결 화면 창을 닫을 때만 부른다. */
 async function provisionConnectTargets() {
   const p = S.draft.profile;
   const homeroom = p["담임여부"] === "예";
@@ -1573,7 +1573,7 @@ async function refreshSettingsStatus() {
 function computerSectionHtml() {
   const c = S.computer;
   if (!c) return `<div class="panel"><div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div></div>`;
-  return `<div class="section-h section-head"><span>컴퓨터 준비</span><span>처음 실행할 때 자동으로 준비해요</span></div>
+  return `<div class="section-h section-head"><span>컴퓨터 준비</span><button class="btn-quiet" data-action="settings-refresh" data-busy-text="점검 중…">다시 점검</button></div>
     <div class="panel">
       ${readinessRow("Windows 자동 설치 기능", "없는 프로그램을 자동으로 준비해요", c.installer)}
       ${readinessRow("Python", "Teacher Manager를 실행해요", c.python)}
@@ -1583,9 +1583,7 @@ function computerSectionHtml() {
       ${googleLoginRowsHtml()}
     </div>
     ${goeduWarnHtml()}
-    ${loginWaitHtml()}
-    <div class="action-line"><button class="btn-quiet" data-action="settings-refresh" data-busy-text="점검 중…">다시 점검</button></div>
-    <p class="settings-check-note">다시 점검 한 번으로 컴퓨터 준비와 Google 연결을 함께 확인해요.</p>`;
+    ${loginWaitHtml()}`;
 }
 function googleLoginRowsHtml() {
   const g = S.google;
@@ -1644,9 +1642,7 @@ function attachmentFolderRow(d) {
   return rawRow("첨부파일 다운로드 폴더", `<div class="field"><div class="folder-line">
       <input name="brity_download_dir" value="${esc(value)}">
       <button class="btn-tonal" data-action="attachment-folder-choose">폴더 선택</button>
-    </div>${statusLine}
-    <div class="action-line" style="margin-top:8px; justify-content:flex-start">
-      <button class="btn-quiet" data-action="attachment-folder-default">기본 폴더로 되돌리기</button></div></div>`);
+    </div>${statusLine}</div>`);
 }
 function settingsSectionHtml(d) {
   // 이 화면에서 확인: Windows 자동 설치 기능 · Python · Node.js · Microsoft Edge WebView2
@@ -1735,14 +1731,6 @@ bindActions({
     render();
     await autoSaveSettings();
   },
-  "attachment-folder-default": async () => {
-    S.draft.bridge.brity_download_dir = DEFAULT_ATTACHMENT_FOLDER;
-    S.attachmentFolderStatus = await call(
-      "check_attachment_folder", DEFAULT_ATTACHMENT_FOLDER
-    );
-    render();
-    await autoSaveSettings();
-  },
   "hk-record": async () => {
     syncMessengerDraft();
     await stopHotkeyRecording();
@@ -1790,7 +1778,7 @@ stepBodies[7] = function stepFinish() {
       ${summaryRow("단축키", S.draft.bridge.hotkey || DEFAULT_HOTKEY)}
     </div>
     <div class="foot">
-      <button class="btn-back" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>
+      <button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>
       <button class="btn" data-action="apply-all" data-busy-text="적용하는 중… (1~2분 걸릴 수 있어요)">모두 저장하고 적용</button>
     </div>`;
 };
@@ -2186,7 +2174,7 @@ function shouldAutoRefreshChecks() {
   if (S.checks.length || checksRetry.inflight) return false;
   return !checksRetry.failedAt || Date.now() - checksRetry.failedAt > 30000;
 }
-function renderHome() {
+function homeHtml(behind) {
   const info = S.info;
   const problems = checkSummary(uniqueChecks(S.checks)).bad;
   const pill = !S.checks.length ? badge("n", "점검 중…")
@@ -2209,8 +2197,8 @@ function renderHome() {
     ? `<div class="update-banner"><span><b>새 버전(${esc(S.updateInfo.latest)})이 나왔어요.</b> ${esc(S.updateInfo.notes || "")}</span>
         <button class="btn" data-action="update-now" ${S.updating ? "disabled" : ""} data-busy-text="받는 중… (1~2분)">${S.updating ? "받는 중…" : "지금 업데이트"}</button></div>`
     : "";
-  root().innerHTML = `<div class="body"><div class="body-inner"><div class="page">
-    ${bannerHtml()}
+  return `<div class="body"${behind ? " inert" : ""}><div class="body-inner"><div class="page">
+    ${behind ? "" : bannerHtml()}
     ${updateBanner}
     ${firstNotice}
     <div class="hero"><span class="hi">${esc(name)}안녕하세요</span><span class="pill">${pill}</span></div>
@@ -2223,7 +2211,10 @@ function renderHome() {
       <span class="links">
         <button data-action="open-about">버전 및 제작 정보</button>
       </span></div>
-  </div></div></div>` + toastHtml();
+  </div></div></div>`;
+}
+function renderHome() {
+  root().innerHTML = homeHtml(false) + toastHtml();
   if (shouldAutoRefreshChecks()) refreshChecks();
   if (!S.profileCache) call("read_profile").then((p) => { S.profileCache = p; render(); }).catch(() => {});
   if (S.caps === null) {
@@ -2234,14 +2225,33 @@ function renderHome() {
   startCapturePoll();
 }
 
-/* ---------- 편집 화면 ---------- */
-function backBarHtml() {
-  return `<div class="backbar">
-    <button class="btn-back" data-action="back-home">${icon("chevron-left", "small")} 홈</button>
-    <span class="save-state" id="save-state"></span>
-  </div>`;
+/* ---------- 카드 창 — 홈 위에 뜨는 창 (사용자 결정 2026-07-31, ㄱ안) ---------- */
+function windowHtml(title, body, big) {
+  return `<div class="win-overlay">
+    <div class="win-modal${big ? " big" : ""}" role="dialog" aria-label="${esc(title)}">
+      <div class="win-head"><h1 class="win-title">${esc(title)}</h1>
+        <span class="save-state" id="save-state"></span>
+        <button class="win-x" data-action="back-home" aria-label="닫기">✕</button></div>
+      <div class="win-body"><div class="page">${bannerHtml()}${body}</div></div>
+    </div></div>`;
 }
-/* 저장 상태 한 줄 — [< 홈] 오른쪽에 잠깐 나타난다.
+/* 창 닫기 — ✕·어두운 바깥 클릭·Esc·다른 카드로 넘어가기 전, 모두 이 하나를 탄다.
+   저장을 마친 뒤에만 닫힌다. 저장이 실패하면 창은 남고 배너에 이유가 적힌다. */
+async function closeWindow() {
+  if (S.mode !== "edit" && S.mode !== "about") return true;
+  await stopHotkeyRecording();
+  let saved = false;
+  try { saved = await flushEditSave(); } catch (error) { setBanner("error", error.message); return false; }
+  if (!saved) return false;  // 배너에 이유가 적혀 있다
+  stopChatConnectPoll();
+  S.fieldIssues = {};
+  S.chatStatus = null;
+  S.chatSpaces = undefined;
+  S.chatSpaceName = undefined;
+  S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
+  return true;
+}
+/* 저장 상태 한 줄 — 창 제목 줄에 잠깐 나타난다.
    render()를 부르지 않고 글자만 갈아 끼운다. 다시 그리면 입력 중이던 칸에서
    커서가 튕겨 나가고 쓰던 글자가 끊긴다. */
 let saveStateTimer = null;
@@ -2280,6 +2290,7 @@ async function autoSaveSettings(afterHotkey) {
       }
       S.hk.current = result.hotkey;
       if (afterHotkey) S.hk.status = { kind: "ok", text: `${prettyHotkey(result.hotkey)} · 저장했어요` };
+      editDirty = false;  // 방금 저장했다 — 나갈 때 같은 것을 또 저장해 도우미를 두 번 재시작하지 않게
       S.checks = [];
       showToast("저장했어요 — 도우미가 새 설정으로 실행 중이에요");
       render();
@@ -2356,13 +2367,19 @@ function scheduleEditAutoSave() {
     autoSaveEdit().catch((error) => setBanner("error", error.message));
   }, AUTO_SAVE_DELAY_MS);
 }
-/* [< 홈]을 누르면 기다리던 저장을 지금 끝내고, 끝난 뒤에 홈으로 간다. */
+/* 창을 닫을 때 기다리던 저장을 지금 끝내고, 끝난 뒤에 홈으로 간다. */
 /* 저장까지 마쳤으면 true. 저장이 실패했으면 false — 그때는 홈으로 보내지 않는다.
    이유가 적힌 배너를 못 보고 지나치면 무엇이 안 됐는지 알 길이 없다. */
 async function flushEditSave() {
   clearTimeout(editAutoSaveTimer);
   if (S.mode !== "edit") return true;
-  if (S.edit === "settings") { await autoSaveSettings(); return true; }
+  if (S.edit === "settings") {
+    // 설정도 같은 규칙 — 열어 보기만 하고 나오면 저장(도우미 재시작)도, 홈 점검
+    // 다시 돌기도 없어야 한다(사용자 확인 2026-07-31). 값을 바꾸면 그 자리에서
+    // 이미 저장되므로, 여기서는 저장이 미처 못 따라온 경우만 마저 저장한다.
+    if (editDirty) await autoSaveSettings();
+    return true;
+  }
   if (!autoSaveScreen()) return true;
   if (!editDirty) return true;  // 열어 보기만 하고 나온다 — 저장할 것도, 만들 것도 없다
   if (S.edit === "connect") {
@@ -2375,21 +2392,21 @@ async function flushEditSave() {
 }
 for (const eventName of ["input", "change"]) {
   document.addEventListener(eventName, () => {
+    if (S.mode !== "edit") return;
+    if (S.edit === "settings") { editDirty = true; return; }  // 저장은 설정 자체 감지가 한다
     if (!autoSaveScreen()) return;
     editDirty = true;
     scheduleEditAutoSave();
   });
 }
 function settingsEditBody() {
-  const helper = S.checks.find((c) => c.key === "settings.helper");
-  const helperRow = helper
-    ? `<div class="panel" style="margin-top:16px"><div class="row"><span class="name">도우미 실행 상태</span><span class="st">${esc(helper.detail)}</span></div></div>`
-    : "";
+  // 도우미가 살아 있는지 보여주던 줄은 두지 않는다 — 죽었을 때는 홈 점검이
+  // 설정 카드에 "꺼져 있음 — 단축키가 동작하지 않아요"를 띄우므로, 멀쩡할 때도
+  // 늘 떠 있던 그 줄은 겹침이었다 (사용자 결정 2026-07-31).
   return `
     <h1>설정</h1>
     <p class="sub">단축키와 자동 실행을 관리해요. 바꾸면 바로 저장되고 도우미가 새 설정으로 다시 시작해요.</p>
-    ${settingsSectionHtml(S.draft.bridge)}
-    ${helperRow}`;
+    ${settingsSectionHtml(S.draft.bridge)}`;
 }
 // 업데이트 상태·버튼 — '버전 및 제작 정보' 화면의 한 줄에서 쓴다.
 function updateControls() {
@@ -2412,16 +2429,20 @@ function updateControls() {
   return { st: `<span class="st"></span>`,
            btn: `<button class="btn-quiet" data-action="update-check" data-busy-text="확인 중…">업데이트 확인</button>` };
 }
+// 창을 닫으면 기다리던 저장을 끝낸 뒤에 홈으로 간다(closeWindow → flushEditSave).
 function renderEdit(key) {
   let body = "";
   if (key === "connect") body = stepConnect();
   else if (key === "identity") body = stepBodies[2]() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepBodies[3]().replace(/^[\s\S]*?<\/p>/, "");
   else if (key === "timetable") body = stepBodies[4]();
   else if (key === "settings") body = settingsEditBody();
-  // 편집 화면에는 저장 버튼이 없다 — 네 화면 모두 바꾸는 즉시 저장하고,
-  // [< 홈]을 누르면 기다리던 저장을 끝낸 뒤에 홈으로 간다(flushEditSave).
-  root().innerHTML = `<div class="body"><div class="body-inner"><div class="page">
-    ${backBarHtml()}${bannerHtml()}${body}</div></div></div>` + toastHtml();
+  // 화면 제목은 창 제목 줄이 맡는다 — 본문 맨 앞의 <h1>은 뗀다. 마법사는 이 길을
+  // 지나지 않으므로 원래 <h1>을 그대로 쓴다.
+  body = body.replace(/^\s*<h1>[\s\S]*?<\/h1>\s*/, "");
+  const card = CARDS.find((c) => c.key === key);
+  root().innerHTML = homeHtml(true)
+    + windowHtml(card ? card.title : "", body, key === "connect" || key === "timetable")
+    + toastHtml();
 }
 function syncEditFields(key) {
   if (key === "identity") { syncProfileFields(); syncDayFields(); }
@@ -2453,9 +2474,8 @@ async function loadForEdit(key) {
 function renderAbout() {
   const b = S.info.branding;
   const u = updateControls();
-  root().innerHTML = `<div class="body"><div class="body-inner"><div class="page">
-    ${backBarHtml()}${bannerHtml()}
-    <h1>${esc(b.name)}</h1>
+  root().innerHTML = homeHtml(true) + windowHtml("버전 및 제작 정보", `
+    <h2 class="about-brand">${esc(b.name)}</h2>
     <p class="sub">${esc(b.tagline)}</p>
     <div class="panel">
       <div class="row"><span class="name">버전</span><span class="st">v${esc(S.info.version)}</span></div>
@@ -2464,11 +2484,15 @@ function renderAbout() {
       <div class="row"><span class="name">프로그램 업데이트</span>${u.st}${u.btn}</div>
     </div>
     <div class="section-h">웹사이트</div>
-    ${linkRow(b.website)}
-  </div></div></div>` + toastHtml();
+    ${linkRow(b.website)}`, false) + toastHtml();
 }
 
 async function openCard(key) {
+  // 창이 떠 있는 채로 다른 카드를 여는 길(홈 점검의 "설정 열기" 등)은 지금 창을
+  // 같은 닫기 흐름(저장 마무리 포함)으로 닫고 나서 연다 — 한 번에 한 창.
+  if (S.mode === "edit" || S.mode === "about") {
+    if (!(await closeWindow())) return;
+  }
   S.banner = null;
   S.firstHomeNotice = false;  // 카드에 다녀오면 처음 안내 띠는 접는다
   await loadForEdit(key);
@@ -2491,20 +2515,28 @@ bindActions({
     el.innerHTML = icon(showing ? "eye" : "eye-off", "small");
   },
   "open-card": (el) => openCard(el.dataset.card),
-  "back-home": async () => {
-    await stopHotkeyRecording();
-    // 저장이 끝난 뒤에 홈으로 간다 — 나가는 도중에 저장이 잘리면 방금 쓴 것이 사라진다.
-    let saved = false;
-    try { saved = await flushEditSave(); } catch (error) { setBanner("error", error.message); return; }
-    if (!saved) return;  // 배너에 이유가 적혀 있다
-    stopChatConnectPoll();
-    S.fieldIssues = {};
-    S.chatStatus = null;
-    S.chatSpaces = undefined;
-    S.chatSpaceName = undefined;
-    S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
-  },
+  "back-home": () => closeWindow(),
   "open-about": () => { S.mode = "about"; render(); },
+});
+
+/* 어두운 바깥을 눌러 닫기 — mousedown이 가림막에서 시작했을 때만 닫는다.
+   창 안에서 글자를 긁다 바깥에서 손을 떼는 것은 닫기가 아니다. */
+let backdropPressed = false;
+document.addEventListener("mousedown", (event) => {
+  backdropPressed = !!(event.target.classList && event.target.classList.contains("win-overlay"));
+});
+document.addEventListener("click", (event) => {
+  if (!backdropPressed) return;
+  backdropPressed = false;
+  if (event.target.classList && event.target.classList.contains("win-overlay")) closeWindow();
+});
+/* Esc로 닫기 — 단축키를 새로 누르는 중이면 위쪽의 잡기 전용 리스너가 녹음 취소만 하고
+   preventDefault를 걸어 두므로(defaultPrevented), 그때는 창을 닫지 않는다. */
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  if (hotkeyCapture.active) return;
+  if (S.mode !== "edit" && S.mode !== "about") return;
+  closeWindow();
 });
 
 /* ---------- 라우터 ---------- */
@@ -2518,12 +2550,15 @@ function render() {
     call("gws_login_cancel").catch(() => {});
   }
   if (S.mode !== "home") stopCapturePoll();
+  document.body.classList.toggle("win-open", S.mode === "edit" || S.mode === "about");
   if (S.mode === "loading") { root().innerHTML = '<div class="boot">여는 중이에요…</div>'; return; }
   // 같은 화면을 다시 그릴 때는 스크롤을 유지한다 — 세그먼트·선택 조작으로 위로 튀지 않게.
   // 마법사(.shell)는 .body가, 홈·편집 화면은 문서 전체가 스크롤되므로 둘 다 기억한다.
   const prevBody = document.querySelector(".body");
   const prevScroll = prevBody ? prevBody.scrollTop : 0;
   const prevDocScroll = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
+  const prevWin = document.querySelector(".win-body");
+  const prevWinScroll = prevWin ? prevWin.scrollTop : 0;
   const sameScreen = lastScreenKey === screenKey();
   if (S.mode === "wizard") renderWizard();
   else if (S.mode === "edit") renderEdit(S.edit);
@@ -2536,6 +2571,10 @@ function render() {
       if (nextBody) nextBody.scrollTop = prevScroll;
     }
     if (prevDocScroll && document.scrollingElement) document.scrollingElement.scrollTop = prevDocScroll;
+    if (prevWinScroll) {
+      const nextWin = document.querySelector(".win-body");
+      if (nextWin) nextWin.scrollTop = prevWinScroll;
+    }
   }
   if (S.focusTarget) {
     const el = document.querySelector(`[name="${S.focusTarget}"]`);
