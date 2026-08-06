@@ -1,0 +1,31 @@
+Teacher Manager includes Google Workspace CLI 0.22.5.
+
+Source: https://github.com/googleworkspace/cli
+Release archive: https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-pc-windows-msvc.zip
+License: Apache-2.0.  The complete license text is in
+licenses/google-workspace-cli-Apache-2.0.txt.
+
+Teacher Manager can download and keep a private managed copy of Node.js 24.19.0
+only when the user chooses the AI-skill connection feature.
+
+Source: https://nodejs.org/dist/v24.19.0/
+Archive: https://nodejs.org/dist/v24.19.0/node-v24.19.0-win-x64.zip
+License and third-party notices: The complete, byte-for-byte LICENSE file from
+the Windows ZIP is in licenses/nodejs-v24.19.0-LICENSE.txt.  It begins with the
+Node.js MIT terms and includes the notices for third-party components.
+
+Teacher Manager includes the Microsoft Edge WebView2 Evergreen Bootstrapper so
+the installer can prepare the screen-rendering Runtime when needed.
+
+Official download page: https://developer.microsoft.com/en-us/microsoft-edge/webview2/
+Distribution information: https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution
+Official terms source: https://developer.microsoft.com/microsoft-edge/api/eula/webview2?locale=en-us
+Exact official terms JSON: licenses/webview2-evergreen-terms-en-us.json
+
+The installer shows the full terms and requires explicit acceptance before it
+can run the Bootstrapper.  The Runtime includes Microsoft Defender SmartScreen,
+which can send end-user information to Microsoft as described at:
+https://aka.ms/privacy
+https://learn.microsoft.com/en-us/microsoft-edge/privacy-whitepaper#smartscreen
+
+Microsoft does not sponsor or endorse Teacher Manager.

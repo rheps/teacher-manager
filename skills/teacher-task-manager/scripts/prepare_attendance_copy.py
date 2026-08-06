@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -26,9 +27,29 @@ from attendance_chat_marker import (  # noqa: E402
     plan_signature_migration,
 )
 from attendance_install_record import validate_attendance_install_record  # noqa: E402
-from install_attendance_automation import default_runner, run_json  # noqa: E402
+from brity_bridge import gws_env, process_win, tool_runtime  # noqa: E402
+from install_attendance_automation import run_json  # noqa: E402
 
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+REMOTE_COMMAND_TIMEOUT_SECONDS = 120.0
+
+
+def default_runner(args: Sequence[str], cwd: Path) -> str:
+    """사본 준비 중 Google 명령 하나가 끝없이 잠금을 잡지 않게 한다."""
+
+    code, output = process_win.run_captured(
+        list(args),
+        cwd=cwd,
+        timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        env=gws_env.gws_environ(),
+    )
+    if code != 0:
+        raise subprocess.CalledProcessError(
+            code, list(args), output=output, stderr=output
+        )
+    return output
+
+
 INPUT_HEADERS = (
     "날짜", "번호+이름", "구분", "종류", "사유", "교시", "신고서", "첨부",
 )
@@ -885,6 +906,12 @@ def _prepare_once(
         return _result("stopped", "현재 Google 로그인 계정을 확인하지 못했습니다.")
     if installed and _email(installed) != _email(account):
         return _result("stopped", "설치 때 계정과 현재 Google 계정이 다릅니다.")
+    gws = (
+        tool_runtime.resolve_gws_executable()
+        if gws is None
+        else _text(gws)
+    )
+    _need(bool(gws), "Google Workspace CLI 실행 파일 전체 경로가 비어 있습니다.")
     try:
         status = _load_state(path)
     except AttendanceCopyError as exc:
@@ -988,7 +1015,7 @@ def prepare_attendance_copy(
     installed_account: str = "",
     runner: Runner = default_runner,
     workdir: Path | None = None,
-    gws: str = "gws",
+    gws_executable: str | None = None,
     now: Callable[[], dt.datetime] | None = None,
     state_writer: Writer | None = None,
     lock_factory: Callable[[Path], Any] | None = None,
@@ -1004,7 +1031,7 @@ def prepare_attendance_copy(
             installed_account,
             runner,
             Path(workdir or SCRIPTS_DIR),
-            _text(gws) or "gws",
+            gws_executable,
             now or dt.datetime.now,
             state_writer or _atomic_state,
         )

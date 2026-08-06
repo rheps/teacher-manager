@@ -33,19 +33,31 @@ description: "Use when a Korean teacher first installs or uses teacher Google au
 
 ## 설정 대시보드
 
-처음 설치와 설정 변경의 기본 경로다. 사용자가 `설정 대시보드`, `설정 화면`, `설정 고치기`를 말하거나 처음 설치를 시작하면 아래 명령을 실행해 화면으로 안내한다.
+처음 설치와 설정 변경의 기본 경로다. 사용자가 `설정 대시보드`, `설정 화면`, `설정 고치기`를 말하거나 처음 설치를 시작하면 Setup이 기록한 설치 폴더에서 정식 프로그램을 열어 화면으로 안내한다.
+
+설치 전에 선생님이 직접 끝내 둘 준비는 세 가지다.
+
+1. [교육디지털원패스](https://edupass.neisplus.kr/)에서 교직원으로 가입한다.
+2. [경기도교육청 교육용 클라우드 지원시스템](https://www.goedu.kr/)에 가입한다.
+3. 경기도교육청 클라우드 지원시스템 내 서비스인 [Google Workspace 사용을 별도로 신청](https://www.goedu.kr/bbs/3/view/63)하고 `@goedu.kr` 계정을 준비한다.
+
+Google Chat까지 쓸 학급은 학생도 교육디지털원패스와 경기도교육청 교육용 클라우드 지원시스템에 가입하고 Google Workspace 신청을 마쳐 학생 `@goedu.kr` 계정을 준비해야 한다. 선생님이 [Google Chat](https://chat.google.com/)에서 학생 계정을 직접 초대하여 학급 단체톡방을 준비한다. Teacher Manager는 학생 가입·초대·삭제를 자동으로 하지 않는다.
+
+Teacher Manager는 경기도교육청 소속 교사 전용이다. 프로그램은 주소가 정확히 `@goedu.kr`로 끝나는지는 확인하지만, 같은 주소를 쓰는 교사와 학생의 신분까지 구별할 수는 없다. 학생에게 프로그램을 쓰게 하거나 선생님의 출결 Sheet 편집 권한을 주지 않는다. 학생은 Google Chat 학급 단체톡방에만 초대한다. 출결 Sheet의 `설정` 탭에는 Chat 연결값이 있으므로 학생이나 믿을 수 없는 공동 편집자와 공유하지 않는다.
 
 ```powershell
-python "<이 스킬 폴더>\scripts\dashboard"
+$installDir = (Get-ItemProperty -LiteralPath "HKCU:\Software\BigSilverEduLab\TeacherManager").InstallDir
+& (Join-Path $installDir "TeacherManager.exe")
 ```
 
-이 화면은 웹 부품(pywebview)을 쓴다. 배포판 프로그램에는 포함돼 있고, 소스로 실행할 때만 한 번 설치가 필요하다: `pip install pywebview`. 실행 후 창이 안 뜨면 `python -m brity_bridge doctor`와 콘솔 안내문을 확인한다.
+설치 폴더를 찾지 못하거나 `TeacherManager.exe`가 없으면 Python·pip·Node를 따로 설치하지 않는다. 받아 둔 공식 Setup을 다시 실행해 복구 또는 재설치한다. 화면에 필요한 Python과 웹 부품은 프로그램 안에 들어 있다.
 
-선생님께 배포할 때의 기본 실행은 스킬 폴더의 `시작하기.vbs`(화면에는 `시작하기`로 보일 수 있음) 더블클릭이다. 이 파일이 Python과 화면 부품(pywebview)을 화면 뒤에서 자동으로 준비한 뒤 위 명령을 대신 실행한다 — 설치 과정에서 키보드로 답할 일은 없다.
+선생님께 배포할 때의 기본 실행은 바탕화면이나 시작 메뉴의 `Teacher Manager`다. 공개 스킬 폴더의 `시작하기.vbs`(화면에는 `시작하기`로 보일 수 있음)를 쓰는 경우에도 이 파일은 위 설치 폴더의 정식 프로그램만 연다. Python·Node·npm을 설치하거나 실행하지 않으며, 설치 과정에서 키보드로 답할 일은 없다.
 
-- 홈은 `내 정보`, `시간표`, `연결`, `설정` 네 카드로 구성되고, 처음 설정은 시작하기 → 내 정보 → 하루 일과 → 시간표 → 설정 → 연결 → 마무리 순서로 진행한다. 문제가 있으면 홈 카드에 `확인 필요`와 `N/M 정상` 숫자가 붙고, 실제 원인은 해당 화면의 입력칸 아래에 정확한 문장으로 보인다.
+- 홈은 `내 정보`, `시간표`, `연결`, `설정` 네 카드로 구성되고, 처음 설정은 시작 전 준비 → Google 로그인 → 내 정보 → 하루 일과 → 시간표 → 이 컴퓨터 설정 → Google 연결 → 학생 계정 준비 → 저장 및 마무리 순서로 진행한다. 문제가 있으면 홈 카드에 `확인 필요`와 `N/M 정상` 숫자가 붙고, 실제 원인은 해당 화면의 입력칸 아래에 정확한 문장으로 보인다.
 - `내 정보`에는 `학년도` 고르기 칸이 있다. 새로 설치하면 오늘 날짜 기준 학년도가 기본으로 골라져 있고, 이 값이 출결 탭 출석부의 학년도 잠김/풀림을 판정하는 기준이 된다.
-- Node.js는 처음 실행에서 자동으로 준비하며, 컴퓨터 준비·Google Workspace CLI 설치·Google 로그인·로그아웃은 모두 설정 화면에서 관리한다. 다른 계정으로 바꾸려면 설정에서 로그아웃한 뒤 다시 로그인한다 (`gws auth logout`). 설정의 `다시 점검` 하나가 컴퓨터·GWS·로그인·Calendar/Tasks 목록을 함께 다시 확인한다.
+- Python과 Google Workspace CLI는 설치본 안의 확인된 파일을 사용한다. 선생님이 시스템 Python·Node·npm·GWS를 따로 준비하지 않는다. GWS 새 판 확인·적용과 Google 로그인·로그아웃은 모두 설정 화면에서 관리한다. 다른 계정으로 바꾸려면 설정에서 로그아웃한 뒤 다시 로그인한다 (`TeacherManagerTools.exe gws auth logout`). 설정의 `다시 점검` 하나가 프로그램 부품·GWS·로그인·Calendar/Tasks 목록을 함께 다시 확인한다.
+- Node.js는 기본 기능이나 Google 연결에 필요하지 않다. `AI 비서 연결`을 실제로 누를 때만 Teacher Manager 전용 폴더에 준비하며, 시스템 PATH나 다른 프로그램의 Node를 바꾸지 않는다.
 - 연결 화면은 `Brity 메신저`·`출결`·`AI 에이전트` 세 탭이다(AI 에이전트 탭은 공개 준비 중 안내만 보인다). 메신저 탭은 Calendar·Tasks·Gemini API key를, 출결 탭은 출결 Google Sheet·Docs·Tasks 준비 상태를 각각 저장한다.
 - 출결 탭은 Google Sheet·Docs·Tasks·Chat 네 칸이고, 각 칸이 자기 상태와 자기 단추만 갖는다.
   Sheet 칸에 `열기`와 `새 시트에 출석부 만들기`(내 정보의 학년도와 연결된 출석부의 학년도가
@@ -57,7 +69,7 @@ python "<이 스킬 폴더>\scripts\dashboard"
 - 출결 자료는 별도 설치 버튼 없이 출결 탭의 첫 `저장하기` 또는 처음 설정 마지막 `모두 저장하고 적용`에서 자동으로 준비된다. 기존 설치 기록이 있으면 새 Sheet를 만들지 않고 그대로 재사용하며, 저장을 반복해도 자료가 중복 생성되지 않는다.
 - 마무리 탭의 `모두 저장하고 적용` 하나가 저장 → 설정 파서 → 출결 자동 준비 → 도우미 재시작을 순서대로 실행한다.
 - 대시보드도 정본 파일은 같다: `teacher-profile.csv`와 `weekly-timetable.xlsx`에 쓰고 설정 파서로 `profile.generated.json`을 만든다. 아래 대화 절차와 섞어 써도 안전하다.
-- 문제가 생기면 `python -m brity_bridge doctor` 출력을 받아 원인 항목부터 해결한다.
+- 문제가 생기면 설정 화면의 `다시 점검` 결과와 눈에 보이는 오류 문구부터 확인한다. 개인 폴더 경로, OAuth 값, 토큰은 복사해 보내지 않는다.
 
 GUI를 쓸 수 없는 환경에서만 아래 `처음 시작 프로토콜`의 대화 절차를 처음부터 진행한다.
 
@@ -78,93 +90,72 @@ GUI를 쓸 수 없는 환경에서만 아래 `처음 시작 프로토콜`의 대
 
 설정 파일은 스킬 폴더 안이 아니라 위 설정 폴더에 둔다. 스킬을 업데이트하거나 다시 설치해도 이 폴더 안의 개인 설정 파일은 지워지지 않는다.
 
-### GWS 먼저 설치하고 로그인하기
+### GWS 준비를 확인하고 로그인하기
 
 처음 설정에서는 선생님 이름, 학교, 담임, 시간표 질문보다 GWS 준비를 먼저 끝낸다. GWS 준비가 끝나기 전에는 이름, 학교, 담임, 시간표 질문을 시작하지 않는다.
 
 이 스킬은 MCP나 커넥터를 쓰지 않는다. `gws`는 계속 켜두는 프로그램이 아니라, 필요할 때 한 번 실행하고 끝나는 명령어다.
 
-안내만 하지 말고, 설치가 필요한지 먼저 확인한 뒤 필요한 설치는 에이전트가 직접 처리한다. 단, 전역 설치나 Node.js 설치처럼 컴퓨터 상태를 바꾸는 작업은 먼저 짧게 동의를 받는다. 동의 없이 전역 설치를 실행하지 않는다.
+선생님 컴퓨터에 설치된 Python·Node·npm·winget·PATH는 준비 여부 판정에 쓰지 않는다. GWS는 공식 Setup에 포함된 확인된 파일을 쓰며, 새 판은 설정 화면이 공식 주소와 파일 지문을 확인한 뒤에만 별도 적용한다. 실패하면 설치본의 기본 GWS를 계속 쓴다. 시스템 전체 설치나 npm 전역 설치를 실행하지 않는다.
 
-먼저 Node.js와 npm이 있는지 확인한다.
+먼저 Setup이 현재 사용자 폴더에 만든 안전한 명령 파일을 찾는다. 이 작은 파일이 Windows 등록정보에서 실제 설치 폴더를 읽고 같은 폴더의 `TeacherManagerTools.exe`만 부른다.
 
 ```powershell
-node --version
-npm --version
+$gws = Join-Path $env:LOCALAPPDATA "BigSilverEduLab\TeacherManager\bin\teacher-manager-gws.cmd"
+& $gws --help
 ```
 
-둘 중 하나라도 안 되면 이렇게 묻는다.
-
-> Node.js가 없어 GWS CLI를 설치할 수 없습니다. 제가 백그라운드에서 Node.js LTS를 설치해도 될까요?
-
-동의하면 에이전트가 직접 실행한다.
+설정·출결 준비처럼 예전에 Python 파일을 직접 실행하던 작업은 설치된 안전한 명령 창구만 쓴다. 설치 위치는 Setup이 기록한 값으로만 읽고, 파일이 없으면 임의의 Python이나 다른 프로그램으로 우회하지 않는다.
 
 ```powershell
-winget install --id OpenJS.NodeJS.LTS -e --silent --accept-package-agreements --accept-source-agreements
+$installDir = (Get-ItemProperty -LiteralPath "HKCU:\Software\BigSilverEduLab\TeacherManager" -Name InstallDir -ErrorAction Stop).InstallDir
+$tools = Join-Path $installDir "TeacherManagerTools.exe"
+if (-not (Test-Path -LiteralPath $tools -PathType Leaf)) { throw "Teacher Manager 설치 파일로 복구 또는 재설치해 주세요." }
 ```
 
-`--silent --accept-package-agreements --accept-source-agreements`는 winget이 영어로 라이선스 동의를 묻는 프롬프트에서 멈추지 않게 한다. 설치 뒤에는 PowerShell이나 터미널을 새로 열고 다시 `node --version`, `npm --version`을 확인한다.
+`teacher-manager-gws.cmd`를 찾지 못하거나 이 파일이 설치 위치 오류를 알리면 PATH에서 이름으로 찾은 다른 GWS나 npm 폴더를 대신 쓰지 않는다. 받아 둔 공식 Setup을 다시 실행해 복구 또는 재설치한다. 설치 폴더를 임의로 찾아 실행하거나 인터넷 명령을 추측해 만들지 않는다.
 
-그다음 gws CLI가 있는지 확인한다.
+로그인 명령 전에 설정 화면에서 다음 세 줄을 따로 확인한다.
 
-```powershell
-gws --help
-```
+- `Google Workspace CLI`: 준비됨
+- `Google 로그인 준비`: 준비됨
+- `Google 계정`: 로그인됨 또는 로그인 필요
 
-Windows PowerShell에서 실행 정책 때문에 `gws`가 막히면 `gws.cmd --help`로 실행한다. 아래 모든 `gws` 명령도 같은 상황에서는 `gws.cmd`로 바꿔 쓸 수 있다.
+`Google 로그인 준비`가 없거나 서로 다른 OAuth 클라이언트 준비 파일이 충돌한다고 나오면 로그인 명령을 실행하지 않는다. 화면에 보이는 `설치 파일로 복구` 안내를 따르고, 계속되면 배포 담당자에게 오류 문구만 전달한다. OAuth 클라이언트 값·파일 내용·개인 폴더 경로를 화면이나 대화에 출력하지 않는다. 별도 개발자용 OAuth 준비 명령, 클라우드 개발 도구 설치, keyring 방식 강제 변경으로 우회하지 않는다.
 
-없으면 이렇게 묻는다.
-
-> GWS CLI가 없어 Google Calendar, Tasks, Drive, Sheets, Docs, Apps Script를 연결할 수 없습니다. 제가 백그라운드에서 GWS CLI를 전역 설치해도 될까요?
-
-동의하면 에이전트가 직접 실행한다. gws CLI는 전역 설치로 설치한다.
+준비 상태가 정상일 때만 안전한 명령 창구로 현재 로그인을 확인한다.
 
 ```powershell
-npm install -g @googleworkspace/cli
-gws --help
-```
-
-터미널에서 gws를 실행할 때는 먼저 키 보관 방식을 앱과 같은 file 백엔드로 고정한다. 앱(대시보드·도우미)은 이 값을 고정해 쓰는데, 터미널이 기본 keyring을 쓰면 양쪽이 서로의 로그인 토큰을 지우는 수시 로그아웃이 재발한다.
-
-```powershell
-$env:GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND = "file"
-```
-
-로그인 명령을 실행하기 전에 로그인 준비 상태부터 확인한다. (새 터미널 창을 열었다면 위 환경 변수 설정부터 다시 실행한다.)
-
-```powershell
-gws auth status
+& $gws auth status
 ```
 
 - 이미 원하는 계정으로 로그인돼 있으면 다시 로그인하지 않는다.
-- `No OAuth client configured` 같은 안내가 나오면 OAuth 클라이언트 준비가 먼저다. 에이전트가 사용자에게 "로그인 준비가 안 되어 있어 준비 단계를 먼저 진행하겠습니다"라고 알린 뒤 `gws auth setup`을 안내한다. `gws auth setup`은 gcloud CLI가 필요하다. gcloud가 없는 컴퓨터에서는 `gws auth setup --help`와 gws 공식 안내가 제시하는 대안을 그대로 안내하고, 추측으로 명령을 만들어내지 않는다.
-
-준비가 되어 있으면 Google Calendar, Tasks, Drive, Sheets, Docs, Apps Script 권한으로 로그인한다. 이 단계도 명령은 에이전트가 실행하되, 로그인은 브라우저에서 사용자가 직접 마무리해야 한다. 브라우저가 열리면 선생님 계정으로 로그인하고 권한을 허용해야 한다.
+- 로그인되지 않았으면 Google Calendar, Tasks, Drive, Sheets, Docs, Apps Script 권한으로 로그인한다. 명령은 에이전트가 실행하되, 로그인은 브라우저에서 사용자가 직접 마무리해야 한다. 브라우저가 열리면 선생님 계정으로 로그인하고 권한을 허용한다.
 
 ```powershell
-gws auth login --scopes "email,profile,openid,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/documents,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/tasks,https://www.googleapis.com/auth/script.projects,https://www.googleapis.com/auth/script.deployments,https://www.googleapis.com/auth/script.container.ui"
+& $gws auth login --scopes "email,profile,openid,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/documents,https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/tasks,https://www.googleapis.com/auth/script.projects,https://www.googleapis.com/auth/script.deployments,https://www.googleapis.com/auth/script.container.ui"
 ```
 
 여기서는 Calendar, Drive, Docs, Sheets, Tasks, Apps Script 설치와 실행에 필요한 권한만 로그인한다. Google Chat 직접 발송 권한은 Apps Script 로그인에 넣지 않는다. Chat 발송은 시트 메뉴의 `처음 한 번 설정하기 -> 처음 설정 한 번에 끝내기`가 부르는 `Google Chat 최초 발송 연결하기`에서 선생님 계정 허락을 따로 받고, 실제 발송은 중앙 발송기로 넘긴다.
 
 **[중요] 로그인 계정은 반드시 `@goedu.kr` 계정이어야 한다.** 경기도교육청은 `@goedu.kr`로 끝나는 공식 계정에만 구글 워크스페이스(Google Workspace) 기능(Calendar 공유, Tasks, Docs, Apps Script, Chat 등)을 온전히 제공한다. 개인 Gmail 계정(`@gmail.com` 등)으로 로그인하면 학교 공유 캘린더 접근, Chat 학급 스페이스, Apps Script 배포 등이 막히거나 학교 정책에 맞지 않을 수 있다.
 
-`gws auth status` 결과의 `user` 값을 반드시 확인한다. `@goedu.kr`로 끝나지 않으면 설정 질문으로 넘어가지 말고 아래처럼 안내한 뒤 다시 로그인한다.
+`& $gws auth status` 결과의 `user` 값을 반드시 확인한다. `@goedu.kr`로 끝나지 않으면 설정 질문으로 넘어가지 말고 아래처럼 안내한 뒤 다시 로그인한다.
 
 > 지금 로그인된 계정은 `{user}`입니다. 이 스킬은 경기도교육청 공식 계정(예: 이름@goedu.kr)으로 로그인해야 캘린더 공유, Tasks, Chat 쪽지가 학교 계정 기준으로 정상 동작합니다. `@goedu.kr` 계정으로 다시 로그인해도 될까요?
 
-동의하면 같은 scope로 `gws auth login`을 다시 실행하고, 브라우저 계정 선택 화면에서 `@goedu.kr` 계정을 고르도록 안내한다. 로그인이 끝나면 `gws auth status`로 `user` 값이 `@goedu.kr`로 끝나는지 다시 확인한 뒤에만 다음 단계로 넘어간다. 사용자가 개인 Gmail 계정으로 계속 진행하겠다고 명시적으로 말하면 그 결정은 존중하되, Chat 쪽지 등 일부 기능이 제한될 수 있다고 짧게 안내한다.
+동의하면 같은 scope로 `& $gws auth login`을 다시 실행하고, 브라우저 계정 선택 화면에서 `@goedu.kr` 계정을 고르도록 안내한다. 로그인이 끝나면 `& $gws auth status`로 `user` 값이 `@goedu.kr`로 끝나는지 다시 확인한 뒤에만 다음 단계로 넘어간다. 다른 주소라면 Calendar·Tasks·Sheet·Docs·출결·Chat 작업과 처음 설정 완료를 시작하지 않는다.
 
 로그인 계정 확인이 끝난 뒤에만 캘린더와 Tasks 목록을 조회한다.
 
 ```powershell
-gws calendar calendarList list --params '{"maxResults":250}' --format table
-gws tasks tasklists list --format table
+& $gws calendar calendarList list --params '{"maxResults":250}' --format table
+& $gws tasks tasklists list --format table
 ```
 
 목록 조회가 성공하면 그때부터 설정 질문을 시작한다. 개인 업무 일정 캘린더, 학사일정 캘린더, 담임 안내 Tasks 목록은 사용자가 이름으로 고르게 하고, 실제 저장은 ID로 한다. 선택한 개인 업무용 캘린더와 학사일정 캘린더의 ID와 이름을 `teacher-profile.csv`에 저장한 뒤 파서를 다시 실행한다. 담임 교사일 때만 담임 안내 Tasks 목록도 고르게 한다. 비담임이면 담임 안내 Tasks 목록은 묻지 않는다.
 
-ID는 선생님이 직접 적지 않는다. 에이전트가 `gws calendar calendarList list`와 `gws tasks tasklists list` 결과에서 이름 목록을 보여주고, 선생님이 이름을 고르면 에이전트가 해당 ID를 teacher-profile.csv에 대신 적는다.
+ID는 선생님이 직접 적지 않는다. 에이전트가 `& $gws calendar calendarList list`와 `& $gws tasks tasklists list` 결과에서 이름 목록을 보여주고, 선생님이 이름을 고르면 에이전트가 해당 ID를 teacher-profile.csv에 대신 적는다.
 
 ### 표준 Google 공간
 
@@ -188,10 +179,10 @@ Tasks는 `조종례시 담임학급 안내사항` 목록 하나로 담임 안내
 
 설정 폴더나 설정 파일이 없으면 업무 등록을 멈추고 아래 순서로 처리한다. 사용자에게 안내할 때는 실제 계산된 전체 경로를 포함한다.
 
-1. 위 `GWS 먼저 설치하고 로그인하기`를 끝낸다.
+1. 위 `GWS 준비를 확인하고 로그인하기`를 끝낸다.
 2. 설정 폴더와 설정 견본을 만든다.
-   ```bash
-   python "<이 스킬 폴더>/scripts/setup_teacher_google_automation.py" --config-dir "$HOME/TeacherTaskManager" --init
+   ```powershell
+   & $tools setup-init --config-dir "$HOME\TeacherTaskManager"
    ```
 3. Windows에서는 폴더를 바로 열어준다.
    ```powershell
@@ -211,8 +202,8 @@ Tasks는 `조종례시 담임학급 안내사항` 목록 하나로 담임 안내
 
 `profile.generated.json`이 없거나, `teacher-profile.csv` 또는 `weekly-timetable.xlsx`가 JSON보다 새로우면 먼저 파서를 실행한다.
 
-```bash
-python "<이 스킬 폴더>/scripts/parse_settings.py" --config-dir "$HOME/TeacherTaskManager"
+```powershell
+& $tools parse-settings --config-dir "$HOME\TeacherTaskManager"
 ```
 
 파서가 실패하면 부족한 항목만 알려주고, 다시 `explorer "$HOME\TeacherTaskManager"`로 폴더를 열어준다. 이때도 설정 폴더와 `README-setup.txt`의 전체 경로를 함께 말한다.
@@ -279,14 +270,13 @@ python "<이 스킬 폴더>/scripts/parse_settings.py" --config-dir "$HOME/Teach
 원하면 먼저 명령 모양을 확인한다.
 
 ```powershell
-python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --install-attendance --dry-run
+& $tools attendance-install --config-dir "C:\Users\<사용자이름>\TeacherTaskManager"
 ```
 
-사용자가 실제 Google Docs, Google Sheets, Drive 폴더, Tasks 목록, Apps Script 프로젝트 생성을 승인하면 `--dry-run`을 빼고 실행한다.
-공개 배포판에서 Google Chat 발송까지 켤 때는 개발자가 배포한 중앙 발송소 주소를 함께 넣는다.
+기본 실행은 Google 자료를 바꾸지 않는 확인 실행이다. 사용자가 실제 Google Docs, Google Sheets, Drive 폴더, Tasks 목록, Apps Script 프로젝트 생성을 승인하면 `--apply`를 붙여 실행한다. 중앙 발송소 주소는 설치본 안의 공개 배포 정보에서만 읽으며, 대화나 외부 입력으로 주소를 넘기지 않는다.
 
 ```powershell
-python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --install-attendance --central-chat-sender-url "<중앙 발송소 URL>"
+& $tools attendance-install --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --apply
 ```
 
 설치가 끝나면 Google Sheet 링크와 Google Docs 템플릿 링크를 알려준다. 설치 도우미는 `attendance-install.generated.json`도 함께 만들어서, 나중에 LLM 흐름이 시트의 쪽지 대장을 바로 채울 수 있게 한다.
@@ -301,7 +291,7 @@ python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config
 6. `학생명단` 시트를 채우게 한다. 열은 왼쪽부터 `번호`(A), `이름`(B), `번호+이름`(C), `학생 Google 이메일`(D) 4개다.
    - **선생님이 직접 채우는 열**
      - `번호`(A), `이름`(B): 나이스나 엑셀 명단에서 그대로 붙여넣으면 된다.
-     - `학생 Google 이메일`(D): 개인 DM을 보낼 학생만 적는다. 이메일이 있으면 그 학생은 자동으로 개인 DM 대상이고, 없으면 발송에서 건너뛰고 발송기록에 남는다. 별도의 사용 여부(Y/N) 표시는 없다.
+     - `학생 Google 이메일`(D): 개인 DM을 보낼 학생의 정확한 `@goedu.kr` 주소만 적는다. 주소가 없거나 다른 도메인이면 보내지 않고 발송기록에 이유를 남긴다. 별도의 사용 여부(Y/N) 표시는 없다.
    - **자동으로 채워지는 열**
      - `번호+이름`(C): A열과 B열을 입력하는 즉시 자동 생성된다. 월별 시트 학생 드롭다운의 원본이다. 반대로 C열에 `3김민수`처럼 직접 적으면 번호/이름이 자동 분리된다 — 양방향 모두 동작한다.
    - DM 방(Space)은 발송할 때마다 이메일로 자동 연결되므로 시트에 Space ID를 적어둘 필요가 없다. 발송 이력은 `발송기록` 시트에 남는다.
@@ -336,7 +326,7 @@ python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config
 - `assets/absence-report-template.docx`
 - `assets/Code.gs`
 - `assets/appsscript.json`
-- `scripts/install_attendance_automation.py`
+- 설치된 `TeacherManagerTools.exe`의 `attendance-install` 명령
 
 ### 이미 쓰던 출결 시트가 있을 때
 
@@ -354,9 +344,12 @@ python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config
 로컬 설치 기록만 만드는 것이다. 다섯 값 중 하나라도 비어 있으면 멈추고 어느 값이
 비었는지 이름을 알려 준다.
 
-그 시트에 붙어 있는 Apps Script가 `release.json`의 `minimumAppsScriptVersion`보다
-오래된 판이면 이어 쓰지 않고 멈춘다. 옛 판 스크립트를 그대로 몰고 가면 시트 모양이
-어긋난다.
+그 시트에 붙어 있는 Apps Script는 먼저 읽기만 해서 확인한다. 이번 설치본과 정확히
+같으면 그대로 연결하고, 이 프로그램이 배포했던 믿을 수 있는 옛 판이면 출결 연결은
+보존한 채 화면에 `출결 기능 업데이트`를 보여 준다. 실제 코드는
+선생님이 따로 승인했을 때만 같은 Apps Script 프로젝트 안에서 바꾼다. 출처를 확인할 수 없거나 선생님이 직접
+고친 Apps Script는 자동으로 덮어쓰지 않는다. 확인이 끝나기 전에는 Google Chat과
+Brity 쪽지 발송을 열지 않는다.
 
 `설정` 탭을 덮어쓰지 않는 이유가 있다. 거기에 `CENTRAL_CHAT_SHEET_ID`와
 `CENTRAL_CHAT_SHEET_SECRET`이 들어 있어서, 덮어쓰면 Google Chat 발송 등록이 끊어진다.
@@ -370,7 +363,14 @@ python "<이 스킬 폴더>\scripts\setup_teacher_google_automation.py" --config
 `attendance-install.before-connect.generated.json`으로 한 번 남긴다.
 
 ```powershell
-python -c "import sys; sys.path.insert(0, r'<이 스킬 폴더>\scripts'); from connect_existing_attendance_sheet import connect_existing_attendance_sheet; print(connect_existing_attendance_sheet(r'C:\Users\<사용자이름>\TeacherTaskManager', '<쓰던 시트 ID>', account='<gws auth status로 읽은 계정>'))"
+& $tools connect-attendance --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --spreadsheet-id "<쓰던 시트 ID>"
+```
+
+이 첫 호출은 `state: approval_required`, `changes_applied: false`로 끝나야 한다. 어떤 로컬
+연결 기록을 바꿀지 사용자에게 설명하고 승인을 받은 뒤에만 같은 명령에 `--apply`를 붙인다.
+
+```powershell
+& $tools connect-attendance --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --spreadsheet-id "<쓰던 시트 ID>" --apply
 ```
 
 ### Apps Script ID 확인과 사본 시트 복구
@@ -402,16 +402,15 @@ Code.gs 반영, 버전 확인, Apps Script API 실행에 필요한 스크립트 
 
 **1단계 — 비공개 사본 하나 만들기**
 
-```python
-import sys
-sys.path.insert(0, r"<이 스킬 폴더>\scripts")
-from attendance_install_record import load_attendance_install_record
-from prepare_attendance_copy import prepare_attendance_copy
+```powershell
+& $tools prepare-attendance-copy --config-dir "C:\Users\<사용자이름>\TeacherTaskManager"
+```
 
-config_dir = r"C:\Users\<사용자이름>\TeacherTaskManager"
-record = load_attendance_install_record(config_dir + r"\attendance-install.generated.json")
-result = prepare_attendance_copy(config_dir, record, current_account="<gws auth status로 읽은 계정>")
-print(result.state, result.copy_spreadsheet_id, result.copy_spreadsheet_url)
+첫 호출은 사본을 만들지 않고 `approval_required`, `changes_applied: false`로 멈춘다. 원본은
+그대로 두고 Google Drive에 비공개 사본 하나를 만든다는 점을 설명해 승인받은 뒤에만 실행한다.
+
+```powershell
+& $tools prepare-attendance-copy --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --apply
 ```
 
 사본 이름은 `<원본 이름> - AI 입력 준비 사본 (연-월-일 시분초)`가 된다. 이 이름은 나중에 AI 입력을 켤 수 있는 파일인지 판단하는 기준이므로 사용자에게 바꾸지 말라고 안내한다.
@@ -437,7 +436,7 @@ print(result.state, result.copy_spreadsheet_id, result.copy_spreadsheet_url)
 먼저 아무것도 쓰지 않는 확인 실행을 한다.
 
 ```powershell
-python "<이 스킬 폴더>\scripts\prepare_attendance_copy_script.py" --copied-spreadsheet-id "<사본 Sheet ID>" --copied-script-id "<사본 Script ID>"
+& $tools prepare-attendance-copy-script --copied-spreadsheet-id "<사본 Sheet ID>" --copied-script-id "<사본 Script ID>"
 ```
 
 `state`가 `ready_for_apply`면 사용자 승인을 받고 `--apply`를 붙여 한 번 실행한다. 성공하면 `version_number`, `deployment_id`, `bundle_sha256`이 나온다. 이 세 값을 3단계에 그대로 쓴다.
@@ -446,31 +445,30 @@ python "<이 스킬 폴더>\scripts\prepare_attendance_copy_script.py" --copied-
 
 **3단계 — 올린 코드를 다시 읽어 확인하고 기록하기**
 
-```python
-from switch_attendance_connection import record_prepared_copy_script
+```powershell
+& $tools record-prepared-copy-script --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --copied-spreadsheet-id "<사본 Sheet ID>" --copied-script-id "<사본 Script ID>" --version-number <2단계 version_number> --deployment-id "<2단계 deployment_id>" --bundle-sha256 "<2단계 bundle_sha256>"
+```
 
-record_prepared_copy_script(
-    config_dir,
-    copy_spreadsheet_id="<사본 Sheet ID>",
-    copy_script_id="<사본 Script ID>",
-    version_number=<2단계 version_number>,
-    deployment_id="<2단계 deployment_id>",
-    bundle_sha256="<2단계 bundle_sha256>",
-)
+`approval_required`, `changes_applied: false`를 확인하고, 검증값을 로컬 사본 진행 기록에
+남긴다는 승인을 받은 뒤 같은 명령에 `--apply`를 붙인다.
+
+```powershell
+& $tools record-prepared-copy-script --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --copied-spreadsheet-id "<사본 Sheet ID>" --copied-script-id "<사본 Script ID>" --version-number <2단계 version_number> --deployment-id "<2단계 deployment_id>" --bundle-sha256 "<2단계 bundle_sha256>" --apply
 ```
 
 이 호출은 사본의 현재 코드, 지정한 버전, 지정한 배포판을 각각 다시 읽어 정식 `Code.gs`와 정확히 같은지 확인한다. 모두 맞을 때만 사본 진행 기록에 남기고 옛 코드 보류를 푼다. 하나라도 다르면 `ATTENDANCE_CONNECTION_SWITCH_HOLD`로 멈추고 아무것도 기록하지 않는다.
 
 **4단계 — 연결을 사본으로 바꾸기**
 
-```python
-from switch_attendance_connection import switch_attendance_connection
+```powershell
+& $tools switch-attendance-connection --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --new-script-id "<사본 Script ID>" --new-deployment-id "<2단계 deployment_id>"
+```
 
-switch_attendance_connection(
-    config_dir,
-    new_script_id="<사본 Script ID>",
-    new_deployment_id="<2단계 deployment_id>",
-)
+`approval_required`, `changes_applied: false`를 확인한다. 앞으로 쓰는 출결 파일과 중앙 발송
+연결이 사본으로 바뀐다는 설명 뒤 사용자가 승인했을 때만 `--apply`를 붙인다.
+
+```powershell
+& $tools switch-attendance-connection --config-dir "C:\Users\<사용자이름>\TeacherTaskManager" --new-script-id "<사본 Script ID>" --new-deployment-id "<2단계 deployment_id>" --apply
 ```
 
 이 호출 하나가 같은 출결 잠금 안에서 아래를 순서대로 한다.
@@ -508,7 +506,7 @@ Enter를 누른 뒤 그 칸은 회색 안내 문구로 되돌아간다. 출결�
 
 원본 시트와 4단계가 끝나지 않은 사본에서는 `AI 출결 입력 켜기` 단계만 건너뛰고, 결과 화면에 `AI 입력을 켤 수 있는 사본이 아닙니다`라고 적힌다. 나머지 사전 세팅은 그대로 진행된다. 사용자에게 원본 시트에서 켜는 방법을 안내하지 않는다.
 
-이 절차는 시트 스크립트 `5.10.0`부터 이 모양이다. 감지기를 만들고 정리하는 데 `https://www.googleapis.com/auth/script.scriptapp` 권한이 필요해서, 이미 쓰던 선생님도 처음 한 번 다시 승인해야 한다. `5.9.0` 이전 판에서 시트 메뉴로 직접 키를 넣어 둔 선생님은 그 값이 그대로 쓰인다.
+이 절차는 시트 스크립트 `5.11.0`부터 이 모양이다. 예전 공개판을 그대로 쓰는 시트는 Teacher Manager 출결 탭에서 먼저 상태를 확인하고, 선생님이 `출결 기능 업데이트`를 따로 승인했을 때만 같은 Apps Script를 갱신한다. 직접 고친 스크립트는 자동으로 덮지 않는다. 감지기를 만들고 정리하는 데 `https://www.googleapis.com/auth/script.scriptapp` 권한이 필요해서, 이미 쓰던 선생님도 처음 한 번 다시 승인해야 한다. `5.9.0` 이전 판에서 시트 메뉴로 직접 키를 넣어 둔 선생님은 그 값이 그대로 쓰인다.
 
 ## Google Chat 쪽지 발송
 
@@ -531,10 +529,10 @@ LLM 입력(공문 분석 등)으로 담임 Tasks를 만들었으면 같은 안�
 
 ```powershell
 # 1) 중복 확인: 오늘 날짜에 같은 내용이 이미 있으면 추가하지 않는다.
-gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID>","range":"메신저 단체톡 내용!A:G"}' --format json
+& $gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID>","range":"메신저 단체톡 내용!A:G"}' --format json
 
 # 2) 새 안내 문장 추가 (열: 보낼 날짜, 안내 종류, 안내 내용, 들어온 곳, 상태, 보낸 시각, 결과)
-gws sheets spreadsheets values append --params '{"spreadsheetId":"<출결 시트 ID>","range":"메신저 단체톡 내용!A1","valueInputOption":"RAW","insertDataOption":"INSERT_ROWS"}' --json '{"majorDimension":"ROWS","values":[["<오늘 YYYY-MM-DD>","기타","<안내 문장>","자동분석","확인필요","",""]]}'
+& $gws sheets spreadsheets values append --params '{"spreadsheetId":"<출결 시트 ID>","range":"메신저 단체톡 내용!A1","valueInputOption":"RAW","insertDataOption":"INSERT_ROWS"}' --json '{"majorDimension":"ROWS","values":[["<오늘 YYYY-MM-DD>","기타","<안내 문장>","자동분석","확인필요","",""]]}'
 ```
 
 메신저 개인톡 내용의 열은 `보낼 날짜, 번호, 이름, 쪽지 종류, 쪽지 내용, 들어온 곳, 상태, 연결 표시, 보낸 시각, 결과` 10개다. 같은 방식으로 append하되 번호와 이름을 채운다. 번호와 이름은 추측하지 말고 아래 절차로 학생명단과 대조해 확정한다.
@@ -542,7 +540,7 @@ gws sheets spreadsheets values append --params '{"spreadsheetId":"<출결 시트
 1. 등록 전에 `학생명단` 시트에서 번호(A)와 이름(B)만 읽는다. D열(학생 Google 이메일)은 대화 컨텍스트로 가져오지 않는다.
 
 ```powershell
-gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID>","range":"학생명단!A:B"}' --format json
+& $gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID>","range":"학생명단!A:B"}' --format json
 ```
 
 2. "길동이", "길동 학생" 같은 호칭은 명단과 대조해 정식 번호·이름(예: 10, 홍길동)으로 바꾼다. 등록을 마치면 "10번 홍길동으로 등록했습니다"처럼 해석 결과를 함께 보고한다.
@@ -554,13 +552,11 @@ gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID
 
 기본 배포판은 쪽지 대장 자동 준비를 안정 기본값으로 둔다. 선생님에게 별도 관리 화면으로 들어가라고 안내하지 않는다. 자동 발송은 중앙 발송 방식이 준비된 배포에서만 켠다. 공개 배포판은 릴리스 정보에 들어 있는 중앙 발송소 주소를 설치 때 자동으로 시트에 채운다. 이 값이 시트의 중앙 발송 URL이다. 개발 테스트에서는 `--central-chat-sender-url` 또는 `CENTRAL_CHAT_SENDER_URL` 환경값으로 다른 주소를 넣을 수 있다. 자동 발송 준비가 막히면 같은 실패를 반복하지 말고 쪽지 내용은 보낼 상태로 시트에 남겨둔다. 중앙 발송 준비가 끝난 뒤 같은 시트 메뉴를 다시 누르면 재시도되게 안내한다.
 
-단체방 발송을 쓰려면 선생님이 먼저 Google Chat에서 학급 스페이스를 만들어야 한다. 학생 개인 Google 계정을 쓸 경우 그 방은 반드시 외부 사용자 허용 스페이스여야 한다. 이미 일반 방으로 만든 방은 외부 허용으로 바꾸기 어려우므로, 학생용 방은 새로 만드는 편이 안전하다.
+Google Chat 발송을 쓰려면 학생도 교육디지털원패스와 경기도교육청 교육용 클라우드 지원시스템 가입, Google Workspace 신청을 마쳐 학생 `@goedu.kr` 계정을 준비해야 한다. 선생님은 Google Chat에서 학생 계정을 직접 초대하여 학급 단체톡방을 준비한다.
 
-교육청 설정에서 외부 스페이스가 막혀 있으면, 선생님이 개인 Gmail 학생과 1:1 Chat은 할 수 있어도 학급 스페이스에는 초대하지 못한다. 이 경우 방 목록에 스페이스가 보여도 개인 Gmail 학생용 단체방으로 쓰면 안 된다. 학생 개인 Gmail 대상 안내는 `메신저 쪽지 내용 Google Chat으로 개인톡 보내기`로 돌리고, 실패한 학생은 발송기록에 남긴다.
+학생 초대와 방 참여는 선생님이 수작업으로 진행한다. 스킬은 학생 가입·초대·삭제를 자동으로 하지 않는다.
 
-학생 초대와 방 참여는 선생님이 수작업으로 진행한다. 스킬은 학생을 학급 방에 자동 초대하지 않는다.
-
-개인 DM은 `학생명단`의 학생 Google 이메일을 기준으로 보낸다. 학생 Google 이메일이 있으면 개인 DM 대상이고, 없거나 외부 DM이 막혀 있으면 해당 학생은 건너뛰고 발송기록에 남긴다.
+개인 DM은 `학생명단`의 학생 Google 이메일을 기준으로 보내되 정확한 `@goedu.kr` 주소만 대상으로 삼는다. 주소가 없거나 다른 도메인이면 보내지 않고 발송기록에 이유를 남긴다.
 
 설치 뒤 선생님에게 이렇게 안내한다.
 
@@ -577,15 +573,15 @@ gws sheets spreadsheets values get --params '{"spreadsheetId":"<출결 시트 ID
 
 먼저 개인 설정 JSON(`profile.generated.json`)과 gws CLI 로그인, Gemini API key가 있어야 한다. 셋 다 `설정 대시보드`가 안내한다. key 발급은 연결의 Brity 메신저 탭에서 `Google API key 발급 URL`을 열어 진행한다.
 
-실행:
+정식 프로그램이 설치되면 도우미도 함께 들어오며, 설정 화면에서 자동실행을 켜거나 바로 시작한다. 터미널에서 직접 시작해야 할 때만 설치 폴더의 실행 파일을 쓴다.
 
 ```powershell
-cd "<이 스킬 폴더>\scripts"
-python -m brity_bridge run
+$installDir = (Get-ItemProperty -LiteralPath "HKCU:\Software\BigSilverEduLab\TeacherManager").InstallDir
+& (Join-Path $installDir "TeacherManagerHelper.exe") run
 ```
 
 - 누르면 바로 등록된다. 잘못 등록한 항목은 대시보드 홈의 처리한 메시지 목록에서 확인하고 Google Calendar/Tasks에서 지우면 된다.
-- 도우미가 시작되면 `도우미가 시작됐습니다` 알림이 뜬다. 알림이 없으면 실행되지 않은 것이다 — `python -m brity_bridge doctor`로 점검한다.
+- 도우미가 시작되면 `도우미가 시작됐습니다` 알림이 뜬다. 알림이 없으면 설정 화면의 `다시 점검`에서 실패 문구를 확인한다.
 - 브리티 글자가 선택된 것처럼 보여도 오른쪽 클릭과 복사가 작동하지 않는다. 따라서 복사를 시도하거나 사용자에게 복사를 부탁하지 않고, 쪽지나 대화를 열어 둔 뒤 `Ctrl+Alt+Win`을 누르면 화면의 글을 직접 읽어 분석한다.
 - 화면에 첨부파일이 보이면 모두 내려받은 뒤에만 분석한다. 하나라도 없으면 `첨부파일을 먼저 내려받아 주세요.`라고 알리고 Calendar·Tasks·학생 안내 시트 어느 곳에도 등록하지 않는다.
 - 기본 첨부파일 다운로드 폴더는 `C:\BrityWorks\BrityMessenger\download`이며 설정 화면에서 바꿀 수 있다.
@@ -599,7 +595,7 @@ python -m brity_bridge run
 - 메시지에 학생·학급 안내가 있으면 출결 자동화 시트의 `메신저 개인톡 내용`/`메신저 단체톡 내용` 시트에 상태 `확인필요`로 들어간다. 학생에게 바로 발송되지 않는다. 학생 안내를 개인톡·단체톡 시트에 확인필요로 옮긴 것은 아직 학생에게 보낸 것이 아니다. 선생님이 확인 후 발송 대기로 바꾼 줄만 나중에 보낸다. 출결 자동화 시트가 없으면 `옮기지 못함 · 처음 설정 필요`로 남긴다.
 - Google Tasks에는 날짜·시간을 지정하지 않는다. 원문·메모 안의 날짜와 시간 문장은 보존하되, Tasks 제목 끝의 (몇교시) 표시는 제거한다.
 - 사용 한도에 도달하면 그날은 분석이 멈춘다. 잠시 뒤 또는 다음 날 다시 시도한다.
-- 마지막 결과는 `python -m brity_bridge status`, 전체 점검은 `python -m brity_bridge doctor`로 본다.
+- 마지막 결과와 전체 점검은 설정 화면의 `다시 점검`에서 본다. Python 명령을 따로 실행하지 않는다.
 - Windows 시작 시 자동 실행은 대시보드 완료 단계가 기본으로 켠다.
 
 ## 워크플로우 (4단계 + 예외처리)
@@ -727,7 +723,7 @@ python -m brity_bridge run
 
 ```
 0. 개인 설정 확인 → 없으면 처음 시작 프로토콜 실행 후 멈춤
-1. `teacher-profile.csv` 또는 `weekly-timetable.xlsx`가 JSON보다 새로우면 parse_settings.py 실행
+1. `teacher-profile.csv` 또는 `weekly-timetable.xlsx`가 JSON보다 새로우면 `& $tools parse-settings` 실행
 2. profile.generated.json 읽기
 3. 텍스트 받으면 → 1~3단계 내부 처리 (출력 금지)
 4. actions 확정 → 즉시 gws CLI 명령 실행 (확인 요청 금지)
@@ -736,10 +732,12 @@ python -m brity_bridge run
 
 ## gws CLI 호출 예시
 
+아래 예시는 모두 `GWS 준비를 확인하고 로그인하기`에서 찾은 `$gws`를 사용한다. 새 PowerShell 창이면 고정된 명령 파일 경로 한 줄을 다시 준비한 뒤 실행한다. PATH의 다른 GWS를 대신 쓰지 않는다.
+
 **캘린더 이벤트 생성** (업무 캘린더, 시간 지정):
-```bash
-gws calendar events insert \
-  --params '{"calendarId":"<work_calendar_id>"}' \
+```powershell
+& $gws calendar events insert `
+  --params '{"calendarId":"<work_calendar_id>"}' `
   --json '{
     "summary": "[정산] 수련활동 지원금 정산 🟠 High (2-3교시)",
     "start": {"dateTime": "2025-12-03T10:05:00+09:00", "timeZone": "Asia/Seoul"},
@@ -749,9 +747,9 @@ gws calendar events insert \
 ```
 
 **학사일정 (all-day) 생성**:
-```bash
-gws calendar events insert \
-  --params '{"calendarId":"<school_calendar_id>"}' \
+```powershell
+& $gws calendar events insert `
+  --params '{"calendarId":"<school_calendar_id>"}' `
   --json '{
     "summary": "2학년 기말고사 (12/10~12/12)",
     "start": {"date": "2025-12-10"},
@@ -762,13 +760,13 @@ gws calendar events insert \
 > all-day end 처리: end_date(12/12) + 1일 = 12/13 (exclusive)
 
 **Tasks 생성**:
-```bash
+```powershell
 # Tasks 목록 ID 조회 (최초 1회)
-gws tasks tasklists list
+& $gws tasks tasklists list
 
 # Tasks 등록
-gws tasks tasks insert \
-  --params '{"tasklist":"<homeroom_tasks_id>"}' \
+& $gws tasks tasks insert `
+  --params '{"tasklist":"<homeroom_tasks_id>"}' `
   --json '{
     "title": "[학생안내] 내일 체육복 입고 오기 (마감: 12/03)",
     "notes": "내일 체육복 꼭 입고 오기\n\n- 대상: 담임 학급 학생\n- 전달 시점: 조회/종례"

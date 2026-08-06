@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,17 +22,25 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from attendance_install_record import (  # noqa: E402
     AttendanceInstallRecordError,
+    CONNECTION_FIELDS,
+    SCRIPT_ATTESTATION_FIELD,
+    SCRIPT_UPDATE_REQUIRED_FIELD,
+    build_script_attestation,
     ensure_create_only_install_backup,
     read_attendance_install_snapshot,
+    replace_attendance_install_record,
     validate_attendance_install_record,
     write_attendance_install_record,
 )
-from apps_script_version import (  # noqa: E402
-    app_version_in_source,
-    is_at_least,
-    minimum_apps_script_version,
+from attendance_script_update import inspect_attendance_script_update  # noqa: E402
+from apps_script_version import app_version_in_source  # noqa: E402
+from brity_bridge import (  # noqa: E402
+    bundle_paths,
+    gws_env,
+    paths,
+    process_win,
+    tool_runtime,
 )
-from brity_bridge import bundle_paths, gws_env, paths, process_win  # noqa: E402
 
 
 SETTINGS_RANGE = "설정!A1:D200"
@@ -41,6 +48,7 @@ SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 DOCUMENT_MIME = "application/vnd.google-apps.document"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SPREADSHEET_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+REMOTE_COMMAND_TIMEOUT_SECONDS = 120.0
 
 # 설치 기록의 연결값이 시트 설정의 어느 항목에서 오는지.
 SETTING_TO_FIELD = {
@@ -90,18 +98,13 @@ def _text(value: Any, label: str) -> str:
     return clean
 
 
-def _resolve_command(args: Sequence[str], which=shutil.which) -> list[str]:
-    """Windows에서 "gws" 이름은 npm이 깐 gws.cmd를 못 찾는다."""
-    args = list(args)
-    if args and args[0] == "gws":
-        args[0] = which("gws") or which("gws.cmd") or "gws"
-    return args
-
-
 def _default_run_command(args: Sequence[str]) -> tuple[int, str]:
     # 앱과 같은 곳에 gws 열쇠를 두게 고정한다 — 이 명령에만 넘긴다.
     return process_win.run_captured(
-        _resolve_command(args), cwd=SCRIPTS_DIR, env=gws_env.gws_environ()
+        list(args),
+        cwd=SCRIPTS_DIR,
+        timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        env=gws_env.gws_environ(),
     )
 
 
@@ -173,41 +176,59 @@ def _check_drive_file(
     _need(reply.get("trashed") is False, f"{label}이 휴지통에 있습니다.")
 
 
-def _check_script_version(run_command, gws: str, script_id: str) -> str:
-    """시트에 붙은 Apps Script가 동봉 배포 정보의 하한선 이상인지 본다."""
+def _script_update_required(
+    run_command,
+    gws: str,
+    spreadsheet_id: str,
+    script_id: str,
+    deployment_id: str,
+) -> tuple[bool, str]:
+    """Sheet 부모·현재 편집본·실제 배포판을 모두 읽어 연결 가능 여부를 정한다."""
 
-    reply = _run_json(
-        run_command,
-        [
-            gws, "script", "projects", "getContent",
-            "--params", _params({"scriptId": script_id}),
-            "--format", "json",
-        ],
-        "Apps Script 판 번호 확인",
+    def runner(args, _cwd):
+        return run_command(args)
+
+    inspection = inspect_attendance_script_update(
+        spreadsheet_id,
+        script_id,
+        deployment_id,
+        assets_dir=bundle_paths.bundle_root() / "assets",
+        runner=runner,
+        gws_executable=gws,
     )
-    files = reply.get("files")
-    _need(isinstance(files, list) and files, "Apps Script 원본을 읽지 못했습니다.")
-    found = None
-    for item in files:
-        if not isinstance(item, dict):
-            continue
-        found = app_version_in_source(item.get("source"))
-        if found:
-            break
-    _need(
-        bool(found),
-        "Apps Script 원본에서 판 번호(APP_VERSION)를 찾지 못했습니다.",
-    )
+    if inspection.verified and inspection.state == "current":
+        return False, inspection.target_bundle_sha256
+    if inspection.verified and inspection.state == "update_available":
+        return True, ""
+    found_version = ""
     try:
-        minimum = minimum_apps_script_version(bundle_paths.bundle_root())
-    except ValueError as exc:
-        _hold("동봉된 배포 정보에서 최소 판 번호를 읽지 못했습니다.", cause=exc)
-    _need(
-        is_at_least(found, minimum),
-        f"이 시트의 Apps Script는 {found} 판이라 최소 {minimum} 판에 못 미칩니다. "
-        "설치 도우미로 스크립트를 올린 뒤 다시 연결해 주세요.",
+        reply = _run_json(
+            run_command,
+            [
+                gws, "script", "projects", "getContent",
+                "--params", _params({"scriptId": script_id}),
+                "--format", "json",
+            ],
+            "Apps Script 판 번호 확인",
+        )
+        for item in reply.get("files") or []:
+            if isinstance(item, dict):
+                found_version = app_version_in_source(item.get("source")) or ""
+                if found_version:
+                    break
+    except AttendanceConnectHold:
+        found_version = ""
+    version_note = (
+        f" 화면에서 읽힌 판은 {found_version}입니다."
+        if found_version
+        else ""
     )
-    return found
+    _hold(
+        "Apps Script가 공식 배포 코드인지, 이 출결 시트에 묶여 있는지, "
+        "현재 편집본과 실제 배포판이 같은지를 모두 확인하지 못했습니다. "
+        "사용자 수정 코드는 자동으로 덮어쓰지 않습니다."
+        + version_note
+    )
 
 
 def connect_existing_attendance_sheet(
@@ -216,19 +237,25 @@ def connect_existing_attendance_sheet(
     *,
     account: str,
     run_command: Callable[[Sequence[str]], tuple[int, str]] | None = None,
-    gws_executable: str = "gws",
+    gws_executable: str | None = None,
 ) -> ConnectResult:
     """쓰던 시트의 설정을 읽어 설치 기록만 다시 만든다. 시트에는 쓰지 않는다."""
 
     config_dir = Path(config_dir)
     run_command = run_command or _default_run_command
-    gws = _text(gws_executable, "gws 명령 이름")
     account = _text(account, "현재 Google 계정")
     sheet_id = _text(spreadsheet_id, "출결 시트 ID")
     _need(
         SPREADSHEET_ID_PATTERN.fullmatch(sheet_id) is not None,
         "출결 시트 ID 모양이 Google Sheet ID가 아닙니다.",
     )
+    gws = _text(
+        tool_runtime.resolve_gws_executable()
+        if gws_executable is None
+        else gws_executable,
+        "Google Workspace 실행 파일",
+    )
+    _need(Path(gws).is_absolute(), "Google Workspace 실행 파일이 전체 경로가 아닙니다.")
 
     # 1) 시트가 실제로 내 것인 스프레드시트인지 확인한다.
     file_reply = _run_json(
@@ -268,21 +295,13 @@ def connect_existing_attendance_sheet(
     _check_drive_file(
         run_command, gws, settings["DEST_FOLDER_ID"], FOLDER_MIME, "출력 폴더"
     )
-    script_reply = _run_json(
+    script_update_required, script_bundle_sha256 = _script_update_required(
         run_command,
-        [
-            gws, "script", "projects", "get",
-            "--params", _params({"scriptId": settings["SCRIPT_ID"]}),
-            "--format", "json",
-        ],
-        "Apps Script 확인",
+        gws,
+        sheet_id,
+        settings["SCRIPT_ID"],
+        settings["DEPLOYMENT_ID"],
     )
-    _need(script_reply.get("scriptId") == settings["SCRIPT_ID"], "Apps Script ID가 요청과 다릅니다.")
-    _need(
-        script_reply.get("parentId") == sheet_id,
-        "Apps Script가 이 출결 시트에 묶여 있지 않습니다.",
-    )
-    _check_script_version(run_command, gws, settings["SCRIPT_ID"])
     tasks_reply = _run_json(
         run_command,
         [
@@ -310,6 +329,12 @@ def connect_existing_attendance_sheet(
     homeroom = settings.get("HOMEROOM_TASK_LIST_ID", "")
     if homeroom:
         record["homeroom_task_list_id"] = homeroom
+    if script_update_required:
+        record[SCRIPT_UPDATE_REQUIRED_FIELD] = True
+    if script_bundle_sha256:
+        record[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
+            record, script_bundle_sha256
+        )
     try:
         validate_attendance_install_record(record)
     except AttendanceInstallRecordError as exc:
@@ -321,15 +346,46 @@ def connect_existing_attendance_sheet(
     #    두 번째 연결이 첫 백업을 덮으면 가장 처음 쓰던 시트로는 돌아갈 수 없으므로,
     #    백업은 파일이 없을 때 딱 한 번만 만든다.
     backup_path = paths.attendance_connect_backup_path(config_dir)
-    if record_path.exists() and not backup_path.exists():
+    previous = None
+    if record_path.exists():
         try:
             previous = read_attendance_install_snapshot(record_path)
-            ensure_create_only_install_backup(backup_path, previous)
+            if not backup_path.exists():
+                ensure_create_only_install_backup(backup_path, previous)
         except AttendanceInstallRecordError as exc:
             _hold("지금 쓰던 설치 기록을 백업하지 못했습니다.", cause=exc)
 
     try:
-        written = write_attendance_install_record(record_path, record)
+        if previous is None:
+            written = write_attendance_install_record(record_path, record)
+        else:
+            merged = dict(previous.record)
+            for key in CONNECTION_FIELDS:
+                merged[key] = record[key]
+            for key, value in record.items():
+                if (
+                    key not in CONNECTION_FIELDS
+                    and key not in {
+                        SCRIPT_UPDATE_REQUIRED_FIELD,
+                        SCRIPT_ATTESTATION_FIELD,
+                    }
+                    and key not in merged
+                ):
+                    merged[key] = value
+            # 연결 대상이 바뀌었으므로 이전 시트에 대한 증명과 표식은 먼저 버리고,
+            # 이번 원격 확인 결과만 다시 남긴다.
+            merged.pop(SCRIPT_UPDATE_REQUIRED_FIELD, None)
+            merged.pop(SCRIPT_ATTESTATION_FIELD, None)
+            if script_update_required:
+                merged[SCRIPT_UPDATE_REQUIRED_FIELD] = True
+            if script_bundle_sha256:
+                merged[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
+                    merged, script_bundle_sha256
+                )
+            validate_attendance_install_record(merged)
+            written = replace_attendance_install_record(
+                record_path, merged, previous
+            ).record
     except AttendanceInstallRecordError as exc:
         _hold("설치 기록을 안전하게 쓰지 못했습니다.", cause=exc)
     _need(
@@ -338,10 +394,16 @@ def connect_existing_attendance_sheet(
     )
 
     return ConnectResult(
-        state="connected",
+        state=(
+            "script-update-required" if script_update_required else "ready"
+        ),
         detail=(
-            "쓰시던 출결 시트의 설정을 읽어 프로그램 연결만 다시 맞췄습니다. "
-            "시트에는 아무것도 쓰지 않았습니다."
+            (
+                "쓰시던 공식 출결 시트를 연결했습니다. 출결 기능을 최신판으로 "
+                "올린 뒤 사용할 수 있습니다. "
+            )
+            if script_update_required
+            else "쓰시던 출결 시트의 설정을 읽어 프로그램 연결만 다시 맞췄습니다. "
         ),
         spreadsheet_id=sheet_id,
         account=account,

@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import stat
+import tempfile
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
+
+from brity_bridge import bundle_paths
 
 
 DAYS = ["월", "화", "수", "목", "금"]
@@ -54,7 +59,14 @@ TIME_KEYS = ["출근시간", "퇴근시간", "조회시작", "1교시시작", "�
 
 def parse_config_dir(config_dir: str | Path, *, require_links: bool = True) -> Path:
     config_dir = Path(config_dir)
-    profile = _read_profile_csv(config_dir / "teacher-profile.csv")
+    _reject_reparse_components(config_dir, "개인 설정 폴더")
+    profile_path = config_dir / "teacher-profile.csv"
+    xlsx_path = config_dir / "weekly-timetable.xlsx"
+    csv_path = config_dir / "weekly-timetable.csv"
+    for source in (profile_path, xlsx_path, csv_path):
+        if source.exists() or source.is_symlink():
+            _reject_reparse_components(source, source.name)
+    profile = _read_profile_csv(profile_path)
     # 옛 견본(5교시시작)으로 만든 설정 파일도 계속 읽는다. 새 이름이 우선이다.
     if not profile.get("점심종료시간") and profile.get("5교시시작"):
         profile["점심종료시간"] = profile["5교시시작"]
@@ -108,35 +120,149 @@ def parse_config_dir(config_dir: str | Path, *, require_links: bool = True) -> P
     }
 
     output_path = config_dir / "profile.generated.json"
-    output_path.write_text(json.dumps(generated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_verified_json(output_path, generated)
     return output_path
 
 
 def init_config_dir(config_dir: str | Path) -> list[Path]:
     config_dir = Path(config_dir)
+    _reject_reparse_components(config_dir, "개인 설정 폴더")
     config_dir.mkdir(parents=True, exist_ok=True)
-    template_dir = Path(__file__).resolve().parent.parent / "templates"
+    _reject_reparse_components(config_dir, "개인 설정 폴더")
+    template_dir = bundle_paths.bundle_root() / "templates"
     copied = []
     for template_path in template_dir.iterdir():
         if template_path.name == "weekly-timetable.csv":
             continue
         target_path = config_dir / template_path.name
+        if target_path.exists() or target_path.is_symlink():
+            _reject_reparse_components(target_path, target_path.name)
         if target_path.exists():
             continue
         if template_path.name == "README-setup.txt":
-            _write_readme(template_path, target_path, config_dir)
+            text = _readme_text(template_path, target_path, config_dir)
+            made = _atomic_create_bytes(target_path, text.encode("utf-8"))
         else:
             encoding = "utf-8-sig" if target_path.suffix.lower() == ".csv" else "utf-8"
-            target_path.write_text(template_path.read_text(encoding="utf-8-sig"), encoding=encoding)
-        copied.append(target_path)
+            text = template_path.read_text(encoding="utf-8-sig")
+            made = _atomic_create_bytes(target_path, text.encode(encoding))
+        if made:
+            copied.append(target_path)
     timetable_path = config_dir / "weekly-timetable.xlsx"
+    if timetable_path.exists() or timetable_path.is_symlink():
+        _reject_reparse_components(timetable_path, timetable_path.name)
     if not timetable_path.exists():
-        write_timetable_xlsx(timetable_path)
-        copied.append(timetable_path)
+        if _atomic_create_timetable(timetable_path):
+            copied.append(timetable_path)
     return copied
 
 
-def _write_readme(template_path: Path, target_path: Path, config_dir: Path) -> None:
+def _reject_reparse_components(path: Path, label: str) -> None:
+    """설정 입출력이 symlink·junction을 따라 다른 폴더로 새지 않게 막는다."""
+    absolute = Path(os.path.abspath(str(path)))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    for candidate in (absolute, *absolute.parents):
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        if stat.S_ISLNK(info.st_mode) or bool(attributes & flag):
+            raise ValueError(f"{label}에 바로가기나 연결 폴더를 사용할 수 없습니다.")
+
+
+def _atomic_verified_json(path: Path, value: dict) -> None:
+    """완성 파일을 다시 읽어 확인한 뒤 한 번에 바꾸고, 실패하면 옛 파일을 둔다."""
+    path = Path(path)
+    _reject_reparse_components(path.parent, "개인 설정 폴더")
+    if path.exists() or path.is_symlink():
+        _reject_reparse_components(path, path.name)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+            file.write(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        reread = json.loads(temporary.read_text(encoding="utf-8"))
+        if reread != value:
+            raise ValueError("새 개인 설정 파일을 다시 읽은 값이 다릅니다.")
+        if path.exists() or path.is_symlink():
+            _reject_reparse_components(path, path.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _publish_create_only(temporary: Path, target: Path) -> bool:
+    """완성 임시 파일을 대상이 아직 없을 때만 한 번에 공개한다."""
+    try:
+        os.link(temporary, target)
+        return True
+    except FileExistsError:
+        _reject_reparse_components(target, target.name)
+        return False
+
+
+def _atomic_create_bytes(target: Path, data: bytes) -> bool:
+    target = Path(target)
+    _reject_reparse_components(target.parent, "개인 설정 폴더")
+    if target.exists() or target.is_symlink():
+        _reject_reparse_components(target, target.name)
+        return False
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.name}-", suffix=".tmp", dir=str(target.parent)
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        if temporary.read_bytes() != data:
+            raise ValueError(f"새 {target.name} 파일을 다시 읽은 값이 다릅니다.")
+        return _publish_create_only(temporary, target)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_create_timetable(target: Path) -> bool:
+    target = Path(target)
+    _reject_reparse_components(target.parent, "개인 설정 폴더")
+    if target.exists() or target.is_symlink():
+        _reject_reparse_components(target, target.name)
+        return False
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.name}-", suffix=".tmp", dir=str(target.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        write_timetable_xlsx(temporary)
+        with zipfile.ZipFile(temporary) as workbook:
+            if workbook.testzip() is not None:
+                raise ValueError("새 시간표 견본의 압축 내용을 끝까지 읽지 못했습니다.")
+        _read_timetable_xlsx(temporary)
+        return _publish_create_only(temporary, target)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _readme_text(template_path: Path, target_path: Path, config_dir: Path) -> str:
     values = {
         "CONFIG_DIR": str(config_dir),
         "README_PATH": str(target_path),
@@ -147,7 +273,7 @@ def _write_readme(template_path: Path, target_path: Path, config_dir: Path) -> N
     text = template_path.read_text(encoding="utf-8")
     for key, value in values.items():
         text = text.replace("{" + key + "}", value)
-    target_path.write_text(text, encoding="utf-8")
+    return text
 
 
 def write_timetable_xlsx(path: str | Path, rows: list[list[str]] | None = None) -> None:

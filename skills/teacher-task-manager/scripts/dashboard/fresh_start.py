@@ -16,7 +16,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from brity_bridge import paths, process_win
+from brity_bridge import paths, process_win, tool_runtime
 
 _KEEP_NAMES = {"dev-fresh-start.flag", "last-run-version.txt"}
 _PROFILE_NAME = "profile.generated.json"
@@ -31,14 +31,19 @@ def _record_version(config_dir: Path, app_version: str) -> None:
     paths.last_run_version_path(config_dir).write_text(app_version + "\n", encoding="utf-8")
 
 
-def _default_logout(run=process_win.run_captured) -> None:
+def _default_logout(
+    run=process_win.run_captured,
+    *,
+    gws_executable: str | None = None,
+) -> None:
     """구글 로그인은 설정 폴더가 아니라 gws에 있다 — 진짜 처음 흐름을 보려면 함께 지운다.
 
-    Windows에서 "gws" 이름은 npm의 gws.cmd를 못 찾아 127로 실패하므로 gws.cmd로 재시도한다.
+    PATH에 설치된 다른 GWS는 보지 않고 제품이 검증한 실행 파일만 쓴다.
     """
-    code, _output = run(["gws", "auth", "logout"], timeout=30)
-    if code == 127:
-        run(["gws.cmd", "auth", "logout"], timeout=30)
+    executable = str(gws_executable or tool_runtime.resolve_gws_executable())
+    if not Path(executable).is_absolute():
+        raise ValueError("Google Workspace CLI 실행 파일은 전체 경로여야 합니다.")
+    run([executable, "auth", "logout"], timeout=30)
 
 
 def _default_stop_helper() -> None:

@@ -9,6 +9,8 @@ const S = {
   info: null,                // get_app_info data
   checks: [],
   google: null,
+  gwsUpdate: null,            // 승인 확인 결과와 현재 실제 Google 도구 판
+  gwsUpdateInstalling: false, // 화면을 다시 그려도 갱신을 두 번 시작하지 않는다
   computer: null,
   computerLoading: false,
   attachmentFolderStatus: null,
@@ -28,7 +30,9 @@ const S = {
   updating: false,            // 지금 업데이트 진행 중 (중복 클릭·재실행 방지)
   updateOffer: null,          // update_offer 결과 — 켤 때 한 번 묻는 자리에서 씀
   aiTools: null,              // AI 에이전트 탭 — 도구 감지 결과 (null=미조회, "loading"=조회 중)
+  aiNode: null,               // 사용자가 연결을 누른 뒤에만 읽는 전용 Node 준비 상태
   aiInstall: null,            // AI 에이전트 탭 — 연결 실행 결과
+  aiConnecting: false,        // 화면을 다시 그려도 두 번째 다운로드를 시작하지 않는다
   maxStep: 1,                 // 마법사에서 한 번이라도 도달한 가장 먼 단계
   login: null,
   progress: null,            // capture_progress 스냅샷 (active일 때만)
@@ -41,6 +45,8 @@ const S = {
   connectTab: "messenger",   // messenger | attendance
   attendance: null,          // attendance_status/ensure_attendance 응답
   attendanceSaving: false,   // 탭을 오가며 다시 그려도 출결 준비 중복 클릭을 막는다
+  attendanceScriptUpdate: null, // 사용자가 눌러 확인한 기존 출결 Apps Script 상태
+  attendanceScriptUpdating: false,
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
@@ -48,8 +54,13 @@ const S = {
 };
 
 const WIZARD_STEPS = [
-  "시작하기", "내 정보", "하루 일과", "시간표", "설정", "연결", "마무리",
+  "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
+  "이 컴퓨터 설정", "Google 연결", "학생 계정 준비", "저장 및 마무리",
 ];
+const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
+function isGoeduGoogleStatus(status) {
+  return Boolean(status && status.logged_in && status.account_allowed === true);
+}
 
 /* ---------- bridge ---------- */
 function call(name, ...args) {
@@ -64,6 +75,20 @@ function esc(text) {
   return String(text == null ? "" : text)
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+}
+const GWS_OFFER_NOTE_LIMIT = 300;
+function safeGwsOfferText(value) {
+  // 승인 파일은 Python에서도 검사하지만, 화면은 원격 글을 그대로 코드로 만들지
+  // 않는다. 숨은 제어 문자와 글 방향 뒤집기를 걷고 300자로 제한한다.
+  const cleaned = String(value == null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return Array.from(cleaned).slice(0, GWS_OFFER_NOTE_LIMIT).join("");
+}
+function safeGwsOfferDate(value) {
+  const cleaned = safeGwsOfferText(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(cleaned) ? cleaned : "";
 }
 function icon(name, cls) {
   return `<svg class="ic ${cls || ""}"><use href="#ic-${name}"/></svg>`;
@@ -245,7 +270,8 @@ function railHtml() {
     const mark = n < S.step ? "✓" : String(n);
     // 한 번이라도 지나간 단계는 앞뒤 어디로든 바로 이동할 수 있다.
     const attr = n !== S.step && n <= reached ? ` data-action="go-step" data-step="${n}"` : "";
-    return `<button class="step ${cls}"${attr}><span class="n">${mark}</span>${esc(title)}</button>`;
+    const current = n === S.step ? ' aria-current="step"' : "";
+    return `<button class="step ${cls}"${attr}${current}><span class="n">${mark}</span><span class="step-label">${esc(title)}</span></button>`;
   }).join("");
   const info = S.info || { version: "", branding: { name: "" } };
   return `<div class="rail">${rows}` +
@@ -255,6 +281,19 @@ function railHtml() {
 /* ---------- 로그인 상시 감시 — 끊어지면 끊어졌다고 말한다 ---------- */
 const LOGIN_WATCH_INTERVAL_MS = 3 * 60 * 1000;  // 검증 전 앱은 토큰이 수시로 회수된다
 let loginWatchTimer = null;
+function googleStatusKey(status) {
+  if (!status) return "";
+  return [status.login_state || "", status.logged_in ? "1" : "0", status.user || "", status.account_allowed === true ? "1" : "0"].join("|");
+}
+function clearGoogleDependentState() {
+  S.attendance = null;
+  S.attendanceScriptUpdate = null;
+  S.chatStatus = null;
+  S.checks = [];
+  S.lists = { calendars: [], tasklists: [] };
+  S.listsLoaded = false;
+  S.listsError = false;
+}
 function startLoginWatch() {
   if (loginWatchTimer) return;
   const tick = async () => {
@@ -262,18 +301,20 @@ function startLoginWatch() {
     if (S.login) return;  // 로그인 진행 중에는 전용 폴링이 따로 본다
     try {
       const status = await call("google_status");
-      const before = S.google ? Boolean(S.google.logged_in) : null;
+      const before = S.google;
+      const beforeKey = googleStatusKey(before);
       S.google = status;
-      if (before === true && !status.logged_in) {
+      const changed = beforeKey && beforeKey !== googleStatusKey(status);
+      if (before && before.logged_in && !status.logged_in) {
         // 끊김 감지 — 화면 곳곳이 실상을 다시 읽게 비우고 알린다
-        S.attendance = null;
-        S.chatStatus = null;
-        S.checks = [];
+        clearGoogleDependentState();
         setBanner("warn", "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.");
-      } else if (before === false && status.logged_in) {
-        S.attendance = null;
-        S.chatStatus = null;
-        S.checks = [];
+      } else if (changed) {
+        clearGoogleDependentState();
+        if (status.logged_in && !isGoeduGoogleStatus(status)) {
+          setBanner("warn", GOEDU_REQUIRED_MESSAGE);
+          return;
+        }
         render();
       }
     } catch (error) { /* 다음 틱에 다시 */ }
@@ -282,13 +323,17 @@ function startLoginWatch() {
 }
 
 function stepStub(n) {
-  return `<h1>${esc(WIZARD_STEPS[n - 1])}</h1><p class="sub">이 단계 화면은 다음 태스크에서 채워요.</p>`;
+  return `<h1>${esc(WIZARD_STEPS[n - 1])}</h1><p class="sub">이 화면을 불러오지 못했어요. 프로그램을 다시 열어 주세요.</p>`;
 }
 
 function wizardFootHtml() {
   const back = S.step > 1 ? `<button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>` : "<span></span>";
-  const nextLabel = S.step === WIZARD_STEPS.length ? "" : "다음";
-  const next = nextLabel ? `<button class="btn" data-action="go-next" data-busy-text="확인 중…">${nextLabel}</button>` : "";
+  const nextLabel = S.step === WIZARD_STEPS.length ? ""
+    : S.step === 1 ? "준비됐어요, 시작하기"
+      : S.step === 8 ? "Chat은 나중에 설정"
+        : "다음";
+  const disabled = S.step === 2 && !isGoeduGoogleStatus(S.google) ? " disabled" : "";
+  const next = nextLabel ? `<button class="btn" data-action="go-next" data-busy-text="확인 중…"${disabled}>${nextLabel}</button>` : "";
   return `<div class="foot">${back}${next}</div>`;
 }
 
@@ -301,7 +346,7 @@ function renderWizard() {
 }
 
 function currentState() {
-  return { version: 1, completed: false, step: S.step, max_step: S.maxStep, draft: S.draft };
+  return { version: 2, completed: false, step: S.step, max_step: S.maxStep, draft: S.draft };
 }
 function saveDraft() { return call("save_setup_state", currentState()); }
 
@@ -317,7 +362,7 @@ async function goNextAsync() {
   const validate = validators[S.step];
   const problem = validate ? await validate() : "";
   if (problem) { setBanner("warn", problem); return; }
-  if (S.step === 6 && S.connectTab === "messenger") {
+  if (S.step === 7 && S.connectTab === "messenger") {
     // 연결은 메신저 → 출결 → AI 에이전트 세 탭을 차례로 지난 뒤에 마무리로 간다.
     S.connectTab = "attendance";
     S.chatStatus = null;
@@ -326,7 +371,7 @@ async function goNextAsync() {
     render();
     return;
   }
-  if (S.step === 6 && S.connectTab === "attendance") {
+  if (S.step === 7 && S.connectTab === "attendance") {
     S.connectTab = "ai";
     S.aiTools = null;
     S.aiInstall = null;
@@ -340,14 +385,14 @@ async function goNextAsync() {
 
 bindActions({
   "go-prev": () => {
-    if (S.step === 6 && S.connectTab === "ai") {
+    if (S.step === 7 && S.connectTab === "ai") {
       S.connectTab = "attendance";
       S.chatStatus = null;
       S.attendance = null;
       render();
       return;
     }
-    if (S.step === 6 && S.connectTab === "attendance") {
+    if (S.step === 7 && S.connectTab === "attendance") {
       S.connectTab = "messenger";
       stopChatConnectPoll();
       render();
@@ -370,53 +415,20 @@ bindActions({
 
 /* ---------- 1단계: 시작하기 ---------- */
 stepBodies[1] = function stepStart() {
-  const b = S.info.branding;
-  const dest = (logo, name, role) =>
-    `<span class="dest"><img class="dest-logo" src="assets/${logo}" alt="${esc(name)} 로고">
-      <span><b>${esc(name)}</b><small>${esc(role)}</small></span></span>`;
+  const prepRow = (number, title, detail, url, label) => `
+    <div class="prep-row">
+      <span class="prep-num">${number}</span>
+      <span class="prep-copy"><b>${esc(title)}</b><span>${esc(detail)}</span></span>
+      <button class="text-link" data-action="link-open" data-url="${esc(url)}">${esc(label)}</button>
+    </div>`;
   return `
-    <p class="start-eyebrow">${esc(b.publisher)}</p>
-    <p class="wordmark">${esc(b.name)}</p>
-    <p class="start-tagline">${esc(b.tagline)}</p>
-    <p class="start-value">학교 업무 <b>두 가지</b>를 자동으로 해 드려요</p>
-    <div class="start-flows">
-      <div class="sflow">
-        <div class="srcbox">
-          <div class="from">① 교육청 업무 메신저 (Brity)</div>
-          <div class="bubble">3/20(금) 2학년 수학여행 사전답사 계획 제출 바랍니다…</div>
-          <div class="bubble">5월 2일 종례 마치고 각 학급의 회장, 부회장은 대의원회의에 참석하도록 안내해주세요</div>
-        </div>
-        <div class="sarrow"><span class="key">단축키 한 번</span><span class="line"></span></div>
-        <div class="dests">
-          ${dest("google-calendar.svg", "Calendar", "일정 등록")}
-          ${dest("google-tasks.svg", "Tasks", "할 일 등록")}
-          ${dest("google-chat.svg", "Chat", "학생·학급 안내 문자")}
-          ${dest("google-sheets.svg", "Sheet", "보낸 안내 자동 기록")}
-        </div>
-      </div>
-      <div class="sflow">
-        <div class="srcbox">
-          <div class="from">② 출결 DB Google Sheet</div>
-          <div class="sheet-entry">
-            <span class="chips"><span class="cell">10월 5일</span><span class="cell">김OO</span><span class="cell">질병조퇴</span><span class="cell">3교시</span><span class="cell">사유-감기</span></span>
-            <span class="plain">결석신고서-미제출 첨부서류-미제출</span>
-          </div>
-          <div class="sheet-entry">
-            <span class="chips"><span class="cell">12월 17일</span><span class="cell">박OO</span><span class="cell">인정결석</span><span class="cell">사유-조부상</span></span>
-            <span class="plain">결석신고서-제출 첨부서류-미제출</span>
-          </div>
-        </div>
-        <div class="sarrow"><span class="key">자동으로</span><span class="line"></span></div>
-        <div class="dests">
-          ${dest("google-docs.svg", "Docs", "결석 신고서 자동완성")}
-          ${dest("google-chat.svg", "Chat", "서류 지참 요청 문자")}
-          ${dest("google-tasks.svg", "Tasks", "조종례 미제출 확인")}
-        </div>
-      </div>
-    </div>
-    <div class="start-bottom">
-      <span class="account-note"><span class="mark">!</span><span>교육디지털원패스 및 경기도교육청 클라우드서비스에 가입한 계정(@goedu.kr)이 있어야 해요</span></span>
-      <p class="start-credit">${esc(b.credit)}</p>
+    <p class="start-eyebrow">처음 설치하는 선생님</p>
+    <h1>설치 전에 세 가지만 준비해 주세요</h1>
+    <p class="sub start-lede">Teacher Manager는 경기도교육청 교직원용입니다. 아래 가입을 먼저 마치면 앱 설치 뒤 바로 Google Workspace와 Brity 메신저를 연결할 수 있어요.</p>
+    <div class="prep-list">
+      ${prepRow(1, "교육디지털원패스 교직원 회원가입", "https://edupass.neisplus.kr/에서 교직원 계정을 준비합니다.", "https://edupass.neisplus.kr/", "교육디지털원패스 열기")}
+      ${prepRow(2, "경기도교육청 교육용 클라우드 지원시스템 가입", "https://www.goedu.kr/에서 디지털원패스 계정을 통해 교직원 가입을 마칩니다. (@goedu.kr)", "https://www.goedu.kr/", "공식 사이트 열기")}
+      ${prepRow(3, "경기도교육청 클라우드 지원시스템 내 서비스인 Google Workspace에 가입", "계정 가입에 그치지 않고 추가로 교육용 클라우드 서비스인 Google Workspace를 신청합니다.", "https://www.goedu.kr/bbs/3/view/63", "도움말 보기")}
     </div>`;
 };
 
@@ -430,9 +442,10 @@ async function pollLoginOnce() {
   if (snap.ok === true) {
     S.login = null;
     delete S.fieldIssues["google-login"];
-    S.attendance = null;  // 로그인 전의 "로그인을 마쳐 주세요" 상태를 버린다
+    clearGoogleDependentState();  // 로그인 전 계정의 자료와 안내를 버린다
     await refreshSettingsStatus();
-    showToast("로그인됐어요");
+    if (isGoeduGoogleStatus(S.google)) showToast("@goedu.kr 계정으로 로그인했어요");
+    else setBanner("warn", GOEDU_REQUIRED_MESSAGE);
     return false;
   }
   if (snap.ok === false) {
@@ -440,9 +453,8 @@ async function pollLoginOnce() {
     setBanner("error", "로그인이 끝나지 않았어요. " + (snap.detail || "다시 시도해 주세요."));
     return false;
   }
-  const urlArrived = S.login && S.login.url !== snap.url;
   S.login = snap;
-  if (urlArrived) render();
+  if (snap.browser_opened) render();
   return true;
 }
 function pollLogin() {
@@ -458,11 +470,39 @@ function pollLogin() {
   }, 1000);
 }
 bindActions({
-  "install-gws": async () => {
-    if (!window.confirm("gws 도구를 npm 전역으로 설치할까요?")) return;
-    const r = await call("install_gws");
-    if (!r.success) throw new Error("설치에 실패했어요: " + r.detail);
+  "install-gws-update": async () => {
+    if (S.gwsUpdateInstalling) return;
+    const offer = S.gwsUpdate && S.gwsUpdate.offer;
+    if (!offer) throw new Error("승인된 Google 도구 새 판을 다시 점검해 주세요.");
+    const offerNote = safeGwsOfferText(offer.notes);
+    const offerDate = safeGwsOfferDate(offer.verified_on);
+    const offerDetails = [
+      offerDate ? `승인 확인: ${offerDate}` : "",
+      offerNote ? `변경 설명: ${offerNote}` : "",
+    ].filter(Boolean).join("\n");
+    if (!window.confirm(
+      `승인된 Google 도구 ${offer.version}로 갱신할까요?\n` +
+      (offerDetails ? `\n${offerDetails}\n` : "\n") +
+      "공식 파일을 받아 두 확인값이 모두 맞을 때만 적용해요."
+    )) return;
+    S.gwsUpdateInstalling = true;
+    render();
+    let result;
+    try {
+      // 화면이 처음 받은 offer를 그대로 돌려준다. Python 쪽은 메모리에 둔 승인
+      // 원문과 한 글자라도 다르면 설치 전에 거부한다.
+      result = await call("install_gws_update", offer);
+    } finally {
+      S.gwsUpdateInstalling = false;
+    }
     await refreshSettingsStatus();
+    if (!result.success) {
+      const fallback = result.can_continue
+        ? "현재 기본판으로 계속 쓸 수 있어요."
+        : "설치 파일이 손상됐어요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+      throw new Error(result.detail || fallback);
+    }
+    showToast(`새 Google 도구 ${result.current_version || offer.version}을 적용했어요`);
   },
   "gws-login": async () => {
     S.banner = null;
@@ -507,7 +547,7 @@ function readRadio(name) {
   const el = document.querySelector(`[name="${name}"]:checked`);
   return el ? el.value : "";
 }
-stepBodies[2] = function stepIdentity() {
+function stepIdentity() {
   const p = S.draft.profile;
   const homeroom = p["담임여부"] || "";
   const choiceCell = (name, options) => {
@@ -536,7 +576,7 @@ stepBodies[2] = function stepIdentity() {
       rawRow("담임을 맡고 있나요?", choiceCell("담임여부", [["예", "예"], ["아니오", "아니오"]])) +
       homeroomRow
     )}`;
-};
+}
 /* 한국 학년도 — 3월 1일에 새 학년도가 시작한다. getMonth()는 0부터라 3월이 2다. */
 function currentSchoolYearJs() {
   const now = new Date();
@@ -556,16 +596,16 @@ function syncProfileFields() {
   const yearSelect = document.querySelector('select[name="학년도"]');
   if (yearSelect) S.draft.profile["학년도"] = yearSelect.value;
 }
-validators[2] = function validateIdentity() {
+function validateIdentity() {
   syncProfileFields();
   const rows = identityIssues();
   replaceEditableIssues(rows);
   if (rows.length) render();
   return firstIssueMessage(rows);
-};
+}
 document.addEventListener("change", (event) => {
   if (event.target.name !== "담임여부") return;
-  if (S.mode === "wizard" && S.step === 2) { syncProfileFields(); render(); return; }
+  if (S.mode === "wizard" && S.step === 3) { syncProfileFields(); render(); return; }
   if (S.mode === "edit" && S.edit === "identity") { syncProfileFields(); syncDayFields(); render(); return; }
 });
 
@@ -583,7 +623,7 @@ function timeOptionValues(current, values) {
   if (current && !list.includes(current)) { list.push(current); list.sort(); }
   return list;
 }
-stepBodies[3] = function stepDay() {
+function stepDay() {
   const p = S.draft.profile;
   const hourValues = Array.from({ length: 17 }, (_, i) => String(i + 6).padStart(2, "0"));
   const minuteValues = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, "0"));
@@ -612,7 +652,7 @@ stepBodies[3] = function stepDay() {
     ${formTable(times)}
     <div class="section-h">요일별 마지막 교시</div>
     ${formTable(lasts)}`;
-};
+}
 function syncDayFields() {
   for (const [name] of DAY_TIME_FIELDS) {
     const hour = document.querySelector(`[data-day-hour="${name}"]`);
@@ -624,20 +664,20 @@ function syncDayFields() {
     if (el) S.draft.profile[name] = el.value;
   }
 }
-validators[3] = function validateDay() {
+function validateDay() {
   syncDayFields();
   const rows = dayIssues();
   replaceEditableIssues(rows);
   if (rows.length) render();
   return firstIssueMessage(rows);
-};
+}
 
 /* ---------- 4단계: 시간표 ---------- */
 const GRID_DAYS = ["월", "화", "수", "목", "금"];
 async function ensureGridLoaded() {
   if (!S.draft.grid || !S.draft.grid.length) S.draft.grid = await call("read_grid");
 }
-stepBodies[4] = function stepTimetable() {
+function stepTimetable() {
   if (!S.draft.grid || !S.draft.grid.length) {
     ensureGridLoaded().then(render).catch((e) => setBanner("error", e.message));
     return `<h1>시간표를 채워주세요</h1><p class="sub">불러오는 중이에요…</p>`;
@@ -653,14 +693,14 @@ stepBodies[4] = function stepTimetable() {
     <h1>시간표를 채워주세요</h1>
     <p class="sub">공강 시간을 중심으로 행정업무 일정을 등록해 드려요. 입력 형식은 자유로워요 (예: 2-1, 2학년 1반, 201…)</p>
     <table class="grid-table">${head}${rows}</table>`;
-};
+}
 function syncGridFields() {
   document.querySelectorAll("[data-grid]").forEach((el) => {
     const [r, c] = el.dataset.grid.split(":").map(Number);
     S.draft.grid[r][c] = el.value.trim();
   });
 }
-validators[4] = function validateTimetable() { syncGridFields(); return ""; };
+function validateTimetable() { syncGridFields(); return ""; }
 
 /* ---------- 연결·설정 공통 ---------- */
 const KEY_MESSAGES = {
@@ -869,6 +909,7 @@ function taskLinkFields() {
 }
 async function loadLinkLists() {
   if (S.linkLoading || S.listsLoaded) return;
+  if (!isGoeduGoogleStatus(S.google)) return;
   S.linkLoading = true;
   S.listsError = false;
   render();
@@ -957,7 +998,17 @@ function connectTabsHtml() {
   return `<div class="connect-tabs">${buttons}</div>`;
 }
 function messengerTabHtml() {
-  const locked = !S.google || !S.google.logged_in;
+  const locked = !isGoeduGoogleStatus(S.google);
+  if (googleAuthCheckFailed(S.google)) {
+    return `<div class="banner warn"><span>${GOOGLE_AUTH_CHECK_MESSAGE}</span>
+      <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>
+      <p class="sub" style="margin-top:14px">Google 연결과 로그인 상태는 설정 화면에서 다시 점검해요.</p>`;
+  }
+  if (S.google && S.google.logged_in && locked) {
+    return `<div class="banner warn"><span>${esc(GOEDU_REQUIRED_MESSAGE)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
+      <p class="sub" style="margin-top:14px">개인 Gmail 계정으로는 Google 연결을 만들거나 고를 수 없어요.</p>`;
+  }
   if (locked) {
     return `<div class="banner warn"><span>${esc(FIELD_MESSAGES["google-login"])}</span>
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>
@@ -1105,14 +1156,17 @@ function classSpaceSubrowHtml(a) {
 /* 서비스 줄 오른쪽 단추 묶음(.svc-acts) — 그 서비스에서 선생님이 누를 수 있는 일을 모은다.
    Tasks는 특정 목록으로 가는 브라우저 주소가 없어 [열기]를 넣지 않는다. */
 function serviceOpenButtonHtml(entry, a) {
-  if (a.state !== "ready") return "";
+  // 기존 코드 확인이 끝나지 않아 Chat 쓰기를 잠가도, 선생님이 이미 가진
+  // Sheet와 안내장 서식은 읽어 볼 수 있어야 한다.
+  const resourcesAvailable = ["ready", "script-check-required", "script-update-required"].includes(a.state);
+  if (!resourcesAvailable) return "";
   if (entry.service === "sheet") {
     const open = a.spreadsheet_url
       ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 열기</button>`
       : "";
     // 처음 설정(마법사) 중에는 안 보인다 — 연 단위 관리 단추다.
     // 보일 때도 학년도가 같으면 잠긴다 — 학년도를 바꾼 뒤에만 눌리는 단추다(설계 2026-07-31).
-    const make = S.mode === "edit"
+    const make = S.mode === "edit" && a.state === "ready"
       ? `<button class="btn-tonal" data-action="new-attendance-go"
       data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch ? "" : "disabled"}>새 시트에 출석부 만들기</button>`
       : "";
@@ -1134,6 +1188,10 @@ function serviceSubrowsHtml(entry, a) {
 /* 서비스 줄 맨 오른쪽 상태 칸 — 글자 색만, 모든 줄 같은 폭(.svc-status, 설계 2026-07-31).
    배경·테두리·둥근 모서리는 칠하지 않는다 — 알약 모양은 2026-07-30에 질책받았다. */
 function serviceStatusHtml(entry, a) {
+  const scriptCheck = a.state === "script-check-required";
+  const scriptUpdate = a.state === "script-update-required";
+  const scriptAttention = scriptCheck || scriptUpdate;
+  const scriptLabel = scriptUpdate ? "기능 업데이트 필요" : "기능 확인 필요";
   if (entry.service === "chat") {
     const cs = S.chatStatus;
     if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
@@ -1145,16 +1203,19 @@ function serviceStatusHtml(entry, a) {
     if (a.state === "ready") {
       return `<span class="svc-status warn">연결 필요</span>`;
     }
+    if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
     return `<span class="svc-status muted">준비 전</span>`;
   }
   if (entry.service === "sheet") {
     if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
+    if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
     return `<span class="svc-status muted">준비 전</span>`;
   }
   // docs · tasks
   if (a.state === "ready") return `<span class="svc-status ok">연결됨</span>`;
+  if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
   if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
   return `<span class="svc-status muted">준비 전</span>`;
 }
@@ -1213,6 +1274,31 @@ function loadAttendanceStatus() {
     })
     .finally(() => { S.attendanceLoading = false; render(); });
 }
+function attendanceScriptUpdateHtml(a) {
+  if (!a || !["ready", "script-check-required", "script-update-required"].includes(a.state)) return "";
+  const update = S.attendanceScriptUpdate;
+  if (!update) {
+    return `<div class="attendance-script-update"><span>기존 출결 기능이 최신인지 확인할 수 있어요. 확인만 할 때는 자료를 바꾸지 않아요.</span>
+      <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">출결 기능 최신 상태 확인</button></div>`;
+  }
+  if (update.state === "current" || update.state === "updated") {
+    const finish = a.state === "script-check-required" || a.state === "script-update-required"
+      ? `<button class="btn-tonal" data-action="attendance-script-update-apply" data-busy-text="마무리 중…" ${S.attendanceScriptUpdating ? "disabled" : ""}>출결 연결 마무리</button>`
+      : `<button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button>`;
+    return `<div class="attendance-script-update ok"><span>${esc(update.detail || "출결 기능이 최신 상태예요.")}</span>
+      ${finish}</div>`;
+  }
+  if (update.state === "update_available") {
+    return `<div class="attendance-script-update warn"><span>${esc(update.detail || "안전하게 바꿀 수 있는 예전 출결 기능을 찾았어요.")}</span>
+      <button class="btn-tonal" data-action="attendance-script-update-apply" data-busy-text="업데이트 중…" ${S.attendanceScriptUpdating ? "disabled" : ""}>출결 기능 업데이트</button></div>`;
+  }
+  if (update.state === "customized") {
+    return `<div class="attendance-script-update warn"><span>${esc(update.detail || "직접 고친 시트라 자동으로 덮지 않아요. 기존 자료는 그대로 두었습니다.")}</span>
+      <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button></div>`;
+  }
+  return `<div class="attendance-script-update warn"><span>${esc(update.detail || "현재 출결 기능 상태를 확실히 확인하지 못했어요. 기존 자료는 바꾸지 않았습니다.")}</span>
+    <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button></div>`;
+}
 function attendanceTabHtml() {
   loadAttendanceStatus();
   if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
@@ -1220,18 +1306,31 @@ function attendanceTabHtml() {
   if (!a || typeof a !== "object") return `<p class="sub">출결 준비 상태를 확인하는 중이에요…</p>`;
   const account = a.account || a.current_user || "";
   let statusArea = "";
-  if (a.state === "login-required" || a.state === "gws-required") {
+  if (a.state === "account-required") {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || GOEDU_REQUIRED_MESSAGE)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
+  } else if (a.state === "login-required" || a.state === "gws-required") {
     statusArea = `<div class="banner warn"><span>설정에서 Google 로그인을 마쳐 주세요</span>
+      <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
+  } else if (a.state === "auth-error") {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
   } else if (a.state === "profile-required"
       && (identityIssues().length || dayIssues().length)) {
     // 초안이 진짜 비어 있을 때만 안내한다.
     statusArea = `<div class="banner warn"><span>${esc(a.detail || "내 정보와 하루 일과를 먼저 입력해 주세요.")}</span>
       <button class="btn-quiet" data-action="goto-identity">내 정보 열기</button></div>`;
+  } else if (a.state === "script-update-required") {
+    statusArea = `<div class="banner warn"><span>기존 출결표를 찾았어요. 학생 명단과 출결 자료는 그대로 두고, 아래에서 출결 기능만 안전하게 확인하고 업데이트해 주세요.</span></div>`;
+  } else if (a.state === "script-check-required") {
+    statusArea = `<div class="banner warn"><span>기존 출결 자료는 그대로 두었어요. 아래에서 현재 출결 기능이 안전한 최신판인지 먼저 확인해 주세요.</span></div>`;
   } else if (a.state === "failed" && (!a.failed_service || a.failed_service === "setup")) {
     statusArea = `<p class="field-error" style="margin:0 0 13px">${esc(a.detail || "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.")}</p>`;
   }
   const ready = a.state === "ready";
+  const scriptCheckRequired = a.state === "script-check-required";
+  const scriptUpdateRequired = a.state === "script-update-required";
+  const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
   const pendingGuide = S.mode === "wizard"
     ? "마지막 단계에서 모두 저장하고 적용하면 함께 준비해요"
     : "아래 버튼을 누르면 로그인한 계정에 자동으로 준비해요.";
@@ -1239,24 +1338,24 @@ function attendanceTabHtml() {
   const rows = ATTENDANCE_SERVICES.map((entry) => attendanceServiceRow(entry, a)).join("");
   return `${statusArea}
     <div class="attendance-head">
-      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready ? "" : `<p>${pendingGuide}</p>`}</div>
+      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready || scriptAttentionRequired ? "" : `<p>${pendingGuide}</p>`}</div>
       <span class="attendance-head-right">${chip}</span>
     </div>
     <div class="promise">
       ${rows}
     </div>
+    ${attendanceScriptUpdateHtml(a)}
     ${ready
       ? ""
-      : S.mode === "wizard" ? ""
+      : scriptAttentionRequired || S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}`;
 }
 /* ---------- 연결 3탭: AI 에이전트 ---------- */
-const AI_SKILL_COMMAND = "npx skills add rheps/teacher-manager -g --all";
 function aiTabHtml() {
   if (!S.info?.features?.ai_skill_install_enabled) {
     return `<div class="attendance-head"><div>
       <h2>AI 에이전트 연결 <span class="tab-optional">(선택)</span></h2>
-      <p>AI 연결 기능은 공개 준비 중이에요. 준비가 끝나면 업데이트로 알려드릴게요.</p>
+      <p>AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요. 준비가 끝나면 업데이트로 알려드릴게요.</p>
     </div></div>`;
   }
   if (S.aiTools === null) {
@@ -1281,20 +1380,21 @@ function aiTabHtml() {
     result = S.aiInstall.success
       ? `<div class="ready-hero"><span class="check">✓</span>
           <span><b>AI 에이전트와 연결했어요.</b> 이제 AI에게 말로 학교 업무를 시킬 수 있어요.</span></div>`
-      : `<div class="banner warn" style="margin-top:12px"><span>자동 연결이 안 됐어요. 아래 명령을 복사해 AI 도구의 터미널에 붙여넣으면 돼요.</span></div>
-        <div class="ai-cmd"><code>${esc(AI_SKILL_COMMAND)}</code>
-          <button class="btn-quiet" data-action="link-copy" data-url="${esc(AI_SKILL_COMMAND)}">복사</button></div>
-        ${S.aiInstall.detail ? `<p class="hint">${esc(S.aiInstall.detail)}</p>` : ""}`;
+      : `<div class="banner warn" style="margin-top:12px"><span>${esc(S.aiInstall.detail || "자동 연결을 마치지 못했어요. 잠시 뒤 다시 눌러 주세요.")}</span></div>
+        <p class="hint">Teacher Manager는 <a href="https://nodejs.org/" target="_blank" rel="noreferrer">Node 공식 주소</a>의 확인된 파일만 사용해요. 다른 기능은 그대로 사용할 수 있어요.</p>`;
   }
+  const nodeLine = S.aiNode && S.aiNode.success
+    ? `<p class="hint">AI 연결에 필요한 전용 도구 ${esc(S.aiNode.version || "")}을 준비했어요.</p>`
+    : "";
   return `<div class="attendance-head"><div>
       <h2>AI 에이전트와 Google을 연결할까요? <span class="tab-optional">(선택)</span></h2>
       <p>연결하면 AI에게 말로 학교 업무(일정·결석·신고서·문자)를 시킬 수 있어요. 안 써도 프로그램 사용에는 지장 없어요.</p>
     </div></div>
     <div class="ai-rows">${rows}</div>
     ${anyFound
-      ? `<div class="attendance-action"><button class="btn" data-action="ai-connect" data-busy-text="연결하는 중… (1~2분 걸릴 수 있어요)">선택한 AI와 연결</button></div>`
+      ? `<div class="attendance-action"><button class="btn" data-action="ai-connect" data-busy-text="연결하는 중… (1~2분 걸릴 수 있어요)" ${S.aiConnecting ? "disabled" : ""}>${S.aiConnecting ? "연결하는 중…" : "선택한 AI와 연결"}</button></div>`
       : `<p class="hint" style="margin-top:12px">이 컴퓨터에서 AI 도구를 찾지 못했어요. AI 도구를 설치한 뒤 이 탭에 다시 들어오면 돼요.</p>`}
-    ${result}`;
+    ${nodeLine}${result}`;
 }
 bindActions({
   "connect-tab": (el) => {
@@ -1313,6 +1413,7 @@ bindActions({
     if (tab === "ai") {
       // AI 도구도 열 때마다 다시 감지 — 그 사이 설치했을 수 있다.
       S.aiTools = null;
+      S.aiNode = null;
       S.aiInstall = null;
     }
     S.chatSpaces = undefined;
@@ -1349,15 +1450,45 @@ bindActions({
     }
   },
   "ai-connect": async () => {
+    if (S.aiConnecting) return;
     if (!S.info?.features?.ai_skill_install_enabled) {
-      showToast("AI 연결 기능은 공개 준비 중이에요");
+      showToast("AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요");
       return;
     }
     const keys = Array.from(document.querySelectorAll('.ai-row input:checked'))
       .map((box) => box.name.replace(/^ai-/, ""));
     if (!keys.length) { showToast("연결할 AI를 하나 이상 선택해 주세요"); return; }
-    S.aiInstall = await call("ai_skills_install", keys);
+    S.aiConnecting = true;
+    S.aiInstall = null;
     render();
+    try {
+      S.aiNode = await call("ai_node_status");
+      if (!S.aiNode.success) {
+        const approved = window.confirm(
+          "AI 연결에 필요한 Teacher Manager 전용 도구를 받을까요?\nNode 공식 주소의 확인된 파일을 이 Windows 계정의 앱 폴더에만 저장해요."
+        );
+        if (!approved) return;
+        S.aiNode = await call("ai_node_prepare");
+        if (!S.aiNode.success) {
+          S.aiInstall = S.aiNode;
+          return;
+        }
+      }
+      const permissionApproved = window.confirm(
+        "AI 연결 권한 안내\n\n" +
+        "검토한 GitHub 공개판의 정확한 묶음을 파일 지문으로 확인한 뒤, 고정된 npm skills 도구가 선택한 AI 설정 폴더에 복사합니다.\n" +
+        "설치된 Teacher Manager 안내는 AI에게 다음 일을 요청할 수 있어요.\n" +
+        "- 내 컴퓨터의 필요한 파일 읽기\n" +
+        "- Teacher Manager 명령 실행\n" +
+        "- Google 일정·할 일·문서·시트 자료 만들기와 변경\n\n" +
+        "이 내용을 확인했고 선택한 AI에 연결할까요?"
+      );
+      if (!permissionApproved) return;
+      S.aiInstall = await call("ai_skills_install", keys, true);
+    } finally {
+      S.aiConnecting = false;
+      render();
+    }
   },
   "save-attendance": async () => {
     if (S.attendanceSaving) return;
@@ -1373,9 +1504,39 @@ bindActions({
       render();
     }
   },
+  "attendance-script-update-check": async () => {
+    S.attendanceScriptUpdate = await call("attendance_script_update_status");
+    render();
+  },
+  "attendance-script-update-apply": async () => {
+    if (S.attendanceScriptUpdating) return;
+    const onlyFinishing = S.attendanceScriptUpdate?.state === "current";
+    const question = onlyFinishing
+      ? "확인한 최신 출결 기능을 이 컴퓨터의 준비 완료 기록에 남길까요?\n\nGoogle 자료는 바꾸지 않습니다."
+      : "기존 출결 Sheet의 Apps Script만 최신판으로 바꿀까요?\n\n" +
+        "학생 명단, 출결 내용, 설정, Google Chat 연결값은 바꾸지 않습니다. " +
+        "직접 고친 스크립트가 발견되면 자동으로 덮지 않습니다.";
+    if (!window.confirm(question)) return;
+    S.attendanceScriptUpdating = true;
+    render();
+    try {
+      S.attendanceScriptUpdate = await call("attendance_script_update_apply");
+      if (S.attendanceScriptUpdate.state === "updated" || S.attendanceScriptUpdate.state === "current") {
+        S.attendance = await call("attendance_status");
+        S.chatStatus = null;
+        showToast(onlyFinishing
+          ? "출결 기능 확인을 마쳤어요"
+          : "출결 기능을 최신판으로 업데이트했어요");
+      }
+    } finally {
+      S.attendanceScriptUpdating = false;
+      render();
+    }
+  },
   "new-attendance-go": async () => {
     const data = await call("start_new_attendance");
     S.attendance = data;
+    S.attendanceScriptUpdate = null;
     // 새 출석부는 발송 연결·단톡방이 새로 시작된다 — 상태를 다시 확인한다.
     S.chatStatus = null;
     S.chatSpaces = undefined;
@@ -1431,7 +1592,7 @@ bindActions({
     showToast("안내 영상을 준비 중이에요");
   },
   "goto-identity": async () => {
-    if (S.mode === "wizard") { await goStepAsync(2); return; }
+    if (S.mode === "wizard") { await goStepAsync(3); return; }
     await openCard("identity");
   },
 });
@@ -1487,22 +1648,33 @@ function stepConnect() {
     call("google_status").then((data) => { S.google = data; render(); }).catch((e) => setBanner("error", e.message));
     return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>`;
   }
-  const locked = !S.google.logged_in;
-  if (!locked && S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
+  if (googleAuthCheckFailed(S.google)) {
+    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
+  }
+  if (!isGoeduGoogleStatus(S.google)) {
+    const message = S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
+    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(message)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
+      <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 @goedu.kr 계정을 확인한 뒤에만 시작해요.</p>`;
+  }
+  if (S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
     loadLinkLists();
   }
   const body = S.connectTab === "attendance" ? attendanceTabHtml()
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
-    <h1>연결</h1>
+    <h1>Google 연결</h1>
     <p class="sub">Google Workspace 안에서 각 서비스를 연결하여 학교 업무를 자동화해요.</p>
     ${connectTabsHtml()}
     ${body}`;
 }
 async function validateConnect() {
   if (!S.google) S.google = await call("google_status");
+  if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return "구글 로그인을 마쳐야 다음으로 갈 수 있어요.";
+  if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
   syncConnectFields();
   const rows = connectIssues();
   // 선택 항목(gemini key)은 표시만 하고 진행을 막지 않는다 — 마법사에서는 표시도 하지 않는다.
@@ -1523,6 +1695,7 @@ async function validateConnect() {
    구글에 무언가를 만드는 일이라 타자 한 자마다 돌면 안 된다 — 마법사에서 [다음]을 누를 때와
    연결 화면 창을 닫을 때만 부른다. */
 async function provisionConnectTargets() {
+  if (!isGoeduGoogleStatus(S.google)) throw new Error(GOEDU_REQUIRED_MESSAGE);
   const p = S.draft.profile;
   const homeroom = p["담임여부"] === "예";
   const modes = linkModes();
@@ -1557,7 +1730,8 @@ async function refreshSettingsStatus() {
   // 컴퓨터 → Google → 로그인 시 Calendar·Tasks 목록까지 한 번에 재점검한다.
   S.computer = await call("computer_status");
   S.google = await call("google_status");
-  if (S.google && S.google.logged_in) {
+  S.gwsUpdate = await call("gws_update_status");
+  if (isGoeduGoogleStatus(S.google)) {
     try {
       const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
       S.lists = { calendars, tasklists };
@@ -1567,39 +1741,121 @@ async function refreshSettingsStatus() {
     } catch (error) {
       // 한 목록이라도 실패하면 기존 목록과 선택 ID를 그대로 둔다.
     }
+  } else {
+    S.lists = { calendars: [], tasklists: [] };
+    S.listsLoaded = false;
+    S.listsError = false;
   }
   render();
 }
-function computerSectionHtml() {
+const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인 상태를 확인하지 못했어요. 다시 점검하고 인터넷 연결이나 학교 보안 정책을 확인해 주세요.";
+const OAUTH_REPAIR_MESSAGES = {
+  GWS_ACCOUNT_STORAGE_OUTSIDE_USER: {
+    status: "Google 로그인 저장 위치가 현재 Windows 계정 폴더 밖이에요",
+    repair: "공용 또는 다른 계정의 환경 설정을 지운 뒤 Teacher Manager를 다시 열어 주세요.",
+  },
+  OAUTH_CLIENT_ENV_INCOMPLETE: {
+    status: "Windows 로그인 준비값이 한쪽만 있어요",
+    repair: "두 항목을 함께 넣거나 둘 다 지운 뒤 다시 점검해 주세요.",
+  },
+  OAUTH_CONFIG_CLIENT_INVALID: {
+    status: "기존 Google 로그인 준비 파일이 올바르지 않아요",
+    repair: "기존 준비 파일을 다시 받거나 지운 뒤 다시 점검해 주세요.",
+  },
+  OAUTH_BUNDLED_CLIENT_INVALID: {
+    status: "설치판의 Google 로그인 준비 파일이 손상됐어요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
+  },
+  OAUTH_CLIENT_CONFLICT: {
+    status: "기존 준비와 설치판 준비가 서로 달라요",
+    repair: "기존 Google 로그인 준비를 정리하거나 설치판과 같은 준비로 바꾼 뒤 다시 점검해 주세요.",
+  },
+};
+function oauthRepairMessage(g) {
+  const code = String(g?.error_code || "");
+  return OAUTH_REPAIR_MESSAGES[code] || null;
+}
+function googleAuthCheckFailed(g) {
+  return Boolean(g && (g.login_state === "error" || g.error_code === "GWS_AUTH_STATUS_FAILED"));
+}
+function settingsRefreshButtonHtml() {
+  return `<button class="btn-quiet" data-action="settings-refresh" data-busy-text="점검 중…">다시 점검</button>`;
+}
+function computerSectionHtml(includeGoogle) {
   const c = S.computer;
   if (!c) return `<div class="panel"><div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div></div>`;
-  return `<div class="section-h section-head"><span>컴퓨터 준비</span><button class="btn-quiet" data-action="settings-refresh" data-busy-text="점검 중…">다시 점검</button></div>
+  return `<div class="section-h section-head"><span>컴퓨터 준비</span>${settingsRefreshButtonHtml()}</div>
     <div class="panel">
-      ${readinessRow("Windows 자동 설치 기능", "없는 프로그램을 자동으로 준비해요", c.installer)}
       ${readinessRow("Python", "Teacher Manager를 실행해요", c.python)}
-      ${readinessRow("Node.js", "구글 업무 도구를 준비해요", c.node, "install-node")}
       ${readinessRow("문서 읽기 도구", "PDF와 첨부 문서를 읽어요", c.documents)}
       ${readinessRow("Microsoft Edge WebView2", "Teacher Manager 화면을 보여줘요", c.screen)}
-      ${googleLoginRowsHtml()}
     </div>
-    ${goeduWarnHtml()}
-    ${loginWaitHtml()}`;
+    ${includeGoogle ? googleAccountSectionHtml(false) : ""}`;
 }
 function googleLoginRowsHtml() {
   const g = S.google;
-  if (!g) return `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요</small></span><span class="st">확인 중이에요…</span></div>`;
+  if (!g) return `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
+    <div class="row"><span class="nameblock"><b>OAuth 로그인 준비</b><small>Google 로그인에 필요한 승인 정보를 확인해요</small></span><span class="st">확인 중이에요…</span></div>
+    <div class="row"><span class="nameblock"><b>Google 로그인</b><small>이 계정에 출결 업무를 준비해요</small></span><span class="st">확인 중이에요…</span></div>`;
   const loginError = fieldError("google-login");
-  const cliRight = g.gws
-    ? `<span class="st ok">준비됐어요</span>`
-    : `<button class="btn-tonal" data-action="install-gws" data-busy-text="진행 중…">설치하기</button>`;
-  const cliRow = `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요</small></span><span class="row-actions">${cliRight}</span></div>`;
+  const update = S.gwsUpdate;
+  const accountStorageProblem = g.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
+    ? OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER
+    : null;
+  const runtimeReady = update ? Boolean(update.runtime_ready) : Boolean(g.gws_runtime_ready);
+  const sourceLabel = update && update.current_source === "approved-update" ? "새 Google 도구" : "기본판";
+  const versionLabel = update && update.current_version ? ` · ${sourceLabel} ${esc(update.current_version)}` : "";
+  const offerNote = update && update.offer ? safeGwsOfferText(update.offer.notes) : "";
+  const offerDate = update && update.offer ? safeGwsOfferDate(update.offer.verified_on) : "";
+  const offerExplanation = update && update.offer && runtimeReady
+    ? [offerDate ? `승인 확인 ${esc(offerDate)}` : "", offerNote ? esc(offerNote) : ""]
+      .filter(Boolean).join(" · ")
+    : "";
+  const offerExplanationHtml = offerExplanation
+    ? `<br><span data-gws-update-note="true">${offerExplanation}</span>`
+    : "";
+  const updateButton = update && update.offer && runtimeReady
+    ? `<button class="btn-tonal" data-action="install-gws-update" data-busy-text="갱신 중…" ${S.gwsUpdateInstalling ? "disabled" : ""}>승인된 Google 도구 ${esc(update.offer.version)}로 갱신</button>`
+    : "";
+  const cliRight = accountStorageProblem
+    ? `<span class="st warn">Google 도구 실행을 안전하게 멈췄어요</span>`
+    : runtimeReady
+    ? `<span class="st ok">준비됐어요${versionLabel}</span>${updateButton}`
+    : `<span class="st warn">설치 파일이 손상됐어요 · 설치 파일을 다시 실행해 주세요</span>`;
+  const cliRow = `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요${offerExplanationHtml}</small></span><span class="row-actions">${cliRight}</span></div>`;
+  const oauthBlock = `<span class="nameblock"><b>OAuth 로그인 준비</b><small>Google 로그인에 필요한 승인 정보를 확인해요</small></span>`;
+  // 예전 화면 다리에서 오류 글자 없이 충돌 여부만 돌려줘도 로그인은 막는다.
+  const oauthProblem = oauthRepairMessage(g) || (g.oauth_client_conflict ? {
+    status: "기존 준비와 설치판 준비가 서로 달라요",
+    repair: "기존 Google 로그인 준비를 정리하거나 설치판과 같은 준비로 바꾼 뒤 다시 점검해 주세요.",
+  } : null);
+  const oauthRight = oauthProblem
+    ? `<span class="st warn">${esc(oauthProblem.status)}</span><small>${esc(oauthProblem.repair)}</small>`
+    : g.oauth_client_ready
+      ? `<span class="st ok">준비됐어요</span>`
+      : `<span class="st warn">로그인 준비 파일이 없어요</span>`;
+  const oauthRow = `<div class="row">${oauthBlock}<span class="row-actions">${oauthRight}</span></div>`;
   const loginBlock = `<span class="nameblock"><b>Google 로그인</b><small>이 계정에 출결 업무를 준비해요</small></span>`;
+  const authCheckFailed = googleAuthCheckFailed(g);
+  const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem && !authCheckFailed);
+  const blockedReason = oauthProblem
+    ? "OAuth 준비를 먼저 확인해 주세요"
+    : !runtimeReady
+      ? "Google Workspace CLI를 먼저 준비해 주세요"
+      : "OAuth 로그인 준비 파일이 필요해요";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
     : g.logged_in
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st ok">${esc(g.user || "완료")}</span><button class="btn-quiet" data-action="gws-logout">로그아웃</button></span></div>`
-      : `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button></span></div>`;
+      : accountStorageProblem
+        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
+      : authCheckFailed
+        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${GOOGLE_AUTH_CHECK_MESSAGE}</span></span></div>`
+      : canLogin
+        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button></span></div>`
+        : `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<span class="st warn">${esc(blockedReason)}</span></span></div>`;
   return `${cliRow}
+    ${oauthRow}
     ${loginRow}`;
 }
 function loginWaitHtml() {
@@ -1607,29 +1863,69 @@ function loginWaitHtml() {
   return `<div class="panel" style="margin-top:12px">
       <p class="sub" style="margin:0 0 8px">브라우저가 자동으로 열렸어요.
         <b class="login-account-em">반드시 경기도교육청 클라우드 계정(@goedu.kr)으로 로그인해 주세요.</b><br>
-        개인 계정 화면이 열리면 [다른 계정 사용]을 눌러 @goedu.kr 계정을 고르면 돼요.
-        창이 안 열렸으면 아래 주소로 직접 여세요.</p>
-      ${S.login.url ? linkRow(S.login.url) : `<p class="sub">로그인 주소를 준비하는 중이에요…</p>`}
+        개인 계정 화면이 열리면 [다른 계정 사용]을 눌러 @goedu.kr 계정을 고르면 돼요.<br>
+        창이 열리지 않으면 취소한 뒤 다시 로그인해 주세요.</p>
       <div class="action-line"><button class="btn-quiet" data-action="login-cancel">취소</button></div>
     </div>`;
 }
-function goeduWarnHtml() {
+function accountAvatar(user) {
+  const text = String(user || "G").trim();
+  return esc((text[0] || "G").toUpperCase());
+}
+function lockedGoogleServicesHtml() {
+  const rows = [
+    ["CAL", "Calendar", "업무 일정 등록"],
+    ["TSK", "Tasks", "업무·전달사항 등록"],
+    ["SHT", "Sheet·Docs", "출결 자료와 결석 신고서"],
+    ["CHT", "Google Chat", "학급 공간 연결과 메시지 발송"],
+  ];
+  return `<div class="locked-services" aria-label="잠긴 Google 기능">${rows.map(([mark, name, note]) =>
+    `<div class="service-row"><span class="service-mark">${mark}</span><span class="service-copy"><b>${name}</b><span>${note}</span></span><span class="lock-label">계정 확인 필요</span></div>`
+  ).join("")}</div>`;
+}
+function googleAccountDecisionHtml() {
   const g = S.google;
-  if (!g || !g.logged_in || !g.user || g.user.endsWith("@goedu.kr")) return "";
-  return `<div class="banner warn">경기도교육청 계정(@goedu.kr)이 아니에요 — 일부 기능이 제한될 수 있어요.</div>`;
+  if (!g || !g.logged_in) return "";
+  const allowed = isGoeduGoogleStatus(g);
+  const account = `<div class="account-box">
+    <span class="avatar${allowed ? " good" : ""}">${accountAvatar(g.user)}</span>
+    <span class="account-copy"><span>현재 선택한 계정</span><b>${esc(g.user || "계정 확인 필요")}</b></span>
+    <span class="account-state ${allowed ? "good" : "bad"}">${allowed ? "확인 완료" : "사용할 수 없음"}</span>
+  </div>`;
+  if (!allowed) {
+    return `${account}<div class="decision-banner error">
+      <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>@goedu.kr 계정으로만 진행할 수 있습니다.</p>
+    </div>${lockedGoogleServicesHtml()}`;
+  }
+  return `${account}<div class="decision-banner success">
+      <h3>@goedu.kr 계정으로 Google Workspace에 로그인을 성공했습니다.</h3>
+    </div><div class="success-next">
+      <div><b>Calendar·Tasks</b><span>업무와 전달사항을 넣을 곳을 고릅니다.</span></div>
+      <div><b>Sheet·Docs</b><span>출결 DB와 결석 신고서를 준비합니다.</span></div>
+      <div><b>Google Chat</b><span>쓸 선생님만 학급 공간을 연결합니다.</span></div>
+    </div>`;
+}
+function googleAccountSectionHtml(includeRefresh) {
+  return `<div class="section-h section-head"><span>Google Workspace 준비</span>${includeRefresh ? settingsRefreshButtonHtml() : ""}</div>
+    <div class="panel">${googleLoginRowsHtml()}</div>
+    ${googleAccountDecisionHtml()}
+    ${loginWaitHtml()}`;
 }
 async function refreshComputerStatus() {
   S.computer = await call("computer_status");
   render();
 }
 function ensureComputerStatus() {
-  if ((S.computer && S.google) || S.computerLoading) return;
+  if ((S.computer && S.google && S.gwsUpdate) || S.computerLoading) return;
   S.computerLoading = true;
   Promise.all([
     S.computer ? Promise.resolve(S.computer) : call("computer_status"),
     S.google ? Promise.resolve(S.google) : call("google_status"),
+    S.gwsUpdate ? Promise.resolve(S.gwsUpdate) : call("gws_update_status"),
   ])
-    .then(([computer, google]) => { S.computer = computer; S.google = google; })
+    .then(([computer, google, gwsUpdate]) => {
+      S.computer = computer; S.google = google; S.gwsUpdate = gwsUpdate;
+    })
     .catch((error) => { S.banner = { kind: "error", text: error.message }; })
     .finally(() => { S.computerLoading = false; render(); });
 }
@@ -1644,12 +1940,43 @@ function attachmentFolderRow(d) {
       <button class="btn-tonal" data-action="attachment-folder-choose">폴더 선택</button>
     </div>${statusLine}</div>`);
 }
-function settingsSectionHtml(d) {
-  // 이 화면에서 확인: Windows 자동 설치 기능 · Python · Node.js · Microsoft Edge WebView2
+function stepGoogleLogin() {
+  ensureComputerStatus();
+  const g = S.google;
+  const title = g && g.logged_in && !isGoeduGoogleStatus(g)
+    ? "이 계정으로는 진행할 수 없어요"
+    : isGoeduGoogleStatus(g)
+      ? "경기도교육청 계정으로 확인됐어요"
+      : "Google Workspace에 로그인해 주세요";
+  const lead = g && g.logged_in && !isGoeduGoogleStatus(g)
+    ? "Teacher Manager 앱은 @goedu.kr 계정 전용입니다."
+    : "Calendar·Tasks·Sheet·Docs·Chat을 사용할 경기도교육청 계정으로 로그인해 주세요.";
+  return `<h1>${title}</h1><p class="sub">${lead}</p>${googleAccountSectionHtml(true)}`;
+}
+async function validateGoogleLogin() {
+  try {
+    S.google = await call("google_status");
+  } catch (error) {
+    return GOOGLE_AUTH_CHECK_MESSAGE;
+  }
+  if (S.google.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER") {
+    const problem = OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER;
+    return `${problem.status}. ${problem.repair}`;
+  }
+  if (!S.google.gws_runtime_ready) return "Google Workspace CLI를 준비해 주세요.";
+  if (S.google.oauth_client_conflict) return "기존 Google 로그인 준비와 설치판 준비가 서로 달라요.";
+  if (!S.google.oauth_client_ready) return "OAuth 로그인 준비 파일이 필요해요.";
+  if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
+  if (!S.google.logged_in) return FIELD_MESSAGES["google-login"];
+  if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
+  return "";
+}
+function settingsSectionHtml(d, includeGoogle = true) {
+  // 이 화면에서 확인: 제품에 포함된 Python · 문서 읽기 · Microsoft Edge WebView2
   ensureComputerStatus();
   if (d.autostart === undefined) d.autostart = true;
   ensureHotkeyState(d);
-  return `${computerSectionHtml()}
+  return `${computerSectionHtml(includeGoogle)}
     <div class="section-h">동작 설정</div>
     ${formTable(
       hotkeyRow(d) +
@@ -1664,7 +1991,7 @@ function stepSettings() {
   return `
     <h1>이 컴퓨터에서의 동작을 정할게요</h1>
     <p class="sub">Brity 대화방에 메시지를 띄우고 단축키를 누르면 화면에서 직접 읽어 바로 구글에 등록해요.</p>
-    ${settingsSectionHtml(S.draft.bridge)}`;
+    ${settingsSectionHtml(S.draft.bridge, false)}`;
 }
 function syncMessengerDraft() {
   S.draft.bridge.hotkey = S.draft.bridge.hotkey || DEFAULT_HOTKEY;
@@ -1687,38 +2014,32 @@ async function validateSettings() {
   const rows = [];
   const folderProblem = await validateAttachmentFolder();
   if (folderProblem) rows.push(issue("settings.attachment-folder", "brity_download_dir", folderProblem));
-  try {
-    S.google = await call("google_status");
-  } catch (error) {
-    S.google = S.google || null;
-  }
-  if (!S.google || !S.google.gws) {
-    rows.push(issue("settings.gws-cli", "gws-cli", "Google Workspace CLI를 준비해 주세요."));
-  } else if (!S.google.logged_in) {
-    rows.push(issue("settings.google-login", "google-login", FIELD_MESSAGES["google-login"]));
-  }
+  const googleProblem = await validateGoogleLogin();
+  if (googleProblem) rows.push(issue("settings.google-login", "google-login", googleProblem));
   setFieldIssues(rows);
   if (rows.length) render();
   return firstIssueMessage(rows);
 }
 
 // 숫자에 직접 기대지 않도록 함수를 이름으로 둔 뒤 배선한다.
-stepBodies[5] = stepSettings;
-validators[5] = validateSettings;
-stepBodies[6] = stepConnect;
-validators[6] = validateConnect;
+stepBodies[2] = stepGoogleLogin;
+validators[2] = validateGoogleLogin;
+stepBodies[3] = stepIdentity;
+validators[3] = validateIdentity;
+stepBodies[4] = stepDay;
+validators[4] = validateDay;
+stepBodies[5] = stepTimetable;
+validators[5] = validateTimetable;
+stepBodies[6] = stepSettings;
+validators[6] = validateSettings;
+stepBodies[7] = stepConnect;
+validators[7] = validateConnect;
 
 bindActions({
   "settings-refresh": () => refreshSettingsStatus(),
   "goto-settings": async () => {
-    if (S.mode === "wizard") { await goStepAsync(5); return; }
+    if (S.mode === "wizard") { await goStepAsync(2); return; }
     await openCard("settings");
-  },
-  "install-node": async () => {
-    const result = await call("install_node");
-    await refreshComputerStatus();
-    if (!result.success) throw new Error("자동 설치에 실패했어요: " + result.detail);
-    showToast("Node.js 준비를 마쳤어요");
   },
   "attachment-folder-choose": async () => {
     syncMessengerDraft();
@@ -1758,11 +2079,34 @@ bindActions({
   },
 });
 
-/* ---------- 7단계: 마무리 ---------- */
+/* ---------- 8단계: 학생 계정 준비 ---------- */
+function stepStudentAccounts() {
+  const chatRow = (number, title, detail) => `<div class="chat-row">
+    <span class="check-ring">${number}</span><span><b>${esc(title)}</b><span>${esc(detail)}</span></span>
+  </div>`;
+  return `
+    <p class="start-eyebrow optional">Google Chat을 쓸 때만</p>
+    <h1><span class="student-title-line">학생 <code>@goedu.kr</code> 계정을 준비시키시고,</span><span class="student-title-line">Google Chat에서 학생 계정을 직접 초대하여</span><span class="student-title-line">학급 단체톡방을 개설해 주세요.</span></h1>
+    <p class="sub student-lede">이 준비는 Google Chat으로 학생에게 안내 메시지를 자동 발송할 때 필요합니다. 교사가 학생과 함께 아래 4단계의 준비를 직접 완료해 주세요. Teacher Manager는 학생을 자동 가입시키거나 초대할 수 없습니다.</p>
+    <div class="chat-checks">
+      ${chatRow(1, "교육디지털원패스 학생 회원가입", "https://edupass.neisplus.kr/에서 학생 계정을 준비합니다.")}
+      ${chatRow(2, "경기도교육청 교육용 클라우드 지원시스템 가입", "https://www.goedu.kr/에서 디지털원패스 계정을 통해 학생 계정 가입을 마칩니다. (@goedu.kr)")}
+      ${chatRow(3, "경기도교육청 클라우드 지원시스템 내 서비스인 Google Workspace에 가입", "계정 가입에 그치지 않고 추가로 교육용 클라우드 서비스인 Google Workspace를 신청합니다.")}
+      ${chatRow(4, "선생님이 본인의 클라우드 계정(@goedu.kr)의 Google Chat에서 학생을 직접 초대", "Google Chat에서 학생 계정을 구성원으로 직접 초대합니다. 학급 단체톡방도 개설합니다.")}
+    </div>
+    <div class="chat-boundary"><b>Teacher Manager가 하는 일:</b> 선생님이 고른 기존 학급 공간으로 안내를 보냅니다. 학생을 자동 가입시키거나, 초대하거나, 기존 방을 삭제하지 않습니다.<br><b>자료 보호:</b> 학생에게 출결 Google Sheet를 공유하거나 편집 권한을 주지 마세요. 학생은 Google Chat 학급 단체톡방에만 초대합니다.</div>
+    <div class="student-links">
+      <button class="btn-quiet" data-action="link-open" data-url="https://www.goedu.kr/bbs/2/view/55">학생 가입 안내</button>
+      <button class="btn-tonal" data-action="link-open" data-url="https://chat.google.com/">Google Chat 열기</button>
+    </div>`;
+}
+stepBodies[8] = stepStudentAccounts;
+
+/* ---------- 9단계: 마무리 ---------- */
 function summaryRow(label, value) {
   return `<div class="row"><span class="name">${esc(label)}</span><span class="st">${esc(value || "—")}</span></div>`;
 }
-stepBodies[7] = function stepFinish() {
+stepBodies[9] = function stepFinish() {
   const p = S.draft.profile;
   return `
     <h1>모두 저장하고 적용할게요</h1>
@@ -1784,12 +2128,32 @@ stepBodies[7] = function stepFinish() {
 };
 bindActions({
   "apply-all": async () => {
+    try {
+      S.google = await call("google_status");
+    } catch (error) {
+      setBanner("warn", GOOGLE_AUTH_CHECK_MESSAGE);
+      return;
+    }
+    if (!isGoeduGoogleStatus(S.google)) {
+      setBanner("warn", S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"]);
+      return;
+    }
     // 마무리 화면엔 격자 입력이 없다 — draft에 저장된 최신 값을 그대로 쓴다.
     await ensureGridLoaded();
     const results = await call("apply_all", S.draft.profile, S.draft.grid, S.draft.bridge);
     const failed = results.filter((r) => r.status === "failed");
     // 성공이든 실패든 곧장 홈으로 — 실패 항목은 홈 점검과 출결 탭이 이유를 보여준다.
     await call("finish_setup");
+    try {
+      S.attendance = await call("attendance_status");
+    } catch (_error) {
+      S.attendance = null;
+    }
+    S.attendanceScriptUpdate = null;
+    S.chatStatus = null;
+    S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
+      ? "attendance"
+      : "messenger";
     S.mode = "home";
     S.checks = [];
     S.applyResults = null;
@@ -1874,7 +2238,7 @@ function uniqueChecks(rows) {
   });
 }
 // 편집 중인 카드 — 그 카드의 입력칸은 저장된 점검 대신 현재 입력을 본다.
-const WIZARD_CARD_BY_STEP = { 2: "identity", 3: "identity", 4: "timetable", 5: "settings", 6: "connect" };
+const WIZARD_CARD_BY_STEP = { 3: "identity", 4: "identity", 5: "timetable", 6: "settings", 7: "connect" };
 function editingCard() {
   if (S.mode === "edit") return S.edit || "";
   if (S.mode === "wizard") return WIZARD_CARD_BY_STEP[S.step] || "";
@@ -1912,8 +2276,8 @@ function currentScreenIssues() {
     return null;
   }
   if (S.mode === "wizard") {
-    if (S.step === 2) { syncProfileFields(); return identityIssues(); }
-    if (S.step === 3) { syncDayFields(); return dayIssues(); }
+    if (S.step === 3) { syncProfileFields(); return identityIssues(); }
+    if (S.step === 4) { syncDayFields(); return dayIssues(); }
     if (WIZARD_CARD_BY_STEP[S.step] === "connect") {
       syncConnectFields();
       return connectIssues().filter((row) => !row.optional);
@@ -2433,8 +2797,8 @@ function updateControls() {
 function renderEdit(key) {
   let body = "";
   if (key === "connect") body = stepConnect();
-  else if (key === "identity") body = stepBodies[2]() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepBodies[3]().replace(/^[\s\S]*?<\/p>/, "");
-  else if (key === "timetable") body = stepBodies[4]();
+  else if (key === "identity") body = stepIdentity() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepDay().replace(/^[\s\S]*?<\/p>/, "");
+  else if (key === "timetable") body = stepTimetable();
   else if (key === "settings") body = settingsEditBody();
   // 화면 제목은 창 제목 줄이 맡는다 — 본문 맨 앞의 <h1>은 뗀다. 마법사는 이 길을
   // 지나지 않으므로 원래 <h1>을 그대로 쓴다.
@@ -2465,6 +2829,18 @@ async function loadForEdit(key) {
       recording: false,
       status: null,
     };
+  }
+  if (key === "connect") {
+    try {
+      S.attendance = await call("attendance_status");
+    } catch (_error) {
+      S.attendance = null;
+    }
+    S.attendanceScriptUpdate = null;
+    S.chatStatus = null;
+    S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
+      ? "attendance"
+      : "messenger";
   }
   // 설정 화면은 열 때마다 실제 상태를 다시 확인한다 — 홈 점검과 화면이 어긋나지 않게.
   if (key === "settings") refreshSettingsStatus().catch(() => {});
@@ -2543,7 +2919,7 @@ document.addEventListener("keydown", (event) => {
 function screenKey() { return `${S.mode}|${S.step}|${S.edit}|${S.connectTab}`; }
 let lastScreenKey = "";
 function render() {
-  const onLoginScreen = (S.mode === "wizard" && S.step === 5) || (S.mode === "edit" && S.edit === "settings");
+  const onLoginScreen = (S.mode === "wizard" && S.step === 2) || (S.mode === "edit" && S.edit === "settings");
   if (S.login && !onLoginScreen) {
     stopLoginPoll();
     S.login = null;

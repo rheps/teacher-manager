@@ -6,6 +6,7 @@ pywebview는 배포판 프로그램에 포함된다. 소스로 실행할 때만 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from pathlib import Path
@@ -13,10 +14,6 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brity_bridge import bundle_paths, paths
-from dashboard import version
-
-APP_NAME = version.BRANDING["name"]
 WEB_INDEX = Path(__file__).resolve().parent / "web" / "index.html"
 _IMPORT = object()  # "실제 pywebview를 임포트해라" 표식
 
@@ -71,6 +68,7 @@ def _background_setup(app_info, ensure_helper, ensure_shortcut) -> None:
 
 def _run_background(config_dir) -> None:
     try:
+        from brity_bridge import paths
         from dashboard import engine
         from dashboard.bridge import Api
 
@@ -93,6 +91,8 @@ def _spawn_background(config_dir) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from brity_bridge import paths
+
     parser = argparse.ArgumentParser(prog="dashboard", description="티처 매니저")
     parser.add_argument("--config-dir", default=str(paths.default_config_dir()))
     parser.add_argument("--verify-settings-only", action="store_true", help=argparse.SUPPRESS)
@@ -100,6 +100,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv[:1] == ["--ai-process-worker"]:
+        # 사용자 설정이나 화면을 읽기 전에 시작 신호를 기다리는 내부 작업자로 갈라진다.
+        from brity_bridge import process_supervision
+
+        return process_supervision.worker_main(raw_argv[1:])
+    if "--probe-webview2" in raw_argv:
+        # 이 검사는 사용자 설정·도우미·바로가기보다 먼저 갈라진다. pywebview를
+        # 읽기 전 Stable 채널만 고정해 Beta/Dev/Canary를 준비 완료로 세지 않는다.
+        os.environ["WEBVIEW2_RELEASE_CHANNELS"] = "0"
+        from dashboard import webview2_probe
+
+        injected_webview = None if webview_module is _IMPORT else webview_module
+        return webview2_probe.webview2_probe_main(
+            raw_argv, webview_module=injected_webview
+        )
+
+    from brity_bridge import bundle_paths
+    from dashboard import version
+
+    app_name = version.BRANDING["name"]
     from brity_bridge import app_identity
 
     app_identity.apply_app_identity()  # 트레이와 같은 이름표를 써야 한 프로그램으로 보인다
@@ -107,17 +128,18 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
     from brity_bridge import gws_env
 
     gws_env.prepare_gws_env()  # gws 로그인이 수시로 풀리지 않게 키 보관 방식을 고정한다
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(raw_argv)
     notify = notify or _default_notify
     background = background or _spawn_background
     if webview_module is _IMPORT:
+        os.environ["WEBVIEW2_RELEASE_CHANNELS"] = "0"
         try:
             import webview as webview_module  # type: ignore[no-redef]
         except ImportError:
             webview_module = None
     if webview_module is None:
         print(MISSING_WEBVIEW_MESSAGE)
-        _notify_safely(notify, APP_NAME, MISSING_WEBVIEW_MESSAGE)
+        _notify_safely(notify, app_name, MISSING_WEBVIEW_MESSAGE)
         return 1
 
     from dashboard import fresh_start
@@ -132,12 +154,12 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
         )
     except fresh_start.RecoveryError:
         print(SETTINGS_RECOVERY_HELP_MESSAGE)
-        _notify_safely(notify, APP_NAME, SETTINGS_RECOVERY_HELP_MESSAGE)
+        _notify_safely(notify, app_name, SETTINGS_RECOVERY_HELP_MESSAGE)
         return 1
     except Exception as error:  # noqa: BLE001 - 초기화 실패가 실행을 막으면 안 되지만 조용히 삼키지도 않는다
         message = f"{DEV_RESET_WARNING_MESSAGE}\n(자세한 원인: {error})"
         print(message)
-        _notify_safely(notify, APP_NAME, message)
+        _notify_safely(notify, app_name, message)
     api = Api(Path(args.config_dir))
     if args.verify_settings_only:
         if not installed:
@@ -155,7 +177,7 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
                 from brity_bridge import app_icon
 
                 for _ in range(20):
-                    if app_icon.apply_to_window(APP_NAME):
+                    if app_icon.apply_to_window(app_name):
                         return
                     time.sleep(0.15)
             except Exception:  # noqa: BLE001 - 아이콘 실패가 실행을 막으면 안 된다
@@ -165,7 +187,7 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
 
     try:
         window = webview_module.create_window(
-            APP_NAME,
+            app_name,
             url=str(WEB_INDEX),
             js_api=api,
             width=980,
@@ -180,11 +202,11 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
             background(Path(args.config_dir))
         except Exception:  # noqa: BLE001 - 배경 준비 실패가 화면 실행을 막으면 안 된다
             pass
-        webview_module.start()
+        webview_module.start(gui="edgechromium")
     except Exception as error:  # noqa: BLE001 - WebView2 부재 등 환경 문제를 사람 말로
         print(WEBVIEW2_HELP_MESSAGE)
         print(f"(자세한 원인: {error})")
-        _notify_safely(notify, APP_NAME, WEBVIEW2_HELP_MESSAGE)
+        _notify_safely(notify, app_name, WEBVIEW2_HELP_MESSAGE)
         return 1
     return 0
 

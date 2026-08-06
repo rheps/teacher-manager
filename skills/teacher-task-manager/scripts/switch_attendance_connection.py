@@ -11,6 +11,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -29,7 +30,7 @@ from attendance_install_record import (  # noqa: E402
     replace_attendance_install_record,
     validate_attendance_install_record,
 )
-from brity_bridge import paths  # noqa: E402
+from brity_bridge import bundle_paths, paths, tool_runtime  # noqa: E402
 from verify_attendance_access import (  # noqa: E402
     AttendanceAccessCheckResult,
     _check_attendance_access_once,
@@ -314,7 +315,7 @@ def _strict_sha256(value: Any, label: str) -> str:
 
 
 def _default_assets_dir() -> Path:
-    return SCRIPTS_DIR.parent / "assets"
+    return bundle_paths.bundle_root() / "assets"
 
 
 def _copy_script_evidence(
@@ -368,6 +369,7 @@ def _default_script_verifier(
     deployment_id: str,
     bundle_sha256: str,
     assets_dir: Path,
+    gws_executable: str | None = None,
 ):
     from prepare_attendance_copy_script import verify_prepared_copied_script
 
@@ -378,6 +380,7 @@ def _default_script_verifier(
         deployment_id=deployment_id,
         bundle_sha256=bundle_sha256,
         assets_dir=Path(assets_dir),
+        gws_executable=gws_executable,
     )
 
 
@@ -424,8 +427,15 @@ def _verified_copy_script(
     )
 
 
-def _default_access_check(config_dir: Path) -> AttendanceAccessCheckResult:
-    return _check_attendance_access_once(config_dir)
+def _default_access_check(
+    config_dir: Path,
+    *,
+    gws_executable: str | None = None,
+) -> AttendanceAccessCheckResult:
+    return _check_attendance_access_once(
+        config_dir,
+        gws_executable=gws_executable,
+    )
 
 
 def _default_script_check(
@@ -436,6 +446,7 @@ def _default_script_check(
     deployment_id: str,
     script_verifier: Callable[..., Any] | None = None,
     assets_dir: Path | None = None,
+    gws_executable: str | None = None,
 ) -> AttendanceScriptCheckResult:
     """사본 진행 기록의 확인값으로 parent·HEAD·버전·배포를 다시 읽어 대조한다."""
 
@@ -452,9 +463,13 @@ def _default_script_check(
         evidence["deployment_id"] == _strict_text(deployment_id, "이번 새 배포 ID"),
         "사본 진행 기록의 새 배포 ID가 이번 값과 다릅니다.",
     )
+    verifier = script_verifier or partial(
+        _default_script_verifier,
+        gws_executable=gws_executable,
+    )
     return _verified_copy_script(
         evidence,
-        verifier=script_verifier or _default_script_verifier,
+        verifier=verifier,
         assets_dir=Path(assets_dir) if assets_dir else _default_assets_dir(),
     )
 
@@ -1172,17 +1187,47 @@ def switch_attendance_connection(
     state_writer: StateWriter = _atomic_copy_status,
     record_writer: RecordWriter = _default_record_writer,
     lock_factory: LockFactory = _default_lock_factory,
+    assets_dir: Path | None = None,
 ) -> ConnectionSwitchResult:
     """같은 출결 잠금 안에서 중앙 확인 뒤 로컬 연결을 한 번만 바꾼다."""
 
     config_dir = Path(config_dir)
+    script_id = _strict_text(new_script_id, "이번 새 Apps Script ID")
+    deployment_id = _strict_text(new_deployment_id, "이번 새 배포 ID")
+    selected_access_check = access_check
+    selected_script_check = script_check
+    if access_check is _default_access_check or script_check is _default_script_check:
+        try:
+            gws = _strict_text(
+                tool_runtime.resolve_gws_executable(),
+                "Google Workspace CLI 실행 파일",
+            )
+        except AttendanceConnectionSwitchHold:
+            raise
+        except Exception as exc:
+            _hold("Google Workspace CLI 실행 파일을 고르지 못했습니다.", cause=exc)
+        _need(
+            Path(gws).is_absolute(),
+            "Google Workspace CLI 실행 파일이 전체 경로가 아닙니다.",
+        )
+        if access_check is _default_access_check:
+            selected_access_check = partial(
+                _default_access_check,
+                gws_executable=gws,
+            )
+        if script_check is _default_script_check:
+            selected_script_check = partial(
+                _default_script_check,
+                gws_executable=gws,
+                assets_dir=Path(assets_dir) if assets_dir else _default_assets_dir(),
+            )
     with lock_factory(config_dir):
         return _switch_attendance_connection_once(
             config_dir,
-            new_script_id=new_script_id,
-            new_deployment_id=new_deployment_id,
-            access_check=access_check,
-            script_check=script_check,
+            new_script_id=script_id,
+            new_deployment_id=deployment_id,
+            access_check=selected_access_check,
+            script_check=selected_script_check,
             central_transition=central_transition,
             state_writer=state_writer,
             record_writer=record_writer,

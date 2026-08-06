@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.10.0
+ * 버전: 5.11.0
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.10.0';
+const APP_VERSION = '5.11.0';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -176,6 +176,7 @@ function onOpen() {
  * 나머지는 계속 진행한 뒤 실패한 것만 결과 화면에 적는다.
  */
 function runFirstTimeSetup() {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   const steps = [
     { title: '기본 시트/설정 점검', run: firstTimeSetupWorkbookStep_ },
@@ -298,6 +299,7 @@ function showAbout() {
  * 기본 세팅/설정/드롭다운
  *************************************************/
 function setupAttendanceWorkbook() {
+  requireGoeduTeacherAccount_();
   setupAttendanceWorkbookCore_();
 
   SpreadsheetApp.getUi().alert(
@@ -310,6 +312,7 @@ function setupAttendanceWorkbook() {
 
 // LLM/설치 도우미가 Apps Script API로 UI 없이 실행하는 진입점.
 function apiSetupAttendanceWorkbook() {
+  requireGoeduTeacherAccount_();
   setupAttendanceWorkbookCore_();
   return 'ok';
 }
@@ -356,6 +359,7 @@ function setupAttendanceWorkbookCore_() {
 }
 
 function refreshInputFormattingAndDropdowns() {
+  requireGoeduTeacherAccount_();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   ensureConfigSheet_(ss);
   ensureRosterSheet_(ss);
@@ -946,6 +950,7 @@ function attendanceAiInputBoxFor_(sheet) {
  */
 function onSelectionChange(e) {
   try {
+    if (!mayRunLocalSheetTrigger_(e)) return;
     if (!e || !e.range || typeof e.range.getSheet !== 'function') return;
     const sheet = e.range.getSheet();
     const box = attendanceAiInputBoxFor_(sheet);
@@ -987,6 +992,7 @@ function resetAttendanceAiInputRow_(sheet) {
 }
 
 function handleAttendanceAiEdit(e, testPorts) {
+  requireGoeduTeacherAccount_({ event: e, allowEffectiveUser: false });
   if (
     !e
     || !e.source
@@ -1374,6 +1380,7 @@ function ensureAttendanceAiEditTrigger_(spreadsheetId) {
 
 /** 메뉴: 이 사본에서만 1행 AI 입력을 켠다. */
 function enableAttendanceAiInput(options) {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   // 통합 설정이 부를 때는 단계마다 창을 띄우지 않고 결과만 돌려준다 — 화면은 마지막에 한 번만 뜬다.
   const quiet = !!(options && options.quiet === true);
@@ -1834,6 +1841,7 @@ function ensureChatLogSheet_(ss) {
 }
 
 function openChatLogSheet() {
+  requireGoeduTeacherAccount_();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ensureChatLogSheet_(ss);
   ss.setActiveSheet(sh);
@@ -2118,6 +2126,7 @@ function replaceOptionalConfigPlaceholders_(body) {
 
 function checkExistingTemplateDoc() {
   try {
+    requireGoeduTeacherAccount_();
     const id = getTemplateDocId_();
     const file = DriveApp.getFileById(id);
     const doc = DocumentApp.openById(id);
@@ -2129,6 +2138,7 @@ function checkExistingTemplateDoc() {
 
 function connectDestinationFolder() {
   try {
+    requireGoeduTeacherAccount_();
     const folder = getDestinationFolder_();
     setConfigValue_('DEST_FOLDER_ID', folder.getId());
     SpreadsheetApp.getUi().alert('출력 폴더 연결 완료\n\n폴더명: ' + folder.getName() + '\nID: ' + folder.getId());
@@ -2138,6 +2148,7 @@ function connectDestinationFolder() {
 }
 
 function connectTasksList() {
+  requireGoeduTeacherAccount_();
   if (typeof Tasks === 'undefined') {
     SpreadsheetApp.getUi().alert(
       'Google Tasks API 고급 서비스가 켜져 있지 않습니다.\n\n' +
@@ -2164,12 +2175,86 @@ function isChatAppConfigurationError_(err) {
   return isCentralChatConnectionError_(err);
 }
 
+function isExactGoeduEmail_(value) {
+  return /^[^@\s]+@goedu\.kr$/i.test(String(value || '').trim());
+}
+
+function readSessionEmail_(event, allowEffectiveUser) {
+  let eventEmail = '';
+  try {
+    eventEmail = String(
+      event && event.user && typeof event.user.getEmail === 'function'
+        ? event.user.getEmail()
+        : ''
+    ).trim();
+  } catch (ignored) {}
+  if (eventEmail) return eventEmail;
+
+  let activeEmail = '';
+  try {
+    activeEmail = String(Session.getActiveUser().getEmail() || '').trim();
+  } catch (ignored) {}
+  // 현재 사용자가 보이면 그 계정을 그대로 판단한다. Gmail 사용자가 시트를 열었는데
+  // 소유자의 @goedu.kr 계정으로 바꿔 판단하면 안 된다.
+  if (activeEmail) return activeEmail;
+  // 설치형 자동 감지기는 실제 편집 계정을 모를 때 소유자 계정으로 대신 판단하지 않는다.
+  // 누가 고쳤는지 확인할 수 없는 편집은 조용히 멈추는 것이 학생 자료를 잘못 다루는 것보다 안전하다.
+  if (allowEffectiveUser === false) return '';
+  try {
+    return String(Session.getEffectiveUser().getEmail() || '').trim();
+  } catch (ignored) {
+    return '';
+  }
+}
+
+function mayRunLocalSheetTrigger_(event) {
+  // 단순 onEdit/onSelectionChange에서는 Google이 사용자 주소를 주지 않을 수 있다.
+  // 이 두 함수는 현재 시트의 표시·서식만 고치므로, 주소가 정말 안 보일 때는 계속
+  // 동작하게 한다. 다만 주소가 보인다면 정확한 @goedu.kr만 허용한다.
+  const email = readSessionEmail_(event, false);
+  return !email || isExactGoeduEmail_(email);
+}
+
+function requireGoeduTeacherAccount_(options) {
+  const opts = options || {};
+  const email = readSessionEmail_(opts.event, opts.allowEffectiveUser !== false);
+  if (!isExactGoeduEmail_(email)) {
+    throw new Error(
+      '이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 ' +
+      '클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 다시 로그인해 주세요.'
+    );
+  }
+  return email;
+}
+
+function requireGoeduStudentAccount_(value) {
+  const email = String(value || '').trim();
+  if (!isExactGoeduEmail_(email)) {
+    throw new Error(
+      '학생 개인톡은 @goedu.kr 학생 계정으로만 보낼 수 있어요. 학생 계정을 확인해 주세요.'
+    );
+  }
+  return email;
+}
+
+function centralChatPathNeedsTeacher_(path) {
+  // 연결을 끊거나 서버 기록을 지우는 길만 예외다. 새 작업 주소가 나중에 생겨도
+  // 목록에 깜빡하고 더하지 않았다는 이유로 개인 계정에서 열리지 않게 기본은 차단한다.
+  return ['/v1/disconnect', '/v1/account/delete']
+    .indexOf(String(path || '').trim()) === -1;
+}
+
 function callCentralChatSender_(path, payload) {
+  if (centralChatPathNeedsTeacher_(path)) requireGoeduTeacherAccount_();
+  const safePayload = Object.assign({}, payload || {});
+  if (String(path || '').trim() === '/v1/send/personal') {
+    safePayload.studentEmail = requireGoeduStudentAccount_(safePayload.studentEmail);
+  }
   const central = ensureCentralChatConfig_();
   if (!central.url) {
     throw new Error('Google Chat 중앙 발송소 주소가 비어 있습니다. 공개 배포 설정을 확인해 주세요.');
   }
-  const body = Object.assign({}, payload || {}, {
+  const body = Object.assign({}, safePayload, {
     sheetId: central.sheetId,
     sheetSecret: central.sheetSecret
   });
@@ -2290,13 +2375,16 @@ const CENTRAL_SHEET_MOVED_MESSAGE =
 function centralChatErrorMessage_(err) {
   const code = String(err && err.centralCode || '').trim();
   if (code === CENTRAL_SHEET_MOVED_CODE) return CENTRAL_SHEET_MOVED_MESSAGE;
+  if (code === 'GOEDU_ACCOUNT_REQUIRED') {
+    return '이 계정으로는 진행할 수 없어요. @goedu.kr 계정으로 다시 로그인해 주세요.';
+  }
   return errorMessage_(err);
 }
 
 function isCentralChatConnectionError_(err) {
   const code = String(err && err.centralCode || '').trim();
   if (code === CENTRAL_SHEET_MOVED_CODE) return true;
-  if (['CHAT_NOT_CONNECTED', 'SHEET_AUTH_REQUIRED', 'AUTH_STATE_EXPIRED'].indexOf(code) !== -1) return true;
+  if (['CHAT_NOT_CONNECTED', 'SHEET_AUTH_REQUIRED', 'AUTH_STATE_EXPIRED', 'GOEDU_ACCOUNT_REQUIRED'].indexOf(code) !== -1) return true;
   const message = String(err && err.message ? err.message : err || '');
   return message.indexOf('최초 발송 연결') !== -1 ||
     message.indexOf('연결') !== -1 ||
@@ -2315,6 +2403,7 @@ function showChatApiSetupRequired_(ui) {
 }
 
 function connectClassChatSpace(options) {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   // 통합 설정이 부를 때는 결과 창을 띄우지 않고 결과만 돌려준다.
   // 단톡방 목록에서 고르는 화면은 조용해도 그대로 뜬다 — 사람만 고를 수 있는 일이다.
@@ -2345,12 +2434,15 @@ function connectClassChatSpace(options) {
       return finish_(false, '번호를 확인할 수 없습니다. 목록에 보이는 번호를 입력해 주세요.');
     }
     const selected = spaces[index];
+    // 실제 발송이 읽는 설정 시트를 먼저 저장한다. 서버부터 바꾸면 시트 저장이
+    // 실패했을 때 화면에는 선택된 것처럼 보이지만 발송은 방을 찾지 못한다.
+    // ID를 이름보다 먼저 적어, 이름 저장에서 멈춰도 재시도와 발송이 가능하게 한다.
+    setConfigValue_('CLASS_CHAT_SPACE_ID', selected.name);
+    setConfigValue_('CLASS_CHAT_SPACE_NAME', selected.displayName);
     callCentralChatSender_('/v1/class-space', {
       spaceName: selected.name,
       displayName: selected.displayName
     });
-    setConfigValue_('CLASS_CHAT_SPACE_ID', selected.name);
-    setConfigValue_('CLASS_CHAT_SPACE_NAME', selected.displayName);
     return finish_(true, 'Google Chat 학급 단톡방을 골랐습니다.\n\n' + selected.displayName);
   } catch (err) {
     return finish_(false, 'Google Chat 학급 단톡방을 고르지 못했습니다.\n\n' + (err && err.message ? err.message : err));
@@ -2630,6 +2722,7 @@ function appendClassMessageQueueLines_(lines, sendDateKey, source, status, kind)
 }
 
 function appendPersonalMessageQueueItemsForAutomation(items) {
+  requireGoeduTeacherAccount_();
   const rows = [];
   (items || []).forEach(item => {
     const content = normalizeMessageLine_(item && item.content);
@@ -2656,6 +2749,7 @@ function appendPersonalMessageQueueItemsForAutomation(items) {
 }
 
 function appendClassMessageQueueItemsForAutomation(items) {
+  requireGoeduTeacherAccount_();
   const lines = [];
   (items || []).forEach(item => {
     const content = item && item.content;
@@ -2665,6 +2759,7 @@ function appendClassMessageQueueItemsForAutomation(items) {
 }
 
 function appendAnalyzedMessageQueueItemsForAutomation(payload) {
+  requireGoeduTeacherAccount_();
   const data = payload || {};
   return {
     personal: appendPersonalMessageQueueItemsForAutomation(data.personal || []),
@@ -3068,6 +3163,7 @@ function sendTodayPersonalMessageQueue_(targetDateKey) {
 
 // 메신저 단체톡 내용의 오늘 '대기' 줄만 학급 단톡방으로 보낸다.
 function sendTodayClassMessagesOnly() {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3107,6 +3203,7 @@ function sendTodayClassMessagesOnly() {
 
 // 메신저 개인톡 내용의 오늘 '대기' 줄만 학생별 개인톡으로 보낸다.
 function sendTodayPersonalMessagesOnly() {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3157,6 +3254,7 @@ function sendTodayPersonalMessagesOnly() {
 }
 
 function sendTodayDismissalMessages() {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -3243,14 +3341,17 @@ function sendTodayDismissalMessages() {
 }
 
 function sendMessengerPersonalMessages() {
+  requireGoeduTeacherAccount_();
   return sendTodayPersonalMessagesOnly();
 }
 
 function sendMessengerClassMessages() {
+  requireGoeduTeacherAccount_();
   return sendTodayClassMessagesOnly();
 }
 
 function sendMessengerAllMessages() {
+  requireGoeduTeacherAccount_();
   return sendTodayDismissalMessages();
 }
 
@@ -3260,6 +3361,7 @@ function startCentralChatConnection(options) {
   // 권한 허용·연결 화면은 조용해도 그대로 띄운다 — 사람이 눌러야 끝나는 일이라 없앨 수 없다.
   const quiet = !!(options && options.quiet === true);
   try {
+    requireGoeduTeacherAccount_();
     const info = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL);
     const authorizationUrl = info.getAuthorizationStatus() === ScriptApp.AuthorizationStatus.REQUIRED
       ? String(info.getAuthorizationUrl() || '').trim()
@@ -3280,11 +3382,12 @@ function startCentralChatConnection(options) {
 }
 
 function checkCentralChatStatus() {
+  requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   try {
     const status = callCentralChatSender_('/v1/status', {});
     if (!status.connected) {
-      ui.alert('Google Chat 최초 발송 연결이 아직 안 됐습니다.\n\n[Google Chat 최초 발송 연결하기]를 먼저 눌러 주세요.');
+      ui.alert(status.reason || 'Google Chat 최초 발송 연결이 아직 안 됐습니다.\n\n[Google Chat 최초 발송 연결하기]를 먼저 눌러 주세요.');
       return;
     }
     ui.alert(
@@ -3348,6 +3451,7 @@ function shouldSkipSheet_(sheet) {
  * 시트 컬럼(A~F): 날짜 / 번호+이름 / 구분 / 종류 / 사유 / (지각·조퇴·결과 교시)
  *************************************************/
 function createDocFromTemplate() {
+  requireGoeduTeacherAccount_();
   try {
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
 
@@ -3368,6 +3472,7 @@ function createDocFromTemplate() {
 }
 
 function createDocFromRowForAutomation(sheetName, rowIdx) {
+  requireGoeduTeacherAccount_();
   const sheet = getSheetForAutomation_(sheetName);
   return createDocsFromRows_(sheet, [Number(rowIdx)]);
 }
@@ -3507,6 +3612,7 @@ function processRowToDoc_(sheet, rowIdx, absIndex, holidaySet, issuedSpanKeys) {
  * - 기존 Tasks 중복 체크: 완료(completed)는 제외, 페이지네이션 처리
  *************************************************/
 function addSelectedRowToTasks() {
+  requireGoeduTeacherAccount_();
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getActiveSheet();
@@ -3547,6 +3653,7 @@ function addSelectedRowToTasks() {
 }
 
 function addRowToTasksForAutomation(sheetName, rowIdx) {
+  requireGoeduTeacherAccount_();
   const sheet = getSheetForAutomation_(sheetName);
   return addRowsToTasks_(sheet, [Number(rowIdx)]);
 }
@@ -3629,6 +3736,7 @@ function addRowsToTasks_(sheet, selectedRows) {
  * - 이미 월별 결과가 '보냄'인 행은 다시 보내지 않는다.
  *************************************************/
 function sendSelectedRowsChatNow() {
+  requireGoeduTeacherAccount_();
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getActiveSheet();
@@ -3687,6 +3795,7 @@ function sendSelectedRowsChatNow() {
 }
 
 function sendSelectedRowChatForAutomation(sheetName, rowIdx) {
+  requireGoeduTeacherAccount_();
   const sheet = getSheetForAutomation_(sheetName);
   return sendSelectedRowsPersonalMessagesNow_(sheet, [Number(rowIdx)]);
 }
@@ -4337,6 +4446,7 @@ function getRowText_(row){
 }
 function onEdit(e) {
   try {
+    if (!mayRunLocalSheetTrigger_(e)) return;
     if (!e || !e.range) return;
     const range = e.range;
     const sheet = range.getSheet();
@@ -4373,12 +4483,14 @@ function onEdit(e) {
 }
 /** 메뉴: 현재 탭만 줄무늬 재적용 */
 function reStripeActiveSheet() {
+  requireGoeduTeacherAccount_();
   const sheet = SpreadsheetApp.getActiveSheet();
   reStripeSheet_(sheet);
 }
 
 /** 메뉴: 모든 탭에 줄무늬 재적용 */
 function reStripeAllSheets() {
+  requireGoeduTeacherAccount_();
   const ss = SpreadsheetApp.getActive();
   ss.getSheets().forEach(sh => reStripeSheet_(sh));
 }

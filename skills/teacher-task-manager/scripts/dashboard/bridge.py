@@ -11,6 +11,7 @@ import functools
 import json
 import os
 import sys
+import threading
 import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,13 +19,25 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brity_bridge import capture_store, paths
+from brity_bridge import bundle_paths, capture_store, gws_env, paths
 from brity_bridge.settings import load_settings
 from dashboard import engine
 from dashboard import version
 
 SETUP_STATE_NAME = "setup-state.json"
-_FRESH_STATE = {"version": 1, "completed": False, "step": 1, "draft": {"profile": {}, "grid": [], "bridge": {}}}
+SETUP_STATE_VERSION = 2
+SETUP_LAST_STEP = 9
+_FRESH_STATE = {
+    "version": SETUP_STATE_VERSION,
+    "completed": False,
+    "step": 1,
+    "max_step": 1,
+    "draft": {"profile": {}, "grid": [], "bridge": {}},
+}
+_V1_STEP_TO_V2 = {1: 1, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 9}
+_ATTENDANCE_AUTH_BLOCKED_STATES = {
+    "gws-required", "login-required", "account-required", "auth-error"
+}
 
 
 def _ok(data):
@@ -69,6 +82,19 @@ class BridgeDeps:
     dir_opener: object = None
     popen_factory: object = None
     folder_picker: object = None
+    environ: object = None
+    gws_config_dir: object = None
+    bundled_oauth_client_path: object = None
+    node_local_app_data: object = None
+    node_opener: object = None
+    node_run_command: object = None
+    gws_update_checker: object = None
+    gws_update_installer: object = None
+    gws_runtime_resolver: object = None
+    gws_component_root: object = None
+    attendance_script_updater: object = None
+    attendance_script_runner: object = None
+    attendance_remote_work_timeout_seconds: object = None
 
 
 class Api:
@@ -76,6 +102,11 @@ class Api:
         self._config_dir = Path(config_dir)
         self._deps = deps or BridgeDeps()
         self._login = engine.LoginSession()
+        self._gws_update_offer = None
+        self._gws_update_offer_key = ""
+        self._gws_update_last_status = None
+        self._gws_update_install_lock = threading.Lock()
+        self._attendance_script_update_lock = threading.Lock()
 
     # ----- setup-state -----
 
@@ -89,23 +120,84 @@ class Api:
         self._config_dir.mkdir(parents=True, exist_ok=True)
         self._state_path().write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
+    def _migrate_state(self, state: dict) -> tuple[dict, bool]:
+        """예전 7단계 기록을 9단계로 옮기되 작성 중인 값은 그대로 둔다."""
+
+        merged = self._fresh_state()
+        merged.update(state)
+        try:
+            saved_version = int(state.get("version") or 1)
+        except (TypeError, ValueError):
+            saved_version = 1
+
+        def bounded_step(value, default=1) -> int:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                number = default
+            return max(1, min(SETUP_LAST_STEP, number))
+
+        if saved_version >= SETUP_STATE_VERSION:
+            if bool(merged.get("completed")):
+                # 완료 기록은 중간 단계 숫자가 깨져도 기존 사용자를 처음 화면으로
+                # 되돌리지 않는다. 초안과 미래 보조값은 merged에 그대로 남긴다.
+                merged["step"] = SETUP_LAST_STEP
+                merged["max_step"] = SETUP_LAST_STEP
+                return merged, merged != state
+            merged["step"] = bounded_step(merged.get("step"), 1)
+            merged["max_step"] = max(
+                merged["step"],
+                bounded_step(merged.get("max_step"), merged["step"]),
+            )
+            return merged, merged != state
+
+        completed = bool(merged.get("completed"))
+
+        def move(value) -> int:
+            try:
+                old = int(value or 1)
+            except (TypeError, ValueError):
+                old = 1
+            if completed and old >= 7:
+                return SETUP_LAST_STEP
+            if old >= 7:
+                return SETUP_LAST_STEP
+            return _V1_STEP_TO_V2.get(max(1, old), 1)
+
+        merged["version"] = SETUP_STATE_VERSION
+        merged["step"] = move(merged.get("step"))
+        merged["max_step"] = max(
+            merged["step"], move(merged.get("max_step") or merged["step"])
+        )
+        return merged, True
+
     def _load_state(self) -> dict:
         path = self._state_path()
         if path.exists():
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(state, dict):
-                    merged = self._fresh_state()
-                    merged.update(state)
+                    merged, changed = self._migrate_state(state)
+                    if changed:
+                        self._write_state(merged)
                     return merged
-            except ValueError:
+            except (TypeError, ValueError):
                 pass
+            if paths.profile_path(self._config_dir).exists():
+                # 읽을 수 없는 진행 파일을 빈 값으로 덮지 않는다. 실제 사용자 정보가
+                # 있으면 화면만 완료 상태로 열고, 망가진 원본은 그대로 남겨 복구할 수 있게 한다.
+                state = self._fresh_state()
+                state["completed"] = True
+                state["step"] = SETUP_LAST_STEP
+                state["max_step"] = SETUP_LAST_STEP
+                return state
             return self._fresh_state()
         if paths.profile_path(self._config_dir).exists():
             # 기존 사용자(웹 UI 이전 설치): 마법사로 끌고 가지 않는다.
             state = self._fresh_state()
             state["completed"] = True
-            state["step"] = 7
+            state["step"] = SETUP_LAST_STEP
+            state["max_step"] = SETUP_LAST_STEP
             self._write_state(state)
             return state
         return self._fresh_state()
@@ -212,23 +304,55 @@ class Api:
         return engine.ai_tools_status()
 
     @guarded
-    def ai_skills_install(self, keys):
-        return engine.ai_skills_install(keys)
+    def ai_node_status(self):
+        kwargs = {}
+        if self._deps.node_local_app_data is not None:
+            kwargs["local_app_data"] = self._deps.node_local_app_data
+        if self._deps.node_run_command is not None:
+            kwargs["run_command"] = self._deps.node_run_command
+        return engine.ai_node_status(**kwargs)
+
+    @guarded
+    def ai_node_prepare(self):
+        kwargs = {}
+        if self._deps.node_local_app_data is not None:
+            kwargs["local_app_data"] = self._deps.node_local_app_data
+        if self._deps.node_opener is not None:
+            kwargs["opener"] = self._deps.node_opener
+        if self._deps.node_run_command is not None:
+            kwargs["run_command"] = self._deps.node_run_command
+        return engine.ai_node_prepare(**kwargs)
+
+    @guarded
+    def ai_skills_install(self, keys, permission_ack=False):
+        kwargs = {}
+        if self._deps.node_run_command is not None:
+            kwargs["run_command"] = self._deps.node_run_command
+        return engine.ai_skills_install(keys, permission_ack=permission_ack, **kwargs)
 
     @guarded
     def save_setup_state(self, state):
         if not isinstance(state, dict):
             raise ValueError("설정 진행 상태 모양이 올바르지 않아요")
-        merged = self._fresh_state()
-        merged.update(state)
+        previous = self._load_state()
+        combined = dict(previous)
+        combined.update(state)
+        # 이 문은 작성 중인 칸만 저장한다. 화면이 completed=true를 보내더라도
+        # 완료 권한을 주지 않으며, 이미 끝낸 사용자는 늦은 저장으로 되돌리지 않는다.
+        combined["completed"] = bool(previous.get("completed"))
+        merged, _changed = self._migrate_state(combined)
         self._write_state(merged)
         return True
 
     @guarded
     def finish_setup(self):
-        state = self._fresh_state()
+        self._resolve_goedu_gws_or_fail()
+        state = self._load_state()
+        state["version"] = SETUP_STATE_VERSION
         state["completed"] = True
-        state["step"] = 7
+        state["step"] = SETUP_LAST_STEP
+        state["max_step"] = SETUP_LAST_STEP
+        state["draft"] = self._fresh_state()["draft"]
         self._write_state(state)  # draft(키 포함)를 비운 채 기록
         return True
 
@@ -242,17 +366,48 @@ class Api:
     def _run(self):
         return self._deps.run_command or engine._default_run_command
 
+    def _attendance_remote_run(self):
+        """출결 Google 명령은 자식 작업까지 실제 제한 시간이 있는 길로 실행한다."""
+
+        if self._deps.run_command is not None:
+            return self._deps.run_command
+        environment = gws_env.gws_environ(self._gws_base_environ())
+
+        def run(args):
+            return engine.attendance_remote_command(args, environment=environment)
+
+        return run
+
+    def _gws_base_environ(self) -> dict:
+        """GWS가 물려받을 Windows 환경값의 읽기 전용 사본."""
+
+        return dict(os.environ if self._deps.environ is None else self._deps.environ)
+
+    def _unsafe_gws_account_storage(self) -> tuple[str, ...]:
+        return gws_env.unsafe_account_storage_overrides(self._gws_base_environ())
+
+    def _require_safe_gws_account_storage(self) -> None:
+        if self._unsafe_gws_account_storage():
+            raise gws_env.GwsAccountStorageError(
+                gws_env.ACCOUNT_STORAGE_ERROR_MESSAGE
+            )
+
     @guarded
     def home_checks(self):
+        self._require_safe_gws_account_storage()
         results = engine.home_checks(self._config_dir, deps=self._deps.home_check_deps)
         return [asdict(r) for r in results]
 
     @guarded
     def attendance_status(self):
-        # 옛 기록에 학년도 도장이 없으면 여기서 한 번 채워 적는다 — read_attendance_status는
-        # 판정만 하고 파일을 고치지 않는다.
-        engine.backfill_attendance_record_stamp(self._config_dir)
-        status = asdict(engine.read_attendance_status(self._config_dir, self._run()))
+        self._require_safe_gws_account_storage()
+        status_value = engine.read_attendance_status(self._config_dir, self._run())
+        if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
+            return asdict(status_value)
+        # 허용 계정임을 확인한 뒤에만 옛 기록에 학년도 도장을 채운다.
+        if engine.backfill_attendance_record_stamp(self._config_dir):
+            status_value = engine.read_attendance_status(self._config_dir, self._run())
+        status = asdict(status_value)
         # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다.
         engine.save_attendance_status_cache(self._config_dir, status)
         return status
@@ -264,30 +419,271 @@ class Api:
 
     @guarded
     def ensure_attendance(self):
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(run_command=self._run())
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
         status = asdict(engine.ensure_attendance(self._config_dir, deps=deps))
         # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
-        engine.save_attendance_status_cache(self._config_dir, status)
+        if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
+            engine.save_attendance_status_cache(self._config_dir, status)
         return status
 
     @guarded
     def start_new_attendance(self):
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(run_command=self._run())
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
         status = asdict(engine.start_new_attendance(self._config_dir, deps=deps))
         # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
-        engine.save_attendance_status_cache(self._config_dir, status)
+        if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
+            engine.save_attendance_status_cache(self._config_dir, status)
         return status
+
+    def _attendance_script_update(
+        self,
+        *,
+        apply: bool,
+        record_snapshot=None,
+        resolved=None,
+    ):
+        """기존 출결 Sheet의 Apps Script만 확인하거나 명시적으로 갱신한다."""
+
+        record_path = paths.attendance_install_record_path(self._config_dir)
+        if record_snapshot is None and not record_path.exists():
+            return {
+                "state": "not-ready",
+                "verified": False,
+                "detail": "출결 준비를 먼저 마쳐 주세요.",
+            }
+        from attendance_install_record import (
+            mark_attendance_script_current,
+            read_attendance_install_snapshot,
+        )
+
+        run, gws = (
+            resolved
+            if resolved is not None
+            else self._resolve_attendance_goedu_gws_or_fail()
+        )
+        if record_snapshot is None:
+            record_snapshot = read_attendance_install_snapshot(record_path)
+        record = record_snapshot.record
+        updater = self._deps.attendance_script_updater
+        if updater is None:
+            from attendance_script_update import inspect_or_update_attendance_script
+
+            updater = inspect_or_update_attendance_script
+        script_runner = self._deps.attendance_script_runner
+        if script_runner is None:
+            # Apps Script의 +push는 임시 폴더 위치를 꼭 넘겨야 한다. 자식 작업까지
+            # 제한 시간 안에 끝내는 출결 전용 실행기를 사용한다.
+            environment = gws_env.gws_environ(self._gws_base_environ())
+
+            def script_runner(args, cwd):
+                return engine.attendance_remote_runner(
+                    args, cwd, environment=environment
+                )
+        assets_dir = bundle_paths.bundle_root() / "assets"
+        result = updater(
+            record,
+            assets_dir=assets_dir,
+            apply=apply,
+            runner=script_runner,
+            gws_executable=gws,
+        )
+        payload = dict(result) if isinstance(result, dict) else asdict(result)
+        if (
+            apply
+            and payload.get("verified") is True
+            and payload.get("state") in {"current", "updated"}
+        ):
+            # 결과 글자만 믿지 않는다. 현재 프로그램에 실제로 든 코드 지문, 원격
+            # 확인 결과, 처음 읽은 세 연결 ID가 모두 같을 때만 준비 증명을 남긴다.
+            expected_sha256 = engine.current_attendance_script_bundle_sha256()
+            same_ids = all(
+                payload.get(key) == record.get(key)
+                for key in ("spreadsheet_id", "script_id", "deployment_id")
+            )
+            if (
+                not same_ids
+                or payload.get("target_bundle_sha256") != expected_sha256
+                or payload.get("current_bundle_sha256") != expected_sha256
+            ):
+                raise RuntimeError(
+                    "확인한 출결 기능이 지금 프로그램에 든 파일과 달라서 준비 완료로 바꾸지 않았어요."
+                )
+            # 업데이트를 시작할 때 읽은 기록이 지금도 정확히 같을 때만 증명을 쓰고
+            # 옛판 표식을 함께 지운다. 다른 창의 새 기록은 건드리지 않는다.
+            mark_attendance_script_current(
+                record_path, record_snapshot, expected_sha256
+            )
+        return payload
+
+    def _require_current_attendance_script(self, record=None) -> None:
+        """예전 공식 출결 기능을 되찾은 직후에는 Chat 쓰기를 먼저 막는다."""
+
+        record_path = paths.attendance_install_record_path(self._config_dir)
+        if record is None and not record_path.exists():
+            return
+        from attendance_install_record import (
+            attendance_script_is_attested,
+            load_attendance_install_record,
+        )
+
+        if record is None:
+            record = load_attendance_install_record(record_path)
+        if (
+            record.get("script_update_required") is True
+            or not attendance_script_is_attested(
+                record, engine.current_attendance_script_bundle_sha256()
+            )
+        ):
+            raise RuntimeError(
+                "기존 자료는 그대로 두었지만 출결 기능 확인 또는 업데이트가 먼저 필요해요. "
+                "출결 탭에서 [출결 기능 최신 상태 확인]을 눌러 주세요."
+            )
+
+    def _require_current_remote_attendance_script(
+        self,
+        record_snapshot,
+        resolved,
+    ) -> None:
+        """Chat 직전에 HEAD·고정 배포판·현재 프로그램 파일을 다시 읽어 맞춘다."""
+
+        payload = self._attendance_script_update(
+            apply=False,
+            record_snapshot=record_snapshot,
+            resolved=resolved,
+        )
+        record = record_snapshot.record
+        expected_sha256 = engine.current_attendance_script_bundle_sha256()
+        same_ids = all(
+            payload.get(key) == record.get(key)
+            for key in ("spreadsheet_id", "script_id", "deployment_id")
+        )
+        if not (
+            payload.get("state") == "current"
+            and payload.get("verified") is True
+            and same_ids
+            and payload.get("current_bundle_sha256") == expected_sha256
+            and payload.get("target_bundle_sha256") == expected_sha256
+        ):
+            raise RuntimeError(
+                "현재 Google의 출결 기능을 안전하게 다시 확인하지 못해 "
+                "Chat 작업을 시작하지 않았어요. 출결 탭에서 "
+                "[출결 기능 최신 상태 확인]을 눌러 주세요."
+            )
+
+    def _run_attendance_chat_action(self, action):
+        """긴 작업은 별도 잠금으로 직렬화하고 설치 기록 잠금은 짧게만 쓴다."""
+
+        from attendance_install_record import (
+            attendance_install_record_lock,
+            read_attendance_install_snapshot,
+        )
+
+        record_path = paths.attendance_install_record_path(self._config_dir)
+        timeout = self._deps.attendance_remote_work_timeout_seconds
+        lock_options = {}
+        if timeout is not None:
+            lock_options["timeout_seconds"] = float(timeout)
+        # 출결 새 준비·연결 교체·Chat 작업은 같은 원격 작업 잠금을 쓴다. 반면
+        # 설치 기록 파일은 처음 snapshot과 마지막 대조 순간에만 잠근다.
+        with engine.attendance_remote_work_lock(self._config_dir, **lock_options):
+            resolved = (
+                self._resolve_attendance_goedu_gws_or_fail()
+                if record_path.exists()
+                else None
+            )
+            with attendance_install_record_lock(record_path):
+                record_snapshot = (
+                    read_attendance_install_snapshot(record_path)
+                    if record_path.exists()
+                    else None
+                )
+
+            if record_snapshot is not None:
+                if resolved is None:
+                    # 파일이 없다고 본 직후 다른 과정이 새 연결을 놓은 드문 경우다.
+                    # 그 새 연결을 이 버튼이 우연히 이어 쓰지 않고 다시 눌러 확인시킨다.
+                    raise RuntimeError(
+                        "출결 연결이 방금 바뀌었어요. 현재 출결 상태를 다시 확인해 주세요."
+                    )
+                run, gws = resolved
+                self._require_current_attendance_script(record_snapshot.record)
+                self._require_current_remote_attendance_script(
+                    record_snapshot, (run, gws)
+                )
+            else:
+                run, gws = self._attendance_remote_run(), None
+
+            result = action(
+                run,
+                gws,
+                None if record_snapshot is None else record_snapshot.record,
+            )
+
+            if record_snapshot is not None:
+                with attendance_install_record_lock(record_path):
+                    changed = not record_path.exists()
+                    if not changed:
+                        current = read_attendance_install_snapshot(record_path)
+                        changed = (
+                            current.raw != record_snapshot.raw
+                            or current.sha256 != record_snapshot.sha256
+                        )
+                if changed:
+                    raise RuntimeError(
+                        "Chat 작업 중 다른 창에서 출결 연결이 바뀌었어요. "
+                        "새 연결에는 결과를 쓰지 않았습니다. 현재 출결 상태를 다시 확인해 주세요."
+                    )
+            return result
+
+    @guarded
+    def attendance_script_update_status(self):
+        # 이 길은 Apps Script와 배포 상태만 읽는다. Sheet나 설치 기록은 쓰지 않는다.
+        return self._attendance_script_update(apply=False)
+
+    @guarded
+    def attendance_script_update_apply(self):
+        # 화면의 별도 확인창을 통과해 여기로 왔을 때만 쓰기 동작을 허용한다.
+        if not self._attendance_script_update_lock.acquire(blocking=False):
+            raise RuntimeError("출결 기능을 이미 업데이트하고 있어요. 잠시만 기다려 주세요.")
+        try:
+            # 다른 대시보드 창과 새 학년도 출결 준비도 같은 기록과 Google Script를
+            # 만질 수 있다. 공용 잠금 안에서 계정부터 다시 확인하고 한 번씩 실행한다.
+            with engine.attendance_setup_lock(self._config_dir):
+                return self._attendance_script_update(apply=True)
+        finally:
+            self._attendance_script_update_lock.release()
 
     @guarded
     def attendance_chat_status(self):
         from dashboard import central_chat
         # 상태 조회는 화면에 보여 줄 값만 읽고, Google 시트는 바꾸지 않는다.
-        return central_chat.chat_status(self._config_dir)
+        if paths.attendance_install_record_path(self._config_dir).exists():
+            run, gws = self._resolve_attendance_goedu_gws_or_fail()
+        else:
+            run, gws = self._run(), None
+        return central_chat.chat_status(
+            self._config_dir,
+            run,
+            gws_executable=gws,
+        )
 
     @guarded
     def attendance_chat_connect(self):
         from dashboard import central_chat
-        auth_url = central_chat.start_auth(self._config_dir)
+        auth_url = self._run_attendance_chat_action(
+            lambda run, gws, record: central_chat.start_auth(
+                self._config_dir,
+                run,
+                gws_executable=gws,
+                attendance_record=record,
+            )
+        )
         opener = self._deps.url_opener or webbrowser.open
         opener(auth_url)
         return {"opened": True}
@@ -295,17 +691,41 @@ class Api:
     @guarded
     def attendance_chat_spaces(self):
         from dashboard import central_chat
-        return central_chat.list_spaces(self._config_dir)
+        return self._run_attendance_chat_action(
+            lambda run, gws, record: central_chat.list_spaces(
+                self._config_dir,
+                run,
+                gws_executable=gws,
+                attendance_record=record,
+            )
+        )
 
     @guarded
     def attendance_chat_set_space(self, space_name, display_name):
         from dashboard import central_chat
-        return central_chat.set_class_space(self._config_dir, str(space_name), str(display_name))
+        return self._run_attendance_chat_action(
+            lambda run, gws, record: central_chat.set_class_space(
+                self._config_dir,
+                str(space_name),
+                str(display_name),
+                run,
+                gws_executable=gws,
+                attendance_record=record,
+            )
+        )
 
     @guarded
     def attendance_chat_create_space(self, display_name=""):
         from dashboard import central_chat
-        return central_chat.create_class_space(self._config_dir, str(display_name))
+        return self._run_attendance_chat_action(
+            lambda run, gws, record: central_chat.create_class_space(
+                self._config_dir,
+                str(display_name),
+                run,
+                gws_executable=gws,
+                attendance_record=record,
+            )
+        )
 
     @guarded
     def computer_status(self):
@@ -313,16 +733,88 @@ class Api:
 
     @guarded
     def google_status(self):
+        base, _config_dir, _bundled, selection = self._oauth_context()
+        credential_override = bool(
+            str(base.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") or "").strip()
+        )
+        if gws_env.unsafe_account_storage_overrides(base):
+            # 파일 위치를 고치기 전에는 gws --version이나 auth status조차 실행하지
+            # 않는다. 공용/다른 계정의 토큰을 우연히 읽는 일을 먼저 막는다.
+            return {
+                "gws_runtime_ready": False,
+                "oauth_client_ready": bool(selection.ready),
+                "oauth_client_conflict": selection.source == "conflict",
+                "credential_override_present": credential_override,
+                "account_storage_override_unsafe": True,
+                "login_state": "error",
+                "error_code": gws_env.ACCOUNT_STORAGE_ERROR_CODE,
+                "logged_in": False,
+                "account_allowed": False,
+                "user": "",
+            }
+
         run = self._run()
-        gws = engine.resolve_gws(run)
-        auth = engine.gws_auth_status(run, gws) if gws else {"logged_in": False, "user": "", "raw": ""}
+        runtime_error = ""
+        try:
+            gws = engine.resolve_gws(run)
+        except engine.tool_runtime.GwsRuntimeError as error:
+            gws = ""
+            runtime_error = error.code
+        auth = (
+            engine.gws_auth_status(run, gws)
+            if gws
+            else {
+                "logged_in": False,
+                "account_allowed": False,
+                "user": "",
+                "login_state": "not_checked",
+                "error_code": "",
+            }
+        )
+        error_code = runtime_error or selection.error_code or auth.get("error_code", "")
         return {
-            "node": engine.check_version(run, "node"),
-            "npm": engine.check_version(run, "npm"),
-            "gws": gws,
+            "gws_runtime_ready": bool(gws),
+            "oauth_client_ready": bool(selection.ready),
+            "oauth_client_conflict": selection.source == "conflict",
+            "credential_override_present": credential_override,
+            "account_storage_override_unsafe": False,
+            "login_state": auth.get("login_state", "not_checked"),
+            "error_code": error_code,
             "logged_in": bool(auth["logged_in"]),
+            "account_allowed": bool(auth.get("account_allowed")),
             "user": auth["user"],
         }
+
+    @guarded
+    def gws_update_status(self):
+        if self._unsafe_gws_account_storage():
+            self._gws_update_offer = None
+            self._gws_update_offer_key = ""
+            self._gws_update_last_status = {
+                "success": False,
+                "code": gws_env.ACCOUNT_STORAGE_ERROR_CODE,
+                "detail": gws_env.ACCOUNT_STORAGE_ERROR_MESSAGE,
+                "checked_on": "",
+                "offer": None,
+                "runtime_ready": False,
+                "can_continue": False,
+                "repair_required": True,
+                "current_version": "",
+                "current_source": "",
+                "runtime_error_code": gws_env.ACCOUNT_STORAGE_ERROR_CODE,
+            }
+            return dict(self._gws_update_last_status)
+        status, exact_offer = engine.read_gws_update_status(
+            version.APP_VERSION,
+            self._run(),
+            component_root=self._deps.gws_component_root,
+            checker=self._deps.gws_update_checker,
+            resolver=self._deps.gws_runtime_resolver,
+        )
+        self._gws_update_offer = exact_offer
+        self._gws_update_offer_key = self._screen_offer_key(status.get("offer"))
+        self._gws_update_last_status = dict(status)
+        return status
 
     @guarded
     def read_profile(self):
@@ -334,11 +826,13 @@ class Api:
 
     @guarded
     def list_calendars(self):
-        return engine.list_calendars(self._run(), engine.resolve_gws(self._run()))
+        run, gws = self._resolve_gws_or_fail()
+        return engine.list_calendars(run, gws)
 
     @guarded
     def list_tasklists(self):
-        return engine.list_tasklists(self._run(), engine.resolve_gws(self._run()))
+        run, gws = self._resolve_gws_or_fail()
+        return engine.list_tasklists(run, gws)
 
     @guarded
     def verify_gemini_key(self, key, model=None):
@@ -372,22 +866,112 @@ class Api:
     def _success(self, ok, detail):
         return {"success": bool(ok), "detail": detail}
 
-    @guarded
-    def install_node(self):
-        return self._success(*engine.install_node(self._run()))
+    @staticmethod
+    def _screen_offer_key(offer) -> str:
+        if not isinstance(offer, dict):
+            return ""
+        try:
+            return json.dumps(
+                offer,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return ""
+
+    def _gws_update_failure(self, code: str, detail: str) -> dict:
+        previous = self._gws_update_last_status or {}
+        return {
+            "success": False,
+            "code": code,
+            "detail": detail,
+            "runtime_ready": bool(previous.get("runtime_ready")),
+            "can_continue": bool(previous.get("can_continue")),
+            "repair_required": bool(previous.get("repair_required")),
+            "current_version": str(previous.get("current_version") or ""),
+            "current_source": str(previous.get("current_source") or ""),
+            "runtime_error_code": str(previous.get("runtime_error_code") or ""),
+        }
 
     @guarded
-    def install_gws(self):
-        return self._success(*engine.install_gws(self._run()))
+    def install_gws_update(self, offer):
+        self._require_safe_gws_account_storage()
+        if not self._gws_update_install_lock.acquire(blocking=False):
+            return self._gws_update_failure(
+                "COMPONENT_UPDATE_BUSY",
+                "다른 Google 도구 갱신이 끝난 뒤 다시 눌러 주세요.",
+            )
+        try:
+            shown_key = self._screen_offer_key(offer)
+            if (
+                self._gws_update_offer is None
+                or not shown_key
+                or shown_key != self._gws_update_offer_key
+            ):
+                return self._gws_update_failure(
+                    "UPDATE_OFFER_CHANGED",
+                    "처음 확인한 승인 정보와 달라 적용하지 않았어요. 다시 점검해 주세요.",
+                )
+            result = engine.apply_gws_update(
+                self._gws_update_offer,
+                self._run(),
+                component_root=self._deps.gws_component_root,
+                installer=self._deps.gws_update_installer,
+                resolver=self._deps.gws_runtime_resolver,
+            )
+            self._gws_update_last_status = {
+                **(self._gws_update_last_status or {}),
+                **result,
+            }
+            if result.get("success"):
+                self._gws_update_offer = None
+                self._gws_update_offer_key = ""
+                self._gws_update_last_status["offer"] = None
+            return result
+        finally:
+            self._gws_update_install_lock.release()
 
     @guarded
     def gws_login_start(self):
-        run = self._run()
-        gws = engine.resolve_gws(run)
-        if not gws:
-            raise RuntimeError("gws 도구가 아직 없어요. 먼저 설치해 주세요")
-        self._login.start(engine.login_command(gws), popen=self._deps.popen_factory)
+        run, gws = self._resolve_gws_or_fail()
+        base, _config_dir, _bundled, selection = self._oauth_context()
+        if not selection.ready:
+            if selection.error_code == "OAUTH_CLIENT_CONFLICT":
+                raise RuntimeError(
+                    "기존 Google 로그인 설정과 Teacher Manager의 로그인 설정이 서로 달라요. "
+                    "로그인 설정을 확인해 주세요."
+                )
+            if selection.error_code == "OAUTH_CLIENT_MISSING":
+                raise RuntimeError(
+                    "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
+                )
+            raise RuntimeError("Google 로그인 준비 파일을 안전하게 읽지 못했어요.")
+        child_env = gws_env.login_environ(base, selection)
+        self._login.start(
+            engine.login_command(gws),
+            popen=self._deps.popen_factory,
+            env=child_env,
+        )
         return self._login.snapshot()
+
+    def _oauth_context(self):
+        """화면 상태와 로그인 시작이 똑같은 OAuth 준비 판정을 함께 쓴다."""
+        base = self._gws_base_environ()
+        config_dir = (
+            Path(self._deps.gws_config_dir)
+            if self._deps.gws_config_dir is not None
+            else gws_env.default_gws_config_dir(base)
+        )
+        if self._deps.bundled_oauth_client_path is False:
+            bundled = None
+        elif self._deps.bundled_oauth_client_path is not None:
+            bundled = Path(self._deps.bundled_oauth_client_path)
+        else:
+            candidate = bundle_paths.bundle_root() / "assets" / gws_env.CLIENT_FILE_NAME
+            bundled = candidate if candidate.is_file() else None
+        selection = gws_env.select_desktop_oauth_client(base, config_dir, bundled)
+        return base, config_dir, bundled, selection
 
     @guarded
     def gws_login_status(self):
@@ -398,10 +982,31 @@ class Api:
         return {"cancelled": self._login.cancel()}
 
     def _resolve_gws_or_fail(self):
+        self._require_safe_gws_account_storage()
         run = self._run()
         gws = engine.resolve_gws(run)
         if not gws:
             raise RuntimeError("gws 도구가 아직 없어요. 먼저 설치해 주세요")
+        return run, gws
+
+    def _resolve_goedu_gws_or_fail(self):
+        run, gws = self._resolve_gws_or_fail()
+        engine.require_goedu_gws_session(run, gws)
+        return run, gws
+
+    def _resolve_attendance_goedu_gws_or_fail(self):
+        """출결 자료는 처음 준비한 학교 계정으로만 읽거나 바꾼다."""
+
+        self._require_safe_gws_account_storage()
+        run = self._attendance_remote_run()
+        gws = engine.resolve_gws(run)
+        if not gws:
+            raise RuntimeError("gws 도구가 아직 없어요. 먼저 설치해 주세요")
+        current = engine.require_goedu_gws_session(run, gws)
+        saved = engine._read_setup_status(self._config_dir)
+        owner = str(saved.get("account", "") or "").strip()
+        if owner and owner.casefold() != current.casefold():
+            raise RuntimeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
         return run, gws
 
     @guarded
@@ -411,10 +1016,10 @@ class Api:
 
     @guarded
     def ensure_calendar_named(self, name):
-        run, gws = self._resolve_gws_or_fail()
         name = str(name or "").strip()
         if not name:
             raise ValueError("캘린더 이름을 적어 주세요")
+        run, gws = self._resolve_gws_or_fail()
         made_id = engine.ensure_calendar(run, gws, name)
         if not made_id:
             raise RuntimeError(f"'{name}' 캘린더를 만들지 못했어요. 잠시 뒤 다시 시도해 주세요")
@@ -422,10 +1027,10 @@ class Api:
 
     @guarded
     def ensure_tasklist_named(self, name):
-        run, gws = self._resolve_gws_or_fail()
         name = str(name or "").strip()
         if not name:
             raise ValueError("할일 목록 이름을 적어 주세요")
+        run, gws = self._resolve_gws_or_fail()
         made_id = engine.ensure_tasklist(run, gws, name)
         if not made_id:
             raise RuntimeError(f"'{name}' 할일 목록을 만들지 못했어요. 잠시 뒤 다시 시도해 주세요")

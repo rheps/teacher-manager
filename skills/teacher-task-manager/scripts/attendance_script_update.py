@@ -1,0 +1,717 @@
+"""기존 출결 Apps Script를 확인하고 같은 배포를 안전하게 갱신한다.
+
+이 모듈은 호출하는 쪽에서 넘긴 ``runner``만 사용한다. 따라서 판정만 하는 동안에는
+Google 자료를 바꾸지 않으며, 실제 명령 실행기를 저절로 찾아 실행하지도 않는다.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import tempfile
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
+# 2026-08-06에 공개 저장소 rheps/teacher-manager의 각 tag/commit에서
+# ``skills/teacher-task-manager/assets/Code.gs``와 ``appsscript.json``을 raw로
+# 읽고, 아래 ``canonical_bundle_sha256`` 규칙을 별도 PowerShell/.NET 계산으로
+# 대조했다. raw 파일을 다시 확인하지 못한 더 오래된 설치본은 일부러 넣지 않는다.
+TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    (
+        "b1b45e67c5f6f12e" "fdbc229ca134b9ce"
+        "1e928684c7d91083" "608650994d7ad9e1"
+    ): (
+        ("v2.0", "9402f9abe6a0923e54a4" "4f44da46348930e7a92a"),
+        ("v1.9", "f7e34b6808d346cc9c48" "f2fd6c0d1f125e3eef98"),
+    ),
+    (
+        "246aebaca5bdb9ac" "95c0bbf6916c1f18"
+        "bd28023c73cbe48e" "d549b34a942db8e6"
+    ): (
+        ("v1.8", "5311c6b1f4d8290b0886" "a51f51ea097cb1902fc0"),
+    ),
+    (
+        "e130cc0e7f580075" "a2ce7363e355e0ef"
+        "077a46b8a60643f1" "65adba39e7e2eb59"
+    ): (
+        ("v1.7.14", "0635efc7f281ecca77d7b" "d87a6b6714158c509cb"),
+    ),
+    (
+        "dbb569e4b0da0df7" "7674d3b99d62413b"
+        "a3d296515c30820c" "d1f212c5c7ab7ba0"
+    ): (
+        ("v1.7.12", "2ca4b8b41e7d3de317a8" "9594e54c972498671bef"),
+    ),
+}
+TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
+
+
+@dataclass(frozen=True)
+class AttendanceScriptUpdateResult:
+    """확인 또는 갱신 결과.
+
+    ``verified``는 원격 상태를 필요한 읽기 명령으로 모두 대조했다는 뜻이다.
+    ``customized``와 ``hold``는 자동으로 덮어쓰지 않으므로 항상 False다.
+    """
+
+    state: str
+    verified: bool
+    spreadsheet_id: str = ""
+    script_id: str = ""
+    deployment_id: str = ""
+    current_bundle_sha256: str = ""
+    target_bundle_sha256: str = ""
+    deployment_version_number: int = 0
+    backup_version_number: int = 0
+    updated_version_number: int = 0
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class _Bundle:
+    sha256: str
+    has_extra_files: bool
+
+
+class _Hold(Exception):
+    """자료가 모호하거나 빠져 있어 안전하게 계속할 수 없음."""
+
+
+def _need(condition: Any, detail: str = "") -> None:
+    if not condition:
+        raise _Hold(detail)
+
+
+def _clean_id(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _positive_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    raise _Hold("번호를 확인할 수 없어요.")
+
+
+def _normalized_source(source: str) -> str:
+    return source.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _validated_files(files: Any) -> list[dict[str, str]]:
+    _need(isinstance(files, list) and len(files) >= 2, "스크립트 파일이 빠졌어요.")
+    result: list[dict[str, str]] = []
+    names: set[str] = set()
+    for item in files:
+        _need(isinstance(item, dict), "스크립트 파일 정보가 완전하지 않아요.")
+        name, file_type, source = item.get("name"), item.get("type"), item.get("source")
+        _need(
+            isinstance(name, str)
+            and name != ""
+            and name not in names
+            and isinstance(file_type, str)
+            and file_type != ""
+            and isinstance(source, str),
+            "스크립트 파일 정보가 완전하지 않아요.",
+        )
+        names.add(name)
+        result.append({"name": name, "type": file_type, "source": source})
+
+    for name, expected_type in EXPECTED_FILE_TYPES.items():
+        matches = [item for item in result if item["name"] == name]
+        _need(len(matches) == 1, f"{name} 파일을 확인할 수 없어요.")
+        _need(
+            matches[0]["type"] == expected_type and matches[0]["source"] != "",
+            f"{name} 파일 내용이 완전하지 않아요.",
+        )
+    return result
+
+
+def canonical_bundle_sha256(files: Sequence[Mapping[str, Any]]) -> str:
+    """기존 설치 코드와 같은 이름·종류·내용 묶음 지문을 계산한다.
+
+    각 파일은 ``이름\0종류\0LF로 맞춘 내용``이며 파일 사이에도 NUL 한 글자를
+    둔다. 정확한 두 정식 파일에서는 기존 ``prepare_attendance_copy_script``가
+    저장해 온 값과 같고, 추가 파일이 있으면 그 파일까지 지문에 들어간다.
+    """
+
+    checked = _validated_files(list(files))
+    pieces = []
+    for item in sorted(checked, key=lambda value: value["name"].encode("utf-8")):
+        pieces.append(
+            item["name"]
+            + "\0"
+            + item["type"]
+            + "\0"
+            + _normalized_source(item["source"])
+        )
+    return hashlib.sha256("\0".join(pieces).encode("utf-8")).hexdigest()
+
+
+def _compact(value: Mapping[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _find_json_container(output: str, start: int = 0):
+    decoder = json.JSONDecoder()
+    for position in (index for index in range(start, len(output)) if output[index] in "[{"):
+        try:
+            value, end = decoder.raw_decode(output, position)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value, end
+    return None
+
+
+def _run_one_json(runner, args: Sequence[str], cwd: Path | None = None):
+    """runner를 정확히 한 번 부르고 두 허용 반환형을 한곳에서 처리한다."""
+
+    _need(callable(runner), "명령 실행 방법이 없어요.")
+    raw = runner(list(args), SCRIPTS_DIR if cwd is None else Path(cwd))
+    if isinstance(raw, tuple):
+        _need(len(raw) == 2, "명령 결과 형식이 달라요.")
+        code, output = raw
+        _need(
+            isinstance(code, int) and not isinstance(code, bool),
+            "명령 결과 번호를 확인할 수 없어요.",
+        )
+        _need(code == 0, str(output) if isinstance(output, str) else "명령이 실패했어요.")
+    else:
+        output = raw
+    _need(isinstance(output, str), "명령 결과가 글자가 아니에요.")
+    found = _find_json_container(output)
+    _need(found is not None, "명령 결과를 확인할 수 없어요.")
+    value, end = found
+    _need(_find_json_container(output, end) is None, "명령 결과가 하나로 정해지지 않아요.")
+    return value
+
+
+def _call(
+    runner,
+    gws: str,
+    parts: Sequence[str],
+    params: Mapping[str, Any],
+    body: Mapping[str, Any] | None = None,
+    *,
+    cwd: Path | None = None,
+):
+    args = [gws, *parts, "--params", _compact(params)]
+    if body is not None:
+        args += ["--json", _compact(body)]
+    args += ["--format", "json"]
+    return _run_one_json(runner, args, cwd)
+
+
+def _project(runner, gws: str, script: str):
+    return _call(runner, gws, ["script", "projects", "get"], {"scriptId": script})
+
+
+def _content(runner, gws: str, script: str, version: int | None = None):
+    params: dict[str, Any] = {"scriptId": script}
+    if version is not None:
+        params["versionNumber"] = version
+    return _call(
+        runner,
+        gws,
+        ["script", "projects", "getContent"],
+        params,
+    )
+
+
+def _deployment(runner, gws: str, script: str, deployment: str):
+    return _call(
+        runner,
+        gws,
+        ["script", "projects", "deployments", "get"],
+        {"scriptId": script, "deploymentId": deployment},
+    )
+
+
+def _check_project(reply: Any, sheet: str, script: str) -> None:
+    _need(
+        isinstance(reply, dict)
+        and reply.get("scriptId") == script
+        and reply.get("parentId") == sheet,
+        "출결표에 묶인 스크립트가 아니에요.",
+    )
+
+
+def _bundle_from_reply(reply: Any, script: str) -> _Bundle:
+    _need(
+        isinstance(reply, dict)
+        and reply.get("scriptId") == script
+        and isinstance(reply.get("files"), list),
+        "스크립트 내용을 확인할 수 없어요.",
+    )
+    files = _validated_files(reply["files"])
+    return _Bundle(
+        canonical_bundle_sha256(files),
+        set(item["name"] for item in files) != set(EXPECTED_FILE_TYPES),
+    )
+
+
+def _check_deployment_base(reply: Any, script: str, deployment: str) -> tuple[int, str]:
+    _need(isinstance(reply, dict) and reply.get("deploymentId") == deployment)
+    config = reply.get("deploymentConfig")
+    _need(
+        isinstance(config, dict)
+        and config.get("scriptId") == script
+        and config.get("manifestFileName") == "appsscript",
+        "기존 배포 정보를 확인할 수 없어요.",
+    )
+    version = _positive_int(config.get("versionNumber"))
+    description = config.get("description")
+    _need(isinstance(description, str), "기존 배포 설명을 확인할 수 없어요.")
+    return version, description
+
+
+def _check_version(reply: Any, description: str) -> int:
+    _need(isinstance(reply, dict), "버전 생성 결과를 확인할 수 없어요.")
+    number = _positive_int(reply.get("versionNumber"))
+    _need(
+        reply.get("description") == description
+        and isinstance(reply.get("createTime"), str)
+        and reply.get("createTime") != "",
+        "버전 생성 결과가 요청과 달라요.",
+    )
+    return number
+
+
+def _check_updated_deployment(
+    reply: Any,
+    script: str,
+    deployment: str,
+    version: int,
+    description: str,
+) -> None:
+    actual_version, actual_description = _check_deployment_base(reply, script, deployment)
+    _need(
+        actual_version == version and actual_description == description,
+        "기존 배포가 새 버전을 가리키지 않아요.",
+    )
+
+
+def _load_target(assets_dir: Path) -> tuple[bytes, bytes, list[dict[str, str]], str]:
+    folder = Path(assets_dir)
+    code_bytes = (folder / "Code.gs").read_bytes()
+    manifest_bytes = (folder / "appsscript.json").read_bytes()
+    code = code_bytes.decode("utf-8")
+    manifest = manifest_bytes.decode("utf-8")
+    files = [
+        {"name": "Code", "type": "SERVER_JS", "source": code},
+        {"name": "appsscript", "type": "JSON", "source": manifest},
+    ]
+    return code_bytes, manifest_bytes, files, canonical_bundle_sha256(files)
+
+
+def target_bundle_sha256(assets_dir: Path) -> str:
+    """현재 프로그램에 들어 있는 정식 Code.gs 묶음의 지문을 돌려준다."""
+
+    _code, _manifest, _files, bundle_sha256 = _load_target(Path(assets_dir))
+    return bundle_sha256
+
+
+def _result(
+    state: str,
+    *,
+    verified: bool = False,
+    sheet: str = "",
+    script: str = "",
+    deployment: str = "",
+    current_sha: str = "",
+    target_sha: str = "",
+    deployed_version: int = 0,
+    detail: str = "",
+) -> AttendanceScriptUpdateResult:
+    return AttendanceScriptUpdateResult(
+        state=state,
+        verified=verified,
+        spreadsheet_id=sheet,
+        script_id=script,
+        deployment_id=deployment,
+        current_bundle_sha256=current_sha,
+        target_bundle_sha256=target_sha,
+        deployment_version_number=deployed_version,
+        detail=detail,
+    )
+
+
+def inspect_attendance_script_update(
+    spreadsheet_id,
+    script_id,
+    deployment_id,
+    *,
+    assets_dir,
+    runner=None,
+    gws_executable: str | None = None,
+) -> AttendanceScriptUpdateResult:
+    """프로젝트·HEAD·고정 버전을 읽기만 하여 자동 갱신 가능 여부를 정한다."""
+
+    sheet = _clean_id(spreadsheet_id)
+    script = _clean_id(script_id)
+    deployment = _clean_id(deployment_id)
+    gws = _clean_id(gws_executable)
+    if not sheet or not script or not deployment or not gws or not callable(runner):
+        return _result(
+            "hold",
+            sheet=sheet,
+            script=script,
+            deployment=deployment,
+            detail="확인에 필요한 값이 빠졌어요.",
+        )
+
+    target_sha = ""
+    current_sha = ""
+    deployed_version = 0
+    try:
+        _code_bytes, _manifest_bytes, _target_files, target_sha = _load_target(
+            Path(assets_dir)
+        )
+        _check_project(_project(runner, gws, script), sheet, script)
+        head = _bundle_from_reply(_content(runner, gws, script), script)
+        current_sha = head.sha256
+
+        deployment_reply = _deployment(runner, gws, script, deployment)
+        deployed_version, _description = _check_deployment_base(
+            deployment_reply, script, deployment
+        )
+        fixed = _bundle_from_reply(
+            _content(runner, gws, script, deployed_version), script
+        )
+
+        _need(
+            head.sha256 == fixed.sha256
+            and head.has_extra_files == fixed.has_extra_files,
+            "현재 편집본과 실제 배포 중인 버전이 달라요.",
+        )
+        if head.has_extra_files:
+            return _result(
+                "customized",
+                sheet=sheet,
+                script=script,
+                deployment=deployment,
+                current_sha=current_sha,
+                target_sha=target_sha,
+                deployed_version=deployed_version,
+                detail="추가한 스크립트 파일이 있어 자동으로 덮어쓰지 않아요.",
+            )
+        if current_sha == target_sha:
+            state, verified = "current", True
+        elif current_sha in TRUSTED_PUBLIC_BUNDLE_SHA256:
+            state, verified = "update_available", True
+        else:
+            state, verified = "customized", False
+        return _result(
+            state,
+            verified=verified,
+            sheet=sheet,
+            script=script,
+            deployment=deployment,
+            current_sha=current_sha,
+            target_sha=target_sha,
+            deployed_version=deployed_version,
+        )
+    except Exception as exc:  # 외부 응답은 조금이라도 모호하면 쓰지 않는다.
+        return _result(
+            "hold",
+            sheet=sheet,
+            script=script,
+            deployment=deployment,
+            current_sha=current_sha,
+            target_sha=target_sha,
+            deployed_version=deployed_version,
+            detail=str(exc),
+        )
+
+
+def inspect_or_update_attendance_script(
+    record,
+    *,
+    assets_dir,
+    apply,
+    runner,
+    gws_executable,
+    temp_parent=None,
+) -> AttendanceScriptUpdateResult:
+    """저장된 설치 기록의 세 ID만 엄격히 읽어 확인 또는 갱신으로 보낸다."""
+
+    if not isinstance(record, Mapping) or not isinstance(apply, bool):
+        return _result("hold", detail="저장된 출결 연결 정보를 확인할 수 없어요.")
+
+    values: dict[str, str] = {}
+    for key in ("spreadsheet_id", "script_id", "deployment_id"):
+        value = record.get(key)
+        if (
+            not isinstance(value, str)
+            or value == ""
+            or value != value.strip()
+        ):
+            return _result("hold", detail="저장된 출결 연결 정보가 완전하지 않아요.")
+        values[key] = value
+
+    common = {
+        "assets_dir": assets_dir,
+        "runner": runner,
+        "gws_executable": gws_executable,
+    }
+    if apply is False:
+        return inspect_attendance_script_update(
+            values["spreadsheet_id"],
+            values["script_id"],
+            values["deployment_id"],
+            **common,
+        )
+    return apply_attendance_script_update(
+        values["spreadsheet_id"],
+        values["script_id"],
+        values["deployment_id"],
+        **common,
+        temp_parent=temp_parent,
+    )
+
+
+def _require_bundle(reply: Any, script: str, wanted_sha: str) -> None:
+    bundle = _bundle_from_reply(reply, script)
+    _need(
+        not bundle.has_extra_files and bundle.sha256 == wanted_sha,
+        "스크립트 내용이 요청한 묶음과 달라요.",
+    )
+
+
+def _create_version(runner, gws: str, script: str, description: str) -> int:
+    reply = _call(
+        runner,
+        gws,
+        ["script", "projects", "versions", "create"],
+        {"scriptId": script},
+        {"description": description},
+    )
+    return _check_version(reply, description)
+
+
+def _push_exact_files(
+    runner,
+    gws: str,
+    script: str,
+    code_bytes: bytes,
+    manifest_bytes: bytes,
+    temp_parent: Path | None,
+):
+    parent = None if temp_parent is None else str(Path(temp_parent))
+    with tempfile.TemporaryDirectory(
+        prefix="attendance-script-update-", dir=parent
+    ) as name:
+        folder = Path(name)
+        (folder / "Code.gs").write_bytes(code_bytes)
+        (folder / "appsscript.json").write_bytes(manifest_bytes)
+        return _run_one_json(
+            runner,
+            [
+                gws,
+                "script",
+                "+push",
+                "--script",
+                script,
+                "--dir",
+                folder.name,
+                "--format",
+                "json",
+            ],
+            folder.parent,
+        )
+
+
+def _safe_head_read(runner, gws: str, script: str) -> None:
+    try:
+        _content(runner, gws, script)
+    except Exception:
+        pass
+
+
+def _safe_deployment_read(runner, gws: str, script: str, deployment: str) -> None:
+    try:
+        _deployment(runner, gws, script, deployment)
+    except Exception:
+        pass
+
+
+def apply_attendance_script_update(
+    spreadsheet_id,
+    script_id,
+    deployment_id,
+    *,
+    assets_dir,
+    runner=None,
+    gws_executable: str | None = None,
+    temp_parent=None,
+) -> AttendanceScriptUpdateResult:
+    """검증된 옛 공개본만 백업한 뒤 같은 배포 ID를 새 버전으로 바꾼다."""
+
+    inspected = inspect_attendance_script_update(
+        spreadsheet_id,
+        script_id,
+        deployment_id,
+        assets_dir=assets_dir,
+        runner=runner,
+        gws_executable=gws_executable,
+    )
+    if inspected.state != "update_available" or not inspected.verified:
+        return inspected
+
+    sheet = inspected.spreadsheet_id
+    script = inspected.script_id
+    deployment = inspected.deployment_id
+    gws = _clean_id(gws_executable)
+    old_sha = inspected.current_bundle_sha256
+    target_sha = inspected.target_bundle_sha256
+    before_description = "attendance-before-update-" + old_sha[:16]
+    update_description = "attendance-update-" + target_sha[:16]
+
+    try:
+        code_bytes, manifest_bytes, _target_files, fresh_target_sha = _load_target(
+            Path(assets_dir)
+        )
+        _need(fresh_target_sha == target_sha, "업데이트 파일이 확인 도중 바뀌었어요.")
+
+        backup_version = _create_version(
+            runner, gws, script, before_description
+        )
+        _require_bundle(
+            _content(runner, gws, script, backup_version), script, old_sha
+        )
+        # 백업을 만드는 사이에 다른 사람이 편집했다면 그 사람의 내용을 덮지 않는다.
+        # 실제 업로드 바로 앞에서 현재 편집본을 한 번 더 읽어 옛 정식본 그대로인지 본다.
+        _require_bundle(_content(runner, gws, script), script, old_sha)
+    except Exception as exc:
+        return replace(inspected, state="hold", verified=False, detail=str(exc))
+
+    try:
+        pushed = _push_exact_files(
+            runner,
+            gws,
+            script,
+            code_bytes,
+            manifest_bytes,
+            None if temp_parent is None else Path(temp_parent),
+        )
+        _require_bundle(pushed, script, target_sha)
+    except Exception as exc:
+        # 쓰기가 성공했는데 답만 사라졌을 수 있다. 읽기는 한 번 하되 쓰기는 반복하지 않는다.
+        _safe_head_read(runner, gws, script)
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            backup_version_number=backup_version,
+            detail=str(exc),
+        )
+
+    try:
+        _require_bundle(_content(runner, gws, script), script, target_sha)
+        updated_version = _create_version(
+            runner, gws, script, update_description
+        )
+        _need(
+            updated_version > backup_version,
+            "새 버전 번호가 백업 버전보다 크지 않아요.",
+        )
+        _require_bundle(
+            _content(runner, gws, script, updated_version), script, target_sha
+        )
+    except Exception as exc:
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            backup_version_number=backup_version,
+            detail=str(exc),
+        )
+
+    update_body = {
+        "deploymentConfig": {
+            "scriptId": script,
+            "versionNumber": updated_version,
+            "manifestFileName": "appsscript",
+            "description": update_description,
+        }
+    }
+    try:
+        # 새 편집본을 준비하는 사이 다른 창이 같은 배포를 바꿨다면 그 선택을 덮지
+        # 않는다. 처음 확인한 고정 버전을 아직 가리킬 때만 같은 배포 ID를 갱신한다.
+        live_version, _live_description = _check_deployment_base(
+            _deployment(runner, gws, script, deployment), script, deployment
+        )
+        _need(
+            live_version == inspected.deployment_version_number,
+            "확인하는 사이 기존 배포가 다른 버전으로 바뀌었어요.",
+        )
+        update_reply = _call(
+            runner,
+            gws,
+            ["script", "projects", "deployments", "update"],
+            {
+                "deploymentConfig.scriptId": script,
+                "deploymentId": deployment,
+            },
+            update_body,
+        )
+        _check_updated_deployment(
+            update_reply, script, deployment, updated_version, update_description
+        )
+    except Exception as exc:
+        # 같은 배포를 읽어 결과만 확인한다. 모호한 update 명령은 절대 다시 보내지 않는다.
+        _safe_deployment_read(runner, gws, script, deployment)
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            backup_version_number=backup_version,
+            updated_version_number=updated_version,
+            detail=str(exc),
+        )
+
+    try:
+        _check_updated_deployment(
+            _deployment(runner, gws, script, deployment),
+            script,
+            deployment,
+            updated_version,
+            update_description,
+        )
+    except Exception as exc:
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            backup_version_number=backup_version,
+            updated_version_number=updated_version,
+            detail=str(exc),
+        )
+
+    return AttendanceScriptUpdateResult(
+        state="updated",
+        verified=True,
+        spreadsheet_id=sheet,
+        script_id=script,
+        deployment_id=deployment,
+        current_bundle_sha256=target_sha,
+        target_bundle_sha256=target_sha,
+        deployment_version_number=updated_version,
+        backup_version_number=backup_version,
+        updated_version_number=updated_version,
+    )
+
+
+__all__ = [
+    "AttendanceScriptUpdateResult",
+    "TRUSTED_PUBLIC_BUNDLE_PROVENANCE",
+    "TRUSTED_PUBLIC_BUNDLE_SHA256",
+    "apply_attendance_script_update",
+    "canonical_bundle_sha256",
+    "inspect_attendance_script_update",
+    "inspect_or_update_attendance_script",
+    "target_bundle_sha256",
+]

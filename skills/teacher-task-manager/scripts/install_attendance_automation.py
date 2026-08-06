@@ -17,10 +17,32 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import apps_script_version
-from brity_bridge import bundle_paths, gws_env, process_win
+import attendance_script_update
+from brity_bridge import bundle_paths, gws_env, process_win, tool_runtime
 
 
 CommandRunner = Callable[[Sequence[str], Path], str]
+
+_PENDING_DEPLOYMENT_DESCRIPTION = "pending_deployment_description"
+_PENDING_DEPLOYMENT_VERSION = "pending_deployment_version_number"
+_DEPLOYMENT_DESCRIPTION_PREFIX = "teacher-manager-attendance-install-"
+_DRIVE_INTENT_PROPERTY = "teacherManagerInstallIntent"
+_PENDING_TEMPLATE_INTENT = "pending_template_doc_intent"
+_PENDING_SHEET_INTENT = "pending_spreadsheet_intent"
+_PENDING_FOLDER_INTENT = "pending_folder_intent"
+_PENDING_TASK_TITLE = "pending_task_list_title"
+_PENDING_SCRIPT_TITLE = "pending_script_project_title"
+_PENDING_SCRIPT_VERSION_DESCRIPTION = "pending_script_version_description"
+_SCRIPT_TITLE_PREFIX = "출결 신고서 자동화 [설치표식 "
+_VERSION_DESCRIPTION_PREFIX = "teacher-manager-attendance-version-"
+
+
+class DeploymentRecoveryPendingError(RuntimeError):
+    """배포 만들기 응답이 끊겨, 읽기 확인만 반복해야 하는 상태."""
+
+
+class CreationRecoveryPendingError(RuntimeError):
+    """생성 응답을 잃어 새로 만들지 않고 읽기 확인만 해야 하는 상태."""
 
 # 월 탭의 Google Chat 제목 네 개는 Code.gs가 직접 쓴다(ensureMonthlyChatResultColumns_).
 # 파이썬 쪽 사본은 attendance_chat_marker.CHAT_RESULT_HEADERS 한 벌만 둔다 —
@@ -46,25 +68,24 @@ class AttendanceInstallResult:
     folder_id: str
     task_list_id: str
     workbook_name: str = ""
-
-
-def resolve_command(args: Sequence[str]) -> list[str]:
-    if not args:
-        return []
-    executable = shutil.which(args[0])
-    return [executable or args[0], *args[1:]]
+    # 깨끗한 새 컴퓨터에서 예전에 설치한 공식 시트를 다시 찾았지만, 그 시트의
+    # Apps Script가 현재 필수 판보다 오래된 경우다. 시트는 그대로 연결하되,
+    # 사용자가 별도 업데이트 단추를 누르기 전에는 준비 완료로 보지 않는다.
+    script_update_required: bool = False
+    # 지금 프로그램에 들어 있는 Code.gs와 원격 배포판이 정확히 같다고 확인한
+    # 경우에만 남긴다. 프로그램이 바뀌면 지문도 달라져 다시 읽기 확인을 거친다.
+    script_bundle_sha256: str = ""
 
 
 def default_runner(args: Sequence[str], cwd: Path) -> str:
     # gws 열쇠를 파일에 두게 고정한다. 앱과 스크립트가 서로 다른 곳을 보면
     # 한쪽 로그인이 다른 쪽에서 안 보이고, 자격 증명 관리자 읽기가 실패하면
     # gws가 토큰을 스스로 지운다. 이 명령에만 넘기고 파이썬 환경은 그대로 둔다.
-    resolved = resolve_command(args)
     code, output = process_win.run_captured(
-        resolved, cwd=cwd, env=gws_env.gws_environ()
+        list(args), cwd=cwd, env=gws_env.gws_environ()
     )
     if code != 0:
-        raise subprocess.CalledProcessError(code, resolved, output=output, stderr=output)
+        raise subprocess.CalledProcessError(code, list(args), output=output, stderr=output)
     return output
 
 
@@ -241,6 +262,533 @@ def run_json(runner: CommandRunner, args: Sequence[str], cwd: Path) -> Any:
         raise CommandOutputError(args, output) from error
 
 
+def _pending_deployment_identity(created_ids: dict[str, str]) -> tuple[str, int] | None:
+    description = str(created_ids.get(_PENDING_DEPLOYMENT_DESCRIPTION, "") or "")
+    version_text = str(created_ids.get(_PENDING_DEPLOYMENT_VERSION, "") or "")
+    if not description and not version_text:
+        return None
+    token = description.removeprefix(_DEPLOYMENT_DESCRIPTION_PREFIX)
+    valid_token = (
+        description.startswith(_DEPLOYMENT_DESCRIPTION_PREFIX)
+        and len(token) == 32
+        and all(char in "0123456789abcdef" for char in token)
+    )
+    try:
+        version_number = int(version_text)
+    except (TypeError, ValueError):
+        version_number = 0
+    if not valid_token or version_number <= 0 or str(version_number) != version_text:
+        raise DeploymentRecoveryPendingError(
+            "앞선 Apps Script 배포 진행 기록을 안전하게 확인할 수 없어요. "
+            "기존 자료는 건드리지 않았습니다."
+        )
+    return description, version_number
+
+
+def _list_script_deployments(
+    runner: CommandRunner,
+    workdir: Path,
+    script_id: str,
+    gws_executable: str,
+) -> list[dict]:
+    deployments: list[dict] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params: dict[str, Any] = {"scriptId": script_id, "pageSize": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "script",
+                "projects",
+                "deployments",
+                "list",
+                "--params",
+                json.dumps(params, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        if not isinstance(reply, dict):
+            raise DeploymentRecoveryPendingError(
+                "앞선 Apps Script 배포 목록을 안전하게 읽지 못했어요. "
+                "새 배포는 만들지 않았습니다."
+            )
+        page = reply.get("deployments", [])
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise DeploymentRecoveryPendingError(
+                "앞선 Apps Script 배포 목록을 안전하게 읽지 못했어요. "
+                "새 배포는 만들지 않았습니다."
+            )
+        deployments.extend(page)
+        next_token = reply.get("nextPageToken", "")
+        if not next_token:
+            return deployments
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise DeploymentRecoveryPendingError(
+                "앞선 Apps Script 배포 목록을 끝까지 읽지 못했어요. "
+                "새 배포는 만들지 않았습니다."
+            )
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+def _recover_pending_deployment(
+    runner: CommandRunner,
+    workdir: Path,
+    script_id: str,
+    description: str,
+    version_number: int,
+    gws_executable: str,
+) -> str:
+    matches: list[str] = []
+    for deployment in _list_script_deployments(
+        runner, workdir, script_id, gws_executable
+    ):
+        config = deployment.get("deploymentConfig")
+        deployment_id = deployment.get("deploymentId")
+        if (
+            isinstance(config, dict)
+            and isinstance(deployment_id, str)
+            and deployment_id.strip()
+            and config.get("scriptId") == script_id
+            and config.get("versionNumber") == version_number
+            and config.get("manifestFileName") == "appsscript"
+            and config.get("description") == description
+        ):
+            matches.append(deployment_id.strip())
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise DeploymentRecoveryPendingError(
+            "앞선 Apps Script 배포와 정확히 같은 결과가 둘 이상 보여 자동으로 고르지 않았어요. "
+            "새 배포도 만들지 않았습니다."
+        )
+    raise DeploymentRecoveryPendingError(
+        "앞선 Apps Script 배포 결과를 아직 확인하지 못했어요. "
+        "중복 배포를 막기 위해 새로 만들지 않았습니다. 잠시 뒤 다시 시도해 주세요."
+    )
+
+
+def _intent_token(value: str, prefix: str, label: str) -> str:
+    text = str(value or "")
+    token = text.removeprefix(prefix)
+    if (
+        not text.startswith(prefix)
+        or len(token) != 32
+        or any(char not in "0123456789abcdef" for char in token)
+    ):
+        raise CreationRecoveryPendingError(
+            f"앞선 {label} 만들기 기록을 안전하게 확인할 수 없어요. "
+            "기존 자료는 건드리지 않았습니다."
+        )
+    return text
+
+
+def _new_drive_intent(kind: str) -> str:
+    return f"{kind}:{secrets.token_hex(16)}"
+
+
+def _checked_drive_intent(value: str, kind: str, label: str) -> str:
+    return _intent_token(value, f"{kind}:", label)
+
+
+def _drive_files_all(
+    runner: CommandRunner,
+    workdir: Path,
+    params: dict[str, Any],
+    gws_executable: str,
+) -> list[dict]:
+    files: list[dict] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        page_params = dict(params)
+        if page_token:
+            page_params["pageToken"] = page_token
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "drive",
+                "files",
+                "list",
+                "--params",
+                json.dumps(page_params, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        if not isinstance(reply, dict) or reply.get("incompleteSearch") is True:
+            raise CreationRecoveryPendingError(
+                "Google Drive 목록을 끝까지 확인하지 못했어요. "
+                "중복 자료를 막기 위해 새로 만들지 않았습니다."
+            )
+        page = reply.get("files", [])
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise CreationRecoveryPendingError(
+                "Google Drive 목록 응답을 안전하게 읽지 못했어요. "
+                "중복 자료를 막기 위해 새로 만들지 않았습니다."
+            )
+        files.extend(page)
+        next_token = reply.get("nextPageToken", "")
+        if not next_token:
+            return files
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise CreationRecoveryPendingError(
+                "Google Drive 목록을 끝까지 확인하지 못했어요. "
+                "중복 자료를 막기 위해 새로 만들지 않았습니다."
+            )
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+def _recover_drive_resource(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    intent: str,
+    name: str,
+    mime_type: str,
+    label: str,
+    gws_executable: str,
+) -> dict:
+    query = (
+        f"appProperties has {{ key='{_DRIVE_INTENT_PROPERTY}' and value='{intent}' }} and "
+        f"name = '{name}' and mimeType = '{mime_type}' and "
+        "trashed = false and 'me' in owners"
+    )
+    candidates = _drive_files_all(
+        runner,
+        workdir,
+        {
+            "q": query,
+            "fields": (
+                "nextPageToken,incompleteSearch,"
+                "files(id,name,mimeType,ownedByMe,appProperties,webViewLink,parents)"
+            ),
+            "pageSize": 1000,
+            "supportsAllDrives": True,
+        },
+        gws_executable,
+    )
+    exact = [
+        item
+        for item in candidates
+        if str(item.get("id", "") or "").strip()
+        and item.get("name") == name
+        and item.get("mimeType") == mime_type
+        and item.get("ownedByMe") is True
+        and isinstance(item.get("appProperties"), dict)
+        and item["appProperties"].get(_DRIVE_INTENT_PROPERTY) == intent
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise CreationRecoveryPendingError(
+            f"앞선 {label} 만들기 결과가 여러 개 보여 자동으로 고르지 않았어요. "
+            "새 자료도 만들지 않았습니다."
+        )
+    raise CreationRecoveryPendingError(
+        f"앞선 {label} 만들기 결과를 아직 확인하지 못했어요. "
+        "중복 자료를 막기 위해 새로 만들지 않았습니다. 잠시 뒤 다시 시도해 주세요."
+    )
+
+
+def _task_lists_all(
+    runner: CommandRunner,
+    workdir: Path,
+    gws_executable: str,
+) -> list[dict]:
+    items: list[dict] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params: dict[str, Any] = {"maxResults": 1000}
+        if page_token:
+            params["pageToken"] = page_token
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "tasks",
+                "tasklists",
+                "list",
+                "--params",
+                json.dumps(params, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        if not isinstance(reply, (dict, list)):
+            raise CreationRecoveryPendingError(
+                "Google Tasks 목록을 안전하게 읽지 못했어요. "
+                "새 목록은 만들지 않았습니다."
+            )
+        if isinstance(reply, dict):
+            if "items" in reply and not isinstance(reply.get("items"), list):
+                raise CreationRecoveryPendingError(
+                    "Google Tasks 목록을 안전하게 읽지 못했어요. "
+                    "새 목록은 만들지 않았습니다."
+                )
+            if "value" in reply and not isinstance(reply.get("value"), list):
+                raise CreationRecoveryPendingError(
+                    "Google Tasks 목록을 안전하게 읽지 못했어요. "
+                    "새 목록은 만들지 않았습니다."
+                )
+        page = tasklist_items(reply)
+        items.extend(page)
+        next_token = reply.get("nextPageToken", "") if isinstance(reply, dict) else ""
+        if not next_token:
+            return items
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise CreationRecoveryPendingError(
+                "Google Tasks 목록을 끝까지 읽지 못했어요. "
+                "새 목록은 만들지 않았습니다."
+            )
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+def _exact_task_lists(items: Sequence[dict], title: str) -> list[dict]:
+    return [
+        {"id": str(item.get("id") or "").strip(), "title": title}
+        for item in items
+        if str(item.get("id") or "").strip()
+        and str(item.get("title") or "").strip() == title
+    ]
+
+
+def _script_head_files(
+    runner: CommandRunner,
+    workdir: Path,
+    script_id: str,
+    gws_executable: str,
+) -> list[dict]:
+    reply = run_json(
+        runner,
+        [
+            gws_executable,
+            "script",
+            "projects",
+            "getContent",
+            "--params",
+            json.dumps({"scriptId": script_id}, ensure_ascii=False),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    files = reply.get("files") if isinstance(reply, dict) else None
+    if not isinstance(files, list) or any(not isinstance(item, dict) for item in files):
+        raise CreationRecoveryPendingError(
+            "되찾은 Apps Script의 내용을 안전하게 읽지 못했어요. "
+            "기존 코드는 덮어쓰지 않았습니다."
+        )
+    return files
+
+
+def _new_project_is_still_empty(files: Sequence[dict]) -> bool:
+    return (
+        len(files) == 1
+        and files[0].get("name") == "appsscript"
+        and files[0].get("type") == "JSON"
+        and isinstance(files[0].get("source"), str)
+    )
+
+
+def _recover_script_project(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    title: str,
+    spreadsheet_id: str,
+    gws_executable: str,
+) -> str:
+    query = (
+        f"name = '{title}' and mimeType = 'application/vnd.google-apps.script' and "
+        "trashed = false and 'me' in owners"
+    )
+    drive_candidates = _drive_files_all(
+        runner,
+        workdir,
+        {
+            "q": query,
+            "fields": "nextPageToken,incompleteSearch,files(id,name,mimeType,ownedByMe)",
+            "pageSize": 1000,
+        },
+        gws_executable,
+    )
+    exact: list[str] = []
+    for item in drive_candidates:
+        script_id = str(item.get("id", "") or "").strip()
+        if (
+            not script_id
+            or item.get("name") != title
+            or item.get("mimeType") != "application/vnd.google-apps.script"
+            or item.get("ownedByMe") is not True
+        ):
+            continue
+        project = run_json(
+            runner,
+            [
+                gws_executable,
+                "script",
+                "projects",
+                "get",
+                "--params",
+                json.dumps({"scriptId": script_id}, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        creator = project.get("creator") if isinstance(project, dict) else None
+        if (
+            isinstance(project, dict)
+            and project.get("scriptId") == script_id
+            and project.get("title") == title
+            and project.get("parentId") == spreadsheet_id
+            and isinstance(creator, dict)
+            and str(creator.get("email", "") or "").strip()
+        ):
+            exact.append(script_id)
+    if len(exact) > 1:
+        raise CreationRecoveryPendingError(
+            "앞선 Apps Script 프로젝트가 여러 개 보여 자동으로 고르지 않았어요. "
+            "새 프로젝트도 만들지 않았습니다."
+        )
+    if not exact:
+        raise CreationRecoveryPendingError(
+            "앞선 Apps Script 프로젝트 만들기 결과를 아직 확인하지 못했어요. "
+            "중복 프로젝트를 막기 위해 새로 만들지 않았습니다."
+        )
+    script_id = exact[0]
+    if not _new_project_is_still_empty(
+        _script_head_files(runner, workdir, script_id, gws_executable)
+    ):
+        raise CreationRecoveryPendingError(
+            "되찾은 Apps Script에 사용자가 고친 코드가 있어 자동으로 덮어쓰지 않았어요."
+        )
+    return script_id
+
+
+def _script_versions_all(
+    runner: CommandRunner,
+    workdir: Path,
+    script_id: str,
+    gws_executable: str,
+) -> list[dict]:
+    versions: list[dict] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params: dict[str, Any] = {"scriptId": script_id, "pageSize": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "script",
+                "projects",
+                "versions",
+                "list",
+                "--params",
+                json.dumps(params, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        if not isinstance(reply, dict):
+            raise CreationRecoveryPendingError(
+                "Apps Script 버전 목록을 안전하게 읽지 못했어요. "
+                "새 버전은 만들지 않았습니다."
+            )
+        page = reply.get("versions", [])
+        if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+            raise CreationRecoveryPendingError(
+                "Apps Script 버전 목록을 안전하게 읽지 못했어요. "
+                "새 버전은 만들지 않았습니다."
+            )
+        versions.extend(page)
+        next_token = reply.get("nextPageToken", "")
+        if not next_token:
+            return versions
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise CreationRecoveryPendingError(
+                "Apps Script 버전 목록을 끝까지 읽지 못했어요. "
+                "새 버전은 만들지 않았습니다."
+            )
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
+def _recover_script_version(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    script_id: str,
+    description: str,
+    expected_bundle_sha256: str,
+    gws_executable: str,
+) -> int:
+    matches: list[int] = []
+    for version in _script_versions_all(runner, workdir, script_id, gws_executable):
+        number = version.get("versionNumber")
+        if (
+            version.get("scriptId") != script_id
+            or version.get("description") != description
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
+            or not str(version.get("createTime", "") or "").strip()
+        ):
+            continue
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "script",
+                "projects",
+                "getContent",
+                "--params",
+                json.dumps(
+                    {"scriptId": script_id, "versionNumber": number},
+                    ensure_ascii=False,
+                ),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        files = reply.get("files") if isinstance(reply, dict) else None
+        try:
+            bundle_sha256 = attendance_script_update.canonical_bundle_sha256(files or [])
+        except Exception:
+            continue
+        if bundle_sha256 == expected_bundle_sha256:
+            matches.append(number)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise CreationRecoveryPendingError(
+            "앞선 Apps Script 버전과 정확히 같은 결과가 여러 개 보여 자동으로 고르지 않았어요. "
+            "새 버전도 만들지 않았습니다."
+        )
+    raise CreationRecoveryPendingError(
+        "앞선 Apps Script 버전 만들기 결과를 아직 확인하지 못했어요. "
+        "중복 버전을 막기 위해 새로 만들지 않았습니다."
+    )
+
+
 # 옛 고정 이름 — 학년도 도입(2026-07-31) 전에 만든 시트가 이 이름을 갖고 있다.
 # 새로 만드는 시트는 attendance_workbook_name()이 학년도 이름을 만든다. 이름이 해마다
 # 다르므로, 기록을 잃고 이름으로 되찾을 때 작년 것을 조용히 붙잡는 일이 없다.
@@ -323,11 +871,12 @@ def _read_existing_settings(
     runner: CommandRunner,
     workdir: Path,
     spreadsheet_id: str,
+    gws_executable: str,
 ) -> dict[str, str]:
     reply = run_json(
         runner,
         [
-            "gws",
+            gws_executable,
             "sheets",
             "spreadsheets",
             "values",
@@ -358,53 +907,78 @@ def _require_new_enough_script(
     workdir: Path,
     sheet: dict,
     script_id: str,
+    deployment_id: str,
     name: str,
-) -> str:
-    """쓰던 시트의 Apps Script가 동봉 배포 정보의 하한선 이상인지 본다."""
+    gws_executable: str,
+) -> tuple[str, bool, str]:
+    """쓰던 Apps Script의 Sheet 연결·편집본·실제 배포판을 함께 확인한다."""
 
-    reply = run_json(
-        runner,
-        [
-            "gws",
-            "script",
-            "projects",
-            "getContent",
-            "--params",
-            json.dumps({"scriptId": script_id}, ensure_ascii=False),
-            "--format",
-            "json",
-        ],
-        workdir,
+    from attendance_script_update import inspect_attendance_script_update
+
+    inspection = inspect_attendance_script_update(
+        str(sheet.get("id") or "").strip(),
+        script_id,
+        deployment_id,
+        assets_dir=bundle_paths.bundle_root() / "assets",
+        runner=runner,
+        gws_executable=gws_executable,
     )
+    if inspection.verified and inspection.state == "current":
+        return "", False, inspection.target_bundle_sha256
+    if inspection.verified and inspection.state == "update_available":
+        return "", True, ""
+
+    # 중단 안내에는 가능하면 사용자가 보던 판 번호도 남긴다. 이 추가 조회는
+    # 읽기뿐이며, 위의 Sheet 부모·HEAD·고정 배포판 대조를 대신하지 않는다.
     found = None
-    for item in reply.get("files") or []:
-        if isinstance(item, dict):
-            found = apps_script_version.app_version_in_source(item.get("source"))
-            if found:
-                break
+    try:
+        reply = run_json(
+            runner,
+            [
+                gws_executable,
+                "script",
+                "projects",
+                "getContent",
+                "--params",
+                json.dumps({"scriptId": script_id}, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        for item in reply.get("files") or []:
+            if isinstance(item, dict):
+                found = apps_script_version.app_version_in_source(item.get("source"))
+                if found:
+                    break
+    except Exception:  # noqa: BLE001 - 안내용 판 번호를 못 읽어도 안전 중단은 유지한다
+        found = None
     minimum = apps_script_version.minimum_apps_script_version(
         bundle_paths.bundle_root()
     )
-    if not apps_script_version.is_at_least(found, minimum):
-        raise ExistingAttendanceSheetError(
-            "\n".join(
-                [
-                    "쓰시던 "
-                    + name
-                    + " 시트를 찾았지만, 그 시트에 붙은 Apps Script가 "
-                    + (f"{found} 판이라" if found else "판 번호를 읽을 수 없어")
-                    + f" 최소 {minimum} 판에 못 미칩니다.",
-                    "",
-                ]
-                + _sheet_lines([sheet])
-                + [
-                    "",
-                    "그대로 이어 쓰면 새 프로그램과 시트 모양이 어긋납니다. "
-                    "이 시트를 계속 쓰시려면 먼저 스크립트를 올려 주세요.",
-                ]
-            )
+    raise ExistingAttendanceSheetError(
+        "\n".join(
+            [
+                "쓰시던 "
+                + name
+                + " 시트를 찾았지만, 그 시트에 붙은 Apps Script를 안전하게 "
+                "이어 쓸 수 없습니다.",
+                (
+                    f"화면에서 읽힌 판은 {found}이고 현재 필요한 판은 {minimum}입니다."
+                    if found
+                    else f"현재 필요한 판은 {minimum}입니다."
+                ),
+                "",
+            ]
+            + _sheet_lines([sheet])
+            + [
+                "",
+                "공식 배포 코드인지, 이 Sheet에 묶인 코드인지, 현재 편집본과 실제 "
+                "배포판이 같은지를 모두 확인하지 못해 자동으로 덮어쓰지 않았습니다.",
+                "사용자 수정 코드가 있다면 그대로 보호됩니다.",
+            ]
         )
-    return found
+    )
 
 
 def reuse_existing_attendance_sheet(
@@ -412,6 +986,7 @@ def reuse_existing_attendance_sheet(
     workdir: Path,
     sheet: dict,
     name: str,
+    gws_executable: str,
 ) -> AttendanceInstallResult:
     """쓰던 시트의 `설정` 탭을 읽어 연결값만 돌려준다. 시트에는 쓰지 않는다.
 
@@ -419,7 +994,9 @@ def reuse_existing_attendance_sheet(
     """
 
     spreadsheet_id = str(sheet.get("id") or "").strip()
-    settings = _read_existing_settings(runner, workdir, spreadsheet_id)
+    settings = _read_existing_settings(
+        runner, workdir, spreadsheet_id, gws_executable
+    )
     wanted = {
         "template_doc_id": "TEMPLATE_DOC_ID",
         "folder_id": "DEST_FOLDER_ID",
@@ -430,7 +1007,15 @@ def reuse_existing_attendance_sheet(
     missing = sorted(key for key in wanted.values() if not settings.get(key))
     if missing:
         raise ExistingAttendanceSheetError(_cannot_reuse_message(sheet, missing, name))
-    _require_new_enough_script(runner, workdir, sheet, settings[wanted["script_id"]], name)
+    _found_version, script_update_required, script_bundle_sha256 = _require_new_enough_script(
+        runner,
+        workdir,
+        sheet,
+        settings[wanted["script_id"]],
+        settings[wanted["deployment_id"]],
+        name,
+        gws_executable,
+    )
     link = str(sheet.get("webViewLink") or "").strip()
     return AttendanceInstallResult(
         spreadsheet_id=spreadsheet_id,
@@ -447,6 +1032,8 @@ def reuse_existing_attendance_sheet(
         folder_id=settings[wanted["folder_id"]],
         task_list_id=settings[wanted["task_list_id"]],
         workbook_name=str(sheet.get("name", "") or name),
+        script_update_required=script_update_required,
+        script_bundle_sha256=script_bundle_sha256,
     )
 
 
@@ -455,6 +1042,7 @@ def find_existing_attendance_sheets(
     workdir: Path,
     dry_run: bool,
     name: str,
+    gws_executable: str,
 ) -> list[dict]:
     """내 드라이브에서 같은 이름의 출결 시트를 찾는다. 읽기만 한다."""
 
@@ -465,38 +1053,32 @@ def find_existing_attendance_sheets(
         f"mimeType = '{SPREADSHEET_MIME}' and "
         "trashed = false and 'me' in owners"
     )
-    reply = run_json(
+    files = _drive_files_all(
         runner,
-        [
-            "gws",
-            "drive",
-            "files",
-            "list",
-            "--params",
-            json.dumps(
-                {
-                    "q": query,
-                    "fields": "files(id,name,webViewLink)",
-                    "pageSize": 20,
-                    "supportsAllDrives": True,
-                },
-                ensure_ascii=False,
-            ),
-            "--format",
-            "json",
-        ],
         workdir,
+        {
+            "q": query,
+            "fields": (
+                "nextPageToken,incompleteSearch,"
+                "files(id,name,mimeType,ownedByMe,webViewLink)"
+            ),
+            "pageSize": 1000,
+            "supportsAllDrives": True,
+        },
+        gws_executable,
     )
-    files = reply.get("files") if isinstance(reply, dict) else None
-    if not isinstance(files, list):
-        return []
-    return [
-        item
-        for item in files
-        if isinstance(item, dict)
-        and str(item.get("name", "")).strip() == name
-        and str(item.get("id", "")).strip()
-    ]
+    for item in files:
+        if not (
+            str(item.get("name", "")).strip() == name
+            and item.get("mimeType") == SPREADSHEET_MIME
+            and item.get("ownedByMe") is True
+            and str(item.get("id", "")).strip()
+        ):
+            raise CreationRecoveryPendingError(
+                "기존 출결 시트 목록 응답을 안전하게 확인할 수 없어요. "
+                "새 시트는 만들지 않았습니다."
+            )
+    return files
 
 
 def with_dry_run_fallback(response: dict, fallback: dict, dry_run: bool) -> dict:
@@ -551,6 +1133,11 @@ def validate_appsscript_manifest(manifest_path: Path) -> None:
 
 
 def write_install_record(profile_json: Path, result: AttendanceInstallResult) -> Path:
+    from attendance_install_record import (
+        SCRIPT_ATTESTATION_FIELD,
+        build_script_attestation,
+    )
+
     record_path = profile_json.parent / "attendance-install.generated.json"
     profile = load_profile(profile_json)
     school = profile.get("school") or {}
@@ -569,6 +1156,15 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
         "homeroom_class": str(homeroom.get("class", "") or "").strip(),
         "workbook_name": result.workbook_name,
     }
+    if result.script_update_required:
+        record["script_update_required"] = True
+    script_bundle_sha256 = str(
+        getattr(result, "script_bundle_sha256", "") or ""
+    )
+    if script_bundle_sha256:
+        record[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
+            record, script_bundle_sha256
+        )
     descriptor, temp_name = tempfile.mkstemp(
         prefix=".attendance-install-", suffix=".tmp", dir=str(record_path.parent)
     )
@@ -614,6 +1210,8 @@ def install_attendance_automation(
     resume: dict | None = None,
     progress: Callable[[dict], None] | None = None,
     gemini_api_key: str = "",
+    *,
+    gws_executable: str,
 ) -> AttendanceInstallResult:
     profile_json = Path(profile_json)
     asset_root = bundle_paths.bundle_root() / "assets"
@@ -637,12 +1235,19 @@ def install_attendance_automation(
         # 아무것도 만들기 전에 쓰던 시트가 있는지 먼저 본다. 설치 기록이 사라졌다고
         # 같은 이름의 시트를 또 만들면, 선생님은 쓰던 시트를 그대로 두고
         # 프로그램만 빈 시트를 보게 된다. 하나면 그 시트에 연결하고, 여럿이면 멈춘다.
-        if not created_ids.get("spreadsheet_id"):
-            existing = find_existing_attendance_sheets(runner, workdir, dry_run, workbook_name)
+        if (
+            not created_ids.get("spreadsheet_id")
+            and not created_ids.get(_PENDING_SHEET_INTENT)
+        ):
+            existing = find_existing_attendance_sheets(
+                runner, workdir, dry_run, workbook_name, gws_executable
+            )
             if len(existing) > 1:
                 raise ExistingAttendanceSheetError(_too_many_sheets_message(existing, workbook_name))
             if len(existing) == 1:
-                reused = reuse_existing_attendance_sheet(runner, workdir, existing[0], workbook_name)
+                reused = reuse_existing_attendance_sheet(
+                    runner, workdir, existing[0], workbook_name, gws_executable
+                )
                 created_ids.update(
                     {
                         "spreadsheet_id": reused.spreadsheet_id,
@@ -655,126 +1260,197 @@ def install_attendance_automation(
                         "task_list_id": reused.task_list_id,
                     }
                 )
-                report_progress()
+                # 여기서는 Google 자료를 새로 만든 것이 없다. 이 값을 "만들다 만
+                # 진행 기록"으로 남기면 로컬 기록 저장 실패 뒤 재시도에서 기존
+                # Sheet의 설정을 새 설치값으로 덮어쓸 수 있으므로 기록하지 않는다.
                 return reused
 
         if not created_ids.get("template_doc_id"):
-            template = run_json(
-                runner,
-                [
-                    "gws",
-                    "drive",
-                    "files",
-                    "create",
-                    *dry,
-                    "--json",
-                    json.dumps(
-                        {
-                            "name": "결석신고서 템플릿",
-                            "mimeType": "application/vnd.google-apps.document",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "--upload",
-                    ".\\absence-report-template.docx",
-                    "--upload-content-type",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            template = with_dry_run_fallback(
-                template,
-                {
-                    "id": "dry-run-template-doc-id",
-                    "webViewLink": "https://docs.google.com/document/d/dry-run-template-doc-id/edit",
-                },
-                dry_run,
-            )
-            created_ids["template_doc_id"] = template["id"]
+            intent = str(created_ids.get(_PENDING_TEMPLATE_INTENT, "") or "")
+            if intent:
+                intent = _checked_drive_intent(intent, "template", "결석신고서 템플릿")
+                template = _recover_drive_resource(
+                    runner,
+                    workdir,
+                    intent=intent,
+                    name="결석신고서 템플릿",
+                    mime_type="application/vnd.google-apps.document",
+                    label="결석신고서 템플릿",
+                    gws_executable=gws_executable,
+                )
+            else:
+                intent = _new_drive_intent("template")
+                created_ids[_PENDING_TEMPLATE_INTENT] = intent
+                report_progress()
+                template = run_json(
+                    runner,
+                    [
+                        gws_executable,
+                        "drive",
+                        "files",
+                        "create",
+                        *dry,
+                        "--json",
+                        json.dumps(
+                            {
+                                "name": "결석신고서 템플릿",
+                                "mimeType": "application/vnd.google-apps.document",
+                                "appProperties": {_DRIVE_INTENT_PROPERTY: intent},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "--upload",
+                        ".\\absence-report-template.docx",
+                        "--upload-content-type",
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "--format",
+                        "json",
+                    ],
+                    workdir,
+                )
+                template = with_dry_run_fallback(
+                    template,
+                    {
+                        "id": "dry-run-template-doc-id",
+                        "webViewLink": "https://docs.google.com/document/d/dry-run-template-doc-id/edit",
+                    },
+                    dry_run,
+                )
+            template_id = str(template.get("id", "") or "").strip()
+            if not template_id:
+                raise CreationRecoveryPendingError(
+                    "결석신고서 템플릿 번호를 확인하지 못했어요. 새로 만들지 않습니다."
+                )
+            created_ids["template_doc_id"] = template_id
             created_ids["template_doc_url"] = template.get(
-                "webViewLink", f"https://docs.google.com/document/d/{template['id']}/edit"
+                "webViewLink", f"https://docs.google.com/document/d/{template_id}/edit"
             )
+            created_ids.pop(_PENDING_TEMPLATE_INTENT, None)
             report_progress()
         elif not created_ids.get("template_doc_url"):
             created_ids["template_doc_url"] = (
                 f"https://docs.google.com/document/d/{created_ids['template_doc_id']}/edit"
             )
         if not created_ids.get("spreadsheet_id"):
-            sheet = run_json(
-                runner,
-                [
-                    "gws",
-                    "drive",
-                    "files",
-                    "create",
-                    *dry,
-                    "--json",
-                    json.dumps(
-                        {
-                            "name": workbook_name,
-                            "mimeType": SPREADSHEET_MIME,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "--upload",
-                    ".\\attendance-workbook.xlsx",
-                    "--upload-content-type",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            sheet = with_dry_run_fallback(
-                sheet,
-                {
-                    "id": "dry-run-spreadsheet-id",
-                    "webViewLink": "https://docs.google.com/spreadsheets/d/dry-run-spreadsheet-id/edit",
-                },
-                dry_run,
-            )
-            created_ids["spreadsheet_id"] = sheet["id"]
+            intent = str(created_ids.get(_PENDING_SHEET_INTENT, "") or "")
+            if intent:
+                intent = _checked_drive_intent(intent, "sheet", "출결 시트")
+                sheet = _recover_drive_resource(
+                    runner,
+                    workdir,
+                    intent=intent,
+                    name=workbook_name,
+                    mime_type=SPREADSHEET_MIME,
+                    label="출결 시트",
+                    gws_executable=gws_executable,
+                )
+            else:
+                intent = _new_drive_intent("sheet")
+                created_ids[_PENDING_SHEET_INTENT] = intent
+                report_progress()
+                sheet = run_json(
+                    runner,
+                    [
+                        gws_executable,
+                        "drive",
+                        "files",
+                        "create",
+                        *dry,
+                        "--json",
+                        json.dumps(
+                            {
+                                "name": workbook_name,
+                                "mimeType": SPREADSHEET_MIME,
+                                "appProperties": {_DRIVE_INTENT_PROPERTY: intent},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "--upload",
+                        ".\\attendance-workbook.xlsx",
+                        "--upload-content-type",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "--format",
+                        "json",
+                    ],
+                    workdir,
+                )
+                sheet = with_dry_run_fallback(
+                    sheet,
+                    {
+                        "id": "dry-run-spreadsheet-id",
+                        "webViewLink": "https://docs.google.com/spreadsheets/d/dry-run-spreadsheet-id/edit",
+                    },
+                    dry_run,
+                )
+            spreadsheet_id = str(sheet.get("id", "") or "").strip()
+            if not spreadsheet_id:
+                raise CreationRecoveryPendingError(
+                    "출결 시트 번호를 확인하지 못했어요. 새 시트는 만들지 않습니다."
+                )
+            created_ids["spreadsheet_id"] = spreadsheet_id
             created_ids["spreadsheet_url"] = sheet.get(
-                "webViewLink", f"https://docs.google.com/spreadsheets/d/{sheet['id']}/edit"
+                "webViewLink", f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
             )
+            created_ids.pop(_PENDING_SHEET_INTENT, None)
             report_progress()
         elif not created_ids.get("spreadsheet_url"):
             created_ids["spreadsheet_url"] = (
                 f"https://docs.google.com/spreadsheets/d/{created_ids['spreadsheet_id']}/edit"
             )
         if not created_ids.get("folder_id"):
-            folder = run_json(
-                runner,
-                [
-                    "gws",
-                    "drive",
-                    "files",
-                    "create",
-                    *dry,
-                    "--json",
-                    json.dumps(
-                        {
-                            "name": "출결 증빙",
-                            "mimeType": "application/vnd.google-apps.folder",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            folder = with_dry_run_fallback(
-                folder,
-                {
-                    "id": "dry-run-folder-id",
-                    "webViewLink": "https://drive.google.com/drive/folders/dry-run-folder-id",
-                },
-                dry_run,
-            )
-            created_ids["folder_id"] = folder["id"]
+            intent = str(created_ids.get(_PENDING_FOLDER_INTENT, "") or "")
+            if intent:
+                intent = _checked_drive_intent(intent, "folder", "출결 증빙 폴더")
+                folder = _recover_drive_resource(
+                    runner,
+                    workdir,
+                    intent=intent,
+                    name="출결 증빙",
+                    mime_type="application/vnd.google-apps.folder",
+                    label="출결 증빙 폴더",
+                    gws_executable=gws_executable,
+                )
+            else:
+                intent = _new_drive_intent("folder")
+                created_ids[_PENDING_FOLDER_INTENT] = intent
+                report_progress()
+                folder = run_json(
+                    runner,
+                    [
+                        gws_executable,
+                        "drive",
+                        "files",
+                        "create",
+                        *dry,
+                        "--json",
+                        json.dumps(
+                            {
+                                "name": "출결 증빙",
+                                "mimeType": "application/vnd.google-apps.folder",
+                                "appProperties": {_DRIVE_INTENT_PROPERTY: intent},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "--format",
+                        "json",
+                    ],
+                    workdir,
+                )
+                folder = with_dry_run_fallback(
+                    folder,
+                    {
+                        "id": "dry-run-folder-id",
+                        "webViewLink": "https://drive.google.com/drive/folders/dry-run-folder-id",
+                    },
+                    dry_run,
+                )
+            folder_id = str(folder.get("id", "") or "").strip()
+            if not folder_id:
+                raise CreationRecoveryPendingError(
+                    "출결 증빙 폴더 번호를 확인하지 못했어요. 새 폴더는 만들지 않습니다."
+                )
+            created_ids["folder_id"] = folder_id
+            created_ids.pop(_PENDING_FOLDER_INTENT, None)
             report_progress()
         task_list_id = str(attendance_task_list_id or "").strip()
         task_list_title = str(attendance_task_list_title or "출결 미제출 확인").strip() or "출결 미제출 확인"
@@ -785,24 +1461,37 @@ def install_attendance_automation(
         else:
             task_list = None
             if not dry_run:
-                existing_task_lists = run_json(
-                    runner,
-                    [
-                        "gws",
-                        "tasks",
-                        "tasklists",
-                        "list",
-                        "--format",
-                        "json",
-                    ],
-                    workdir,
+                matches = _exact_task_lists(
+                    _task_lists_all(runner, workdir, gws_executable),
+                    task_list_title,
                 )
-                task_list = find_task_list_by_title(existing_task_lists, task_list_title)
+                pending_task_title = str(
+                    created_ids.get(_PENDING_TASK_TITLE, "") or ""
+                )
+                if pending_task_title and pending_task_title != task_list_title:
+                    raise CreationRecoveryPendingError(
+                        "앞선 Google Tasks 목록 이름이 지금 설정과 달라 새 목록을 만들지 않았어요."
+                    )
+                if len(matches) > 1:
+                    raise CreationRecoveryPendingError(
+                        "같은 이름의 Google Tasks 목록이 여러 개 있어 자동으로 고르지 않았어요. "
+                        "새 목록도 만들지 않았습니다."
+                    )
+                if len(matches) == 1:
+                    task_list = matches[0]
+                elif pending_task_title:
+                    raise CreationRecoveryPendingError(
+                        "앞선 Google Tasks 목록 만들기 결과를 아직 확인하지 못했어요. "
+                        "중복 목록을 막기 위해 새로 만들지 않았습니다."
+                    )
         if not task_list:
+            if not dry_run:
+                created_ids[_PENDING_TASK_TITLE] = task_list_title
+                report_progress()
             task_list = run_json(
                 runner,
                 [
-                    "gws",
+                    gws_executable,
                     "tasks",
                     "tasklists",
                     "insert",
@@ -819,105 +1508,252 @@ def install_attendance_automation(
                 {"id": "dry-run-task-list-id", "title": task_list_title},
                 dry_run,
             )
-        if created_ids.get("task_list_id") != str(task_list["id"]):
-            created_ids["task_list_id"] = str(task_list["id"])
+        task_list_result_id = str(task_list.get("id", "") or "").strip()
+        if not task_list_result_id:
+            raise CreationRecoveryPendingError(
+                "Google Tasks 목록 번호를 확인하지 못했어요. 새 목록은 만들지 않습니다."
+            )
+        if created_ids.get("task_list_id") != task_list_result_id:
+            created_ids["task_list_id"] = task_list_result_id
+            created_ids.pop(_PENDING_TASK_TITLE, None)
             report_progress()
         if not created_ids.get("script_id"):
-            script = run_json(
-                runner,
-                [
-                    "gws",
-                    "script",
-                    "projects",
-                    "create",
-                    *dry,
-                    "--json",
-                    json.dumps(
-                        {"title": "출결 신고서 자동화", "parentId": created_ids["spreadsheet_id"]},
-                        ensure_ascii=False,
-                    ),
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            script = with_dry_run_fallback(
-                script,
-                {"scriptId": "dry-run-script-id"},
-                dry_run,
-            )
-            created_ids["script_id"] = script["scriptId"]
+            pending_title = str(created_ids.get(_PENDING_SCRIPT_TITLE, "") or "")
+            if pending_title:
+                if not (
+                    pending_title.startswith(_SCRIPT_TITLE_PREFIX)
+                    and pending_title.endswith("]")
+                ):
+                    raise CreationRecoveryPendingError(
+                        "앞선 Apps Script 프로젝트 만들기 기록을 안전하게 확인할 수 없어요."
+                    )
+                suffix = pending_title[len(_SCRIPT_TITLE_PREFIX):-1]
+                _intent_token(suffix, "", "Apps Script 프로젝트")
+                script_id = _recover_script_project(
+                    runner,
+                    workdir,
+                    title=pending_title,
+                    spreadsheet_id=created_ids["spreadsheet_id"],
+                    gws_executable=gws_executable,
+                )
+            else:
+                pending_title = _SCRIPT_TITLE_PREFIX + secrets.token_hex(16) + "]"
+                created_ids[_PENDING_SCRIPT_TITLE] = pending_title
+                report_progress()
+                script = run_json(
+                    runner,
+                    [
+                        gws_executable,
+                        "script",
+                        "projects",
+                        "create",
+                        *dry,
+                        "--json",
+                        json.dumps(
+                            {"title": pending_title, "parentId": created_ids["spreadsheet_id"]},
+                            ensure_ascii=False,
+                        ),
+                        "--format",
+                        "json",
+                    ],
+                    workdir,
+                )
+                script = with_dry_run_fallback(
+                    script,
+                    {"scriptId": "dry-run-script-id"},
+                    dry_run,
+                )
+                script_id = str(script.get("scriptId", "") or "").strip()
+            if not script_id:
+                raise CreationRecoveryPendingError(
+                    "Apps Script 프로젝트 번호를 확인하지 못했어요. 새 프로젝트는 만들지 않습니다."
+                )
+            created_ids["script_id"] = script_id
+            created_ids.pop(_PENDING_SCRIPT_TITLE, None)
             report_progress()
         if not created_ids.get("deployment_id"):
-            run_json(
-                runner,
-                [
-                    "gws",
-                    "script",
-                    "+push",
-                    *dry,
-                    "--script",
+            pending = _pending_deployment_identity(created_ids)
+            if pending is not None:
+                description, version_number = pending
+                created_ids["deployment_id"] = _recover_pending_deployment(
+                    runner,
+                    workdir,
                     created_ids["script_id"],
-                    "--dir",
-                    ".\\script-src",
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            version = run_json(
-                runner,
-                [
-                    "gws",
-                    "script",
-                    "projects",
-                    "versions",
-                    "create",
-                    *dry,
-                    "--params",
-                    json.dumps({"scriptId": created_ids["script_id"]}, ensure_ascii=False),
-                    "--json",
-                    json.dumps({"description": "출결 자동화 안내장 API"}, ensure_ascii=False),
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            version = with_dry_run_fallback(
-                version,
-                {"versionNumber": 1},
-                dry_run,
-            )
-            deployment = run_json(
-                runner,
-                [
-                    "gws",
-                    "script",
-                    "projects",
-                    "deployments",
-                    "create",
-                    *dry,
-                    "--params",
-                    json.dumps({"scriptId": created_ids["script_id"]}, ensure_ascii=False),
-                    "--json",
-                    json.dumps(
-                        {
-                            "versionNumber": version["versionNumber"],
-                            "description": "출결 자동화 안내장 API",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-            deployment = with_dry_run_fallback(
-                deployment,
-                {"deploymentId": "dry-run-deployment-id"},
-                dry_run,
-            )
-            created_ids["deployment_id"] = deployment["deploymentId"]
+                    description,
+                    version_number,
+                    gws_executable,
+                )
+            else:
+                expected_bundle_sha256 = attendance_script_update.target_bundle_sha256(
+                    asset_root
+                )
+                pending_version_description = str(
+                    created_ids.get(_PENDING_SCRIPT_VERSION_DESCRIPTION, "") or ""
+                )
+                if pending_version_description:
+                    pending_version_description = _intent_token(
+                        pending_version_description,
+                        _VERSION_DESCRIPTION_PREFIX,
+                        "Apps Script 버전",
+                    )
+                    version_number = _recover_script_version(
+                        runner,
+                        workdir,
+                        script_id=created_ids["script_id"],
+                        description=pending_version_description,
+                        expected_bundle_sha256=expected_bundle_sha256,
+                        gws_executable=gws_executable,
+                    )
+                else:
+                    run_json(
+                        runner,
+                        [
+                            gws_executable,
+                            "script",
+                            "+push",
+                            *dry,
+                            "--script",
+                            created_ids["script_id"],
+                            "--dir",
+                            ".\\script-src",
+                            "--format",
+                            "json",
+                        ],
+                        workdir,
+                    )
+                    pending_version_description = (
+                        _VERSION_DESCRIPTION_PREFIX + secrets.token_hex(16)
+                    )
+                    created_ids[_PENDING_SCRIPT_VERSION_DESCRIPTION] = (
+                        pending_version_description
+                    )
+                    report_progress()
+                    version = run_json(
+                        runner,
+                        [
+                            gws_executable,
+                            "script",
+                            "projects",
+                            "versions",
+                            "create",
+                            *dry,
+                            "--params",
+                            json.dumps({"scriptId": created_ids["script_id"]}, ensure_ascii=False),
+                            "--json",
+                            json.dumps(
+                                {"description": pending_version_description},
+                                ensure_ascii=False,
+                            ),
+                            "--format",
+                            "json",
+                        ],
+                        workdir,
+                    )
+                    version = with_dry_run_fallback(
+                        version,
+                        {"versionNumber": 1},
+                        dry_run,
+                    )
+                    version_number = version.get("versionNumber") if isinstance(version, dict) else None
+                    if (
+                        not isinstance(version_number, int)
+                        or isinstance(version_number, bool)
+                        or version_number <= 0
+                    ):
+                        raise CreationRecoveryPendingError(
+                            "Apps Script 버전 번호를 확인하지 못했어요. 새 버전은 만들지 않습니다."
+                        )
+                    if not dry_run:
+                        version_reply = run_json(
+                            runner,
+                            [
+                                gws_executable,
+                                "script",
+                                "projects",
+                                "getContent",
+                                "--params",
+                                json.dumps(
+                                    {
+                                        "scriptId": created_ids["script_id"],
+                                        "versionNumber": version_number,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                "--format",
+                                "json",
+                            ],
+                            workdir,
+                        )
+                        version_files = (
+                            version_reply.get("files")
+                            if isinstance(version_reply, dict)
+                            else None
+                        )
+                        try:
+                            actual_bundle_sha256 = (
+                                attendance_script_update.canonical_bundle_sha256(
+                                    version_files or []
+                                )
+                            )
+                        except Exception as error:
+                            raise CreationRecoveryPendingError(
+                                "만든 Apps Script 버전 내용을 확인하지 못했어요. "
+                                "배포를 만들지 않았습니다."
+                            ) from error
+                        if actual_bundle_sha256 != expected_bundle_sha256:
+                            raise CreationRecoveryPendingError(
+                                "만든 Apps Script 버전이 현재 정식 코드와 달라 배포하지 않았어요."
+                            )
+                created_ids.pop(_PENDING_SCRIPT_VERSION_DESCRIPTION, None)
+                description = _DEPLOYMENT_DESCRIPTION_PREFIX + secrets.token_hex(16)
+                created_ids[_PENDING_DEPLOYMENT_DESCRIPTION] = description
+                created_ids[_PENDING_DEPLOYMENT_VERSION] = str(version_number)
+                # 이 기록이 안전하게 끝난 뒤에만 생성 명령을 보낸다. 아래 응답이
+                # 끊겨도 다음 실행은 같은 설명·버전으로 목록을 읽기만 한다.
+                report_progress()
+                deployment = run_json(
+                    runner,
+                    [
+                        gws_executable,
+                        "script",
+                        "projects",
+                        "deployments",
+                        "create",
+                        *dry,
+                        "--params",
+                        json.dumps({"scriptId": created_ids["script_id"]}, ensure_ascii=False),
+                        "--json",
+                        json.dumps(
+                            {
+                                "versionNumber": version_number,
+                                "manifestFileName": "appsscript",
+                                "description": description,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "--format",
+                        "json",
+                    ],
+                    workdir,
+                )
+                deployment = with_dry_run_fallback(
+                    deployment,
+                    {"deploymentId": "dry-run-deployment-id"},
+                    dry_run,
+                )
+                deployment_id = (
+                    str(deployment.get("deploymentId", "") or "").strip()
+                    if isinstance(deployment, dict)
+                    else ""
+                )
+                if not deployment_id:
+                    raise DeploymentRecoveryPendingError(
+                        "Apps Script 배포 응답에서 만든 배포 번호를 확인하지 못했어요. "
+                        "중복 배포를 막기 위해 새로 만들지 않습니다."
+                    )
+                created_ids["deployment_id"] = deployment_id
+            created_ids.pop(_PENDING_DEPLOYMENT_DESCRIPTION, None)
+            created_ids.pop(_PENDING_DEPLOYMENT_VERSION, None)
             report_progress()
 
         ids = {
@@ -943,7 +1779,7 @@ def install_attendance_automation(
         run_json(
             runner,
             [
-                "gws",
+                gws_executable,
                 "sheets",
                 "spreadsheets",
                 "values",
@@ -962,7 +1798,7 @@ def install_attendance_automation(
         run_json(
             runner,
             [
-                "gws",
+                gws_executable,
                 "sheets",
                 "spreadsheets",
                 "values",
@@ -990,7 +1826,7 @@ def install_attendance_automation(
         sheet_info = run_json(
             runner,
             [
-                "gws",
+                gws_executable,
                 "sheets",
                 "spreadsheets",
                 "get",
@@ -1010,7 +1846,7 @@ def install_attendance_automation(
             run_json(
                 runner,
                 [
-                    "gws",
+                    gws_executable,
                     "sheets",
                     "spreadsheets",
                     "batchUpdate",
@@ -1035,7 +1871,7 @@ def install_attendance_automation(
         run_json(
             runner,
             [
-                "gws",
+                gws_executable,
                 "sheets",
                 "spreadsheets",
                 "values",
@@ -1067,7 +1903,7 @@ def install_attendance_automation(
             run_json(
                 runner,
                 [
-                    "gws",
+                    gws_executable,
                     "script",
                     "scripts",
                     "run",
@@ -1089,6 +1925,35 @@ def install_attendance_automation(
                 "처음 설정 한 번에 끝내기를 한 번 실행해 주세요."
             )
 
+        # 올리기·버전 만들기·배포 만들기의 성공 답만으로는 실제 원격 코드가
+        # 이번 설치본과 같다고 증명할 수 없다. 특히 중간 실패 뒤 재개할 때는
+        # script_id/deployment_id가 이미 있어 위 쓰기 단계가 모두 건너뛰어진다.
+        # 따라서 HEAD와 실제 배포판을 다시 읽어 둘 다 현재 묶음과 같은 경우에만
+        # 로컬 설치 기록에 준비 확인표를 남긴다.
+        script_bundle_sha256 = ""
+        if not dry_run:
+            expected_bundle_sha256 = attendance_script_update.target_bundle_sha256(
+                bundle_paths.bundle_root() / "assets"
+            )
+            checked_script = attendance_script_update.inspect_attendance_script_update(
+                created_ids["spreadsheet_id"],
+                created_ids["script_id"],
+                created_ids["deployment_id"],
+                assets_dir=bundle_paths.bundle_root() / "assets",
+                runner=runner,
+                gws_executable=gws_executable,
+            )
+            if (
+                checked_script.verified is True
+                and checked_script.state == "current"
+                and checked_script.spreadsheet_id == created_ids["spreadsheet_id"]
+                and checked_script.script_id == created_ids["script_id"]
+                and checked_script.deployment_id == created_ids["deployment_id"]
+                and checked_script.current_bundle_sha256 == expected_bundle_sha256
+                and checked_script.target_bundle_sha256 == expected_bundle_sha256
+            ):
+                script_bundle_sha256 = expected_bundle_sha256
+
         result = AttendanceInstallResult(
             spreadsheet_id=created_ids["spreadsheet_id"],
             spreadsheet_url=created_ids["spreadsheet_url"],
@@ -1099,6 +1964,7 @@ def install_attendance_automation(
             folder_id=created_ids["folder_id"],
             task_list_id=created_ids["task_list_id"],
             workbook_name=workbook_name,
+            script_bundle_sha256=script_bundle_sha256,
         )
         if not dry_run:
             write_install_record(profile_json, result)
@@ -1128,6 +1994,7 @@ def main() -> int:
         attendance_task_list_id=args.attendance_task_list_id,
         central_chat_sender_url=args.central_chat_sender_url,
         gemini_api_key=local_gemini_api_key(),
+        gws_executable=tool_runtime.resolve_gws_executable(),
     )
     print(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
     if args.dry_run:
