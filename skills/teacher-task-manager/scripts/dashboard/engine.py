@@ -49,6 +49,7 @@ from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, r
 from brity_bridge.gemini_analyze import check_gemini_key
 from brity_bridge.hotkey import MODIFIER_ORDER, parse_hotkey
 from brity_bridge.settings import ALLOWED_GEMINI_MODELS, load_settings, save_settings
+from dashboard import external_url
 
 HELPER_WINDOW_CLASS = "BrityBridgeTrayWindow"
 _WM_CLOSE = 0x0010
@@ -1300,24 +1301,47 @@ def gws_logout(run_command, gws: str) -> tuple[bool, str]:
     return code == 0, output.strip()[-300:]
 
 
-_GWS_AUTH_URL_MARK = "https://accounts.google.com"
+_GWS_AUTH_HOST = "accounts.google.com"
 
 
 def login_command(gws: str) -> list[str]:
     return [gws, "auth", "login", "--scopes", GWS_LOGIN_SCOPES]
 
 
+def _gws_auth_url_from_line(line: str) -> str:
+    """GWS가 한 줄 전체로 내놓은 Google HTTPS 주소만 잠깐 돌려준다."""
+    candidate = str(line or "").strip()
+    if not candidate or any(character.isspace() for character in candidate):
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+        host = parsed.hostname
+        parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if (
+        parsed.scheme.casefold() != "https"
+        or str(host or "").casefold() != _GWS_AUTH_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    return candidate
+
+
 class LoginSession:
-    """gws auth login을 백그라운드로 돌리며 URL·결과를 폴링용으로 내놓는다."""
+    """gws auth login을 백그라운드로 돌리고 주소 원문 없이 결과만 내놓는다."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._proc = None
-        self._url = ""
-        self._lines: list[str] = []
+        self._auth_url_opener = external_url.open_external_url
+        self._auth_url_attempted = False
+        self._browser_opened = False
+        self._error_code = ""
         self._ok: bool | None = None
 
-    def start(self, args: list[str], popen=None, env=None) -> None:
+    def start(self, args: list[str], popen=None, env=None, auth_url_opener=None) -> None:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return  # 이미 진행 중 — 멱등
@@ -1327,23 +1351,55 @@ class LoginSession:
                 text=True, encoding="utf-8", errors="replace",
                 env=dict(env) if env is not None else None,
             )
-            self._url = ""
-            self._lines = []
+            self._auth_url_opener = auth_url_opener or external_url.open_external_url
+            self._auth_url_attempted = False
+            self._browser_opened = False
+            self._error_code = ""
             self._ok = None
         threading.Thread(target=self._read, args=(self._proc,), daemon=True).start()
 
     def _read(self, proc) -> None:
         for line in proc.stdout:
+            auth_url = _gws_auth_url_from_line(line)
+            if not auth_url:
+                continue
             with self._lock:
-                # 로그인 주소에는 client ID와 계정 힌트가 들어갈 수 있다. GWS가
-                # 브라우저를 직접 열기 때문에 화면·로그에는 주소 원문을 보내지 않는다.
-                if _GWS_AUTH_URL_MARK in line:
-                    self._url = "browser-opened"
-                elif line.strip():
-                    self._lines.append("GWS_LOGIN_MESSAGE")
+                if proc is not self._proc or self._auth_url_attempted:
+                    continue
+                self._auth_url_attempted = True
+                opener = self._auth_url_opener
+            try:
+                opened_result = opener(auth_url)
+                opened = (
+                    bool(opened_result.get("opened"))
+                    if isinstance(opened_result, dict)
+                    else opened_result is True
+                )
+            except Exception:  # noqa: BLE001 - 주소와 운영체제 원문은 상태에 남기지 않는다.
+                opened = False
+            if opened:
+                with self._lock:
+                    if proc is self._proc:
+                        self._browser_opened = True
+                continue
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001 - 종료 실패 원문도 화면이나 로그에 내보내지 않는다.
+                pass
+            with self._lock:
+                if proc is self._proc:
+                    self._browser_opened = False
+                    self._error_code = external_url.NO_EXTERNAL_BROWSER
+                    self._ok = False
+            break
         code = proc.wait()
         with self._lock:
-            self._ok = code == 0
+            if proc is not self._proc:
+                return
+            if self._error_code:
+                self._ok = False
+            else:
+                self._ok = code == 0
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1351,9 +1407,10 @@ class LoginSession:
             return {
                 "running": running,
                 "url": "",
-                "browser_opened": bool(self._url),
+                "browser_opened": self._browser_opened,
                 "ok": self._ok,
-                "detail": "" if self._ok is not False else "GWS_LOGIN_FAILED",
+                "error_code": self._error_code if self._ok is False else "",
+                "detail": "" if self._ok is not False else (self._error_code or "GWS_LOGIN_FAILED"),
             }
 
     def cancel(self) -> bool:
@@ -1366,6 +1423,9 @@ class LoginSession:
 
 
 _LOGIN_SETUP_GUIDE = "Google 로그인 준비 파일을 확인한 뒤 다시 시도해 주세요."
+_LOGIN_BROWSER_GUIDE = (
+    "웹 브라우저를 열지 못했어요. 기본 브라우저 또는 Microsoft Edge를 준비한 뒤 다시 눌러 주세요."
+)
 
 
 def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
@@ -1373,7 +1433,14 @@ def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
     del environ
     if snap.get("ok") is not False:
         return snap
-    return {**snap, "url": "", "detail": _LOGIN_SETUP_GUIDE}
+    if snap.get("error_code") == external_url.NO_EXTERNAL_BROWSER:
+        return {
+            **snap,
+            "url": "",
+            "error_code": external_url.NO_EXTERNAL_BROWSER,
+            "detail": _LOGIN_BROWSER_GUIDE,
+        }
+    return {**snap, "url": "", "error_code": "GWS_LOGIN_FAILED", "detail": _LOGIN_SETUP_GUIDE}
 
 
 # 배포 저장소(rheps/teacher-manager)의 최신 Release에 붙은 version.json을 본다.

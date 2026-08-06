@@ -12,7 +12,6 @@ import json
 import os
 import sys
 import threading
-import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -29,6 +28,7 @@ from brity_bridge import (
 )
 from brity_bridge.settings import load_settings
 from dashboard import engine
+from dashboard import external_url
 from dashboard import version
 
 SETUP_STATE_NAME = "setup-state.json"
@@ -52,7 +52,10 @@ def _ok(data):
 
 
 def _fail(error):
-    return {"ok": False, "error": str(error) or "알 수 없는 오류가 났어요"}
+    reply = {"ok": False, "error": str(error) or "알 수 없는 오류가 났어요"}
+    if isinstance(error, external_url.ExternalUrlOpenError):
+        reply["code"] = external_url.NO_EXTERNAL_BROWSER
+    return reply
 
 
 def guarded(method):
@@ -86,6 +89,9 @@ class BridgeDeps:
     autostart_enable: object = None
     autostart_disable: object = None
     url_opener: object = None
+    edge_url_opener: object = None
+    external_url_platform: object = None
+    https_handler_available: object = None
     dir_opener: object = None
     popen_factory: object = None
     folder_picker: object = None
@@ -114,6 +120,15 @@ class Api:
         self._gws_update_last_status = None
         self._gws_update_install_lock = threading.Lock()
         self._attendance_script_update_lock = threading.Lock()
+
+    def _open_external_url(self, url) -> dict:
+        return external_url.open_external_url(
+            url,
+            default_opener=self._deps.url_opener,
+            edge_opener=self._deps.edge_url_opener,
+            platform=self._deps.external_url_platform,
+            https_handler_available=self._deps.https_handler_available,
+        )
 
     # ----- setup-state -----
 
@@ -724,9 +739,7 @@ class Api:
                 attendance_record=record,
             )
         )
-        opener = self._deps.url_opener or webbrowser.open
-        opener(auth_url)
-        return {"opened": True}
+        return self._open_external_url(auth_url)
 
     @guarded
     def attendance_chat_spaces(self):
@@ -996,6 +1009,7 @@ class Api:
             engine.login_command(gws),
             popen=self._deps.popen_factory,
             env=child_env,
+            auth_url_opener=self._open_external_url,
         )
         return self._login.snapshot()
 
@@ -1152,8 +1166,4 @@ class Api:
 
     @guarded
     def open_url(self, url):
-        if not isinstance(url, str) or not url.startswith("https://"):
-            raise ValueError("https 주소만 열 수 있어요")
-        opener = self._deps.url_opener or webbrowser.open
-        opener(url)
-        return True
+        return self._open_external_url(url)

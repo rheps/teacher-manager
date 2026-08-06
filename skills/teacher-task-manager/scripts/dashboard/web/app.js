@@ -22,6 +22,7 @@ const S = {
   edit: null,
   busy: {},
   banner: null,              // {kind, text}
+  externalLinkFallback: null, // 브라우저가 안 열렸을 때만 {url}; Google 로그인 주소는 오지 않는다
   toast: null,
   applyResults: null,
   firstHomeNotice: false,     // 마법사 직후 홈에 한 번 보여주는 사용법 안내 띠
@@ -107,7 +108,19 @@ function showToast(text) {
 function bannerHtml() {
   // 기록 폴더를 여는 단추는 두지 않는다. 폴더만 열릴 뿐 거기서 뭘 하라는 안내가 없고,
   // 그 폴더에 보이는 파일은 Gemini API key가 든 settings.json이다 (2026-07-30 사용자 결정).
-  return S.banner ? `<div class="banner ${S.banner.kind}"><span>${esc(S.banner.text)}</span></div>` : "";
+  const banner = S.banner
+    ? `<div class="banner ${S.banner.kind}"><span>${esc(S.banner.text)}</span></div>`
+    : "";
+  const fallback = S.externalLinkFallback
+    ? `<div class="external-link-fallback">
+        <b>브라우저를 열지 못했어요</b>
+        <span>아래 주소를 복사해 브라우저 주소창에 붙여넣어 주세요.</span>
+        <div class="linkrow"><span class="url" title="${esc(S.externalLinkFallback.url)}">${esc(S.externalLinkFallback.url)}</span>
+          <span class="acts"><button class="btn-quiet" data-action="link-copy" data-url="${esc(S.externalLinkFallback.url)}">링크 복사</button></span>
+        </div>
+      </div>`
+    : "";
+  return banner + fallback;
 }
 function toastHtml() { return S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ""; }
 
@@ -254,7 +267,19 @@ function linkRow(url) {
     `</span></div>`;
 }
 bindActions({
-  "link-open": (el) => call("open_url", el.dataset.url),
+  "link-open": async (el) => {
+    const url = String(el.dataset.url || "");
+    try {
+      await call("open_url", url);
+      if (S.externalLinkFallback) {
+        S.externalLinkFallback = null;
+        render();
+      }
+    } catch (_error) {
+      S.externalLinkFallback = { url };
+      render();
+    }
+  },
   "link-copy": (el) => { copyText(el.dataset.url); },
 });
 
