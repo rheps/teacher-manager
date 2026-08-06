@@ -78,23 +78,27 @@ def run_gws(
         )
         return 127
 
+    config_dir = Path(gws_config_dir or gws_env.default_gws_config_dir(base))
     is_login = len(args) >= 2 and args[0] == "auth" and args[1] == "login"
     if is_login:
-        config_dir = gws_config_dir or gws_env.default_gws_config_dir(base)
         if bundled_client_path is None:
             candidate = bundle_paths.bundle_root() / "assets" / gws_env.CLIENT_FILE_NAME
             bundled_client_path = candidate if candidate.is_file() else None
         selection = gws_env.select_desktop_oauth_client(
             base,
-            Path(config_dir),
+            config_dir,
             bundled_client_path,
         )
         if not selection.ready:
             print(_oauth_error_message(selection.error_code), file=sys.stderr)
             return 2
-        child_env = gws_env.login_environ(base, selection)
+        child_env = gws_env.login_environ(
+            base,
+            selection,
+            gws_config_dir=config_dir,
+        )
     else:
-        child_env = gws_env.gws_environ(base)
+        child_env = gws_env.gws_environ(base, gws_config_dir=config_dir)
     if not _gws_command_can_run_without_account_check(args):
         code, output = process_win.run_captured(
             [str(executable), "auth", "status"],
@@ -269,7 +273,10 @@ def current_gws_account(
 
     def product_run(args):
         command = list(args)
-        child_env = gws_env.gws_environ(base)
+        child_env = gws_env.gws_environ(
+            base,
+            gws_config_dir=gws_env.default_gws_config_dir(base),
+        )
         if run_command is not None:
             return run_command(command, env=child_env, timeout=30)
         result = supervised_runner(command, env=child_env, timeout=30)

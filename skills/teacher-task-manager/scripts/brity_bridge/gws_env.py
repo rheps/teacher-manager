@@ -3,7 +3,9 @@
 일반 Google 명령과 로그인 명령을 분리한다. 제품이 가진 데스크톱 OAuth 값은
 ``gws auth login`` 자식 한 번에만 넘기고, status·Calendar·Tasks·Sheets 같은
 일반 명령에는 새로 넣지 않는다. 기존 로그인 파일, 암호화 키, token cache와
-사용자가 고른 keyring 방식은 읽거나 옮기거나 지우지 않는다.
+사용자가 고른 keyring 방식은 읽거나 옮기거나 지우지 않는다. 다만 공개 2.0이
+강제로 만들었던 완전한 file 방식 로그인 파일이 그대로 있으면, 그 사용자만
+자식 명령에서 같은 방식을 이어 받아 업데이트 뒤 재로그인을 막는다.
 """
 from __future__ import annotations
 
@@ -319,6 +321,24 @@ def inspect_gws_login_store(
     )
 
 
+def has_complete_legacy_file_login(config_dir: Path) -> bool:
+    """공개 2.0이 남긴 file 방식 로그인 한 쌍이 모두 있는지만 본다.
+
+    내용은 읽거나 고치지 않는다. 암호화 키 하나 또는 로그인 파일 하나만 남은
+    불완전한 상태는 이어 받지 않아 새 Windows 기본 보관 방식을 방해하지 않는다.
+    단일 계정 ``credentials.enc``와 여러 계정 ``credentials.<계정>.enc``를 모두
+    같은 옛 로그인 파일로 알아본다.
+    """
+
+    root = Path(config_dir)
+    try:
+        if not (root / ".encryption_key").is_file():
+            return False
+        return any(path.is_file() for path in root.glob("credentials*.enc"))
+    except OSError:
+        return False
+
+
 def prepare_gws_env(environ=os.environ, client_file_candidates=None) -> None:
     """옛 호출 자리와의 호환용 무동작 함수.
 
@@ -329,7 +349,12 @@ def prepare_gws_env(environ=os.environ, client_file_candidates=None) -> None:
     del environ, client_file_candidates
 
 
-def gws_environ(base: Mapping[str, str] | None = None, client_file_candidates=None) -> dict[str, str]:
+def gws_environ(
+    base: Mapping[str, str] | None = None,
+    client_file_candidates=None,
+    *,
+    gws_config_dir: Path | None = None,
+) -> dict[str, str]:
     """일반 GWS 자식에 넘길 계정별 환경 사본.
 
     공용 또는 다른 Windows 계정의 로그인 폴더를 가리키는 환경값은 자식에게
@@ -352,15 +377,37 @@ def gws_environ(base: Mapping[str, str] | None = None, client_file_candidates=No
         )
     if "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" in unsafe:
         made.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
+    # 새 설치는 Windows 기본 자격 증명 관리자를 그대로 쓴다. 공개 2.0이
+    # file 방식을 강제로 사용해 완전한 로그인 파일 한 쌍을 남긴 경우에만,
+    # 그 파일을 읽거나 옮기지 않고 이 자식 명령 하나에 기존 방식을 이어 준다.
+    # 호출자가 실제 os.environ을 쓰는 일반 실행은 현재 계정 폴더를 직접 보고,
+    # 시험용 환경 사전은 명시적으로 폴더를 건넨 때만 본다.
+    should_inspect_legacy = (
+        gws_config_dir is not None or base is None or values is os.environ
+    )
+    if (
+        should_inspect_legacy
+        and _running_on_windows()
+        and not str(made.get("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND") or "").strip()
+    ):
+        config_dir = (
+            Path(gws_config_dir)
+            if gws_config_dir is not None
+            else default_gws_config_dir(made)
+        )
+        if has_complete_legacy_file_login(config_dir):
+            made["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = "file"
     return made
 
 
 def login_environ(
     base: Mapping[str, str],
     selection: OAuthClientSelection,
+    *,
+    gws_config_dir: Path | None = None,
 ) -> dict[str, str]:
     """``gws auth login`` 자식 하나에만 필요한 client 값을 넣는다."""
-    made = gws_environ(base)
+    made = gws_environ(base, gws_config_dir=gws_config_dir)
     if not selection.ready:
         return made
     if selection.source in {"explicit_client_env", "bundled_client"}:

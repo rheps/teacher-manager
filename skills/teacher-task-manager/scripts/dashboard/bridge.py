@@ -19,7 +19,14 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brity_bridge import bundle_paths, capture_store, gws_env, paths
+from brity_bridge import (
+    bundle_paths,
+    capture_store,
+    component_lock,
+    gws_env,
+    paths,
+    process_win,
+)
 from brity_bridge.settings import load_settings
 from dashboard import engine
 from dashboard import version
@@ -118,7 +125,10 @@ class Api:
 
     def _write_state(self, state: dict) -> None:
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        self._state_path().write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        component_lock.atomic_write_text_unique(
+            self._state_path(),
+            json.dumps(state, ensure_ascii=False, indent=1) + "\n",
+        )
 
     def _migrate_state(self, state: dict) -> tuple[dict, bool]:
         """예전 7단계 기록을 9단계로 옮기되 작성 중인 값은 그대로 둔다."""
@@ -161,7 +171,9 @@ class Api:
             if completed and old >= 7:
                 return SETUP_LAST_STEP
             if old >= 7:
-                return SETUP_LAST_STEP
+                # 예전 마지막 화면까지 왔지만 완료하지 않은 사람은 새로 생긴
+                # 학생 계정·학급 단체톡방 준비 안내(8단계)를 먼저 본다.
+                return SETUP_LAST_STEP - 1
             return _V1_STEP_TO_V2.get(max(1, old), 1)
 
         merged["version"] = SETUP_STATE_VERSION
@@ -364,14 +376,29 @@ class Api:
     # ----- 조회·검증 -----
 
     def _run(self):
-        return self._deps.run_command or engine._default_run_command
+        if self._deps.run_command is not None:
+            return self._deps.run_command
+        base = self._gws_base_environ()
+        environment = gws_env.gws_environ(
+            base,
+            gws_config_dir=self._gws_config_dir(base),
+        )
+
+        def run(args):
+            return process_win.run_captured(args, env=environment)
+
+        return run
 
     def _attendance_remote_run(self):
         """출결 Google 명령은 자식 작업까지 실제 제한 시간이 있는 길로 실행한다."""
 
         if self._deps.run_command is not None:
             return self._deps.run_command
-        environment = gws_env.gws_environ(self._gws_base_environ())
+        base = self._gws_base_environ()
+        environment = gws_env.gws_environ(
+            base,
+            gws_config_dir=self._gws_config_dir(base),
+        )
 
         def run(args):
             return engine.attendance_remote_command(args, environment=environment)
@@ -382,6 +409,15 @@ class Api:
         """GWS가 물려받을 Windows 환경값의 읽기 전용 사본."""
 
         return dict(os.environ if self._deps.environ is None else self._deps.environ)
+
+    def _gws_config_dir(self, base: dict | None = None) -> Path:
+        """현재 Windows 계정만 쓰는 GWS 로그인 폴더."""
+
+        if self._deps.gws_config_dir is not None:
+            return Path(self._deps.gws_config_dir)
+        return gws_env.default_gws_config_dir(
+            self._gws_base_environ() if base is None else base
+        )
 
     def _unsafe_gws_account_storage(self) -> tuple[str, ...]:
         return gws_env.unsafe_account_storage_overrides(self._gws_base_environ())
@@ -479,7 +515,11 @@ class Api:
         if script_runner is None:
             # Apps Script의 +push는 임시 폴더 위치를 꼭 넘겨야 한다. 자식 작업까지
             # 제한 시간 안에 끝내는 출결 전용 실행기를 사용한다.
-            environment = gws_env.gws_environ(self._gws_base_environ())
+            base = self._gws_base_environ()
+            environment = gws_env.gws_environ(
+                base,
+                gws_config_dir=self._gws_config_dir(base),
+            )
 
             def script_runner(args, cwd):
                 return engine.attendance_remote_runner(
@@ -733,7 +773,7 @@ class Api:
 
     @guarded
     def google_status(self):
-        base, _config_dir, _bundled, selection = self._oauth_context()
+        base, config_dir, _bundled, selection = self._oauth_context()
         credential_override = bool(
             str(base.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") or "").strip()
         )
@@ -935,7 +975,7 @@ class Api:
     @guarded
     def gws_login_start(self):
         run, gws = self._resolve_gws_or_fail()
-        base, _config_dir, _bundled, selection = self._oauth_context()
+        base, config_dir, _bundled, selection = self._oauth_context()
         if not selection.ready:
             if selection.error_code == "OAUTH_CLIENT_CONFLICT":
                 raise RuntimeError(
@@ -947,7 +987,11 @@ class Api:
                     "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
                 )
             raise RuntimeError("Google 로그인 준비 파일을 안전하게 읽지 못했어요.")
-        child_env = gws_env.login_environ(base, selection)
+        child_env = gws_env.login_environ(
+            base,
+            selection,
+            gws_config_dir=config_dir,
+        )
         self._login.start(
             engine.login_command(gws),
             popen=self._deps.popen_factory,
@@ -958,11 +1002,7 @@ class Api:
     def _oauth_context(self):
         """화면 상태와 로그인 시작이 똑같은 OAuth 준비 판정을 함께 쓴다."""
         base = self._gws_base_environ()
-        config_dir = (
-            Path(self._deps.gws_config_dir)
-            if self._deps.gws_config_dir is not None
-            else gws_env.default_gws_config_dir(base)
-        )
+        config_dir = self._gws_config_dir(base)
         if self._deps.bundled_oauth_client_path is False:
             bundled = None
         elif self._deps.bundled_oauth_client_path is not None:
