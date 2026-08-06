@@ -2,29 +2,50 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import json as _json
 import os
 import platform
+import re
 import subprocess
 import tempfile
 import threading
 import zipfile
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import install_attendance_automation
+import attendance_script_update
 import parse_settings
 from attendance_install_record import (
     AttendanceInstallRecordError,
+    attendance_script_is_attested,
     load_attendance_install_record,
+    read_attendance_install_snapshot,
+    replace_attendance_install_record,
 )
-from brity_bridge import autostart_win, bundle_paths, hotkey_win, paths, process_win
-from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, _extract_email, run_doctor_checks
+from brity_bridge import (
+    ai_skill_install,
+    autostart_win,
+    bundle_paths,
+    component_lock,
+    component_update,
+    gws_env,
+    google_account,
+    hotkey_win,
+    managed_node,
+    paths,
+    process_supervision,
+    process_win,
+    tool_runtime,
+)
+from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, run_doctor_checks
 from brity_bridge.gemini_analyze import check_gemini_key
 from brity_bridge.hotkey import MODIFIER_ORDER, parse_hotkey
 from brity_bridge.settings import ALLOWED_GEMINI_MODELS, load_settings, save_settings
@@ -66,9 +87,7 @@ def _timetable_check(config_dir: Path) -> CheckResult:
 
 
 _READINESS_ROWS = [
-    ("installer", "자동 설치 도구(winget)"),
     ("python", "Python"),
-    ("node", "Node.js"),
     ("documents", "문서 읽기 도구"),
     ("screen", "화면 표시"),
 ]
@@ -77,10 +96,14 @@ _READINESS_ROWS = [
 # 설정/내 정보 카드가 이미 소유하므로 출결에서 다시 문제로 세지 않는다.
 _ATTENDANCE_STATE_TO_OK = {
     "ready": True,
+    "script-check-required": False,
+    "script-update-required": False,
     "not-ready": False,
     "failed": False,
     "gws-required": None,
     "login-required": None,
+    "account-required": None,
+    "auth-error": None,
     "profile-required": None,
 }
 
@@ -337,7 +360,12 @@ def _attendance_copy_url(config_dir: Path, record_spreadsheet_id: str = "") -> s
     return url if url.startswith("https://docs.google.com/spreadsheets/d/") else ""
 
 
-def push_gemini_key_to_attendance_sheet(config_dir: Path, run_command=None) -> dict:
+def push_gemini_key_to_attendance_sheet(
+    config_dir: Path,
+    run_command=None,
+    *,
+    gws_executable: str | None = None,
+) -> dict:
     """이 컴퓨터에 저장된 Gemini 키를 출결 시트 `설정` 탭에 적어 둔다.
 
     시트 안 Apps Script는 이 컴퓨터의 settings.json을 읽지 못한다. 여기서 넣어 두지 않으면
@@ -355,9 +383,11 @@ def push_gemini_key_to_attendance_sheet(config_dir: Path, run_command=None) -> d
         return {"state": "skipped", "detail": "아직 출결 시트를 만들지 않았어요."}
     runner = run_command or central_chat._default_run_command
     try:
-        rows = central_chat._read_settings_rows(spreadsheet_id, runner)
+        gws = str(gws_executable or resolve_gws(runner))
+        require_goedu_gws_session(runner, gws)
+        rows = central_chat._read_settings_rows(spreadsheet_id, runner, gws)
         central_chat._upsert_settings_value(
-            spreadsheet_id, rows, "GEMINI_API_KEY", key, runner
+            spreadsheet_id, rows, "GEMINI_API_KEY", key, runner, gws
         )
     except Exception as error:  # noqa: BLE001 - 화면에는 한국어 한 문장만 보인다
         return {"state": "failed", "detail": f"출결 시트에 넣지 못했어요: {error}"[:200]}
@@ -608,7 +638,7 @@ def reset_attendance_record(config_dir: Path) -> bool:
 
 @dataclass(frozen=True)
 class AttendanceStatus:
-    state: str             # ready | not-ready | gws-required | login-required | profile-required | failed
+    state: str             # ready | script-check-required | script-update-required | not-ready | gws-required | login-required | account-required | auth-error | profile-required | failed
     account: str = ""      # 처음 준비할 때 사용한 계정
     current_user: str = ""  # 지금 로그인한 계정
     spreadsheet_url: str = ""
@@ -629,11 +659,30 @@ ATTENDANCE_ERROR_MESSAGES = {
 }
 ATTENDANCE_GWS_MESSAGE = "Google Workspace CLI가 아직 준비되지 않았어요. 설정에서 준비해 주세요."
 ATTENDANCE_LOGIN_MESSAGE = "설정에서 학교 Google 계정으로 로그인해 주세요."
+ATTENDANCE_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
+ATTENDANCE_AUTH_STATUS_MESSAGE = (
+    "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검하고 "
+    "인터넷 연결이나 학교 보안 정책을 확인해 주세요."
+)
 ATTENDANCE_PROFILE_MESSAGE = "내 정보와 하루 일과를 먼저 입력해 주세요."
 ATTENDANCE_ACCOUNT_MESSAGE = "처음 준비하던 Google 계정으로 다시 로그인해 주세요."
 ATTENDANCE_RECORD_BROKEN_MESSAGE = "출결 설치 기록을 읽지 못했어요. 이전에 만든 출결 시트를 확인해 주세요."
 ATTENDANCE_NOT_READY_MESSAGE = "출결 준비 시작하기를 누르면 로그인한 계정에 자동으로 준비해요."
+ATTENDANCE_SCRIPT_UPDATE_REQUIRED_MESSAGE = (
+    "예전에 설치한 공식 출결 자료를 찾았어요. 출결 기능을 최신판으로 올린 뒤 사용할 수 있어요."
+)
+ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE = (
+    "기존 출결 자료는 그대로 두고, 현재 출결 기능이 안전한 최신판인지 먼저 확인해 주세요."
+)
 ATTENDANCE_DETAIL_LIMIT = 800  # 화면에 보여줄 실패 안내 길이 상한
+
+
+def current_attendance_script_bundle_sha256() -> str:
+    """지금 실행 중인 프로그램에 묶인 정식 출결 기능의 지문."""
+
+    return attendance_script_update.target_bundle_sha256(
+        bundle_paths.bundle_root() / "assets"
+    )
 
 
 def friendly_attendance_error(error) -> tuple[str, str]:
@@ -732,11 +781,27 @@ def save_attendance_status_cache(config_dir: Path, status: dict) -> None:
 
 
 def load_attendance_status_cache(config_dir: Path) -> dict | None:
+    config_dir = Path(config_dir)
     try:
-        saved = _json.loads((Path(config_dir) / ATTENDANCE_STATUS_CACHE_NAME).read_text(encoding="utf-8"))
+        saved = _json.loads((config_dir / ATTENDANCE_STATUS_CACHE_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return saved if isinstance(saved, dict) and saved.get("state") else None
+    if not isinstance(saved, dict) or not saved.get("state"):
+        return None
+    if saved.get("state") == "ready":
+        record_path = paths.attendance_install_record_path(config_dir)
+        try:
+            record = load_attendance_install_record(record_path)
+            attested = attendance_script_is_attested(
+                record, current_attendance_script_bundle_sha256()
+            ) and record.get("script_update_required") is not True
+        except (OSError, ValueError, AttendanceInstallRecordError):
+            attested = False
+        if not attested:
+            saved = dict(saved)
+            saved["state"] = "script-check-required"
+            saved["detail"] = ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
+    return saved
 
 
 def _profile_school_year(config_dir: Path) -> str:
@@ -747,17 +812,35 @@ def _profile_school_year(config_dir: Path) -> str:
     return year or install_attendance_automation.current_school_year()
 
 
-def read_attendance_status(config_dir: Path, run_command=_default_run_command) -> AttendanceStatus:
+def read_attendance_status(
+    config_dir: Path,
+    run_command=_default_run_command,
+    *,
+    gws_executable: str | None = None,
+) -> AttendanceStatus:
     config_dir = Path(config_dir)
     setup_status = _read_setup_status(config_dir)
     account = str(setup_status.get("account", "") or "")
-    gws = resolve_gws(run_command)
+    gws = str(gws_executable or resolve_gws(run_command))
     if not gws:
         return AttendanceStatus(state="gws-required", account=account, detail=ATTENDANCE_GWS_MESSAGE)
     auth = gws_auth_status(run_command, gws)
     current_user = str(auth.get("user", "") or "")
+    if auth.get("login_state") == "error":
+        return AttendanceStatus(
+            state="auth-error",
+            account=account,
+            detail=ATTENDANCE_AUTH_STATUS_MESSAGE,
+        )
     if not auth.get("logged_in"):
         return AttendanceStatus(state="login-required", account=account, detail=ATTENDANCE_LOGIN_MESSAGE)
+    if not auth.get("account_allowed"):
+        return AttendanceStatus(
+            state="account-required",
+            account=account,
+            current_user=current_user,
+            detail=ATTENDANCE_ACCOUNT_REQUIRED_MESSAGE,
+        )
     record_path = paths.attendance_install_record_path(config_dir)
     if record_path.exists():
         if account and current_user and account != current_user:
@@ -795,9 +878,30 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command) -
         )
         year_mismatch = profile_year != record_year
         if valid_sheet_url:
+            script_update_required = record.get("script_update_required") is True
+            if script_update_required:
+                script_state = "script-update-required"
+                script_detail = ATTENDANCE_SCRIPT_UPDATE_REQUIRED_MESSAGE
+            else:
+                try:
+                    current_bundle_sha256 = current_attendance_script_bundle_sha256()
+                except (OSError, UnicodeError, ValueError):
+                    current_bundle_sha256 = ""
+                script_attested = (
+                    bool(current_bundle_sha256)
+                    and attendance_script_is_attested(
+                        record, current_bundle_sha256
+                    )
+                )
+                script_state = "ready" if script_attested else "script-check-required"
+                script_detail = (
+                    "" if script_attested else ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
+                )
             return AttendanceStatus(
-                state="ready", account=account or current_user, current_user=current_user,
+                state=script_state,
+                account=account or current_user, current_user=current_user,
                 spreadsheet_url=spreadsheet_url, template_doc_url=template_doc_url,
+                detail=script_detail,
                 school_year=record_year, workbook_name=workbook_name, year_mismatch=year_mismatch,
             )
         return AttendanceStatus(
@@ -829,9 +933,11 @@ def backfill_attendance_record_stamp(config_dir: Path) -> bool:
     record_path = paths.attendance_install_record_path(config_dir)
     if not record_path.exists():
         return False
-    record = _read_json_dict(record_path)
-    if record is None:
+    try:
+        snapshot = read_attendance_install_snapshot(record_path)
+    except AttendanceInstallRecordError:
         return False  # 깨진 기록은 여기서 고치지 않는다 — read_attendance_status가 이미 failed로 알린다
+    record = dict(snapshot.record)
     if str(record.get("school_year", "") or "").strip():
         return False
     profile = _read_json_dict(paths.profile_path(config_dir)) or {}
@@ -840,7 +946,11 @@ def backfill_attendance_record_stamp(config_dir: Path) -> bool:
     record["school_year"] = install_attendance_automation.current_school_year()
     record["homeroom_grade"] = str(homeroom.get("grade", "") or "")
     record["homeroom_class"] = str(homeroom.get("class", "") or "")
-    _atomic_write_json(record_path, record)
+    try:
+        replace_attendance_install_record(record_path, record, snapshot)
+    except AttendanceInstallRecordError:
+        # 다른 창이 확인 증명이나 새 출결 연결을 방금 썼다면 그 기록이 우선이다.
+        return False
     return True
 
 
@@ -940,56 +1050,247 @@ def _document_reader_probe() -> tuple[bool, str]:
 
 
 def computer_readiness(run_command=_default_run_command, document_probe=None) -> dict:
-    winget = check_version(run_command, "winget")
-    node = check_version(run_command, "node")
+    del run_command  # 설치형 앱의 Python은 제품 안에 있으며 시스템 명령은 찾지 않는다.
     document_ok, document_detail = (document_probe or _document_reader_probe)()
     return {
-        "installer": _readiness(bool(winget), winget or "자동 설치 기능을 찾지 못했어요"),
         "python": _readiness(True, platform.python_version()),
-        "node": _readiness(bool(node), node or "설치 필요"),
         "documents": _readiness(document_ok, document_detail),
         "screen": _readiness(True, "이 화면을 정상 표시하고 있어요"),
     }
 
 
 def resolve_gws(run_command=_default_run_command) -> str:
-    for candidate in ("gws", "gws.cmd"):
-        code, _output = run_command([candidate, "--help"])
-        if code == 0:
-            return candidate
-    return ""
-
-
-_WINGET_QUIET = ["--silent", "--accept-package-agreements", "--accept-source-agreements"]
-
-
-def resolve_npm(run_command=_default_run_command) -> str:
-    for candidate in ("npm", "npm.cmd"):
-        code, _output = run_command([candidate, "--version"])
-        if code == 0:
-            return candidate
-    return ""
-
-
-def install_node(run_command=_default_run_command) -> tuple[bool, str]:
-    code, output = run_command(
-        ["winget", "install", "--id", "OpenJS.NodeJS.LTS", "-e", *_WINGET_QUIET]
-    )
-    return code == 0, output.strip()[-300:]
+    """PATH와 npm 설치본을 보지 않고 검증된 동봉/승인 GWS 전체 경로를 돌려준다."""
+    del run_command  # 예전 호출 모양은 유지하되, 외부 실행 파일 탐색에는 쓰지 않는다.
+    return tool_runtime.resolve_gws_executable()
 
 
 def install_gws(run_command=_default_run_command) -> tuple[bool, str]:
-    npm = resolve_npm(run_command)
-    if not npm:
-        return False, "Node.js가 아직 없어요. 먼저 Node.js를 설치해 주세요"
-    code, output = run_command([npm, "install", "-g", "@googleworkspace/cli"])
-    return code == 0, output.strip()[-300:]
+    del run_command  # GWS는 npm으로 설치하지 않고 제품 안의 검증된 파일만 쓴다.
+    try:
+        executable = resolve_gws()
+    except tool_runtime.GwsRuntimeError as error:
+        return False, str(error)
+    return True, executable
+
+
+def _gws_offer_for_screen(offer: component_update.GwsUpdateOffer) -> dict:
+    """화면이 다시 돌려줄 수 있는 공개 승인값만 담는다.
+
+    실제 설치에는 이 사본을 쓰지 않는다. bridge가 메모리에 보관한 승인 원문과
+    이 값이 정확히 같은지 확인한 뒤, 승인 원문만 설치 함수에 넘긴다.
+    """
+    manifest = offer.manifest
+    return {
+        "version": manifest.version,
+        "notes": manifest.notes,
+        "verified_on": manifest.verified_on,
+        "checked_on": offer.checked_on,
+        "archive_url": manifest.archive_url,
+        "archive_sha256": manifest.archive_sha256,
+        "executable_sha256": manifest.executable_sha256,
+        "approval_sha256": offer.approval_sha256,
+    }
+
+
+def _gws_runtime_status(
+    run_command=_default_run_command,
+    *,
+    component_root: Path | None = None,
+    resolver=None,
+    force_refresh: bool = False,
+) -> dict:
+    resolver = resolver or tool_runtime.resolve_gws
+    try:
+        resolution = resolver(
+            component_root=component_root,
+            run_command=run_command,
+            force_refresh=force_refresh,
+        )
+    except tool_runtime.GwsRuntimeError as error:
+        return {
+            "runtime_ready": False,
+            "can_continue": False,
+            "repair_required": True,
+            "current_version": "",
+            "current_source": "",
+            "runtime_error_code": error.code,
+        }
+    except OSError:
+        return {
+            "runtime_ready": False,
+            "can_continue": False,
+            "repair_required": True,
+            "current_version": "",
+            "current_source": "",
+            "runtime_error_code": "GWS_RUNTIME_CHECK_FAILED",
+        }
+    return {
+        "runtime_ready": True,
+        "can_continue": True,
+        "repair_required": False,
+        "current_version": str(resolution.version),
+        "current_source": str(resolution.source),
+        "runtime_error_code": "",
+    }
+
+
+def read_gws_update_status(
+    current_app_version: str,
+    run_command=_default_run_command,
+    *,
+    component_root: Path | None = None,
+    checker=None,
+    resolver=None,
+) -> tuple[dict, component_update.GwsUpdateOffer | None]:
+    """승인된 새 판과 현재 실제 실행 판을 한 화면 상태로 묶는다."""
+    checker = checker or component_update.check_gws_update
+    check = checker(
+        current_app_version,
+        component_root=component_root,
+    )
+    runtime = _gws_runtime_status(
+        run_command,
+        component_root=component_root,
+        resolver=resolver,
+    )
+    exact_offer = check.offer if check.success and check.offer is not None else None
+    status_success = bool(check.success)
+    status_code = str(check.code)
+    status_detail = str(check.detail)
+    # 오늘 받은 승인 제안이 cache에 남아 있어도 이미 그 판(또는 더 최신 판)을
+    # 실제로 쓰고 있으면 다시 갱신 단추를 보여 주지 않는다.
+    if (
+        exact_offer is not None
+        and runtime["runtime_ready"]
+        and tool_runtime._compare_versions(
+            runtime["current_version"], exact_offer.manifest.version
+        ) >= 0
+    ):
+        exact_offer = None
+        status_code = "UP_TO_DATE"
+        status_detail = "현재 사용 중인 Google 도구가 승인 목록과 같거나 더 최신입니다."
+    elif (
+        exact_offer is not None
+        and component_update.gws_version_permanently_rejected(
+            exact_offer.manifest.version,
+            component_root=component_root,
+        )
+    ):
+        # 안전검사에서 영구 거부된 판은 설치 함수도 다시 받지 않는다. 눌러도
+        # 끝없이 거절되는 갱신 단추를 다시 보여 주지 않고 기본판 사용을 알린다.
+        exact_offer = None
+        status_success = False
+        status_code = "COMPONENT_VERSION_REJECTED"
+        status_detail = "앞서 안전 확인에 실패한 같은 Google 도구 판은 다시 받지 않고 현재 기본판을 사용합니다."
+    payload = {
+        "success": status_success,
+        "code": status_code,
+        "detail": status_detail,
+        "checked_on": str(check.checked_on),
+        "offer": _gws_offer_for_screen(exact_offer) if exact_offer is not None else None,
+        **runtime,
+    }
+    return payload, exact_offer
+
+
+def apply_gws_update(
+    offer: component_update.GwsUpdateOffer,
+    run_command=_default_run_command,
+    *,
+    component_root: Path | None = None,
+    installer=None,
+    resolver=None,
+) -> dict:
+    """승인 원문 한 판을 적용하고, cache를 버린 실제 선택 결과로 답한다."""
+    installer = installer or component_update.install_gws_update
+    result = installer(
+        offer,
+        component_root=component_root,
+        run_command=run_command,
+    )
+    runtime = _gws_runtime_status(
+        run_command,
+        component_root=component_root,
+        resolver=resolver,
+        force_refresh=True,
+    )
+    selected_new_version = bool(
+        result.success
+        and runtime["runtime_ready"]
+        and runtime["current_version"] == offer.manifest.version
+        and runtime["current_source"] == "approved-update"
+    )
+    code = str(result.code)
+    detail = str(result.detail or "Google 도구 갱신을 끝내지 못했습니다.")
+    if result.success and not selected_new_version:
+        code = "COMPONENT_RESOLUTION_FAILED"
+        detail = "새 Google 도구를 적용한 뒤 실제 실행 판을 확인하지 못했습니다."
+    if not selected_new_version:
+        if runtime["runtime_ready"]:
+            fallback = (
+                "현재 기본판으로 계속 쓸 수 있어요."
+                if runtime["current_source"] == "bundled"
+                else "현재 사용 중인 Google 도구로 계속 쓸 수 있어요."
+            )
+            if fallback not in detail:
+                detail = f"{detail} {fallback}".strip()
+        else:
+            repair = "설치 파일이 손상됐어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
+            if "설치 파일을 다시 실행" not in detail:
+                detail = f"{detail} {repair}".strip()
+    return {
+        "success": selected_new_version,
+        "code": code,
+        "detail": detail,
+        **runtime,
+    }
 
 
 def gws_auth_status(run_command, gws: str) -> dict:
-    code, output = run_command([gws, "auth", "status"])
-    email = _extract_email(output)
-    return {"logged_in": code == 0 and bool(email), "user": email, "raw": output}
+    raw = run_command([gws, "auth", "status"])
+    if isinstance(raw, tuple) and len(raw) == 2:
+        code, output = raw
+    else:
+        code, output = 0, raw
+    email = google_account.extract_email(output)
+    logged_in = code == 0 and bool(email)
+    account_allowed = logged_in and google_account.is_goedu_email(email)
+    lowered = str(output or "").lower()
+    logged_out_markers = (
+        "not logged in", "not authenticated", "no credentials", "login required",
+    )
+    if logged_in:
+        login_state = "logged_in"
+        error_code = ""
+    elif code != 0 and any(mark in lowered for mark in logged_out_markers):
+        login_state = "logged_out"
+        error_code = ""
+    else:
+        login_state = "error"
+        error_code = "GWS_AUTH_STATUS_FAILED"
+    return {
+        "logged_in": logged_in,
+        "account_allowed": account_allowed,
+        "user": email if logged_in else "",
+        "login_state": login_state,
+        "error_code": error_code,
+    }
+
+
+def require_goedu_gws_session(run_command, gws: str) -> str:
+    """실제 Google 자료를 읽거나 쓰기 직전에 학교 계정을 다시 확인한다."""
+
+    if not gws:
+        raise RuntimeError("Google Workspace CLI가 아직 준비되지 않았어요")
+    auth = gws_auth_status(run_command, gws)
+    if not auth.get("logged_in"):
+        if auth.get("login_state") == "error":
+            raise RuntimeError(
+                "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검해 주세요."
+            )
+        raise RuntimeError("Google Workspace에 @goedu.kr 계정으로 먼저 로그인해 주세요.")
+    return google_account.require_goedu_email(auth.get("user", ""))
 
 
 def gws_logout(run_command, gws: str) -> tuple[bool, str]:
@@ -1016,7 +1317,7 @@ class LoginSession:
         self._lines: list[str] = []
         self._ok: bool | None = None
 
-    def start(self, args: list[str], popen=None) -> None:
+    def start(self, args: list[str], popen=None, env=None) -> None:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return  # 이미 진행 중 — 멱등
@@ -1024,6 +1325,7 @@ class LoginSession:
                 args, popen=popen or subprocess.Popen,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
+                env=dict(env) if env is not None else None,
             )
             self._url = ""
             self._lines = []
@@ -1033,12 +1335,12 @@ class LoginSession:
     def _read(self, proc) -> None:
         for line in proc.stdout:
             with self._lock:
-                self._lines.append(line)
-                if not self._url and _GWS_AUTH_URL_MARK in line:
-                    for token in line.split():
-                        if token.startswith(_GWS_AUTH_URL_MARK):
-                            self._url = token
-                            break
+                # 로그인 주소에는 client ID와 계정 힌트가 들어갈 수 있다. GWS가
+                # 브라우저를 직접 열기 때문에 화면·로그에는 주소 원문을 보내지 않는다.
+                if _GWS_AUTH_URL_MARK in line:
+                    self._url = "browser-opened"
+                elif line.strip():
+                    self._lines.append("GWS_LOGIN_MESSAGE")
         code = proc.wait()
         with self._lock:
             self._ok = code == 0
@@ -1048,9 +1350,10 @@ class LoginSession:
             running = self._proc is not None and self._ok is None
             return {
                 "running": running,
-                "url": self._url,
+                "url": "",
+                "browser_opened": bool(self._url),
                 "ok": self._ok,
-                "detail": "".join(self._lines).strip()[-300:],
+                "detail": "" if self._ok is not False else "GWS_LOGIN_FAILED",
             }
 
     def cancel(self) -> bool:
@@ -1062,38 +1365,58 @@ class LoginSession:
         return True
 
 
-_LOGIN_SETUP_GUIDE = (
-    "이 컴퓨터에 Google 로그인 준비 파일(OAuth 클라이언트)이 아직 없는 것 같아요. "
-    "배포자에게 gws-oauth-client.json 파일을 받아 내 폴더의 TeacherTaskManager "
-    "폴더에 넣은 뒤 다시 로그인해 주세요."
-)
+_LOGIN_SETUP_GUIDE = "Google 로그인 준비 파일을 확인한 뒤 다시 시도해 주세요."
 
 
 def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
-    """로그인 URL도 못 낸 실패 = OAuth 클라이언트 부재 신호 — 한국어 준비 안내를 붙인다.
-
-    URL이 나온 뒤의 실패(사용자가 창을 닫음 등)나 클라이언트 파일이 이미
-    물려 있는 실패는 gws 원문이 더 유용하므로 그대로 둔다.
-    """
-    if snap.get("ok") is not False or snap.get("url"):
+    """OAuth 값·주소 질문값·원문 오류를 숨긴 짧은 로그인 상태를 돌려준다."""
+    del environ
+    if snap.get("ok") is not False:
         return snap
-    if environ.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"):
-        return snap
-    detail = str(snap.get("detail", "")).strip()
-    tail = (" · " + detail[-120:]) if detail else ""
-    return {**snap, "detail": _LOGIN_SETUP_GUIDE + tail}
+    return {**snap, "url": "", "detail": _LOGIN_SETUP_GUIDE}
 
 
 # 배포 저장소(rheps/teacher-manager)의 최신 Release에 붙은 version.json을 본다.
 UPDATE_INFO_URL = "https://github.com/rheps/teacher-manager/releases/latest/download/version.json"
+_UPDATE_INFO_MAX_BYTES = 64 * 1024
+_UPDATE_INFO_DEADLINE_SECONDS = 5.0
+_UPDATE_SETUP_MAX_BYTES = 256 * 1024 * 1024
+_UPDATE_SETUP_DEADLINE_SECONDS = 300.0
+_UPDATE_READ_SIZE = 256 * 1024
+
+
+class _UpdateDownloadHashMismatch(ValueError):
+    pass
+
+
+class _UpdateDownloadTooLarge(ValueError):
+    pass
+
+
+class _UpdateDownloadTimeout(TimeoutError):
+    pass
 
 
 def _fetch_update_json() -> dict:
     import urllib.request
 
+    deadline = time.monotonic() + _UPDATE_INFO_DEADLINE_SECONDS
+    contents = bytearray()
     with urllib.request.urlopen(UPDATE_INFO_URL, timeout=3) as response:
         _require_https_response(response, UPDATE_INFO_URL)
-        return _json.loads(response.read().decode("utf-8-sig"))  # BOM이 붙어 있어도 읽는다
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("UPDATE_INFO_TIMEOUT")
+            block = response.read(min(16 * 1024, _UPDATE_INFO_MAX_BYTES + 1 - len(contents)))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("UPDATE_INFO_TIMEOUT")
+            if not block:
+                break
+            contents.extend(block)
+            if len(contents) > _UPDATE_INFO_MAX_BYTES:
+                raise ValueError("UPDATE_INFO_TOO_LARGE")
+    # BOM이 붙어 있어도 읽는다.
+    return _json.loads(bytes(contents).decode("utf-8-sig"))
 
 
 def _empty_update(status: str = "latest", reason: str = "", latest: str = "") -> dict:
@@ -1230,47 +1553,187 @@ def _safe_download_name(url: str) -> str:
     return name
 
 
-def _download_file(url: str, dest_dir, opener=None):
+_OWNED_UPDATE_DOWNLOADS: dict[str, tuple[int, int]] = {}
+_OWNED_UPDATE_DOWNLOADS_GUARD = threading.Lock()
+
+
+def _download_path_key(path: Path) -> str:
+    # resolve()는 링크를 따라간다. 안전 확인 전에는 글자 그대로의 절대 경로만 쓴다.
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _remember_owned_download(path: Path, identity: tuple[int, int]) -> None:
+    with _OWNED_UPDATE_DOWNLOADS_GUARD:
+        _OWNED_UPDATE_DOWNLOADS[_download_path_key(path)] = tuple(identity)
+
+
+def _owned_download_identity(path: Path) -> tuple[int, int] | None:
+    with _OWNED_UPDATE_DOWNLOADS_GUARD:
+        return _OWNED_UPDATE_DOWNLOADS.get(_download_path_key(path))
+
+
+def _forget_owned_download(path: Path) -> None:
+    with _OWNED_UPDATE_DOWNLOADS_GUARD:
+        _OWNED_UPDATE_DOWNLOADS.pop(_download_path_key(path), None)
+
+
+def _unique_download_target(folder: Path, requested_name: str) -> Path:
+    """기존 파일·링크를 건드리지 않고 쓸 수 있는 새 이름을 고른다."""
+    requested = folder / requested_name
+    if not os.path.lexists(requested):
+        return requested
+    suffix = Path(requested_name).suffix
+    stem = requested_name[:-len(suffix)] if suffix else requested_name
+    while True:
+        candidate = folder / f"{stem}-{uuid.uuid4().hex}{suffix}"
+        if not os.path.lexists(candidate):
+            return candidate
+
+
+def _publish_download_no_overwrite(partial: Path, folder: Path, name: str,
+                                   identity: tuple[int, int]) -> Path:
+    """완성된 임시 파일을 기존 파일을 덮지 않는 한 번의 이름 변경으로 공개한다."""
+    while True:
+        component_lock.prepare_direct_directory(folder)
+        if component_lock.direct_file_identity(partial) != identity:
+            raise component_lock.UnsafeLockPathError(
+                "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
+            )
+        target = _unique_download_target(folder, name)
+        try:
+            if os.name == "nt":
+                # Windows의 rename은 대상이 생겼으면 덮어쓰지 않고 실패한다.
+                os.rename(partial, target)
+            else:
+                # POSIX rename은 덮어쓰므로, 단일 파일 시스템 안에서 link를
+                # 독점 생성한 뒤 임시 이름을 떼어 같은 효과를 낸다.
+                os.link(partial, target, follow_symlinks=False)
+                partial.unlink()
+        except OSError as error:
+            if error.errno == errno.EEXIST or getattr(error, "winerror", None) == 183:
+                continue
+            raise
+        try:
+            if component_lock.direct_file_identity(target) != identity:
+                raise component_lock.UnsafeLockPathError(
+                    "완성된 설치 파일이 다른 파일로 바뀌었습니다."
+                )
+        except Exception:
+            # 이름 변경 뒤 검사에서 실패해도, 우리가 만든 바로 그 단일 파일로
+            # 확인되는 경우에만 치운다. 연결 수가 늘었으면 건드리지 않는다.
+            component_lock.remove_owned_file(target, identity)
+            raise
+        return target
+
+
+def _download_file(url: str, dest_dir, expected_sha256: str, opener=None):
+    """Setup을 고유 임시 파일에 받고 같은 읽기에서 크기·시간·확인값을 검사한다."""
     import urllib.request
 
+    expected = _valid_update_sha256(expected_sha256)
+    if not expected:
+        raise ValueError("UPDATE_SETUP_HASH_MISSING")
+    if not _valid_https_update_url(url):
+        raise ValueError("unsafe update URL")
+
     opener = opener or (lambda target, timeout=None: urllib.request.urlopen(target, timeout=timeout))
-    folder = Path(dest_dir) if dest_dir else Path(tempfile.gettempdir()) / "TeacherManager-Update"
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / _safe_download_name(url)
+    requested_folder = (
+        Path(dest_dir)
+        if dest_dir
+        else Path(tempfile.gettempdir()) / "TeacherManager-Update"
+    )
+    folder = component_lock.prepare_direct_directory(requested_folder)
+    name = _safe_download_name(url)
+    partial = folder / f".{name}.{os.getpid()}.{uuid.uuid4().hex}.partial"
+    partial_identity: tuple[int, int] | None = None
+    published: Path | None = None
+    deadline = time.monotonic() + _UPDATE_SETUP_DEADLINE_SECONDS
+    digest = hashlib.sha256()
+    total = 0
     try:
-        with opener(url, timeout=30) as source:
+        with opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS)) as source:
             _require_https_response(source, url)
-            with open(target, "wb") as sink:
+            with partial.open("xb") as sink:
+                partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
                 while True:
-                    chunk = source.read(1024 * 256)
+                    if time.monotonic() >= deadline:
+                        raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                    remaining = _UPDATE_SETUP_MAX_BYTES - total
+                    chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
+                    if time.monotonic() >= deadline:
+                        raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
                     if not chunk:
                         break
+                    total += len(chunk)
+                    if total > _UPDATE_SETUP_MAX_BYTES:
+                        raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
+                    # 네트워크를 읽는 동안 다른 이름이 붙거나 경로가 바뀌었는지,
+                    # 실제 쓰기 바로 전에 열린 handle과 경로를 다시 맞춰 본다.
+                    current = component_lock.assert_open_file_is_direct(partial, sink)
+                    if current != partial_identity:
+                        raise component_lock.UnsafeLockPathError(
+                            "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
+                        )
                     sink.write(chunk)
+                    digest.update(chunk)
+                sink.flush()
+                os.fsync(sink.fileno())
+                if time.monotonic() >= deadline:
+                    raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                current = component_lock.assert_open_file_is_direct(partial, sink)
+                if current != partial_identity:
+                    raise component_lock.UnsafeLockPathError(
+                        "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
+                    )
+
+        if digest.hexdigest() != expected:
+            raise _UpdateDownloadHashMismatch("UPDATE_SETUP_HASH_MISMATCH")
+        if partial_identity is None:
+            raise component_lock.UnsafeLockPathError("받은 설치 파일을 확인하지 못했습니다.")
+        published = _publish_download_no_overwrite(partial, folder, name, partial_identity)
+        _remember_owned_download(published, partial_identity)
+        return published
     except Exception:
-        try:
-            target.unlink()
-        except OSError:
-            pass
+        if published is not None and partial_identity is not None:
+            component_lock.remove_owned_file(published, partial_identity)
         raise
-    return target
+    finally:
+        # 우리가 만든 그 단일 파일이라는 확인이 될 때만 치운다. 공격자가 다른
+        # 이름을 붙인 파일은 지워서 바깥 자료에 영향을 줄 수 있으므로 남긴다.
+        if partial_identity is not None:
+            component_lock.remove_owned_file(partial, partial_identity)
 
 
 def _file_sha256(path: Path) -> str:
+    path = Path(path)
     digest = hashlib.sha256()
-    with open(path, "rb") as source:
+    with path.open("rb") as source:
+        identity = component_lock.assert_open_file_is_direct(path, source)
+        owned = _owned_download_identity(path)
+        if owned is not None and identity != owned:
+            raise component_lock.UnsafeLockPathError(
+                "받은 설치 파일이 다른 파일로 바뀌었습니다."
+            )
         while True:
-            chunk = source.read(1024 * 256)
+            chunk = source.read(_UPDATE_READ_SIZE)
             if not chunk:
                 break
             digest.update(chunk)
+        current = component_lock.assert_open_file_is_direct(path, source)
+        if current != identity:
+            raise component_lock.UnsafeLockPathError(
+                "받은 설치 파일이 읽는 동안 바뀌었습니다."
+            )
     return digest.hexdigest()
 
 
 def _remove_download(path: Path) -> None:
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    path = Path(path)
+    identity = _owned_download_identity(path)
+    if identity is None:
+        return
+    if component_lock.remove_owned_file(path, identity):
+        _forget_owned_download(path)
 
 
 _UPDATE_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -1292,7 +1755,8 @@ class _UpdateRunLease:
 
 
 def _update_lock_key(config_dir: Path) -> str:
-    return os.path.normcase(str(Path(config_dir).resolve()))
+    # 안전 확인 전 resolve()로 정션·링크를 따라가지 않는다.
+    return os.path.normcase(os.path.abspath(str(config_dir)))
 
 
 def _update_thread_lock(config_dir: Path) -> threading.Lock:
@@ -1313,9 +1777,12 @@ def _mark_update_installer_launched(config_dir: Path) -> None:
         _UPDATE_LAUNCHED.add(key)
 
 
-def _try_lock_update_file(lock_file) -> bool:
+def _try_lock_update_file(lock_path: Path, lock_file) -> bool:
+    # 첫 바이트를 쓰기 바로 전에 경로와 열린 handle이 같은 단일 파일인지 확인한다.
+    component_lock.assert_open_file_is_direct(lock_path, lock_file)
     lock_file.seek(0, os.SEEK_END)
     if lock_file.tell() == 0:
+        component_lock.assert_open_file_is_direct(lock_path, lock_file)
         lock_file.write(b"\0")
         lock_file.flush()
     lock_file.seek(0)
@@ -1348,13 +1815,18 @@ def _unlock_update_file(lock_file) -> None:
 @contextmanager
 def update_run_lock(config_dir: Path | None = None):
     """여러 창이나 프로세스가 동시에 누르면 먼저 시작한 한 요청만 들여보낸다."""
-    base = Path(config_dir) if config_dir else Path(tempfile.gettempdir()) / "TeacherManager-Update"
-    key = _update_lock_key(base)
+    requested_base = (
+        Path(config_dir)
+        if config_dir
+        else Path(tempfile.gettempdir()) / "TeacherManager-Update"
+    )
     try:
-        base.mkdir(parents=True, exist_ok=True)
-    except OSError:
+        base = component_lock.prepare_direct_directory(requested_base)
+        lock_path = component_lock.prepare_direct_file_path(base / ".update-run.lock")
+    except (OSError, component_lock.UnsafeLockPathError):
         yield _UpdateRunLease(False)
         return
+    key = _update_lock_key(base)
 
     local_lock = _update_thread_lock(base)
     if not local_lock.acquire(blocking=False):
@@ -1365,11 +1837,23 @@ def update_run_lock(config_dir: Path | None = None):
     lease = _UpdateRunLease(False)
     try:
         try:
-            lock_file = (base / ".update-run.lock").open("a+b")
-        except OSError:
+            try:
+                lock_file = lock_path.open("xb")
+            except FileExistsError:
+                # 기존 파일을 바꾸지 않는 방식으로 연 뒤 identity를 확인한다.
+                lock_file = lock_path.open("r+b")
+            component_lock.assert_open_file_is_direct(lock_path, lock_file)
+        except (OSError, component_lock.UnsafeLockPathError):
+            if lock_file is not None:
+                lock_file.close()
+                lock_file = None
             yield lease
             return
-        if not _try_lock_update_file(lock_file):
+        try:
+            locked = _try_lock_update_file(lock_path, lock_file)
+        except (OSError, component_lock.UnsafeLockPathError):
+            locked = False
+        if not locked:
             lock_file.close()
             lock_file = None
             yield lease
@@ -1393,16 +1877,15 @@ def update_run_lock(config_dir: Path | None = None):
             local_lock.release()
 
 
-# 설치 파일에게 "마법사 없이 돌아라"라고 알리는 표시.
-# /SILENT은 진행 창 하나만 남기고 마법사 화면을 전부 없앤다(/VERYSILENT은 그 창까지 감춘다).
-# /CLOSEAPPLICATIONS은 켜져 있는 프로그램을 설치 프로그램이 닫게 하고,
-# /NORESTART은 컴퓨터를 다시 켜라는 창이 뜨지 않게 한다.
-SILENT_UPDATE_ARGS = ["/SILENT", "/NORESTART", "/CLOSEAPPLICATIONS", "/SUPPRESSMSGBOXES"]
+# 업데이트도 설치 마법사를 눈에 보이게 연다. Setup에는 WebView2 전체 약관과
+# 명시 동의 확인란이 있으므로 /SILENT·/VERYSILENT·/SUPPRESSMSGBOXES로 그 화면을
+# 건너뛰면 안 된다. 실행 중인 앱은 안전하게 닫되 컴퓨터를 자동 재시작하지 않는다.
+UPDATE_SETUP_ARGS = ["/NORESTART", "/CLOSEAPPLICATIONS"]
 
 
 def update_launch_command(path) -> list[str]:
-    """업데이트용 설치 파일 실행 명령을 만든다."""
-    return [str(path), *SILENT_UPDATE_ARGS]
+    """약관을 직접 확인할 수 있는 업데이트용 설치 파일 실행 명령을 만든다."""
+    return [str(path), *UPDATE_SETUP_ARGS]
 
 
 def read_update_state(config_dir) -> dict:
@@ -1498,7 +1981,36 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                 "reason": "다른 창에서 업데이트가 이미 진행 중이에요. 잠시 기다려 주세요.",
             }
         try:
-            path = _download_file(target_url, dest_dir, opener=opener)
+            path = _download_file(
+                target_url,
+                dest_dir,
+                target_sha256,
+                opener=opener,
+            )
+        except _UpdateDownloadHashMismatch:
+            return {
+                "started": False,
+                "latest": target_latest,
+                "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
+            }
+        except _UpdateDownloadTooLarge:
+            return {
+                "started": False,
+                "latest": target_latest,
+                "reason": "받으려는 설치 파일이 허용된 크기보다 커서 중단했어요.",
+            }
+        except _UpdateDownloadTimeout:
+            return {
+                "started": False,
+                "latest": target_latest,
+                "reason": "설치 파일을 받는 시간이 너무 길어 중단했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
+            }
+        except component_lock.UnsafeLockPathError:
+            return {
+                "started": False,
+                "latest": target_latest,
+                "reason": "업데이트를 저장할 폴더와 파일을 안전하게 확인하지 못했어요.",
+            }
         except Exception:  # noqa: BLE001 - 통신 실패를 사람 말로
             return {"started": False, "latest": target_latest,
                     "reason": "새 버전 다운로드에 실패했어요. 인터넷 연결을 확인하고 다시 시도해 주세요."}
@@ -1538,9 +2050,26 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                 "reason": "도우미를 먼저 종료하지 못해 설치를 시작하지 않았어요. 앱을 닫고 다시 시도해 주세요.",
             }
 
+        # 받기가 끝난 뒤 파일이 바뀔 수 있으므로, 도우미를 닫은 다음 설치 창을
+        # 열기 바로 전에 같은 확인값을 다시 계산한다.
         try:
-            # 설치 창은 눈에 보여야 하므로 숨김 실행을 쓰지 않는다.
-            # 마법사만 없앤다 — 진행 창 하나는 그대로 뜬다.
+            launch_sha256 = _file_sha256(path)
+        except OSError:
+            launch_sha256 = ""
+        if launch_sha256 != target_sha256:
+            _remove_download(path)
+            reason = "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요."
+            if helper_was_running:
+                try:
+                    restored = bool((resume_after_launch_failure or start_helper)())
+                except Exception:  # noqa: BLE001
+                    restored = False
+                if not restored:
+                    reason += " 도우미도 다시 켜지지 않았어요. 앱을 다시 실행해 주세요."
+            return {"started": False, "latest": target_latest, "reason": reason}
+
+        try:
+            # WebView2 약관을 직접 읽고 동의해야 하므로 마법사 전체를 보여 준다.
             run = launch or (
                 lambda file: subprocess.Popen(update_launch_command(file), close_fds=True)
             )
@@ -1572,6 +2101,7 @@ AI_TOOLS = [
 # 공개 저장소 — 선생님 컴퓨터에서 로그인 없이 받을 수 있어야 한다.
 # 작업용 저장소(비공개)에는 점검 보고서·서버 소스가 함께 있어 공개하지 않는다.
 AI_SKILL_REPO = "rheps/teacher-manager"
+AI_SKILL_APPROVAL_FILENAME = "ai-skill-approval.json"
 
 
 def ai_skill_install_enabled() -> bool:
@@ -1591,26 +2121,256 @@ def ai_tools_status(home=None) -> list:
     ]
 
 
-def ai_skills_install(keys, run_command=None, enabled=None) -> dict:
-    """npx skills add — 체크한 AI 도구에만 스킬을 연결한다."""
+def _ai_node_result(runtime: tool_runtime.NodeRuntime) -> dict:
+    return {
+        "success": bool(runtime.ready),
+        "code": str(runtime.code),
+        "detail": str(runtime.detail),
+        "version": str(runtime.version or ""),
+    }
+
+
+def ai_node_status(*, local_app_data=None, run_command=process_win.run_captured) -> dict:
+    """시스템 Node를 보지 않고 Teacher Manager 전용 Node만 확인한다."""
+    return _ai_node_result(tool_runtime.resolve_node(
+        local_app_data=local_app_data,
+        run_command=run_command,
+    ))
+
+
+def ai_node_prepare(
+    *, local_app_data=None, opener=None, run_command=process_win.run_captured, enabled=None,
+) -> dict:
+    """사용자가 AI 연결을 누른 뒤에만 전용 Node를 내려받는다."""
     allowed = ai_skill_install_enabled() if enabled is None else enabled is True
     if not allowed:
-        return {"success": False, "detail": "AI 연결 기능은 공개 준비 중이에요."}
+        return {
+            "success": False,
+            "code": "AI_SKILLS_DISABLED",
+            "detail": "AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요.",
+            "version": "",
+        }
+    kwargs = {
+        "local_app_data": local_app_data,
+        "run_command": run_command,
+    }
+    if opener is not None:
+        kwargs["opener"] = opener
+    result = managed_node.prepare_managed_node(**kwargs)
+    return {
+        "success": bool(result.success),
+        "code": str(result.code),
+        "detail": str(result.detail),
+        "version": str(result.runtime.version or ""),
+    }
+
+
+def _ai_command_error(code: int, output: str) -> tuple[str, str]:
+    lowered = str(output or "").casefold()
+    if code == 407 or "407" in lowered or "proxy authentication required" in lowered:
+        return "NETWORK_PROXY_AUTH_REQUIRED", "학교나 기관의 인터넷 중계 서버 로그인이 필요합니다."
+    if "certificate" in lowered or "self signed" in lowered or "unable to verify" in lowered:
+        return "NETWORK_TLS_INSPECTION_BLOCKED", "학교 보안 인증서 때문에 AI 연결 파일을 확인하지 못했습니다."
+    if code == 124 or "timed out" in lowered or "timeout" in lowered:
+        return "NETWORK_TIMEOUT", "AI 연결 시간이 너무 오래 걸렸습니다."
+    if code == 127 or "access is denied" in lowered or "blocked" in lowered:
+        return "NODE_SECURITY_BLOCKED", "보안 프로그램이 AI 연결 도구 실행을 막았습니다."
+    return "AI_SKILLS_INSTALL_FAILED", _ai_safe_output(output) or "AI 연결 명령을 실행하지 못했습니다."
+
+
+def _ai_safe_output(output: str) -> str:
+    text = re.sub(
+        r"(?i)(https?://)[^/@\s]+@",
+        r"\1[로그인 숨김]@",
+        str(output or ""),
+    )
+    safe = process_win.safe_log_text([], text)
+    detail = safe.partition("결과: ")[2] or safe
+    return detail.strip()[-200:]
+
+
+def _ai_skills_install_locked(
+    current, executable, agents, package, environment, run_command, approval, archive_opener,
+) -> dict:
+    """두 창이 함께 들어오지 못하는 상태에서 격리 설치와 적용을 끝낸다."""
+    try:
+        install_plan = ai_skill_install.prepare_install_plan(agents)
+    except ai_skill_install.AiSkillInstallError as error:
+        return {"success": False, "code": error.code, "detail": error.detail, "version": str(current.version or "")}
+    if ai_skill_install.plan_is_already_approved(install_plan, approval):
+        return {
+            "success": True,
+            "code": "AI_SKILLS_READY",
+            "detail": "검토한 AI 연결이 이미 준비돼 있어 파일을 다시 받거나 바꾸지 않았습니다.",
+            "version": str(current.version or ""),
+        }
+    try:
+        stage_root = ai_skill_install.make_stage_root(current.root)
+    except ai_skill_install.AiSkillInstallError as error:
+        return {"success": False, "code": error.code, "detail": error.detail, "version": str(current.version or "")}
+    cleanup_allowed = True
+
+    if run_command is None:
+        def run(arguments, **options):
+            nonlocal cleanup_allowed
+            supervised = ai_skill_install.run_supervised_command(
+                arguments,
+                timeout=options.get("timeout"),
+                env=options.get("env"),
+                cwd=options.get("cwd"),
+            )
+            cleanup_allowed = cleanup_allowed and supervised.tree_stopped
+            return supervised.code, supervised.output
+    else:
+        run = run_command
+    try:
+        environment = ai_skill_install.isolated_environment(environment, stage_root)
+        source_kwargs = {}
+        if archive_opener is not None:
+            source_kwargs["opener"] = archive_opener
+        try:
+            approved_source = ai_skill_install.prepare_approved_source(
+                stage_root, approval, **source_kwargs,
+            )
+        except ai_skill_install.AiSkillInstallError as error:
+            return {
+                "success": False,
+                "code": error.code,
+                "detail": error.detail,
+                "version": str(current.version or ""),
+            }
+        args = [
+            "--yes", package, "add", str(approved_source), "-g", "-y", "--copy",
+            "--skill", "teacher-task-manager",
+        ]
+        for agent in agents:
+            args += ["-a", agent]
+        code, output = run(
+            [executable, "--yes", package, "--help"],
+            timeout=60,
+            env=environment,
+        )
+        if not cleanup_allowed:
+            return {
+                "success": False,
+                "code": "AI_SKILLS_PROCESS_TREE_NOT_STOPPED",
+                "detail": "AI 연결 작업이 모두 끝났는지 확인하지 못해 실제 사용자 파일은 바꾸지 않았습니다.",
+                "version": str(current.version or ""),
+            }
+        if code != 0:
+            error_code, detail = _ai_command_error(code, output)
+            return {
+                "success": False,
+                "code": "AI_SKILLS_CLI_UNAPPROVED" if error_code == "AI_SKILLS_INSTALL_FAILED" else error_code,
+                "detail": detail,
+                "version": str(current.version or ""),
+            }
+        code, output = run([executable, *args], timeout=600, env=environment)
+        if not cleanup_allowed:
+            return {
+                "success": False,
+                "code": "AI_SKILLS_PROCESS_TREE_NOT_STOPPED",
+                "detail": "AI 연결 작업이 모두 끝났는지 확인하지 못해 실제 사용자 파일은 바꾸지 않았습니다.",
+                "version": str(current.version or ""),
+            }
+        tail = _ai_safe_output(output)
+        if code == 0:
+            try:
+                ai_skill_install.write_staged_lock(stage_root, approval)
+                ai_skill_install.apply_staged_install(stage_root, install_plan, approval)
+            except ai_skill_install.AiSkillInstallError as error:
+                return {"success": False, "code": error.code, "detail": error.detail, "version": str(current.version or "")}
+            return {"success": True, "code": "AI_SKILLS_READY", "detail": tail, "version": str(current.version or "")}
+        error_code, detail = _ai_command_error(code, output)
+        return {"success": False, "code": error_code, "detail": detail, "version": str(current.version or "")}
+    finally:
+        if cleanup_allowed:
+            ai_skill_install.cleanup_stage(stage_root)
+
+
+def ai_skills_install(
+    keys,
+    *,
+    runtime=None,
+    run_command=None,
+    enabled=None,
+    permission_ack=False,
+    approval=None,
+    archive_opener=None,
+) -> dict:
+    """별도 동의와 검토한 정확한 공개판이 있을 때만 선택한 AI에 연결한다."""
+    allowed = ai_skill_install_enabled() if enabled is None else enabled is True
+    if not allowed:
+        return {
+            "success": False,
+            "code": "AI_SKILLS_DISABLED",
+            "detail": "AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요.",
+            "version": "",
+        }
     selected = {str(key) for key in (keys or [])}
     agents = [agent for tool in AI_TOOLS if tool["key"] in selected for agent in tool["agents"]]
     if not agents:
-        return {"success": False, "detail": "연결할 AI를 하나 이상 선택해 주세요."}
-    args = ["--yes", "skills", "add", AI_SKILL_REPO, "-g", "-y", "--skill", "*"]
-    for agent in agents:
-        args += ["-a", agent]
-    run = run_command or (lambda a, timeout=None: process_win.run_captured(a, timeout=timeout))
-    code, output = run(["npx", *args], timeout=600)
-    if code == 127:  # Windows에서 npx가 .cmd로만 잡히는 경우
-        code, output = run(["npx.cmd", *args], timeout=600)
-    tail = str(output or "").strip()[-200:]
-    if code == 0:
-        return {"success": True, "detail": tail}
-    return {"success": False, "detail": tail or "연결 명령을 실행하지 못했어요."}
+        return {"success": False, "code": "AI_SELECTION_REQUIRED", "detail": "연결할 AI를 하나 이상 선택해 주세요.", "version": ""}
+    if permission_ack is not True:
+        return {
+            "success": False,
+            "code": "AI_SKILLS_PERMISSION_REQUIRED",
+            "detail": "AI 연결 권한 안내를 읽고 동의해야 연결할 수 있어요.",
+            "version": "",
+        }
+    try:
+        approved = (
+            ai_skill_install.load_approved_skill(
+                bundle_paths.bundle_root() / AI_SKILL_APPROVAL_FILENAME
+            )
+            if approval is None
+            else ai_skill_install.validate_approved_skill(approval)
+        )
+    except ai_skill_install.AiSkillInstallError as error:
+        return {
+            "success": False,
+            "code": error.code,
+            "detail": error.detail,
+            "version": "",
+        }
+    current = runtime if isinstance(runtime, tool_runtime.NodeRuntime) else tool_runtime.resolve_node()
+    if not current.ready or current.npx_cmd is None:
+        return {
+            "success": False,
+            "code": "AI_NODE_NOT_READY",
+            "detail": current.detail or "AI 연결에 필요한 도구가 아직 준비되지 않았습니다.",
+            "version": str(current.version or ""),
+        }
+    spec, manifest_error = tool_runtime._required_node_spec(None)
+    if spec is None:
+        return {
+            "success": False,
+            "code": manifest_error or "NODE_MANIFEST_MISSING",
+            "detail": "AI 연결 도구의 승인 목록을 읽지 못했습니다.",
+            "version": str(current.version or ""),
+        }
+    package = f"{spec.skills_cli_package}@{spec.skills_cli_version}"
+    try:
+        environment = tool_runtime.node_subprocess_env(current)
+    except ValueError as error:
+        return {"success": False, "code": "AI_NODE_NOT_READY", "detail": str(error), "version": str(current.version or "")}
+    try:
+        executable = str(ai_skill_install.resolve_managed_npx(current.root, current.npx_cmd))
+    except ai_skill_install.AiSkillInstallError as error:
+        return {"success": False, "code": error.code, "detail": error.detail, "version": str(current.version or "")}
+    try:
+        with ai_skill_install.exclusive_install_lock():
+            return _ai_skills_install_locked(
+                current, executable, agents, package, environment, run_command, approved,
+                archive_opener,
+            )
+    except TimeoutError:
+        return {
+            "success": False,
+            "code": "AI_SKILLS_INSTALL_BUSY",
+            "detail": "다른 Teacher Manager 창에서 AI 연결을 진행 중입니다. 잠시 뒤 다시 눌러 주세요.",
+            "version": str(current.version or ""),
+        }
 
 
 LIST_CALENDARS_FAILURE = "Calendar 목록을 가져오지 못했어요. 설정에서 다시 점검해 주세요."
@@ -1634,6 +2394,7 @@ def _run_gws_json(run_command, args: list[str], failure_message: str) -> dict:
 
 
 def list_calendars(run_command, gws: str) -> list[dict]:
+    require_goedu_gws_session(run_command, gws)
     reply = _run_gws_json(
         run_command,
         [gws, "calendar", "calendarList", "list", "--params", '{"maxResults":250}', "--format", "json"],
@@ -1643,6 +2404,7 @@ def list_calendars(run_command, gws: str) -> list[dict]:
 
 
 def list_tasklists(run_command, gws: str) -> list[dict]:
+    require_goedu_gws_session(run_command, gws)
     reply = _run_gws_json(
         run_command,
         [gws, "tasks", "tasklists", "list", "--format", "json"],
@@ -1683,12 +2445,86 @@ class StepResult:
     detail: str = ""
 
 
+_ATTENDANCE_REMOTE_COMMAND_TIMEOUT_SECONDS = 120.0
+_ATTENDANCE_REMOTE_LOCK_TIMEOUT_SECONDS = 5.0
+_ATTENDANCE_REMOTE_TIMEOUT_MESSAGE = (
+    "Google 출결 작업이 너무 오래 걸려 중단했어요. "
+    "인터넷 연결을 확인한 뒤 다시 눌러 주세요."
+)
+_ATTENDANCE_REMOTE_TREE_MESSAGE = (
+    "Google 출결 작업을 안전하게 끝내지 못했어요. "
+    "Teacher Manager를 껐다 켠 뒤 다시 눌러 주세요."
+)
+_ATTENDANCE_REMOTE_BUSY_MESSAGE = (
+    "다른 창에서 출결 원격 작업을 진행하고 있어요. "
+    "그 작업이 끝난 뒤 다시 눌러 주세요."
+)
+
+
+class AttendanceRemoteWorkBusyError(RuntimeError):
+    """같은 출결 자료의 다른 원격 작업이 제한 시간 안에 끝나지 않음."""
+
+
+def attendance_remote_command(
+    args,
+    *,
+    cwd=None,
+    timeout_seconds: float = _ATTENDANCE_REMOTE_COMMAND_TIMEOUT_SECONDS,
+    environment=None,
+    supervisor=None,
+) -> tuple[int, str]:
+    """Google 명령과 그 명령이 만든 자식 작업까지 제한 시간 안에서 실행한다."""
+
+    supervisor = supervisor or process_supervision.run_supervised_command
+    child_environment = (
+        gws_env.gws_environ() if environment is None else dict(environment)
+    )
+    result = supervisor(
+        list(args),
+        timeout=max(0.01, float(timeout_seconds)),
+        env=child_environment,
+        cwd=cwd,
+    )
+    if not bool(getattr(result, "tree_stopped", False)):
+        raise RuntimeError(_ATTENDANCE_REMOTE_TREE_MESSAGE)
+    code = int(getattr(result, "code", 127))
+    output = str(getattr(result, "output", "") or "")
+    if code == 124:
+        raise RuntimeError(_ATTENDANCE_REMOTE_TIMEOUT_MESSAGE)
+    return code, output
+
+
+def attendance_remote_runner(
+    args,
+    cwd,
+    *,
+    timeout_seconds: float = _ATTENDANCE_REMOTE_COMMAND_TIMEOUT_SECONDS,
+    environment=None,
+    supervisor=None,
+) -> str:
+    """출결 설치·Apps Script 확인기가 쓰는 폴더 인자형 실행기."""
+
+    code, output = attendance_remote_command(
+        args,
+        cwd=cwd,
+        timeout_seconds=timeout_seconds,
+        environment=environment,
+        supervisor=supervisor,
+    )
+    if code != 0:
+        raise subprocess.CalledProcessError(
+            code, list(args), output=output, stderr=output
+        )
+    return output
+
+
 @dataclass
 class AttendanceDeps:
-    run_command: object = _default_run_command
-    attendance_runner: object = install_attendance_automation.default_runner
+    run_command: object = attendance_remote_command
+    attendance_runner: object = attendance_remote_runner
     attendance_installer: object = install_attendance_automation.install_attendance_automation
     write_record: object = install_attendance_automation.write_install_record
+    gws_resolver: object = tool_runtime.resolve_gws_executable
 
 
 @dataclass
@@ -1702,31 +2538,46 @@ _ATTENDANCE_THREAD_LOCKS: dict[str, threading.Lock] = {}
 _ATTENDANCE_THREAD_LOCKS_GUARD = threading.Lock()
 
 
-def _attendance_thread_lock(config_dir: Path) -> threading.Lock:
-    key = os.path.normcase(str(Path(config_dir).resolve()))
+def _attendance_thread_lock(config_dir: Path, lock_name: str) -> threading.Lock:
+    key = os.path.normcase(
+        str((Path(config_dir).resolve() / str(lock_name)).resolve())
+    )
     with _ATTENDANCE_THREAD_LOCKS_GUARD:
         return _ATTENDANCE_THREAD_LOCKS.setdefault(key, threading.Lock())
 
 
-def _lock_attendance_file(file) -> None:
+def _lock_attendance_file(file, deadline: float) -> None:
+    file.seek(0, os.SEEK_END)
+    if file.tell() == 0:
+        file.write(b"\0")
+        file.flush()
     if sys.platform == "win32":
         import msvcrt
 
-        file.seek(0, os.SEEK_END)
-        if file.tell() == 0:
-            file.write(b"\0")
-            file.flush()
         while True:
             try:
                 file.seek(0)
                 msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
                 return
             except OSError:
-                time.sleep(0.05)
+                if time.monotonic() >= deadline:
+                    raise AttendanceRemoteWorkBusyError(
+                        _ATTENDANCE_REMOTE_BUSY_MESSAGE
+                    )
+                time.sleep(0.02)
     else:
         import fcntl
 
-        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise AttendanceRemoteWorkBusyError(
+                        _ATTENDANCE_REMOTE_BUSY_MESSAGE
+                    )
+                time.sleep(0.02)
 
 
 def _unlock_attendance_file(file) -> None:
@@ -1742,32 +2593,80 @@ def _unlock_attendance_file(file) -> None:
 
 
 @contextmanager
-def attendance_setup_lock(config_dir: Path):
-    """같은 설정 폴더의 출결 준비는 프로그램 창이 여러 개여도 한 번씩 실행한다."""
+def attendance_remote_work_lock(
+    config_dir: Path,
+    *,
+    timeout_seconds: float = _ATTENDANCE_REMOTE_LOCK_TIMEOUT_SECONDS,
+):
+    """같은 출결 자료의 긴 Google 작업은 하나씩, 기다림은 제한 시간까지만."""
+
     config_dir = Path(config_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
-    local_lock = _attendance_thread_lock(config_dir)
-    with local_lock:
-        lock_path = config_dir / ".attendance-setup.lock"
+    lock_name = ".attendance-setup.lock"
+    local_lock = _attendance_thread_lock(config_dir, lock_name)
+    timeout = max(0.01, float(timeout_seconds))
+    deadline = time.monotonic() + timeout
+    if not local_lock.acquire(timeout=timeout):
+        raise AttendanceRemoteWorkBusyError(_ATTENDANCE_REMOTE_BUSY_MESSAGE)
+    try:
+        lock_path = config_dir / lock_name
         with lock_path.open("a+b") as lock_file:
-            _lock_attendance_file(lock_file)
+            _lock_attendance_file(lock_file, deadline)
             try:
                 yield
             finally:
                 _unlock_attendance_file(lock_file)
+    finally:
+        local_lock.release()
+
+
+@contextmanager
+def attendance_setup_lock(
+    config_dir: Path,
+    *,
+    timeout_seconds: float = _ATTENDANCE_REMOTE_LOCK_TIMEOUT_SECONDS,
+):
+    """옛 호출 이름도 출결 원격 작업 공용 잠금과 같은 문을 사용한다."""
+
+    with attendance_remote_work_lock(
+        config_dir, timeout_seconds=timeout_seconds
+    ):
+        yield
 
 
 def ensure_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
     """저장 버튼 한 번으로 출결 자료를 처음 한 번만 준비한다. 반복 호출해도 중복 생성하지 않는다."""
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
+    # 계정 확인은 폴더·잠금 파일을 만들기 전에 한다. 개인 Gmail에서 눌렀다는
+    # 이유만으로 사용자 폴더에 흔적을 남기지 않는다. 실제 준비 직전에는 잠금 안에서
+    # 다시 읽어 다른 창이 먼저 끝낸 결과도 그대로 사용한다.
+    gws = str(deps.gws_resolver())
+    preflight = read_attendance_status(
+        config_dir, deps.run_command, gws_executable=gws
+    )
+    if preflight.state in (
+        "gws-required", "login-required", "account-required", "auth-error",
+        "profile-required", "ready", "script-check-required", "script-update-required",
+    ):
+        return preflight
     with attendance_setup_lock(config_dir):
-        return _ensure_attendance_once(config_dir, deps)
+        return _ensure_attendance_once(config_dir, deps, gws)
 
 
-def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> AttendanceStatus:
-    status = read_attendance_status(config_dir, deps.run_command)
-    if status.state in ("gws-required", "login-required", "profile-required", "ready"):
+def _ensure_attendance_once(
+    config_dir: Path,
+    deps: AttendanceDeps,
+    gws_executable: str | None = None,
+) -> AttendanceStatus:
+    gws = str(gws_executable or deps.gws_resolver())
+    status = read_attendance_status(
+        config_dir, deps.run_command, gws_executable=gws
+    )
+    if status.state in (
+        "gws-required", "login-required", "account-required", "auth-error",
+        "profile-required", "ready", "script-check-required", "script-update-required"
+    ):
         return status
     if paths.attendance_install_record_path(config_dir).exists():
         return status  # 깨진 설치 기록 — 자동으로 새 자료를 만들지 않는다
@@ -1812,6 +2711,7 @@ def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> Attendanc
             attendance_task_list_id=homeroom_tasks_id,
             attendance_task_list_title="조종례시 담임학급 안내사항",
             gemini_api_key=install_attendance_automation.local_gemini_api_key(config_dir),
+            gws_executable=gws,
         )
     except Exception as error:  # noqa: BLE001 - 설치 실패는 쉬운 문장으로 바꿔 화면에 보여준다
         failed_service, message = friendly_attendance_error(error)
@@ -1827,10 +2727,28 @@ def _ensure_attendance_once(config_dir: Path, deps: AttendanceDeps) -> Attendanc
             failed_service=failed_service, detail=detail,
         )
     deps.write_record(profile_json, result)
-    _write_setup_status(config_dir, {"state": "ready", "account": current_user})
+    script_update_required = bool(
+        getattr(result, "script_update_required", False)
+    )
+    result_bundle_sha256 = str(
+        getattr(result, "script_bundle_sha256", "") or ""
+    )
+    if script_update_required:
+        result_state = "script-update-required"
+        result_detail = ATTENDANCE_SCRIPT_UPDATE_REQUIRED_MESSAGE
+    elif result_bundle_sha256 == current_attendance_script_bundle_sha256():
+        result_state = "ready"
+        result_detail = ""
+    else:
+        result_state = "script-check-required"
+        result_detail = ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
+    _write_setup_status(
+        config_dir, {"state": result_state, "account": current_user}
+    )
     return AttendanceStatus(
-        state="ready", account=current_user, current_user=current_user,
+        state=result_state, account=current_user, current_user=current_user,
         spreadsheet_url=result.spreadsheet_url, template_doc_url=result.template_doc_url,
+        detail=result_detail,
         created=True,
         school_year=_profile_school_year(config_dir),
         workbook_name=getattr(result, "workbook_name", "") or "",
@@ -1847,9 +2765,23 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
     """
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
+    # 보관 폴더와 잠금 파일보다 계정 확인이 먼저다. 잘못 로그인한 상태에서는
+    # 기존 기록뿐 아니라 로컬 파일도 한 글자도 바꾸지 않는다.
+    gws = str(deps.gws_resolver())
+    preflight = read_attendance_status(
+        config_dir, deps.run_command, gws_executable=gws
+    )
+    if preflight.state in (
+        "gws-required", "login-required", "account-required", "auth-error", "profile-required"
+    ):
+        return preflight
     with attendance_setup_lock(config_dir):
-        status = read_attendance_status(config_dir, deps.run_command)
-        if status.state in ("gws-required", "login-required", "profile-required"):
+        status = read_attendance_status(
+            config_dir, deps.run_command, gws_executable=gws
+        )
+        if status.state in (
+            "gws-required", "login-required", "account-required", "auth-error", "profile-required"
+        ):
             return status
         record_path = paths.attendance_install_record_path(config_dir)
         if record_path.exists():
@@ -1859,7 +2791,7 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
                 config_dir,
                 (record_path, paths.attendance_setup_status_path(config_dir)),
             )
-        return _ensure_attendance_once(config_dir, deps)
+        return _ensure_attendance_once(config_dir, deps, gws)
 
 
 def _archive_attendance_files(config_dir: Path, sources) -> None:
@@ -1885,6 +2817,11 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     deps = deps or ApplyDeps()
     config_dir = Path(config_dir)
     results: list[StepResult] = []
+
+    # 사용자 파일을 쓰기 전에 계정을 먼저 확인한다. 잘못된 계정에서 멈춘 뒤
+    # profile·시간표 일부만 저장되는 반쪽 적용을 만들지 않는다.
+    gws = str(deps.gws_resolver())
+    require_goedu_gws_session(deps.run_command, gws)
 
     write_profile_values(config_dir, profile_values)
     results.append(StepResult("csv", "선생님·학교 저장", "done", "teacher-profile.csv"))

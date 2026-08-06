@@ -7,8 +7,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from brity_bridge import paths, process_win
+from brity_bridge import paths, process_win, tool_runtime
 from brity_bridge.gemini_analyze import check_gemini_key
+from brity_bridge.google_account import (
+    GOEDU_ACCOUNT_REQUIRED_MESSAGE,
+    extract_email,
+    is_goedu_email,
+)
 from brity_bridge.hotkey import parse_hotkey
 from brity_bridge.settings import load_settings
 
@@ -60,21 +65,18 @@ class DoctorDeps:
     gemini_checker: object = check_gemini_key
     find_helper_window: object = _default_find_helper_window
     autostart_checker: object = _default_autostart_checker
+    gws_resolver: object = tool_runtime.resolve_gws_executable
     python_version: tuple = field(default_factory=lambda: sys.version_info[:3])
 
 
 def _extract_email(text: str) -> str:
-    import re
+    """옛 호출 자리도 공통 계정 판정과 같은 방식으로 이메일을 읽는다."""
 
-    match = re.search(r"[\w.+-]+@[\w.-]+", text)
-    return match.group(0) if match else ""
+    return extract_email(text)
 
 
-def _gws_status(deps: DoctorDeps) -> tuple[int, str]:
-    code, output = deps.run_command(["gws", "auth", "status"])
-    if code == 127:
-        code, output = deps.run_command(["gws.cmd", "auth", "status"])
-    return code, output
+def _gws_status(deps: DoctorDeps, gws_executable: str) -> tuple[int, str]:
+    return deps.run_command([gws_executable, "auth", "status"])
 
 
 def _read_profile_csv_values(config_dir: Path) -> dict[str, str]:
@@ -210,8 +212,22 @@ def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
     return CheckResult("connect.gemini-key", "Gemini API key", False, detail, fix, **common)
 
 
-def run_doctor_checks(config_dir: Path, deps: DoctorDeps | None = None) -> list[CheckResult]:
+def run_doctor_checks(
+    config_dir: Path,
+    deps: DoctorDeps | None = None,
+    *,
+    gws_executable: str | None = None,
+) -> list[CheckResult]:
     deps = deps or DoctorDeps()
+    gws_damage = False
+    if gws_executable is None:
+        try:
+            gws_executable = str(deps.gws_resolver())
+        except tool_runtime.GwsRuntimeError:
+            gws_executable = ""
+            gws_damage = True
+    else:
+        gws_executable = str(gws_executable)
     config_dir = Path(config_dir)
     profile = _read_profile_csv_values(config_dir)
 
@@ -222,12 +238,22 @@ def run_doctor_checks(config_dir: Path, deps: DoctorDeps | None = None) -> list[
     bridge_settings = load_settings(paths.settings_path(config_dir))
     results.append(_gemini_check(deps, bridge_settings))
 
-    code, output = _gws_status(deps)
-    cli_found = code != 127
+    code, output = _gws_status(deps, gws_executable) if gws_executable else (127, "")
+    cli_found = bool(gws_executable) and code != 127
+    cli_detail = (
+        "설치 파일이 손상됐어요"
+        if gws_damage
+        else ("준비됨" if cli_found else "설치가 필요해요")
+    )
+    cli_fix = (
+        "Teacher Manager 설치 파일을 다시 실행해 복구해 주세요."
+        if gws_damage
+        else ("" if cli_found else GWS_CLI_FIX)
+    )
     results.append(CheckResult(
         "settings.gws-cli", "Google Workspace CLI", cli_found,
-        "준비됨" if cli_found else "설치가 필요해요",
-        "" if cli_found else GWS_CLI_FIX,
+        cli_detail,
+        cli_fix,
         card="settings", target="gws-cli",
     ))
     email = _extract_email(output)
@@ -245,10 +271,11 @@ def run_doctor_checks(config_dir: Path, deps: DoctorDeps | None = None) -> list[
             "Google Workspace CLI를 먼저 준비해 주세요.",
             card="settings", target="google-login",
         ))
-    if logged_in and not email.endswith("@goedu.kr"):
+    if logged_in and not is_goedu_email(email):
         results.append(CheckResult(
-            "settings.goedu-account", "교육청 계정(@goedu.kr)", None,
-            f"{email} — goedu.kr 계정이 아니라 일부 기능이 제한될 수 있습니다.",
+            "settings.goedu-account", "교육청 계정(@goedu.kr)", False,
+            f"{email} — {GOEDU_ACCOUNT_REQUIRED_MESSAGE}",
+            GOEDU_ACCOUNT_REQUIRED_MESSAGE,
             card="settings", target="google-login",
         ))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
@@ -65,6 +66,33 @@ def run_captured(
     output = _as_text(getattr(completed, "stdout", ""))
     output += _as_text(getattr(completed, "stderr", ""))
     return int(completed.returncode), output
+
+
+def run_passthrough(
+    args: Sequence[str], *, cwd=None, env=None, runner=subprocess.run
+) -> int:
+    """현재 콘솔에 자식 출력이 그대로 보이게 하고 종료번호만 돌려준다."""
+    options = {}
+    # TeacherManagerTools.exe 자체의 출력이 설치 검사 파일이나 AI 비서의 통로로
+    # 연결돼 있으면, Windows가 그 손잡이를 손자 gws.exe에 자동으로 물려주지
+    # 않는 경우가 있다. 현재 세 통로를 명시하면 subprocess가 안전하게 복제한다.
+    for name, stream in (("stdin", sys.stdin), ("stdout", sys.stdout), ("stderr", sys.stderr)):
+        if stream is None:
+            continue
+        try:
+            stream.fileno()
+        except (AttributeError, io.UnsupportedOperation, OSError):
+            continue
+        options[name] = stream
+    if cwd is not None:
+        options["cwd"] = str(cwd)
+    if env is not None:
+        options["env"] = dict(env)
+    try:
+        completed = runner(list(args), **_hidden_options(options))
+    except OSError:
+        return 127
+    return int(completed.returncode)
 
 
 def popen_hidden(args: Sequence[str], *, popen=subprocess.Popen, **kwargs):

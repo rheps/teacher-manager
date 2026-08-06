@@ -7,13 +7,12 @@ sheetId + sheetSecret을 보낸다.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from brity_bridge import gws_env, paths, process_win
+from brity_bridge import gws_env, paths, process_win, tool_runtime
 
 SETTINGS_RANGE = "설정!A1:D200"
 
@@ -43,6 +42,10 @@ SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
 # 403(SPACE_CREATE_FORBIDDEN)·409(SPACE_NAME_TAKEN)가 아닌 나머지 실패는 전부 이 코드로 온다
 # (services/central-chat-sender의 spaceCreateError 기본값).
 SPACE_CREATE_FAILED_MESSAGE = "방을 만들지 못했어요. 잠시 뒤 다시 눌러 주세요."
+GOEDU_ACCOUNT_REQUIRED_MESSAGE = (
+    "이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 "
+    "클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 다시 로그인해 주세요."
+)
 SERVER_ANSWER_MESSAGES = {
     "SHEET_MOVED": SHEET_MOVED_MESSAGE,
     "SHEET_AUTH_REQUIRED": SHEET_AUTH_REQUIRED_MESSAGE,
@@ -50,6 +53,7 @@ SERVER_ANSWER_MESSAGES = {
     "SPACE_NAME_TAKEN": SPACE_NAME_TAKEN_MESSAGE,
     "SPACE_DISPLAY_NAME_REQUIRED": SPACE_NAME_EMPTY_MESSAGE,
     "SPACE_CREATE_FAILED": SPACE_CREATE_FAILED_MESSAGE,
+    "GOEDU_ACCOUNT_REQUIRED": GOEDU_ACCOUNT_REQUIRED_MESSAGE,
 }
 
 _KEY_MAP = {
@@ -61,30 +65,52 @@ _KEY_MAP = {
     "TASK_LIST_ID": "task_list_id",
     "HOMEROOM_TASK_LIST_ID": "homeroom_task_list_id",
 }
+_ATTENDANCE_RECORD_NOT_SUPPLIED = object()
 
 
 class CentralChatError(RuntimeError):
     pass
 
 
-def _resolve_command(args, which=shutil.which):
-    """Windows에서 "gws" 이름은 npm의 gws.cmd를 못 찾는다 — 실제 경로로 바꿔 실행한다."""
-    args = list(args)
-    if args and args[0] == "gws":
-        args[0] = which("gws") or "gws.cmd"
-    return args
+def _resolved_gws_executable(gws_executable: str | None = None) -> str:
+    executable = str(gws_executable or tool_runtime.resolve_gws_executable())
+    if not executable or not Path(executable).is_absolute():
+        raise CentralChatError("Google Workspace CLI 실행 파일의 전체 경로를 읽지 못했어요.")
+    return executable
 
 
 def _default_run_command(args, cwd=None):
     # 앱과 같은 곳에 gws 열쇠를 두게 고정한다 — 이 명령에만 넘긴다.
     # 출결 탭이 3초 간격으로 부르는 경로 — 창 숨김이 빠지면 검은 창이 계속 뜬다.
-    result = subprocess.run(_resolve_command(args), capture_output=True, text=True,
+    result = subprocess.run(list(args), capture_output=True, text=True,
                             encoding="utf-8", errors="replace", cwd=cwd, shell=False,
                             env=gws_env.gws_environ(),
                             **process_win.hidden_process_kwargs())
     if result.returncode != 0:
         raise CentralChatError(CONFIG_BROKEN_MESSAGE)
     return result.stdout
+
+
+def _command_output(run_command, args) -> str:
+    """두 종류의 명령 실행 결과를 한 모양으로 바꾸고 실패를 놓치지 않는다.
+
+    이 파일 자체 실행기는 출력 문자열을 돌려주지만, 대시보드 bridge 실행기는
+    ``(종료번호, 출력)``을 돌려준다. 예전에는 뒤 모양의 실패도 문자열처럼 넘겨
+    Sheet 변경이 실패했는데 성공으로 표시될 수 있었다.
+    """
+    result = run_command(args)
+    if isinstance(result, tuple):
+        if len(result) < 2:
+            raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+        code, output = result[0], result[1]
+        try:
+            succeeded = int(code) == 0
+        except (TypeError, ValueError):
+            succeeded = False
+        if not succeeded:
+            raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+        return str(output or "")
+    return str(result or "")
 
 
 def _load_record(config_dir: Path) -> dict:
@@ -100,9 +126,28 @@ def _load_record(config_dir: Path) -> dict:
     return record
 
 
-def _read_settings_rows(spreadsheet_id: str, run_command) -> list:
-    output = run_command([
-        "gws", "sheets", "spreadsheets", "values", "get",
+def _chosen_record(config_dir: Path, attendance_record) -> dict:
+    """호출 시작 때 고정한 기록을 쓰고, 없으면 그때만 활성 파일을 읽는다."""
+
+    if attendance_record is _ATTENDANCE_RECORD_NOT_SUPPLIED:
+        return _load_record(config_dir)
+    if attendance_record is None:
+        raise CentralChatError(NOT_PREPARED_MESSAGE)
+    if not isinstance(attendance_record, dict) or not attendance_record.get(
+        "spreadsheet_id"
+    ):
+        raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+    return dict(attendance_record)
+
+
+def _read_settings_rows(
+    spreadsheet_id: str,
+    run_command,
+    gws_executable: str | None = None,
+) -> list:
+    gws = _resolved_gws_executable(gws_executable)
+    output = _command_output(run_command, [
+        gws, "sheets", "spreadsheets", "values", "get",
         "--params", json.dumps({"spreadsheetId": spreadsheet_id, "range": SETTINGS_RANGE},
                                ensure_ascii=False),
         "--format", "json",
@@ -141,13 +186,20 @@ def _spreadsheet_in_use(config_dir: Path, record_spreadsheet_id: str = "") -> st
     return str(saved.get("copy_spreadsheet_id", "") or "").strip()
 
 
-def read_central_config(config_dir: Path, run_command=_default_run_command) -> dict:
-    record = _load_record(config_dir)
+def read_central_config(
+    config_dir: Path,
+    run_command=_default_run_command,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> dict:
+    record = _chosen_record(config_dir, attendance_record)
     spreadsheet_id = (
         _spreadsheet_in_use(config_dir, str(record["spreadsheet_id"]))
         or str(record["spreadsheet_id"])
     )
-    rows = _read_settings_rows(spreadsheet_id, run_command)
+    gws = _resolved_gws_executable(gws_executable)
+    rows = _read_settings_rows(spreadsheet_id, run_command, gws)
     config = {"spreadsheet_id": spreadsheet_id}
     for row in rows:
         if not isinstance(row, list) or len(row) < 2:
@@ -206,20 +258,53 @@ def _server_answer_message(code: str, error) -> str:
 UNIFIED_TASK_LIST_TITLE = "조종례시 담임학급 안내사항"
 
 
-def sync_task_list(config_dir: Path, run_command=_default_run_command) -> bool:
+def sync_task_list(
+    config_dir: Path,
+    run_command=_default_run_command,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> bool:
     """옛 '출결 미제출 확인' 목록을 쓰는 시트를 조종례 목록으로 통합한다. 목록 자체는 지우지 않는다."""
-    config = read_central_config(config_dir, run_command)
+    gws = _resolved_gws_executable(gws_executable)
+    config = read_central_config(
+        config_dir,
+        run_command,
+        gws_executable=gws,
+        attendance_record=attendance_record,
+    )
     homeroom_id = config.get("homeroom_task_list_id", "")
     if not homeroom_id or config.get("task_list_id", "") == homeroom_id:
         return False
-    rows = _read_settings_rows(config["spreadsheet_id"], run_command)
-    _update_settings_value(config["spreadsheet_id"], rows, "TASK_LIST_ID", homeroom_id, run_command)
-    _update_settings_value(config["spreadsheet_id"], rows, "TASK_LIST_TITLE", UNIFIED_TASK_LIST_TITLE, run_command)
+    rows = _read_settings_rows(config["spreadsheet_id"], run_command, gws)
+    _update_settings_values(
+        config["spreadsheet_id"],
+        rows,
+        [
+            ("TASK_LIST_ID", homeroom_id),
+            ("TASK_LIST_TITLE", UNIFIED_TASK_LIST_TITLE),
+        ],
+        run_command,
+        gws,
+    )
     return True
 
 
-def list_spaces(config_dir: Path, run_command=_default_run_command, http_post=_post) -> list:
-    config = read_central_config(config_dir, run_command)
+def list_spaces(
+    config_dir: Path,
+    run_command=_default_run_command,
+    http_post=_post,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> list:
+    gws = _resolved_gws_executable(gws_executable)
+    config = read_central_config(
+        config_dir,
+        run_command,
+        gws_executable=gws,
+        attendance_record=attendance_record,
+    )
     response = http_post(config["url"], "/v1/spaces", {
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
     })
@@ -230,12 +315,20 @@ def list_spaces(config_dir: Path, run_command=_default_run_command, http_post=_p
     ]
 
 
-def _update_settings_value(spreadsheet_id: str, rows: list, key: str, value: str, run_command) -> None:
+def _update_settings_value(
+    spreadsheet_id: str,
+    rows: list,
+    key: str,
+    value: str,
+    run_command,
+    gws_executable: str | None = None,
+) -> None:
+    gws = _resolved_gws_executable(gws_executable)
     for index, row in enumerate(rows):
         if isinstance(row, list) and row and str(row[0]).strip() == key:
             row_number = index + 1  # A1 표기 — values get 결과의 줄 번호 그대로
-            run_command([
-                "gws", "sheets", "spreadsheets", "values", "update",
+            _command_output(run_command, [
+                gws, "sheets", "spreadsheets", "values", "update",
                 "--params", json.dumps({
                     "spreadsheetId": spreadsheet_id,
                     "range": f"설정!B{row_number}",
@@ -249,7 +342,55 @@ def _update_settings_value(spreadsheet_id: str, rows: list, key: str, value: str
     raise CentralChatError(CONFIG_BROKEN_MESSAGE)
 
 
-def _upsert_settings_value(spreadsheet_id: str, rows: list, key: str, value: str, run_command) -> None:
+def _update_settings_values(
+    spreadsheet_id: str,
+    rows: list,
+    values: list[tuple[str, str]],
+    run_command,
+    gws_executable: str | None = None,
+) -> None:
+    """서로 짝인 설정값을 Google Sheet에 한 번에 저장한다.
+
+    방 ID와 방 이름, Tasks 목록 ID와 이름처럼 둘이 함께 바뀌어야 하는 값은
+    명령을 두 번 보내면 첫 번째만 저장된 채 멈출 수 있다. Google의 묶음 저장을
+    사용해 둘 다 저장되거나 둘 다 그대로 남게 한다.
+    """
+    row_numbers: dict[str, int] = {}
+    wanted = {str(key) for key, _value in values}
+    for index, row in enumerate(rows):
+        if not isinstance(row, list) or not row:
+            continue
+        key = str(row[0]).strip()
+        if key in wanted:
+            row_numbers[key] = index + 1
+    if any(key not in row_numbers for key, _value in values):
+        raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+
+    data = [
+        {
+            "range": f"설정!B{row_numbers[key]}",
+            "majorDimension": "ROWS",
+            "values": [[value]],
+        }
+        for key, value in values
+    ]
+    gws = _resolved_gws_executable(gws_executable)
+    _command_output(run_command, [
+        gws, "sheets", "spreadsheets", "values", "batchUpdate",
+        "--params", json.dumps({"spreadsheetId": spreadsheet_id}, ensure_ascii=False),
+        "--json", json.dumps({"valueInputOption": "RAW", "data": data}, ensure_ascii=False),
+        "--format", "json",
+    ])
+
+
+def _upsert_settings_value(
+    spreadsheet_id: str,
+    rows: list,
+    key: str,
+    value: str,
+    run_command,
+    gws_executable: str | None = None,
+) -> None:
     """설정 탭 값을 고치되, 그 이름 줄이 없으면 표 맨 아래에 새로 붙인다.
 
     이미 설치를 끝낸 시트에는 나중에 생긴 설정 이름이 아예 없다. 그럴 때 오류를 내면
@@ -279,30 +420,84 @@ def _upsert_settings_value(spreadsheet_id: str, rows: list, key: str, value: str
             "valueInputOption": "RAW",
         }
         values = [[key, value, SETTINGS_DESCRIPTIONS.get(key, ""), "자동 입력"]]
-    run_command([
-        "gws", "sheets", "spreadsheets", "values", "update",
+    gws = _resolved_gws_executable(gws_executable)
+    _command_output(run_command, [
+        gws, "sheets", "spreadsheets", "values", "update",
         "--params", json.dumps(params, ensure_ascii=False),
         "--json", json.dumps({"majorDimension": "ROWS", "values": values}, ensure_ascii=False),
         "--format", "json",
     ])
 
 
-def set_class_space(config_dir: Path, space_name: str, display_name: str,
-                    run_command=_default_run_command, http_post=_post) -> dict:
-    """Code.gs의 [학급 단톡방 고르기]와 같은 두 저장 경로 — 서버 등록 + 시트 설정."""
-    config = read_central_config(config_dir, run_command)
+def _set_class_space_from_config(
+    config: dict,
+    space_name: str,
+    display_name: str,
+    run_command,
+    http_post,
+    gws_executable: str,
+) -> dict:
+    """이미 확인한 같은 출석부 설정으로 방 선택 저장을 끝낸다."""
+
+    rows = _read_settings_rows(
+        config["spreadsheet_id"], run_command, gws_executable
+    )
+    _update_settings_values(
+        config["spreadsheet_id"],
+        rows,
+        [
+            ("CLASS_CHAT_SPACE_ID", space_name),
+            ("CLASS_CHAT_SPACE_NAME", display_name),
+        ],
+        run_command,
+        gws_executable,
+    )
+    # 시트 저장이 실패했는데 서버만 선택된 상태가 되면 Apps Script 발송은 방을
+    # 찾지 못한다. 그래서 선생님이 실제로 쓰는 시트를 먼저 완성한 뒤 서버에 알린다.
     http_post(config["url"], "/v1/class-space", {
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
         "spaceName": space_name, "displayName": display_name,
     })
-    rows = _read_settings_rows(config["spreadsheet_id"], run_command)
-    _update_settings_value(config["spreadsheet_id"], rows, "CLASS_CHAT_SPACE_ID", space_name, run_command)
-    _update_settings_value(config["spreadsheet_id"], rows, "CLASS_CHAT_SPACE_NAME", display_name, run_command)
     return {"space_name": space_name, "display_name": display_name}
 
 
-def create_class_space(config_dir: Path, display_name: str,
-                       run_command=_default_run_command, http_post=_post) -> dict:
+def set_class_space(
+    config_dir: Path,
+    space_name: str,
+    display_name: str,
+    run_command=_default_run_command,
+    http_post=_post,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> dict:
+    """학급 단톡방을 시트에 온전히 저장한 뒤 발송 서버에도 등록한다."""
+    gws = _resolved_gws_executable(gws_executable)
+    config = read_central_config(
+        config_dir,
+        run_command,
+        gws_executable=gws,
+        attendance_record=attendance_record,
+    )
+    return _set_class_space_from_config(
+        config,
+        space_name,
+        display_name,
+        run_command,
+        http_post,
+        gws,
+    )
+
+
+def create_class_space(
+    config_dir: Path,
+    display_name: str,
+    run_command=_default_run_command,
+    http_post=_post,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> dict:
     """학급 단톡방을 만들고 곧바로 그 방을 학급 단톡방으로 골라 둔다.
 
     만드는 것과 고르는 것을 한 번에 끝낸다 — 만든 뒤 목록에서 또 고르게 하면
@@ -318,7 +513,13 @@ def create_class_space(config_dir: Path, display_name: str,
     if not name:
         return {"state": "failed", "space_name": "", "display_name": "",
                 "detail": SPACE_NAME_EMPTY_MESSAGE}
-    config = read_central_config(config_dir, run_command)
+    gws = _resolved_gws_executable(gws_executable)
+    config = read_central_config(
+        config_dir,
+        run_command,
+        gws_executable=gws,
+        attendance_record=attendance_record,
+    )
     try:
         response = http_post(config["url"], "/v1/spaces/create", {
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
@@ -336,7 +537,16 @@ def create_class_space(config_dir: Path, display_name: str,
                 "detail": "방을 만들었는지 확인하지 못했어요. 목록을 다시 불러와 주세요."}
     shown = str(space.get("displayName", "") or "").strip() or name
     try:
-        set_class_space(config_dir, space_name, shown, run_command, http_post)
+        # 방을 만들기 전에 읽고 확인한 바로 그 출석부 설정을 끝까지 쓴다.
+        # 중간에 활성 기록 파일이 바뀌어도 새 출석부에 방 선택을 잘못 쓰지 않는다.
+        _set_class_space_from_config(
+            config,
+            space_name,
+            shown,
+            run_command,
+            http_post,
+            gws,
+        )
     except CentralChatError as error:
         # 방은 만들어졌다. 만든 이름을 함께 돌려주어, 같은 이름으로 또 만들려다
         # SPACE_NAME_TAKEN을 만나지 않게 한다.
@@ -345,8 +555,22 @@ def create_class_space(config_dir: Path, display_name: str,
     return {"state": "ok", "space_name": space_name, "display_name": shown, "detail": ""}
 
 
-def start_auth(config_dir: Path, run_command=_default_run_command, http_post=_post) -> str:
-    config = read_central_config(config_dir, run_command)
+def start_auth(
+    config_dir: Path,
+    run_command=_default_run_command,
+    http_post=_post,
+    *,
+    gws_executable: str | None = None,
+    attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+) -> str:
+    # 출결 기록이 없으면 그 안내를 먼저 보여 준다. GWS 선택은 기록을 읽은 뒤
+    # read_central_config 안에서 하므로 불필요한 실행 파일 확인도 일어나지 않는다.
+    config = read_central_config(
+        config_dir,
+        run_command,
+        gws_executable=gws_executable,
+        attendance_record=attendance_record,
+    )
     response = http_post(config["url"], "/v1/auth/start", {
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
     })
@@ -356,9 +580,19 @@ def start_auth(config_dir: Path, run_command=_default_run_command, http_post=_po
     return auth_url
 
 
-def chat_status(config_dir: Path, run_command=_default_run_command, http_post=_post) -> dict:
+def chat_status(
+    config_dir: Path,
+    run_command=_default_run_command,
+    http_post=_post,
+    *,
+    gws_executable: str | None = None,
+) -> dict:
     try:
-        config = read_central_config(config_dir, run_command)
+        config = read_central_config(
+            config_dir,
+            run_command,
+            gws_executable=gws_executable,
+        )
         response = http_post(config["url"], "/v1/status", {
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
         })
@@ -369,6 +603,12 @@ def chat_status(config_dir: Path, run_command=_default_run_command, http_post=_p
         "connected": bool(response.get("connected")),
         "registered": bool(response.get("registered")),
         "account": str(response.get("account", "") or ""),
-        "class_space_name": str(response.get("classSpaceName", "") or ""),
-        "reason": "",
+        # 서버에 예전 선택이 남아 있어도 현재 출결 시트에 방 ID가 없으면
+        # "선택 완료"처럼 보이지 않는다. 실제 발송이 읽는 시트 값을 기준으로 삼는다.
+        "class_space_name": (
+            str(config.get("class_space_name", "") or "")
+            if str(config.get("class_space_id", "") or "").strip()
+            else ""
+        ),
+        "reason": str(response.get("reason", "") or ""),
     }

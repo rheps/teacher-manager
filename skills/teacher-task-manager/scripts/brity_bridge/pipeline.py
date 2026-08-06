@@ -5,7 +5,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from brity_bridge import capture_store, paths, status_log
+from attendance_install_record import (
+    attendance_script_is_attested,
+    load_attendance_install_record,
+)
+from attendance_script_update import (
+    inspect_attendance_script_update,
+    target_bundle_sha256,
+)
+from brity_bridge import bundle_paths, capture_store, paths, status_log
 from brity_bridge.gemini_analyze import AnalysisError, run_gemini_analysis
 from brity_bridge.gws_exec import ExecutionReport, execute_actions
 from brity_bridge.history import HistoryStore
@@ -148,15 +156,95 @@ def record_preflight_failure(config_dir: Path, message: str, summary: str) -> Fl
     )
 
 
-def _load_notice_sheet(config_dir: Path) -> str:
-    """출결 자동화 설치 기록에서 학생 안내를 적을 Google Sheet ID를 읽는다. 없으면 빈 문자열."""
+NOTICE_SETUP_REQUIRED_DETAIL = "학생 안내 시트가 준비되지 않았어요 · 처음 설정 필요"
+NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL = (
+    "학생 안내 시트의 출결 기능 확인 또는 업데이트가 먼저 필요해요 · 출결 탭에서 최신 상태를 확인해 주세요"
+)
+
+
+def _load_notice_sheet(config_dir: Path) -> tuple[str, str]:
+    """학생 안내 Sheet ID와 쓸 수 없을 때 보여 줄 이유를 함께 읽는다."""
     try:
-        raw = json.loads(paths.attendance_install_record_path(config_dir).read_text(encoding="utf-8"))
+        raw = load_attendance_install_record(
+            paths.attendance_install_record_path(config_dir)
+        )
+        current_sha256 = target_bundle_sha256(
+            bundle_paths.bundle_root() / "assets"
+        )
+    except (OSError, ValueError):
+        return "", NOTICE_SETUP_REQUIRED_DETAIL
+    if (
+        raw.get("script_update_required") is True
+        or not attendance_script_is_attested(raw, current_sha256)
+    ):
+        return "", NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL
+    sheet_id = str(raw.get("spreadsheet_id") or "")
+    return sheet_id, "" if sheet_id else NOTICE_SETUP_REQUIRED_DETAIL
+
+
+def _remote_notice_script_preflight(
+    config_dir: Path,
+    runner,
+    gws_executable: str,
+    inspector=None,
+) -> tuple[bool, str]:
+    """학생 안내 줄을 쓰기 직전에 원격 원본과 실제 사용판을 다시 읽는다."""
+
+    try:
+        record = load_attendance_install_record(
+            paths.attendance_install_record_path(config_dir)
+        )
+        expected_sha256 = target_bundle_sha256(
+            bundle_paths.bundle_root() / "assets"
+        )
+        inspect = inspector or inspect_attendance_script_update
+
+        def cwd_runner(args, _cwd):
+            return runner(list(args))
+
+        result = inspect(
+            record.get("spreadsheet_id"),
+            record.get("script_id"),
+            record.get("deployment_id"),
+            assets_dir=bundle_paths.bundle_root() / "assets",
+            runner=cwd_runner,
+            gws_executable=gws_executable,
+        )
+        value = (
+            (lambda key: result.get(key))
+            if isinstance(result, dict)
+            else (lambda key: getattr(result, key, None))
+        )
+        exact_ids = all(
+            value(key) == record.get(key)
+            for key in ("spreadsheet_id", "script_id", "deployment_id")
+        )
+        exact_hashes = (
+            value("current_bundle_sha256") == expected_sha256
+            and value("target_bundle_sha256") == expected_sha256
+        )
+        if (
+            value("state") == "current"
+            and value("verified") is True
+            and exact_ids
+            and exact_hashes
+        ):
+            return True, ""
+    except Exception:  # noqa: BLE001 - 원격 결과가 모호하면 쓰지 않고 쉬운 안내만 보인다
+        pass
+    return False, NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL
+
+
+def _load_attendance_owner(config_dir: Path) -> str:
+    """이 설정 폴더에서 처음 출결을 준비한 Google 계정. 옛 기록은 빈 값이다."""
+
+    try:
+        raw = json.loads(
+            paths.attendance_setup_status_path(config_dir).read_text(encoding="utf-8")
+        )
     except (OSError, ValueError):
         return ""
-    if not isinstance(raw, dict):
-        return ""
-    return str(raw.get("spreadsheet_id") or "")
+    return str(raw.get("account", "") or "").strip() if isinstance(raw, dict) else ""
 
 
 def _summarize_report(report: ExecutionReport) -> str:
@@ -175,6 +263,13 @@ def _summarize_report(report: ExecutionReport) -> str:
         and "처음 설정 필요" in row.detail
         for row in report.results
     )
+    update_blocked_notices = sum(
+        row.action.kind == "notice"
+        and row.status == "failed"
+        and "출결 기능" in row.detail
+        and ("확인" in row.detail or "업데이트" in row.detail)
+        for row in report.results
+    )
     parts = []
     if calendar_count:
         parts.append(f"캘린더 {calendar_count}건")
@@ -187,9 +282,13 @@ def _summarize_report(report: ExecutionReport) -> str:
         )
     if blocked_notices:
         parts.append(f"학생 안내 옮기지 못함 {blocked_notices}건 · 처음 설정 필요")
+    if update_blocked_notices:
+        parts.append(
+            f"학생 안내 옮기지 못함 {update_blocked_notices}건 · 출결 기능 업데이트 또는 확인 필요"
+        )
     if report.duplicates:
         parts.append(f"중복 건너뜀 {len(report.duplicates)}건")
-    other_failures = len(report.failures) - blocked_notices
+    other_failures = len(report.failures) - blocked_notices - update_blocked_notices
     if other_failures:
         parts.append(f"실패 {other_failures}건")
     return " · ".join(parts) if parts else "만들 항목 없음"
@@ -212,9 +311,29 @@ def _notice_blocked_note(report: ExecutionReport) -> str:
         and "처음 설정 필요" in row.detail
         for row in report.results
     )
-    if not count:
-        return ""
-    return f"\n학생 안내 {count}건은 시트가 준비되지 않아 옮기지 못했어요 · 처음 설정 필요."
+    update_count = sum(
+        row.action.kind == "notice"
+        and row.status == "failed"
+        and "출결 기능" in row.detail
+        and ("확인" in row.detail or "업데이트" in row.detail)
+        for row in report.results
+    )
+    notes = []
+    if count:
+        notes.append(
+            f"학생 안내 {count}건은 시트가 준비되지 않아 옮기지 못했어요 · 처음 설정 필요."
+        )
+    if update_count:
+        notes.append(
+            f"학생 안내 {update_count}건은 기존 시트의 출결 기능을 먼저 확인하거나 업데이트해야 옮길 수 있어요."
+        )
+    return ("\n" + " ".join(notes)) if notes else ""
+
+
+def _account_blocked_note(report: ExecutionReport) -> str:
+    if any("처음 준비하던 Google 계정" in row.detail for row in report.failures):
+        return "\n처음 준비하던 Google 계정으로 다시 로그인해 주세요."
+    return ""
 
 
 def run_capture_flow(
@@ -226,6 +345,9 @@ def run_capture_flow(
     now: datetime | None = None,
     record=None,
     progress=None,
+    *,
+    gws_executable: str | None = None,
+    attendance_script_inspector=None,
 ) -> FlowResult:
     config_dir = Path(config_dir)
     now = now or datetime.now().astimezone()
@@ -293,7 +415,7 @@ def run_capture_flow(
             attachment_count=attachment_count,
         )
 
-    notice_sheet_id = _load_notice_sheet(config_dir)
+    notice_sheet_id, notice_unavailable_message = _load_notice_sheet(config_dir)
 
     try:
         actions = check_proposal(
@@ -324,16 +446,40 @@ def run_capture_flow(
         progress("register")
 
     report = execute_actions(
-        actions, history, list(bridge_settings.gws_command), runner=gws_runner, source_hash=record.source_hash
+        actions,
+        history,
+        runner=gws_runner,
+        source_hash=record.source_hash,
+        gws_executable=gws_executable,
+        notice_unavailable_message=notice_unavailable_message,
+        expected_account=_load_attendance_owner(config_dir),
+        notice_preflight=(
+            (
+                lambda runner, executable: _remote_notice_script_preflight(
+                    config_dir,
+                    runner,
+                    executable,
+                    attendance_script_inspector,
+                )
+            )
+            if notice_sheet_id
+            else None
+        ),
     )
     summary = _summarize_report(report)
     items = _items_from_report(report, profile)
     notice_note = _notice_created_note(report)
     blocked_note = _notice_blocked_note(report)
+    account_note = _account_blocked_note(report)
     if report.all_done:
         history.mark_completed(record.source_hash)
         history.save()
-        result = FlowResult(True, "done", f"등록했습니다 ({summary})." + notice_note + blocked_note, report=report)
+        result = FlowResult(
+            True,
+            "done",
+            f"등록했습니다 ({summary})." + notice_note + blocked_note + account_note,
+            report=report,
+        )
         return _finish(
             config_dir, result, record.source_hash, detail=summary,
             summary=summary, items=items, progress=progress,
@@ -345,7 +491,7 @@ def run_capture_flow(
         False,
         "execute",
         f"{failure_lead} ({summary}). 같은 메시지에서 다시 실행하면 실패한 항목만 다시 시도합니다."
-        + notice_note + blocked_note,
+        + notice_note + blocked_note + account_note,
         report=report,
     )
     return _finish(

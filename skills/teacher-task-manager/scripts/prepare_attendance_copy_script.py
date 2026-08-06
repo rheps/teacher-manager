@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -16,7 +17,26 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from install_attendance_automation import default_runner  # noqa: E402
+from brity_bridge import gws_env, process_win, tool_runtime  # noqa: E402
+
+
+REMOTE_COMMAND_TIMEOUT_SECONDS = 120.0
+
+
+def default_runner(args: Sequence[str], cwd: Path) -> str:
+    """Apps Script 원격 명령 하나가 끝없이 출결 잠금을 잡지 않게 한다."""
+
+    code, output = process_win.run_captured(
+        list(args),
+        cwd=cwd,
+        timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        env=gws_env.gws_environ(),
+    )
+    if code != 0:
+        raise subprocess.CalledProcessError(
+            code, list(args), output=output, stderr=output
+        )
+    return output
 
 
 @dataclass(frozen=True)
@@ -215,7 +235,7 @@ def prepare_attendance_copy_script(
     assets_dir,
     apply=False,
     runner=default_runner,
-    gws="gws",
+    gws_executable: str | None = None,
     temp_parent=None,
 ) -> AttendanceCopyScriptResult:
     """사본 ID 두 개를 확인하고 --apply일 때만 스크립트를 쓴다."""
@@ -223,9 +243,15 @@ def prepare_attendance_copy_script(
     sheet, script = _id(copied_spreadsheet_id), _id(copied_script_id)
     if not sheet or not script:
         return _out("hold")
+    gws = (
+        tool_runtime.resolve_gws_executable()
+        if gws_executable is None
+        else _id(gws_executable)
+    )
+    if not gws:
+        return _out("hold")
     try:
         code_b, manifest_b, code, manifest, sha = _bundle(Path(assets_dir))
-        gws = _id(gws) or "gws"
         _check_project(_project(runner, gws, script), sheet, script)
         _sources(_content(runner, gws, script), script)
         if apply is not True:
@@ -276,7 +302,7 @@ def verify_prepared_copied_script(
     bundle_sha256,
     assets_dir,
     runner=default_runner,
-    gws="gws",
+    gws_executable: str | None = None,
 ) -> AttendanceCopyScriptResult:
     """parent·HEAD·version·deployment를 새 읽기 네 번으로 재확인한다."""
 
@@ -292,10 +318,16 @@ def verify_prepared_copied_script(
         or re.fullmatch(r"[0-9a-f]{64}", supplied_sha) is None
     ):
         return _out("hold")
+    gws = (
+        tool_runtime.resolve_gws_executable()
+        if gws_executable is None
+        else _id(gws_executable)
+    )
+    if not gws:
+        return _out("hold")
     try:
         _code_b, _manifest_b, code, manifest, local_sha = _bundle(Path(assets_dir))
         _need(supplied_sha == local_sha)
-        gws = _id(gws) or "gws"
         description = _description(local_sha)
         _check_project(_project(runner, gws, script), sheet, script)
         _need(_same_content(_content(runner, gws, script), script, code, manifest))
@@ -323,6 +355,7 @@ def main(
     runner=default_runner,
     assets_dir=None,
     temp_parent=None,
+    gws_executable: str | None = None,
 ) -> AttendanceCopyScriptResult:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--copied-spreadsheet-id", required=True)
@@ -337,6 +370,7 @@ def main(
         apply=args.apply,
         runner=runner,
         temp_parent=temp_parent,
+        gws_executable=gws_executable,
     )
     if from_cli:
         print(json.dumps(asdict(result), ensure_ascii=False, separators=(",", ":")))

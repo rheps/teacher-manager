@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,7 +21,7 @@ from attendance_install_record import (  # noqa: E402
     AttendanceInstallRecordError,
     load_attendance_install_record,
 )
-from brity_bridge import gws_env, process_win  # noqa: E402
+from brity_bridge import gws_env, process_win, tool_runtime  # noqa: E402
 
 
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
@@ -39,6 +38,7 @@ PERMISSION_FIELDS = (
     "permissionDetails(permissionType,inheritedFrom,role,inherited))"
 )
 COMMENT_FIELDS = "kind,nextPageToken,comments(kind,id,deleted)"
+REMOTE_COMMAND_TIMEOUT_SECONDS = 120.0
 KNOWN_PERMISSION_TYPES = {"user", "group", "domain", "anyone"}
 MY_DRIVE_PERMISSION_ROLES = {"owner", "writer", "commenter", "reader"}
 EMAIL_PATTERN = re.compile(
@@ -120,21 +120,13 @@ def _need(condition: Any, message: str) -> None:
         _hold(message)
 
 
-def _resolve_command(args: Sequence[str], which=shutil.which) -> list[str]:
-    """Windows에서 "gws" 이름은 npm이 깐 gws.cmd를 못 찾는다 - 실제 경로로 바꾼다.
-
-    못 찾으면 이름을 그대로 둔다. 그러면 실행 결과(127)로 사람이 알 수 있다.
-    """
-    args = list(args)
-    if args and args[0] == "gws":
-        args[0] = which("gws") or which("gws.cmd") or "gws"
-    return args
-
-
 def _default_run_command(args: Sequence[str]) -> tuple[int, str]:
     # 앱과 같은 곳에 gws 열쇠를 두게 고정한다 — 이 명령에만 넘긴다.
     return process_win.run_captured(
-        _resolve_command(args), cwd=SCRIPTS_DIR, env=gws_env.gws_environ()
+        list(args),
+        cwd=SCRIPTS_DIR,
+        timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        env=gws_env.gws_environ(),
     )
 
 
@@ -400,6 +392,50 @@ def _run_json(
     return _first_json(_run(run_command, args, label), label)
 
 
+def _legacy_auth_output_confirms_login(output: str, account: str) -> bool:
+    """JSON을 주지 않던 예전 gws의 명시적인 로그인 완료 문구만 인정한다."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    lowered = output.casefold()
+    negative_markers = (
+        "logged out",
+        "signed out",
+        "not logged in",
+        "not signed in",
+        "not authenticated",
+        "no credentials",
+        "login required",
+        "authentication required",
+    )
+    if any(marker in lowered for marker in negative_markers):
+        return False
+
+    account_key = account.casefold()
+
+    def line_parts(line: str) -> tuple[str, str] | None:
+        matches = list(EMAIL_PATTERN.finditer(line))
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        if line[match.end():].strip():
+            return None
+        return (
+            line[:match.start()].strip().casefold().rstrip(":").strip(),
+            match.group(0).casefold(),
+        )
+
+    for line in lines:
+        parts = line_parts(line)
+        if parts and parts[0] in {"signed in as", "logged in as"} and parts[1] == account_key:
+            return True
+
+    has_logged_in_line = any(line.casefold() == "logged in" for line in lines)
+    has_matching_user_line = any(
+        parts is not None and parts[0] == "user" and parts[1] == account_key
+        for parts in (line_parts(line) for line in lines)
+    )
+    return has_logged_in_line and has_matching_user_line
+
+
 def _current_gws_account(
     run_command: RunCommand,
     gws_executable: str,
@@ -465,6 +501,11 @@ def _current_gws_account(
         _need(
             _same_email(status_account, raw_account),
             "현재 Google 로그인 상태의 계정과 출력 속 계정이 다릅니다.",
+        )
+    else:
+        _need(
+            _legacy_auth_output_confirms_login(output, raw_account),
+            "현재 Google 로그인 완료를 확인하는 문구가 없습니다.",
         )
     return raw_account
 
@@ -915,13 +956,19 @@ def _check_attendance_access_once(
     config_dir: Path,
     *,
     run_command: RunCommand = _default_run_command,
-    gws_executable: str = "gws",
+    gws_executable: str | None = None,
 ) -> AttendanceAccessCheckResult:
     """호출자가 출결 잠금을 잡았을 때 같은 잠금 안에서 바로 다시 확인한다."""
 
     config_dir = Path(config_dir)
-    gws = _strict_text(gws_executable, "Google Workspace 실행 파일")
     inputs = _load_inputs(config_dir)
+    gws = _strict_text(
+        tool_runtime.resolve_gws_executable()
+        if gws_executable is None
+        else gws_executable,
+        "Google Workspace 실행 파일",
+    )
+    _need(Path(gws).is_absolute(), "Google Workspace 실행 파일이 전체 경로가 아닙니다.")
     current_account = _current_gws_account(run_command, gws)
     _need(
         _same_email(current_account, inputs.account),
@@ -987,7 +1034,7 @@ def verify_attendance_access(
     config_dir: Path,
     *,
     run_command: RunCommand = _default_run_command,
-    gws_executable: str = "gws",
+    gws_executable: str | None = None,
     lock_factory: Callable[[Path], Any] | None = None,
 ) -> AttendanceAccessCheckResult:
     """출결 잠금을 잡고 계정·소유자·공유 사용자·댓글을 읽기만 한다."""

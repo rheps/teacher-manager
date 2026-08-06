@@ -1,5 +1,11 @@
 # 🚀 4. 실행_캘린더·Tasks등록 (gws CLI 실행)
 
+## Google 계정 안전 확인
+
+Calendar·Tasks·Sheet·Docs·출결·Google Chat처럼 Google 자료를 읽거나 바꾸기 전에 설치된 안전한 GWS 명령 파일로 현재 계정을 다시 확인한다. 정확한 `이름@goedu.kr` 주소가 아니거나 계정을 읽지 못하면 Google 자료 작업을 시작하지 않는다. 개인 Gmail을 선택해 계속하는 예외는 두지 않는다. 로그아웃과 `@goedu.kr` 계정으로 다시 로그인하는 일만 허용한다.
+
+출결 Sheet는 선생님만 사용한다. 학생에게는 프로그램이나 출결 Sheet 편집 권한을 주지 않고 Google Chat 학급 단체톡방에만 초대한다. 출결 Sheet의 `설정` 탭에는 Chat 연결값이 있으므로 학생이나 믿을 수 없는 공동 편집자와 공유하지 않는다.
+
 > 이 파일은 1~3단계를 거친 `TaskObject`를 받아  
 > **실제로 어떤 캘린더 이벤트와 어떤 Tasks를 동시에 생성할지**를 결정하는 최종 실행 규칙이다.
 >
@@ -689,22 +695,22 @@ function build_actions(TaskObject):
 > "계획을 세웠으면, 사용자에게 묻지 말고 즉시 실행하라."
 
 ### 6-1. gws CLI 즉시 실행
-- 4-1단계에서 `actions` 리스트가 완성되었다면, **그 즉시** 해당 내용으로 gws CLI Bash 명령을 실행해야 한다.
+- 4-1단계에서 `actions` 리스트가 완성되었다면, **그 즉시** 해당 내용으로 Teacher Manager가 설치한 안전한 GWS 명령 파일을 실행해야 한다.
 - 사용자에게 "이렇게 등록할까요?"라고 묻거나 확인받지 않는다.
 - **등록이 완료된 후**에 "등록했습니다"라고 보고한다.
 
 ### 6-3. gws CLI 실행 패턴
-각 action을 아래 형식으로 Bash 실행:
+먼저 `$gws`를 공개 안내서의 고정 `teacher-manager-gws.cmd` 경로로 준비한 뒤, 각 action을 아래 형식으로 PowerShell에서 실행한다. PATH의 다른 GWS를 대신 쓰지 않는다.
 
-```bash
+```powershell
 # calendar_event → gws calendar events insert
-gws calendar events insert \
-  --params '{"calendarId":"ACTION.calendar_id"}' \
+& $gws calendar events insert `
+  --params '{"calendarId":"ACTION.calendar_id"}' `
   --json '{"summary":"ACTION.title","start":{...},"end":{...},"description":"ACTION.description"}'
 
 # task → gws tasks tasks insert (무날짜 규칙: due·reminder를 보내지 않는다)
-gws tasks tasks insert \
-  --params '{"tasklist":"<homeroom_tasks_id>"}' \
+& $gws tasks tasks insert `
+  --params '{"tasklist":"<homeroom_tasks_id>"}' `
   --json '{"title":"ACTION.title","notes":"ACTION.notes"}'
 ```
 

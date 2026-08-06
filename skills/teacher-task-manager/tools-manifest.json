@@ -1,0 +1,46 @@
+{
+  "gws": {
+    "architecture": "x86_64",
+    "archive_filename": "google-workspace-cli-x86_64-pc-windows-msvc.zip",
+    "archive_sha256": "407705d695dc83d48b1c5f50d71b5aa64095bf6f17d5b439b2e9a373bbe67ec2",
+    "archive_url": "https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-pc-windows-msvc.zip",
+    "executable_relative_path": "gws.exe",
+    "executable_sha256": "82ad48dd28564be969174aaef3e3f99816f959bf2519eeeb4ab77d84f9fa9c67",
+    "license_file": "licenses/google-workspace-cli-Apache-2.0.txt",
+    "license_id": "Apache-2.0",
+    "platform": "windows",
+    "version": "0.22.5"
+  },
+  "node": {
+    "architecture": "x86_64",
+    "archive_filename": "node-v24.19.0-win-x64.zip",
+    "archive_sha256": "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73",
+    "archive_url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-win-x64.zip",
+    "license_file": "licenses/nodejs-v24.19.0-LICENSE.txt",
+    "license_id": "MIT",
+    "node_relative_path": "node-v24.19.0-win-x64/node.exe",
+    "npm_relative_path": "node-v24.19.0-win-x64/npm.cmd",
+    "npx_relative_path": "node-v24.19.0-win-x64/npx.cmd",
+    "platform": "windows",
+    "skills_cli_package": "skills",
+    "skills_cli_version": "1.5.21",
+    "version": "24.19.0"
+  },
+  "schema_version": 1,
+  "webview2": {
+    "architecture": "universal",
+    "bootstrapper_filename": "MicrosoftEdgeWebview2Setup.exe",
+    "bootstrapper_sha256": "e99838c51bb3379b244654aa77e33032d42fc2b5d224c5babce432d9fd3dcb28",
+    "bootstrapper_url": "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+    "file_version": "1.3.251.21",
+    "install_arguments": [
+      "/silent",
+      "/install"
+    ],
+    "license_file": "licenses/webview2-evergreen-terms-en-us.json",
+    "license_id": "Microsoft-Edge-WebView2",
+    "minimum_runtime_version": "146.0.3856.49",
+    "platform": "windows",
+    "publisher_common_name": "Microsoft Corporation"
+  }
+}

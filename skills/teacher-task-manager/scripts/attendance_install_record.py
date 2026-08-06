@@ -7,7 +7,12 @@ import hashlib
 import json
 import math
 import os
+import re
+import sys
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,12 +30,96 @@ CONNECTION_FIELDS = {
     "folder_id",
     "task_list_id",
 }
+SCRIPT_UPDATE_REQUIRED_FIELD = "script_update_required"
+SCRIPT_ATTESTATION_FIELD = "script_attestation"
+SCRIPT_ATTESTATION_SCHEMA = 1
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_RECORD_WRITE_TIMEOUT_SECONDS = 10.0
+_RECORD_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_RECORD_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 class AttendanceInstallRecordError(ValueError):
     """설치 기록을 안전하게 읽거나 쓸 수 없을 때 발생한다."""
 
     code = ATTENDANCE_RECORD_BROKEN
+
+
+def _record_thread_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _RECORD_THREAD_LOCKS_GUARD:
+        return _RECORD_THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _try_lock_record_file(handle) -> bool:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_record_file(handle) -> None:
+    handle.seek(0)
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def attendance_install_record_lock(path: Path):
+    """같은 설치 기록의 읽기-비교-교체를 창과 프로세스 사이에서 한 덩어리로 묶는다."""
+
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise _error("출결 설치 기록 잠금 폴더를 준비하지 못했어요.", cause=exc)
+    lock_path = path.with_name(f".{path.name}.lock")
+    local_lock = _record_thread_lock(lock_path)
+    if not local_lock.acquire(timeout=_RECORD_WRITE_TIMEOUT_SECONDS):
+        raise _error("다른 창의 출결 설치 기록 저장이 끝나지 않았어요.")
+    handle = None
+    locked = False
+    try:
+        try:
+            handle = lock_path.open("a+b")
+        except OSError as exc:
+            raise _error("출결 설치 기록 잠금 파일을 열지 못했어요.", cause=exc)
+        deadline = time.monotonic() + _RECORD_WRITE_TIMEOUT_SECONDS
+        while not _try_lock_record_file(handle):
+            if time.monotonic() >= deadline:
+                raise _error("다른 프로그램의 출결 설치 기록 저장이 끝나지 않았어요.")
+            time.sleep(0.02)
+        locked = True
+        yield
+    finally:
+        try:
+            if handle is not None:
+                try:
+                    if locked:
+                        _unlock_record_file(handle)
+                finally:
+                    handle.close()
+        finally:
+            local_lock.release()
 
 
 @dataclass(frozen=True)
@@ -98,7 +187,75 @@ def validate_attendance_install_record(record: dict) -> dict:
     for key in CONNECTION_FIELDS:
         if not isinstance(record[key], str):
             raise _error(f"{key} 연결값은 글자여야 해요.")
+    if (
+        SCRIPT_UPDATE_REQUIRED_FIELD in record
+        and type(record[SCRIPT_UPDATE_REQUIRED_FIELD]) is not bool
+    ):
+        raise _error("script_update_required 값은 true 또는 false여야 해요.")
+    if SCRIPT_ATTESTATION_FIELD in record:
+        attestation = record[SCRIPT_ATTESTATION_FIELD]
+        if (
+            not isinstance(attestation, dict)
+            or set(attestation) != {
+                "schema",
+                "spreadsheet_id",
+                "script_id",
+                "deployment_id",
+                "bundle_sha256",
+            }
+        ):
+            raise _error("script_attestation 확인값의 모양이 올바르지 않아요.")
+        schema = attestation.get("schema")
+        if type(schema) is not int or schema != SCRIPT_ATTESTATION_SCHEMA:
+            raise _error("script_attestation 확인값의 판을 읽을 수 없어요.")
+        for key in ("spreadsheet_id", "script_id", "deployment_id"):
+            value = attestation.get(key)
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or value != record[key]
+            ):
+                raise _error(f"script_attestation의 {key}가 현재 연결값과 달라요.")
+        bundle_sha256 = attestation.get("bundle_sha256")
+        if not isinstance(bundle_sha256, str) or _SHA256_PATTERN.fullmatch(bundle_sha256) is None:
+            raise _error("script_attestation의 bundle_sha256은 소문자 64자리 SHA-256이어야 해요.")
     return copy.deepcopy(record)
+
+
+def build_script_attestation(record: dict, bundle_sha256: str) -> dict:
+    """현재 연결 세 값에 묶인 출결 코드 확인표를 만든다."""
+
+    if not isinstance(record, dict):
+        raise _error("출결 기능 확인표를 만들 연결 기록이 없어요.")
+    for key in ("spreadsheet_id", "script_id", "deployment_id"):
+        value = record.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise _error(f"출결 기능 확인표에 필요한 {key} 연결값이 비어 있어요.")
+    if not isinstance(bundle_sha256, str) or _SHA256_PATTERN.fullmatch(bundle_sha256) is None:
+        raise _error("확인한 출결 기능의 SHA-256 값이 올바르지 않아요.")
+    return {
+        "schema": SCRIPT_ATTESTATION_SCHEMA,
+        "spreadsheet_id": record.get("spreadsheet_id"),
+        "script_id": record.get("script_id"),
+        "deployment_id": record.get("deployment_id"),
+        "bundle_sha256": bundle_sha256,
+    }
+
+
+def attendance_script_is_attested(record: dict, bundle_sha256: str) -> bool:
+    """확인표가 지금 연결 세 값과 현재 프로그램 코드에 정확히 묶였는지 본다."""
+
+    try:
+        checked = validate_attendance_install_record(record)
+    except AttendanceInstallRecordError:
+        return False
+    attestation = checked.get(SCRIPT_ATTESTATION_FIELD)
+    return (
+        isinstance(attestation, dict)
+        and isinstance(bundle_sha256, str)
+        and _SHA256_PATTERN.fullmatch(bundle_sha256) is not None
+        and attestation.get("bundle_sha256") == bundle_sha256
+    )
 
 
 def _parse_attendance_install_raw(raw: bytes) -> dict[str, Any]:
@@ -225,19 +382,20 @@ def _atomic_write(path: Path, record: dict) -> dict:
 def write_attendance_install_record(path: Path, record: dict) -> dict:
     """연결값을 쓰되 기존의 알 수 없는 정상 JSON 값은 바꾸지 않는다."""
 
-    incoming = validate_attendance_install_record(record)
     path = Path(path)
-    if path.exists():
-        current = load_attendance_install_record(path)
-        merged = copy.deepcopy(current)
-        for key in CONNECTION_FIELDS:
-            merged[key] = incoming[key]
-        for key, value in incoming.items():
-            if key not in CONNECTION_FIELDS and key not in merged:
-                merged[key] = copy.deepcopy(value)
-    else:
-        merged = incoming
-    return _atomic_write(path, validate_attendance_install_record(merged))
+    incoming = validate_attendance_install_record(record)
+    with attendance_install_record_lock(path):
+        if path.exists():
+            current = load_attendance_install_record(path)
+            merged = copy.deepcopy(current)
+            for key in CONNECTION_FIELDS:
+                merged[key] = incoming[key]
+            for key, value in incoming.items():
+                if key not in CONNECTION_FIELDS and key not in merged:
+                    merged[key] = copy.deepcopy(value)
+        else:
+            merged = incoming
+        return _atomic_write(path, validate_attendance_install_record(merged))
 
 
 def replace_attendance_install_record(
@@ -250,12 +408,41 @@ def replace_attendance_install_record(
     if not isinstance(expected, InstallRecordSnapshot):
         raise _error("교체 전 설치 기록 snapshot을 확인하지 못했어요.")
     path = Path(path)
-    current = read_attendance_install_snapshot(path)
-    if current.raw != expected.raw or current.sha256 != expected.sha256:
-        raise _error("교체 직전 활성 설치 기록이 처음 읽은 내용과 달라졌어요.")
     wanted = validate_attendance_install_record(record)
-    _atomic_write(path, wanted)
-    final = read_attendance_install_snapshot(path)
-    if final.record != wanted:
-        raise _error("교체 뒤 활성 설치 기록이 쓰려던 내용과 달라요.")
-    return final
+    with attendance_install_record_lock(path):
+        current = read_attendance_install_snapshot(path)
+        if current.raw != expected.raw or current.sha256 != expected.sha256:
+            raise _error("교체 직전 활성 설치 기록이 처음 읽은 내용과 달라졌어요.")
+        _atomic_write(path, wanted)
+        final = read_attendance_install_snapshot(path)
+        if final.record != wanted:
+            raise _error("교체 뒤 활성 설치 기록이 쓰려던 내용과 달라요.")
+        return final
+
+
+def mark_attendance_script_current(
+    path: Path,
+    expected: InstallRecordSnapshot,
+    bundle_sha256: str,
+) -> dict:
+    """확인한 현재 코드 지문을 남기고 옛판 표식을 한 번에 지운다.
+
+    화면에서 원격 Apps Script와 실제 배포판을 모두 확인한 뒤에만 부른다. 확인을
+    시작할 때 읽은 기록이 다른 창에서 바뀌었으면 새 기록을 덮지 않고 멈춘다.
+    """
+
+    if not isinstance(expected, InstallRecordSnapshot):
+        raise _error("출결 기능 확인을 시작할 때 읽은 설치 기록을 확인하지 못했어요.")
+    if not isinstance(bundle_sha256, str) or _SHA256_PATTERN.fullmatch(bundle_sha256) is None:
+        raise _error("확인한 출결 기능의 SHA-256 값이 올바르지 않아요.")
+    wanted = copy.deepcopy(expected.record)
+    wanted[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
+        wanted, bundle_sha256
+    )
+    wanted.pop(SCRIPT_UPDATE_REQUIRED_FIELD, None)
+    if wanted == expected.record:
+        current = read_attendance_install_snapshot(path)
+        if current.raw != expected.raw or current.sha256 != expected.sha256:
+            raise _error("출결 기능 확인 도중 설치 기록이 다른 내용으로 바뀌었어요.")
+        return copy.deepcopy(expected.record)
+    return replace_attendance_install_record(path, wanted, expected).record
