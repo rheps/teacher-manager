@@ -262,6 +262,11 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .banner { display:flex; gap:10px; align-items:flex-start; border-radius:12px; padding:13px 16px; font-size:14px; margin:0 0 18px; }
 .banner.warn { background:var(--tm-amber-soft); color:#8a5a10; }
 .banner.error { background:var(--tm-red-soft); color:#a03325; }
+.external-link-fallback { margin:-8px 0 18px; padding:14px 16px; border:1px solid #F0C36A;
+  border-radius:12px; background:#FFF9E8; color:#6E4B11; }
+.external-link-fallback > b, .external-link-fallback > span { display:block; }
+.external-link-fallback > span { margin-top:4px; font-size:13.5px; }
+.external-link-fallback .linkrow { margin:10px 0 0; }
 .toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--tm-ink); color:#fff; font-size:14px; border-radius:12px; padding:12px 22px; box-shadow:0 8px 22px rgba(25,31,40,.25); z-index:60; }
 
 /* 홈 카드 */
