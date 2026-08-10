@@ -1361,13 +1361,14 @@ def _gws_auth_url_from_line(line: str) -> str:
 
 
 class LoginSession:
-    """gws auth login을 백그라운드로 돌리고 주소 원문 없이 결과만 내놓는다."""
+    """gws auth login을 돌리며 검증한 주소를 진행 중에만 메모리로 내놓는다."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._proc = None
         self._auth_url_opener = external_url.open_external_url
         self._auth_url_attempted = False
+        self._auth_url = ""
         self._browser_opened = False
         self._error_code = ""
         self._ok: bool | None = None
@@ -1384,6 +1385,7 @@ class LoginSession:
             )
             self._auth_url_opener = auth_url_opener or external_url.open_external_url
             self._auth_url_attempted = False
+            self._auth_url = ""
             self._browser_opened = False
             self._error_code = ""
             self._ok = None
@@ -1408,25 +1410,17 @@ class LoginSession:
                 )
             except Exception:  # noqa: BLE001 - 주소와 운영체제 원문은 상태에 남기지 않는다.
                 opened = False
-            if opened:
-                with self._lock:
-                    if proc is self._proc:
-                        self._browser_opened = True
-                continue
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001 - 종료 실패 원문도 화면이나 로그에 내보내지 않는다.
-                pass
             with self._lock:
                 if proc is self._proc:
-                    self._browser_opened = False
-                    self._error_code = external_url.NO_EXTERNAL_BROWSER
-                    self._ok = False
-            break
+                    # 주소는 파일이나 로그에 쓰지 않고, 이 로그인 프로세스가
+                    # 기다리는 동안 화면의 직접 열기·복사에만 잠깐 쓴다.
+                    self._auth_url = auth_url
+                    self._browser_opened = opened
         code = proc.wait()
         with self._lock:
             if proc is not self._proc:
                 return
+            self._auth_url = ""
             if self._error_code:
                 self._ok = False
             else:
@@ -1437,7 +1431,7 @@ class LoginSession:
             running = self._proc is not None and self._ok is None
             return {
                 "running": running,
-                "url": "",
+                "url": self._auth_url if running else "",
                 "browser_opened": self._browser_opened,
                 "ok": self._ok,
                 "error_code": self._error_code if self._ok is False else "",

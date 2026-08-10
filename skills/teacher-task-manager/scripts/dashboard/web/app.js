@@ -547,8 +547,11 @@ async function pollLoginOnce() {
     setBanner("error", "로그인이 끝나지 않았어요. " + (snap.detail || "다시 시도해 주세요."));
     return false;
   }
+  const viewChanged = !S.login
+    || String(S.login.url || "") !== String(snap.url || "")
+    || Boolean(S.login.browser_opened) !== Boolean(snap.browser_opened);
   S.login = snap;
-  if (snap.browser_opened) render();
+  if (viewChanged) render();
   return true;
 }
 function pollLogin() {
@@ -2125,8 +2128,15 @@ function googleLoginRowsHtml() {
 }
 function loginWaitHtml() {
   if (!S.login) return "";
+  const url = String(S.login.url || "");
+  const browserMessage = !url
+    ? "로그인 주소를 준비하는 중이에요…"
+    : S.login.browser_opened
+      ? "브라우저가 자동으로 열렸어요. 창이 보이지 않으면 아래 주소를 다시 열어 주세요."
+      : "브라우저를 자동으로 열지 못했어요. 아래 주소를 직접 열거나 복사해 주세요.";
   return `<div class="panel" style="margin-top:12px">
-      <p class="sub" style="margin:0 0 8px">브라우저가 자동으로 열렸어요.</p>
+      <p class="sub" style="margin:0 0 8px">${browserMessage}</p>
+      ${url ? linkRow(url) : ""}
       <div class="action-line"><button class="btn-quiet" data-action="login-cancel">취소</button></div>
     </div>`;
 }
