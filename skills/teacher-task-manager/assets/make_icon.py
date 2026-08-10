@@ -1,8 +1,9 @@
-"""티처 매니저 브랜드 아이콘(.ico) 생성기 — stdlib만. 한 번 돌려 teacher-manager.ico를 만든다.
+"""티처 매니저 브랜드 아이콘 생성기 — stdlib만.
 
 투명 배경 + 토스 블루(#3182F6) 체크 하나 — 끝은 둥글고 굵기는 일정하다.
 (구글 Tasks의 "파란 타일 + 흰 체크"와 구분되도록 타일 없이 체크만 쓴다.)
-4배 슈퍼샘플링으로 가장자리를 부드럽게 한다. 런타임에서는 결과 .ico만 쓴다(이 스크립트는 재현용).
+4배 슈퍼샘플링으로 가장자리를 부드럽게 한다. 앱은 .ico를 쓰고 설치 마법사는
+같은 모양의 PNG를 쓴다. 이 스크립트는 두 정식 자산을 다시 만드는 재현용이다.
 """
 from __future__ import annotations
 
@@ -96,7 +97,19 @@ def build_ico() -> bytes:
     return header + bytes(entries) + bytes(blobs)
 
 
+def build_wizard_png() -> bytes:
+    """설치 마법사의 큰 그림과 작은 그림에 함께 쓰는 정식 로고 PNG.
+
+    왼쪽 큰 그림 자리(약 164×314)는 WizardImageStretch=no라 그림이 자리보다
+    크면 잘린다 — 256이 실제로 잘려 보여 절반인 128로 만든다(2026-08-08).
+    """
+    return _png(128, _render_rgba(128))
+
+
 if __name__ == "__main__":
-    target = Path(__file__).resolve().parent / "teacher-manager.ico"
-    target.write_bytes(build_ico())
-    print(f"wrote {target} ({target.stat().st_size} bytes)")
+    icon_target = Path(__file__).resolve().parent / "teacher-manager.ico"
+    wizard_target = Path(__file__).resolve().parents[3] / "installer" / "teacher-manager-wizard.png"
+    icon_target.write_bytes(build_ico())
+    wizard_target.write_bytes(build_wizard_png())
+    print(f"wrote {icon_target} ({icon_target.stat().st_size} bytes)")
+    print(f"wrote {wizard_target} ({wizard_target.stat().st_size} bytes)")

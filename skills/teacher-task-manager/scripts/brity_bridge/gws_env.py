@@ -246,6 +246,11 @@ def _read_desktop_client(path: Path) -> tuple[str, str] | None:
     return client.client_id, client.client_secret
 
 
+def is_valid_desktop_client_file(path: Path) -> bool:
+    """파일이 올바른 데스크톱 OAuth 준비 파일로 읽히면 True. 값은 내보내지 않는다."""
+    return _read_desktop_client(Path(path)) is not None
+
+
 def _selection(
     ready: bool,
     source: Literal[
@@ -293,6 +298,8 @@ def select_desktop_oauth_client(
     bundled_values = _read_desktop_client(bundled_path) if bundled_exists else None
 
     if config_exists and config_values is None:
+        # 조용히 설치판으로 넘어가지 않는다. web client·손상 파일은 사용자가
+        # 의도했을 수 있어, 막고 알린 뒤 사용자가 정리를 누를 때만 치운다.
         return _selection(False, "invalid", error_code="OAUTH_CONFIG_CLIENT_INVALID")
     if bundled_exists and bundled_values is None:
         return _selection(False, "invalid", error_code="OAUTH_BUNDLED_CLIENT_INVALID")

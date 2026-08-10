@@ -191,9 +191,10 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 /* 버튼 */
 .btn { background:var(--tm-blue); color:#fff; font-weight:600; font-size:15.5px; border:none; border-radius:12px; padding:13px 40px; font-family:inherit; cursor:pointer; box-shadow:0 4px 12px rgba(49,130,246,.25); }
 .btn:disabled { background:#B7D4FB; box-shadow:none; cursor:default; }
-.btn-tonal { background:var(--tm-blue-soft); color:var(--tm-blue); font-weight:600; font-size:14px; border:none; border-radius:9px; padding:9px 15px; font-family:inherit; cursor:pointer; }
+.btn-tonal { background:var(--tm-blue-soft); color:var(--tm-blue); font-weight:600; font-size:14px; border:none; border-radius:9px; padding:9px 15px; font-family:inherit; cursor:pointer; white-space:nowrap; }
 .btn-tonal:disabled { opacity:.55; cursor:default; }
 .btn-quiet { background:var(--tm-fill); color:#333D4B; font-weight:600; font-size:14px; border:1px solid var(--tm-line); border-radius:11px; padding:11px 17px; font-family:inherit; cursor:pointer; }
+.btn-quiet:disabled { opacity:.55; cursor:default; }
 /* 마법사 [이전] 버튼 전용 — 카드 창에는 이 자리에 [< 홈]이 없다 (2026-07-31). */
 .btn-prev { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
 .save-state { font-size:13.5px; color:var(--tm-faint); }
@@ -422,11 +423,31 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .ready-hero b { display:block; margin-bottom:2px; font-size:14px; }
 .ready-hero span:last-child { color:var(--tm-sub); font-size:12.5px; }
 .attendance-action { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
-.attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:14px; padding:12px 14px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }
+/* 마법사 7단계 "마지막 한 번" 카드 — 서비스 칸(.svc-group)과 같은 테두리 톤, 상태는 글자 색만 */
+.first-setup-card { margin-top:14px; padding:15px 17px; border:1px solid var(--tm-line); border-radius:15px; background:#fff; }
+.first-setup-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.first-setup-head b { font-size:14px; color:var(--tm-ink); }
+.first-setup-card .svc-status { width:auto; }
+.first-setup-card p { margin:8px 0 12px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
+.first-setup-acts { display:flex; justify-content:flex-end; gap:8px; }
+.attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }
 .attendance-script-update span { flex:1 1 auto; min-width:0; }
 .attendance-script-update button { flex:0 0 auto; }
 .attendance-script-update.ok { border-color:#BDE8D3; background:var(--tm-green-soft); color:#087443; }
 .attendance-script-update.warn { border-color:#F1D4A5; background:var(--tm-amber-soft); color:#8A5A10; }
+.attendance-update-dialog-overlay { position:fixed; inset:0; z-index:60; display:grid; place-items:center; padding:16px; background:rgba(15,23,42,.38); }
+.attendance-update-dialog { width:min(420px,calc(100vw - 32px)); padding:22px; border:1px solid var(--tm-line); border-radius:16px; background:#fff; box-shadow:0 24px 64px rgba(15,23,42,.28); }
+.attendance-update-dialog h3 { margin:0; font-size:18px; }
+.attendance-update-dialog p { margin:10px 0 20px; color:var(--tm-sub); line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
+.attendance-update-dialog-actions { display:flex; justify-content:flex-end; gap:8px; }
+
+/* 1단계 "화면에서 찾기" — 구글 워크스페이스 위치 캡처 안내 */
+.guide-overlay { position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:20px; background:rgba(15,23,42,.5); }
+.guide-box { width:min(760px,94vw); max-height:88vh; overflow:auto; background:#fff; border:1px solid var(--tm-line); border-radius:16px; padding:18px 20px 20px; box-shadow:0 24px 64px rgba(15,23,42,.28); }
+.guide-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+.guide-head b { font-size:16px; }
+.guide-shot { display:block; width:100%; height:auto; border:1px solid var(--tm-line); border-radius:10px; }
+.guide-note { margin:12px 0 0; color:var(--tm-sub); font-size:13.5px; line-height:1.6; word-break:keep-all; }
 
 /* AI 비서 탭 */
 .ai-rows { margin-top:4px; }

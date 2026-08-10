@@ -204,6 +204,22 @@ function runFirstTimeSetup() {
     if (result.ok !== true) leftovers.push(step.title + '\n' + String(result.message || ''));
   });
 
+  // 네 단계가 모두 끝났을 때만 완료 표시를 적는다 — 설치 프로그램이 이 값을 읽어
+  // 마법사의 [다음]을 켠다. 일부 실패면 적지 않는다(거짓 완료 방지).
+  if (leftovers.length === 0) {
+    try {
+      let doneAccount = '';
+      try { doneAccount = String(Session.getActiveUser().getEmail() || ''); } catch (e) {}
+      setConfigValue_('FIRST_TIME_SETUP_DONE', (doneAccount + ' ' + new Date().toISOString()).trim());
+    } catch (err) {
+      // 네 단계가 끝났어도 표시가 없으면 프로그램의 [다음]이 계속 잠긴다.
+      // 다시 눌렀을 때 이미 끝난 네 단계는 건너뛰고 이 표시만 다시 적게 안내한다.
+      const markerError = errorMessage_(err);
+      lines.push('[못 함] 완료 표시 기록 — ' + markerError);
+      leftovers.push('완료 표시 기록\n' + markerError);
+    }
+  }
+
   const closing = leftovers.length
     ? '아직 남은 것\n\n' + leftovers.join('\n\n') + '\n\n' +
       '위 안내대로 마친 뒤 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 다시 누르면 됩니다.\n' +

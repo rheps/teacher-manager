@@ -81,6 +81,14 @@ class _Hold(Exception):
     """자료가 모호하거나 빠져 있어 안전하게 계속할 수 없음."""
 
 
+def _public_failure_detail(error: Exception) -> str:
+    if isinstance(error, _Hold):
+        detail = str(error).strip()
+        if detail:
+            return detail
+    return "출결 기능을 확인하지 못했어요. 학생 자료는 그대로입니다."
+
+
 def _need(condition: Any, detail: str = "") -> None:
     if not condition:
         raise _Hold(detail)
@@ -178,7 +186,10 @@ def _run_one_json(runner, args: Sequence[str], cwd: Path | None = None):
             isinstance(code, int) and not isinstance(code, bool),
             "명령 결과 번호를 확인할 수 없어요.",
         )
-        _need(code == 0, str(output) if isinstance(output, str) else "명령이 실패했어요.")
+        _need(
+            code == 0,
+            "출결 기능을 확인하지 못했어요. 학생 자료는 그대로입니다.",
+        )
     else:
         output = raw
     _need(isinstance(output, str), "명령 결과가 글자가 아니에요.")
@@ -228,6 +239,35 @@ def _deployment(runner, gws: str, script: str, deployment: str):
         ["script", "projects", "deployments", "get"],
         {"scriptId": script, "deploymentId": deployment},
     )
+
+
+def _list_versions(runner, gws: str, script: str) -> list[Mapping[str, Any]]:
+    collected: list[Mapping[str, Any]] = []
+    page_token = ""
+    seen_tokens: set[str] = set()
+    while True:
+        params: dict[str, Any] = {"scriptId": script, "pageSize": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        reply = _call(
+            runner,
+            gws,
+            ["script", "projects", "versions", "list"],
+            params,
+        )
+        _need(isinstance(reply, dict), "만들어진 출결 기능 판을 확인할 수 없어요.")
+        versions = reply.get("versions", [])
+        _need(isinstance(versions, list), "만들어진 출결 기능 판을 확인할 수 없어요.")
+        for item in versions:
+            _need(isinstance(item, dict), "만들어진 출결 기능 판을 확인할 수 없어요.")
+            collected.append(item)
+        next_token = reply.get("nextPageToken", "")
+        _need(isinstance(next_token, str), "만들어진 출결 기능 판을 확인할 수 없어요.")
+        if not next_token:
+            return collected
+        _need(next_token not in seen_tokens, "출결 기능 판 목록이 반복되어 멈췄어요.")
+        seen_tokens.add(next_token)
+        page_token = next_token
 
 
 def _check_project(reply: Any, sheet: str, script: str) -> None:
@@ -292,6 +332,22 @@ def _check_updated_deployment(
         actual_version == version and actual_description == description,
         "기존 배포가 새 버전을 가리키지 않아요.",
     )
+
+
+def _verified_prepared_version(runner, gws: str, script: str, target_sha: str) -> int:
+    description = "attendance-update-" + target_sha[:16]
+    candidates = []
+    for item in _list_versions(runner, gws, script):
+        if item.get("description") == description:
+            candidates.append((
+                _positive_int(item.get("versionNumber")),
+                item,
+            ))
+    for version, _item in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
+        bundle = _bundle_from_reply(_content(runner, gws, script, version), script)
+        if not bundle.has_extra_files and bundle.sha256 == target_sha:
+            return version
+    return 0
 
 
 def _load_target(assets_dir: Path) -> tuple[bytes, bytes, list[dict[str, str]], str]:
@@ -382,11 +438,35 @@ def inspect_attendance_script_update(
             _content(runner, gws, script, deployed_version), script
         )
 
-        _need(
-            head.sha256 == fixed.sha256
-            and head.has_extra_files == fixed.has_extra_files,
-            "현재 편집본과 실제 배포 중인 버전이 달라요.",
-        )
+        if head.sha256 != fixed.sha256 or head.has_extra_files != fixed.has_extra_files:
+            prepared_version = 0
+            if (
+                head.sha256 == target_sha
+                and not head.has_extra_files
+                and fixed.sha256 in TRUSTED_PUBLIC_BUNDLE_SHA256
+                and not fixed.has_extra_files
+            ):
+                prepared_version = _verified_prepared_version(
+                    runner, gws, script, target_sha
+                )
+            _need(
+                prepared_version > 0,
+                "현재 편집본과 실제 배포 중인 버전이 달라요.",
+            )
+            return replace(
+                _result(
+                    "finishing_required",
+                    verified=True,
+                    sheet=sheet,
+                    script=script,
+                    deployment=deployment,
+                    current_sha=target_sha,
+                    target_sha=target_sha,
+                    deployed_version=deployed_version,
+                    detail="새 기능은 준비됐고 마지막 연결만 남았습니다. 학생 자료는 그대로입니다.",
+                ),
+                updated_version_number=prepared_version,
+            )
         if head.has_extra_files:
             return _result(
                 "customized",
@@ -423,7 +503,7 @@ def inspect_attendance_script_update(
             current_sha=current_sha,
             target_sha=target_sha,
             deployed_version=deployed_version,
-            detail=str(exc),
+            detail=_public_failure_detail(exc),
         )
 
 
@@ -538,6 +618,102 @@ def _safe_deployment_read(runner, gws: str, script: str, deployment: str) -> Non
         pass
 
 
+def _updated_result(
+    inspected: AttendanceScriptUpdateResult,
+    updated_version: int,
+) -> AttendanceScriptUpdateResult:
+    return replace(
+        inspected,
+        state="updated",
+        verified=True,
+        current_bundle_sha256=inspected.target_bundle_sha256,
+        deployment_version_number=updated_version,
+        updated_version_number=updated_version,
+        detail="",
+    )
+
+
+def _finish_existing_verified_version(
+    inspected: AttendanceScriptUpdateResult,
+    runner,
+    gws: str,
+) -> AttendanceScriptUpdateResult:
+    """준비된 판을 같은 배포에 한 번만 연결하고, 모호하면 읽기만 한다."""
+
+    script = inspected.script_id
+    deployment = inspected.deployment_id
+    previous_version = inspected.deployment_version_number
+    updated_version = inspected.updated_version_number
+    update_description = "attendance-update-" + inspected.target_bundle_sha256[:16]
+    update_body = {
+        "deploymentConfig": {
+            "scriptId": script,
+            "versionNumber": updated_version,
+            "manifestFileName": "appsscript",
+            "description": update_description,
+        }
+    }
+    error: Exception | None = None
+    try:
+        live_version, _live_description = _check_deployment_base(
+            _deployment(runner, gws, script, deployment), script, deployment
+        )
+        _need(
+            live_version == previous_version,
+            "확인하는 사이 기존 배포가 다른 버전으로 바뀌었어요.",
+        )
+        update_reply = _call(
+            runner,
+            gws,
+            ["script", "projects", "deployments", "update"],
+            {"scriptId": script, "deploymentId": deployment},
+            update_body,
+        )
+        _check_updated_deployment(
+            update_reply, script, deployment, updated_version, update_description
+        )
+    except Exception as exc:
+        error = exc
+
+    if error is not None:
+        try:
+            confirmed_version, confirmed_description = _check_deployment_base(
+                _deployment(runner, gws, script, deployment), script, deployment
+            )
+            if (
+                confirmed_version == updated_version
+                and confirmed_description == update_description
+            ):
+                return _updated_result(inspected, updated_version)
+            if confirmed_version == previous_version:
+                return inspected
+        except Exception as confirm_exc:
+            error = confirm_exc
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            detail=_public_failure_detail(error),
+        )
+
+    try:
+        _check_updated_deployment(
+            _deployment(runner, gws, script, deployment),
+            script,
+            deployment,
+            updated_version,
+            update_description,
+        )
+    except Exception as exc:
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            detail=_public_failure_detail(exc),
+        )
+    return _updated_result(inspected, updated_version)
+
+
 def apply_attendance_script_update(
     spreadsheet_id,
     script_id,
@@ -558,6 +734,12 @@ def apply_attendance_script_update(
         runner=runner,
         gws_executable=gws_executable,
     )
+    if inspected.state == "finishing_required" and inspected.verified:
+        return _finish_existing_verified_version(
+            inspected,
+            runner,
+            _clean_id(gws_executable),
+        )
     if inspected.state != "update_available" or not inspected.verified:
         return inspected
 
@@ -586,7 +768,12 @@ def apply_attendance_script_update(
         # 실제 업로드 바로 앞에서 현재 편집본을 한 번 더 읽어 옛 정식본 그대로인지 본다.
         _require_bundle(_content(runner, gws, script), script, old_sha)
     except Exception as exc:
-        return replace(inspected, state="hold", verified=False, detail=str(exc))
+        return replace(
+            inspected,
+            state="hold",
+            verified=False,
+            detail=_public_failure_detail(exc),
+        )
 
     try:
         pushed = _push_exact_files(
@@ -606,7 +793,7 @@ def apply_attendance_script_update(
             state="hold",
             verified=False,
             backup_version_number=backup_version,
-            detail=str(exc),
+            detail=_public_failure_detail(exc),
         )
 
     try:
@@ -627,7 +814,7 @@ def apply_attendance_script_update(
             state="hold",
             verified=False,
             backup_version_number=backup_version,
-            detail=str(exc),
+            detail=_public_failure_detail(exc),
         )
 
     update_body = {
@@ -653,7 +840,7 @@ def apply_attendance_script_update(
             gws,
             ["script", "projects", "deployments", "update"],
             {
-                "deploymentConfig.scriptId": script,
+                "scriptId": script,
                 "deploymentId": deployment,
             },
             update_body,
@@ -670,7 +857,7 @@ def apply_attendance_script_update(
             verified=False,
             backup_version_number=backup_version,
             updated_version_number=updated_version,
-            detail=str(exc),
+            detail=_public_failure_detail(exc),
         )
 
     try:
@@ -688,7 +875,7 @@ def apply_attendance_script_update(
             verified=False,
             backup_version_number=backup_version,
             updated_version_number=updated_version,
-            detail=str(exc),
+            detail=_public_failure_detail(exc),
         )
 
     return AttendanceScriptUpdateResult(

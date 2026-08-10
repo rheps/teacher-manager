@@ -152,19 +152,21 @@ _WEBVIEW_EVIDENCE_PATHS = {
 }
 _WEBVIEW_EVIDENCE_MARKERS = {
     "installer/webview2_terms.iss": (
-        "WebView2TermsCheck.Checked",
-        "function NextButtonClick",
-        "function PrepareToInstall",
-        "Microsoft Defender SmartScreen",
+        "procedure CenterTeacherManagerWelcomeContent",
+        "procedure CustomizeTeacherManagerWelcomePage",
+        "if WizardSilent() and (not IsVerificationInstall)",
     ),
     "installer/installer.iss": (
         "MinVersion=10.0.17763",
         '#include "webview2_terms.iss"',
     ),
     "tests/test_webview2_terms.py": (
-        "def test_installer_requires_visible_explicit_acceptance_and_smartscreen_notice",
-        "NextButtonClick",
-        "PrepareToInstall",
+        "def test_installer_welcome_has_no_webview_notice_or_terms_link_and_installs_notices",
+        'self.assertNotIn("TNewLinkLabel", include)',
+        'self.assertNotIn("OpenWebView2Terms", include)',
+        'self.assertNotIn("CreateCustomPage", include)',
+        'self.assertIn("THIRD_PARTY_NOTICES.txt", spec)',
+        'self.assertIn("licenses/webview2-evergreen-terms-en-us.json", spec)',
         "MinVersion=10.0.17763",
         "SmartScreen",
     ),

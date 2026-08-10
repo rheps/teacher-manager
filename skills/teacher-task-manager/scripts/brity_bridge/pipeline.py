@@ -283,8 +283,11 @@ def _summarize_report(report: ExecutionReport) -> str:
     if blocked_notices:
         parts.append(f"학생 안내 옮기지 못함 {blocked_notices}건 · 처음 설정 필요")
     if update_blocked_notices:
+        # 상태별로 버튼·할 일이 달라지므로(업데이트/마무리/다시 확인) 동작을
+        # 나열하지 않고 화면의 실제 위치만 가리킨다 — bridge.py 안내문과 같은 규칙.
         parts.append(
-            f"학생 안내 옮기지 못함 {update_blocked_notices}건 · 출결 기능 업데이트 또는 확인 필요"
+            f"학생 안내 옮기지 못함 {update_blocked_notices}건 · "
+            "출결 기능 확인 필요 (출결 탭 위쪽의 한 줄 안내)"
         )
     if report.duplicates:
         parts.append(f"중복 건너뜀 {len(report.duplicates)}건")

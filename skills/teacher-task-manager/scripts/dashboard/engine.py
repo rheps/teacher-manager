@@ -395,6 +395,37 @@ def push_gemini_key_to_attendance_sheet(
     return {"state": "ok", "detail": "출결 시트 설정 탭에도 넣었어요."}
 
 
+def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: str) -> dict:
+    """시트의 [처음 설정 한 번에 끝내기] 완료 표시를 읽는다. 못 읽으면 미완료로 본다.
+
+    시트 안 Apps Script가 네 단계를 모두 마치면 `설정` 탭에
+    FIRST_TIME_SETUP_DONE 줄을 적는다(Code.gs). 마법사 출결 탭은 이 값으로
+    완료를 자동 확인한다 — 네트워크·권한 실패는 오류가 아니라 '아직'이다.
+    """
+    from dashboard import central_chat
+
+    record_path = paths.attendance_install_record_path(Path(config_dir))
+    if not record_path.exists():
+        return {"done": False, "value": ""}
+    try:
+        record = load_attendance_install_record(record_path)
+    except AttendanceInstallRecordError:
+        return {"done": False, "value": ""}
+    spreadsheet_id = str(record.get("spreadsheet_id", "") or "")
+    if not spreadsheet_id:
+        return {"done": False, "value": ""}
+    try:
+        rows = central_chat._read_settings_rows(spreadsheet_id, run_command, gws_executable)
+    except Exception:  # noqa: BLE001 - 네트워크·권한 실패는 '아직'으로만 보인다
+        return {"done": False, "value": ""}
+    value = ""
+    for row in rows or []:
+        if isinstance(row, list) and row and str(row[0]).strip() == "FIRST_TIME_SETUP_DONE":
+            value = str(row[1]).strip() if len(row) > 1 else ""
+            break
+    return {"done": bool(value), "value": value}
+
+
 def save_messenger_settings(
     config_dir: Path,
     updates: dict,
@@ -1944,14 +1975,13 @@ def update_run_lock(config_dir: Path | None = None):
             local_lock.release()
 
 
-# 업데이트도 설치 마법사를 눈에 보이게 연다. Setup에는 WebView2 전체 약관과
-# 명시 동의 확인란이 있으므로 /SILENT·/VERYSILENT·/SUPPRESSMSGBOXES로 그 화면을
-# 건너뛰면 안 된다. 실행 중인 앱은 안전하게 닫되 컴퓨터를 자동 재시작하지 않는다.
+# 업데이트도 설치 진행 상황과 오류를 사용자가 볼 수 있게 설치 마법사를 연다.
+# 실행 중인 앱은 안전하게 닫되 컴퓨터를 자동 재시작하지 않는다.
 UPDATE_SETUP_ARGS = ["/NORESTART", "/CLOSEAPPLICATIONS"]
 
 
 def update_launch_command(path) -> list[str]:
-    """약관을 직접 확인할 수 있는 업데이트용 설치 파일 실행 명령을 만든다."""
+    """진행 상황을 볼 수 있는 업데이트용 설치 파일 실행 명령을 만든다."""
     return [str(path), *UPDATE_SETUP_ARGS]
 
 
@@ -2136,7 +2166,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
             return {"started": False, "latest": target_latest, "reason": reason}
 
         try:
-            # WebView2 약관을 직접 읽고 동의해야 하므로 마법사 전체를 보여 준다.
+            # 설치 진행과 오류를 사용자가 바로 볼 수 있게 마법사 전체를 보여 준다.
             run = launch or (
                 lambda file: subprocess.Popen(update_launch_command(file), close_fds=True)
             )
@@ -2918,3 +2948,20 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     else:
         results.append(StepResult("helper", "도우미 재시작", "failed", "doctor를 실행해 주세요"))
     return results
+
+
+def save_wizard_inputs(config_dir: Path, profile_values: dict, grid: list, bridge_updates: dict,
+                       deps: ApplyDeps | None = None) -> tuple[bool, str]:
+    """메신저 탭 [다음] 순간의 저장 — apply_all 앞부분과 같고 멱등이다."""
+    deps = deps or ApplyDeps()
+    config_dir = Path(config_dir)
+    gws = str(deps.gws_resolver())
+    require_goedu_gws_session(deps.run_command, gws)
+    write_profile_values(config_dir, profile_values)
+    write_timetable_grid(config_dir, grid)
+    bridge = {key: value for key, value in bridge_updates.items() if key != "autostart"}
+    save_bridge_settings(config_dir, bridge)
+    parse_ok, parse_detail = run_parser(config_dir)
+    if not parse_ok:
+        return False, parse_detail
+    return True, ""

@@ -45,14 +45,19 @@ const S = {
   fieldIssues: {},           // target -> {key, target, message, tab}
   connectTab: "messenger",   // messenger | attendance
   attendance: null,          // attendance_status/ensure_attendance 응답
+  firstSetupDone: false,     // 시트 [처음 설정 한 번에 끝내기] 완료 확인 (마법사 출결 탭)
+  attendanceStaleNotice: false, // 준비가 끝난 뒤 3~5단계를 다녀오면 출결 탭에 한 줄 안내
   attendanceSaving: false,   // 탭을 오가며 다시 그려도 출결 준비 중복 클릭을 막는다
   attendanceScriptUpdate: null, // 사용자가 눌러 확인한 기존 출결 Apps Script 상태
+  attendanceScriptDialog: null, // null | "update" | "finish"
   attendanceScriptUpdating: false,
+  workspaceGuideOpen: false,   // 1단계 "화면에서 찾기"로 뜨는 구글 워크스페이스 위치 캡처
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
 };
+let attendanceScriptRequestToken = 0;
 
 const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
@@ -281,6 +286,8 @@ bindActions({
     }
   },
   "link-copy": (el) => { copyText(el.dataset.url); },
+  "show-workspace-guide": () => { S.workspaceGuideOpen = true; render(); },
+  "close-workspace-guide": () => { S.workspaceGuideOpen = false; render(); },
 });
 
 /* ---------- 마법사 골격 ---------- */
@@ -311,8 +318,11 @@ function googleStatusKey(status) {
   return [status.login_state || "", status.logged_in ? "1" : "0", status.user || "", status.account_allowed === true ? "1" : "0"].join("|");
 }
 function clearGoogleDependentState() {
+  clearAttendanceScriptDialogState();
   S.attendance = null;
   S.attendanceScriptUpdate = null;
+  S.firstSetupDone = false;   // 계정이 바뀌면 다른 시트의 완료 표시일 수 있다
+  S.attendanceStaleNotice = false;
   S.chatStatus = null;
   S.checks = [];
   S.lists = { calendars: [], tasklists: [] };
@@ -357,7 +367,9 @@ function wizardFootHtml() {
     : S.step === 1 ? "준비됐어요, 시작하기"
       : S.step === 8 ? "Chat은 나중에 설정"
         : "다음";
-  const disabled = S.step === 2 && !isGoeduGoogleStatus(S.google) ? " disabled" : "";
+  const nextLocked = (S.step === 2 && !isGoeduGoogleStatus(S.google))
+    || (S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
+  const disabled = nextLocked ? " disabled" : "";
   const next = nextLabel ? `<button class="btn" data-action="go-next" data-busy-text="확인 중…"${disabled}>${nextLabel}</button>` : "";
   return `<div class="foot">${back}${next}</div>`;
 }
@@ -375,11 +387,35 @@ function currentState() {
 }
 function saveDraft() { return call("save_setup_state", currentState()); }
 
+/* 마법사 7단계 완주 게이트 — 출결 준비 완료 + 시트 처음 설정 완료 전에는 7단계를 넘어갈 수 없다.
+   출결 탭 [다음], AI 탭 [다음](goNextAsync 낙하), 왼쪽 단계 목록(go-step) 등 7단계 경계를
+   넘어가는 모든 길이 이 판정 하나를 지난다 — 준비 스레드와 9단계 apply_all의 겹침을 막는
+   유일한 방어라 느슨하게 만들면 안 된다. */
+function attendanceWizardGateOpen() {
+  return Boolean(S.attendance && S.attendance.state === "ready" && S.firstSetupDone);
+}
+function attendanceWizardGateMessage() {
+  const state = S.attendance ? S.attendance.state : "";
+  if (state === "installing") return "출결 준비가 끝나야 다음으로 갈 수 있어요";
+  if (state === "ready") return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
+  if (state === "failed") return "출결 준비가 실패했어요. 출결 탭에서 [다시 시도]를 눌러 주세요.";
+  return "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요.";
+}
 async function goStepAsync(n) {
+  const target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
+  if (S.mode === "wizard" && S.step <= 7 && target > 7 && !attendanceWizardGateOpen()) {
+    setBanner("warn", attendanceWizardGateMessage());
+    return;
+  }
   await stopHotkeyRecording();
+  if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
   S.banner = null;
-  S.step = Math.max(1, Math.min(WIZARD_STEPS.length, n));
+  S.step = target;
   S.maxStep = Math.max(S.maxStep || 1, S.step);
+  if (S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
+    // 단계 목록으로 출결 탭에 곧장 돌아와도 진행 표시와 완료 자동 확인이 다시 돈다.
+    startAttendancePreparePoll();
+  }
   await saveDraft();
   render();
 }
@@ -389,14 +425,27 @@ async function goNextAsync() {
   if (problem) { setBanner("warn", problem); return; }
   if (S.step === 7 && S.connectTab === "messenger") {
     // 연결은 메신저 → 출결 → AI 에이전트 세 탭을 차례로 지난 뒤에 마무리로 간다.
+    // [다음] 순간 입력을 실제 저장하고 출결 준비를 뒤에서 시작한다 — 출결 탭이 진행을 보여준다.
+    const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
+    if (!startReply.started) { setBanner("warn", startReply.reason); return; }
+    S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
     S.connectTab = "attendance";
     S.chatStatus = null;
     S.attendance = null;  // 탭 클릭 경로와 동일하게 새로 확인 — 오래된 상태 재사용 방지
+    startAttendancePreparePoll();
     await saveDraft();
     render();
     return;
   }
   if (S.step === 7 && S.connectTab === "attendance") {
+    if (S.mode === "wizard" && !attendanceWizardGateOpen()) {
+      // 게이트 판정과 문구는 goStepAsync의 7단계 경계와 같은 함수 하나를 쓴다 (검토 C1).
+      setBanner("warn", attendanceWizardGateMessage());
+      return;
+    }
+    S.banner = null;  // 게이트 통과 — 남은 안내 배너를 걷고 다음 탭으로 (검토 C2)
+    stopAttendancePreparePoll();
+    clearAttendanceScriptDialogState();
     S.connectTab = "ai";
     S.aiTools = null;
     S.aiInstall = null;
@@ -414,10 +463,13 @@ bindActions({
       S.connectTab = "attendance";
       S.chatStatus = null;
       S.attendance = null;
+      startAttendancePreparePoll();
       render();
       return;
     }
     if (S.step === 7 && S.connectTab === "attendance") {
+      clearAttendanceScriptDialogState();
+      stopAttendancePreparePoll();
       S.connectTab = "messenger";
       stopChatConnectPoll();
       render();
@@ -430,6 +482,7 @@ bindActions({
     const target = Number(el.dataset.step);
     if (target > S.step) {
       // 앞으로 건너뛸 때도 지금 화면의 입력은 검증하고 간다.
+      // 7단계 경계를 넘는 건너뛰기는 goStepAsync 안의 완주 게이트가 막는다 (검토 C1).
       const validate = validators[S.step];
       const problem = validate ? await validate() : "";
       if (problem) { setBanner("warn", problem); return; }
@@ -440,22 +493,38 @@ bindActions({
 
 /* ---------- 1단계: 시작하기 ---------- */
 stepBodies[1] = function stepStart() {
-  const prepRow = (number, title, detail, url, label) => `
+  const linkButton = (url, label) =>
+    `<button class="text-link" data-action="link-open" data-url="${esc(url)}">${esc(label)}</button>`;
+  const prepRow = (number, title, detail, buttonHtml) => `
     <div class="prep-row">
       <span class="prep-num">${number}</span>
       <span class="prep-copy"><b>${esc(title)}</b><span>${esc(detail)}</span></span>
-      <button class="text-link" data-action="link-open" data-url="${esc(url)}">${esc(label)}</button>
+      ${buttonHtml}
     </div>`;
   return `
     <p class="start-eyebrow">처음 설치하는 선생님</p>
     <h1>설치 전에 세 가지만 준비해 주세요</h1>
     <p class="sub start-lede">Teacher Manager는 경기도교육청 교직원용입니다. 아래 가입을 먼저 마치면 앱 설치 뒤 바로 Google Workspace와 Brity 메신저를 연결할 수 있어요.</p>
     <div class="prep-list">
-      ${prepRow(1, "교육디지털원패스 교직원 회원가입", "https://edupass.neisplus.kr/에서 교직원 계정을 준비합니다.", "https://edupass.neisplus.kr/", "교육디지털원패스 열기")}
-      ${prepRow(2, "경기도교육청 교육용 클라우드 지원시스템 가입", "https://www.goedu.kr/에서 디지털원패스 계정을 통해 교직원 가입을 마칩니다. (@goedu.kr)", "https://www.goedu.kr/", "공식 사이트 열기")}
-      ${prepRow(3, "경기도교육청 클라우드 지원시스템 내 서비스인 Google Workspace에 가입", "계정 가입에 그치지 않고 추가로 교육용 클라우드 서비스인 Google Workspace를 신청합니다.", "https://www.goedu.kr/bbs/3/view/63", "도움말 보기")}
-    </div>`;
+      ${prepRow(1, "교육디지털원패스 교직원 회원가입", "https://edupass.neisplus.kr/에서 교직원 계정을 준비합니다.", linkButton("https://edupass.neisplus.kr/", "교육디지털원패스 열기"))}
+      ${prepRow(2, "경기도교육청 교육용 클라우드 지원시스템 가입", "https://www.goedu.kr/에서 디지털원패스 계정을 통해 교직원 가입을 마칩니다. (@goedu.kr)", linkButton("https://www.goedu.kr/", "공식 사이트 열기"))}
+      ${prepRow(3, "경기도교육청 클라우드 지원시스템 내 서비스인 Google Workspace에 가입", "계정 가입에 그치지 않고 추가로 교육용 클라우드 서비스인 Google Workspace를 신청합니다.", `<button class="text-link" data-action="show-workspace-guide">화면에서 찾기</button>`)}
+    </div>
+    ${S.workspaceGuideOpen ? workspaceGuideOverlayHtml() : ""}`;
 };
+function workspaceGuideOverlayHtml() {
+  return `<div class="guide-overlay">
+    <section class="guide-box" role="dialog" aria-modal="true" aria-label="구글 워크스페이스 위치 안내">
+      <div class="guide-head">
+        <b>구글 워크스페이스는 여기서 신청해요</b>
+        <button class="btn-quiet" data-action="close-workspace-guide">닫기</button>
+      </div>
+      <img class="guide-shot" src="assets/goedu-workspace-guide.png"
+        alt="교육용 클라우드 지원시스템 첫 화면에서 구글 워크스페이스 링크 위치" />
+      <p class="guide-note">경기도교육청 교육용 클라우드 지원시스템(goedu.kr)에 로그인한 뒤, 화면 아래 <b>교육용 클라우드 서비스</b>에서 빨간 칸으로 표시한 <b>구글 워크스페이스</b>를 누르세요.</p>
+    </section>
+  </div>`;
+}
 
 /* ---------- 구글 로그인 폴링 ---------- */
 let loginTimer = null;
@@ -551,6 +620,12 @@ bindActions({
     await call("gws_login_cancel");
     S.login = null;
     setBanner("warn", "로그인을 취소했어요. 다시 시도할 수 있어요.");
+  },
+  "gws-repair-oauth": async () => {
+    // 로그인이 중간에 끊겨 gws가 남긴 깨진 준비 파일을 치우고 다시 점검한다.
+    await call("gws_repair_oauth_client");
+    S.google = await call("google_status");
+    render();
   },
 });
 
@@ -1087,6 +1162,60 @@ function startChatConnectPoll() {
   };
   chatPollTimer = setTimeout(tick, 3000);
 }
+/* 마법사 7단계 출결 준비 폴링 — 준비가 도는 동안 attendance_prepare_status를 3초 간격으로
+   읽어 진행을 보여주고, 준비됨 뒤에는 attendance_first_setup_status를 3초 간격으로 읽어
+   시트의 처음 설정 완료를 자동 확인한다. 완료·실패·탭 이탈이면 스스로 멈춘다. */
+let attendancePrepareTimer = null;
+let attendancePrepareGen = 0;       // 늦게 도착한 옛 폴 결과가 새 화면을 덮지 않게 한다
+let attendancePreparePollOn = false;
+function stopAttendancePreparePoll() {
+  attendancePrepareGen += 1;
+  attendancePreparePollOn = false;
+  if (attendancePrepareTimer) { clearTimeout(attendancePrepareTimer); attendancePrepareTimer = null; }
+}
+function startAttendancePreparePoll() {
+  stopAttendancePreparePoll();
+  const gen = attendancePrepareGen;
+  attendancePreparePollOn = true;
+  const tick = async () => {
+    attendancePrepareTimer = null;
+    if (gen !== attendancePrepareGen) return;
+    const onTab = S.mode === "wizard" && S.connectTab === "attendance" &&
+      WIZARD_CARD_BY_STEP[S.step] === "connect";
+    if (!onTab) { attendancePreparePollOn = false; return; }
+    const before = JSON.stringify([S.attendance, S.firstSetupDone]);
+    let keepPolling = false;
+    try {
+      let a = S.attendance;
+      if (!a || a.state !== "ready") {
+        const data = await call("attendance_prepare_status");
+        if (gen !== attendancePrepareGen) return;
+        if (data && data.status && typeof data.status === "object") {
+          S.attendance = data.status;
+          a = data.status;
+        }
+        keepPolling = Boolean(data && data.running);
+      }
+      if (a && a.state === "ready" && !S.firstSetupDone) {
+        const first = await call("attendance_first_setup_status");
+        if (gen !== attendancePrepareGen) return;
+        if (first && first.done === true) {
+          S.firstSetupDone = true;
+          S.chatStatus = null;  // 처음 설정이 발송까지 켠다 — Chat 줄을 연결됨으로 다시 읽는다
+          S.banner = null;      // "처음 설정이 끝나야…" 게이트 배너는 조건이 풀리면 걷는다 (검토 C2)
+        } else {
+          keepPolling = true;
+        }
+      }
+    } catch (error) { keepPolling = true; /* 다음 틱에 다시 */ }
+    // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
+    // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
+    if (JSON.stringify([S.attendance, S.firstSetupDone]) !== before) render();
+    if (!keepPolling) { attendancePreparePollOn = false; return; }
+    attendancePrepareTimer = setTimeout(tick, 3000);
+  };
+  attendancePrepareTimer = setTimeout(tick, 0);  // 첫 확인은 바로 — 그다음부터 3초 간격
+}
 /* 방 이름 기본값 — 내 정보의 학교명·담임학년·담임반으로 만든다. 선생님이 고칠 수 있다. */
 function defaultClassSpaceName() {
   const saved = S.profileCache || {};
@@ -1216,7 +1345,22 @@ function serviceStatusHtml(entry, a) {
   const scriptCheck = a.state === "script-check-required";
   const scriptUpdate = a.state === "script-update-required";
   const scriptAttention = scriptCheck || scriptUpdate;
-  const scriptLabel = scriptUpdate ? "기능 업데이트 필요" : "기능 확인 필요";
+  if (scriptAttention) return `<span class="svc-status" aria-hidden="true"></span>`;
+  // 뒤에서 준비가 도는 동안에도 이미 만들어진 자료는 그 줄부터 바로 켠다.
+  // engine이 progress에 실제 Google 자료 번호를 하나씩 남기므로 화면에서 추측하지 않는다.
+  if (a.state === "installing") {
+    const progress = a.progress && typeof a.progress === "object" ? a.progress : {};
+    if (entry.service === "sheet" && progress.spreadsheet_id) {
+      return `<span class="svc-status ok">준비됨</span>`;
+    }
+    if (entry.service === "docs" && progress.template_doc_id) {
+      return `<span class="svc-status ok">연결됨</span>`;
+    }
+    if (entry.service === "tasks" && progress.task_list_id) {
+      return `<span class="svc-status ok">연결됨</span>`;
+    }
+    return `<span class="svc-status muted">준비 중…</span>`;
+  }
   if (entry.service === "chat") {
     const cs = S.chatStatus;
     if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
@@ -1228,19 +1372,16 @@ function serviceStatusHtml(entry, a) {
     if (a.state === "ready") {
       return `<span class="svc-status warn">연결 필요</span>`;
     }
-    if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
     return `<span class="svc-status muted">준비 전</span>`;
   }
   if (entry.service === "sheet") {
     if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
-    if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
     return `<span class="svc-status muted">준비 전</span>`;
   }
   // docs · tasks
   if (a.state === "ready") return `<span class="svc-status ok">연결됨</span>`;
-  if (scriptAttention) return `<span class="svc-status warn">${scriptLabel}</span>`;
   if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
   return `<span class="svc-status muted">준비 전</span>`;
 }
@@ -1301,31 +1442,82 @@ function loadAttendanceStatus() {
 }
 function attendanceScriptUpdateHtml(a) {
   if (!a || !["ready", "script-check-required", "script-update-required"].includes(a.state)) return "";
+  if (a.state === "ready") return "";
   const update = S.attendanceScriptUpdate;
-  if (!update) {
-    return `<div class="attendance-script-update"><span>기존 출결 기능이 최신인지 확인할 수 있어요. 확인만 할 때는 자료를 바꾸지 않아요.</span>
-      <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">출결 기능 최신 상태 확인</button></div>`;
+  if (update?.state === "customized") {
+    return `<div class="attendance-script-update warn"><span>직접 수정된 기능이라 자동으로 바꾸지 않아요.</span></div>`;
   }
-  if (update.state === "current" || update.state === "updated") {
-    const finish = a.state === "script-check-required" || a.state === "script-update-required"
-      ? `<button class="btn-tonal" data-action="attendance-script-update-apply" data-busy-text="마무리 중…" ${S.attendanceScriptUpdating ? "disabled" : ""}>출결 연결 마무리</button>`
-      : `<button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button>`;
-    return `<div class="attendance-script-update ok"><span>${esc(update.detail || "출결 기능이 최신 상태예요.")}</span>
-      ${finish}</div>`;
+  if (update?.state === "hold") {
+    return `<div class="attendance-script-update warn"><span>출결 기능 상태를 확인하지 못했어요.</span>
+      <button class="btn-quiet" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   }
-  if (update.state === "update_available") {
-    return `<div class="attendance-script-update warn"><span>${esc(update.detail || "안전하게 바꿀 수 있는 예전 출결 기능을 찾았어요.")}</span>
-      <button class="btn-tonal" data-action="attendance-script-update-apply" data-busy-text="업데이트 중…" ${S.attendanceScriptUpdating ? "disabled" : ""}>출결 기능 업데이트</button></div>`;
+  if (update?.state === "current" || update?.state === "finishing_required") {
+    return `<div class="attendance-script-update warn"><span>출결 기능 업데이트를 마무리해야 해요.</span>
+      <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">마무리</button></div>`;
   }
-  if (update.state === "customized") {
-    return `<div class="attendance-script-update warn"><span>${esc(update.detail || "직접 고친 시트라 자동으로 덮지 않아요. 기존 자료는 그대로 두었습니다.")}</span>
-      <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button></div>`;
-  }
-  return `<div class="attendance-script-update warn"><span>${esc(update.detail || "현재 출결 기능 상태를 확실히 확인하지 못했어요. 기존 자료는 바꾸지 않았습니다.")}</span>
-    <button class="btn-quiet" data-action="attendance-script-update-check" data-busy-text="확인 중…">다시 확인</button></div>`;
+  return `<div class="attendance-script-update warn"><span>출결 기능을 최신판으로 바꿔야 해요.</span>
+    <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">문제 해결</button></div>`;
+}
+function attendanceScriptAccountKey() {
+  const attendanceAccount = S.attendance?.account || S.attendance?.current_user || "";
+  return `${S.google?.user || ""}|${attendanceAccount}`;
+}
+function clearAttendanceScriptDialogState() {
+  attendanceScriptRequestToken += 1;
+  S.attendanceScriptDialog = null;
+}
+function focusAttendanceScriptDialog() {
+  const first = document.querySelector(
+    '.attendance-update-dialog [data-action="attendance-script-dialog-close"]'
+  );
+  if (first && first.focus) first.focus();
+}
+function focusAttendanceScriptResolve() {
+  const trigger = document.querySelector('[data-action="attendance-script-update-resolve"]');
+  if (trigger && trigger.focus) trigger.focus();
+}
+function attendanceScriptUpdateDialogHtml() {
+  const kind = S.attendanceScriptDialog;
+  if (!kind) return "";
+  const finishing = kind === "finish";
+  const title = finishing ? "업데이트 마무리" : "출결 기능 업데이트";
+  const message = finishing
+    ? "새 기능은 준비됐고 마지막 연결만 남았습니다. 학생 자료는 그대로입니다."
+    : "학생 명단과 출결 기록은 그대로 두고 기능만 최신으로 바꿉니다.";
+  const action = finishing ? "마무리" : "업데이트";
+  // 실행 중에는 두 단추 모두 잠근다 — 취소로 빠져나가면 다이얼로그 없이 성공 안내만
+  // 뜬금없이 뜨게 된다(실행은 계속 진행 중이라 취소로 멈출 수 없다).
+  const busy = S.attendanceScriptUpdating;
+  const busyDisabled = busy ? " disabled" : "";
+  const actionLabel = busy ? `${action} 중…` : action;
+  return `<div class="attendance-update-dialog-overlay">
+    <section class="attendance-update-dialog" role="dialog" aria-modal="true" aria-label="${title}">
+      <h3>${title}</h3><p>${message}</p>
+      <div class="attendance-update-dialog-actions">
+        <button class="btn-quiet" data-action="attendance-script-dialog-close"${busyDisabled}>취소</button>
+        <button class="btn" data-action="attendance-script-dialog-confirm" data-busy-text="${action} 중…"${busyDisabled}>${actionLabel}</button>
+      </div>
+    </section></div>`;
+}
+/* 마법사 7단계 "마지막 한 번" 카드 — 준비가 끝난 뒤, 시트에서 처음 설정을 끝내라는 안내.
+   기존 서비스 칸(.svc-group)과 같은 톤이고 상태는 글자 색만(.svc-status). */
+function firstSetupCardHtml(a) {
+  const status = S.firstSetupDone
+    ? `<span class="svc-status ok">완료 확인됨</span>`
+    : `<span class="svc-status muted">기다리는 중…</span>`;
+  const open = a.spreadsheet_url
+    ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 시트 열기</button>`
+    : "";
+  return `<div class="first-setup-card">
+    <div class="first-setup-head"><b>마지막 한 번 — 시트에서 처음 설정을 끝내 주세요</b>${status}</div>
+    <p>방금 만든 출결 시트를 열고, 위 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 눌러 주세요. 끝나면 이 화면이 저절로 완료로 바뀝니다.</p>
+    <div class="first-setup-acts">${open}</div>
+  </div>`;
 }
 function attendanceTabHtml() {
-  loadAttendanceStatus();
+  // 마법사에서 준비 폴링이 도는 동안에는 같은 상태를 두 경로로 읽지 않는다 —
+  // 느린 attendance_status 응답이 폴링이 방금 놓은 새 상태를 옛 값으로 덮는 것을 막는다.
+  if (!(S.mode === "wizard" && attendancePreparePollOn)) loadAttendanceStatus();
   if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
   const a = S.attendance;
   if (!a || typeof a !== "object") return `<p class="sub">출결 준비 상태를 확인하는 중이에요…</p>`;
@@ -1345,10 +1537,6 @@ function attendanceTabHtml() {
     // 초안이 진짜 비어 있을 때만 안내한다.
     statusArea = `<div class="banner warn"><span>${esc(a.detail || "내 정보와 하루 일과를 먼저 입력해 주세요.")}</span>
       <button class="btn-quiet" data-action="goto-identity">내 정보 열기</button></div>`;
-  } else if (a.state === "script-update-required") {
-    statusArea = `<div class="banner warn"><span>기존 출결표를 찾았어요. 학생 명단과 출결 자료는 그대로 두고, 아래에서 출결 기능만 안전하게 확인하고 업데이트해 주세요.</span></div>`;
-  } else if (a.state === "script-check-required") {
-    statusArea = `<div class="banner warn"><span>기존 출결 자료는 그대로 두었어요. 아래에서 현재 출결 기능이 안전한 최신판인지 먼저 확인해 주세요.</span></div>`;
   } else if (a.state === "failed" && (!a.failed_service || a.failed_service === "setup")) {
     statusArea = `<p class="field-error" style="margin:0 0 13px">${esc(a.detail || "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.")}</p>`;
   }
@@ -1357,23 +1545,35 @@ function attendanceTabHtml() {
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
   const pendingGuide = S.mode === "wizard"
-    ? "마지막 단계에서 모두 저장하고 적용하면 함께 준비해요"
+    ? a.state === "installing"
+      ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"
+      : a.state === "failed"
+        ? ""  // 실패 줄(field-error)과 [다시 시도]가 그 자리에서 안내한다 (검토 C5)
+        : "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요."
     : "아래 버튼을 누르면 로그인한 계정에 자동으로 준비해요.";
   const chip = account ? `<span class="account-chip">${esc(account)}</span>` : "";
   const rows = ATTENDANCE_SERVICES.map((entry) => attendanceServiceRow(entry, a)).join("");
-  return `${statusArea}
+  const staleNotice = S.mode === "wizard" && S.attendanceStaleNotice
+    ? `<p class="hint" style="margin:0 0 12px">이미 만든 출결 시트에는 새 값이 자동으로 들어가지 않아요.</p>`
+    : "";
+  return `${statusArea}${attendanceScriptUpdateHtml(a)}
     <div class="attendance-head">
-      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready || scriptAttentionRequired ? "" : `<p>${pendingGuide}</p>`}</div>
+      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready || scriptAttentionRequired || !pendingGuide ? "" : `<p>${pendingGuide}</p>`}</div>
       <span class="attendance-head-right">${chip}</span>
     </div>
+    ${staleNotice}
     <div class="promise">
       ${rows}
     </div>
-    ${attendanceScriptUpdateHtml(a)}
+    ${S.mode === "wizard" && a.state === "ready" ? firstSetupCardHtml(a) : ""}
+    ${S.mode === "wizard" && a.state === "failed"
+      ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
+      : ""}
     ${ready
       ? ""
       : scriptAttentionRequired || S.mode === "wizard" ? ""
-      : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}`;
+      : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
+    ${attendanceScriptUpdateDialogHtml()}`;
 }
 /* ---------- 연결 3탭: AI 에이전트 ---------- */
 function aiTabHtml() {
@@ -1426,14 +1626,22 @@ bindActions({
     const tab = el.dataset.tab;
     if (S.connectTab === tab) return;
     if (editingCard() === "connect" && S.connectTab === "messenger") syncConnectFields();
+    if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
+    S.banner = null;  // 이전 탭의 안내 배너(게이트 포함)가 새 탭까지 따라가지 않는다 (검토 C2)
     S.connectTab = tab;
     if (tab === "attendance") {
-      // 다시 확인은 하되 화면을 비우지는 않는다. 비우면 탭을 누를 때마다
-      // "출결 준비 상태를 확인하는 중이에요…"가 뜨면서 방금 보던 내용이 사라진다.
-      // 앞서 읽은 상태를 그대로 두고 조용히 새로 읽어 바뀐 것만 갈아 끼운다.
-      refreshAttendanceStatus();
+      if (S.mode === "wizard") {
+        // 마법사에서는 준비 폴링이 상태를 읽는다 — 같은 정보를 두 경로로 묻지 않는다.
+        startAttendancePreparePoll();
+      } else {
+        // 다시 확인은 하되 화면을 비우지는 않는다. 비우면 탭을 누를 때마다
+        // "출결 준비 상태를 확인하는 중이에요…"가 뜨면서 방금 보던 내용이 사라진다.
+        // 앞서 읽은 상태를 그대로 두고 조용히 새로 읽어 바뀐 것만 갈아 끼운다.
+        refreshAttendanceStatus();
+      }
     } else {
       stopChatConnectPoll();
+      stopAttendancePreparePoll();
     }
     if (tab === "ai") {
       // AI 도구도 열 때마다 다시 감지 — 그 사이 설치했을 수 있다.
@@ -1529,33 +1737,60 @@ bindActions({
       render();
     }
   },
-  "attendance-script-update-check": async () => {
-    S.attendanceScriptUpdate = await call("attendance_script_update_status");
+  "attendance-prepare-retry": async () => {
+    // 실패한 출결 준비를 같은 입력으로 다시 시작한다 — 성공하면 폴링이 진행을 다시 보여준다.
+    const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
+    if (!startReply.started) { setBanner("warn", startReply.reason); return; }
+    S.banner = null;
+    S.attendance = null;
+    startAttendancePreparePoll();
     render();
   },
-  "attendance-script-update-apply": async () => {
+  "attendance-script-update-resolve": async () => {
+    const requestToken = ++attendanceScriptRequestToken;
+    const requestScreen = screenKey();
+    const requestAccount = attendanceScriptAccountKey();
+    const update = await call("attendance_script_update_status");
+    if (requestToken !== attendanceScriptRequestToken
+        || requestScreen !== screenKey()
+        || requestAccount !== attendanceScriptAccountKey()) return;
+    S.attendanceScriptUpdate = update;
+    S.attendanceScriptDialog = null;
+    if (S.attendanceScriptUpdate.state === "update_available") {
+      S.attendanceScriptDialog = "update";
+    } else if (S.attendanceScriptUpdate.state === "current"
+        || S.attendanceScriptUpdate.state === "finishing_required") {
+      S.attendanceScriptDialog = "finish";
+    }
+    render();
+  },
+  "attendance-script-dialog-close": () => {
+    clearAttendanceScriptDialogState();
+    render();
+    focusAttendanceScriptResolve();
+  },
+  "attendance-script-dialog-confirm": async () => {
     if (S.attendanceScriptUpdating) return;
-    const onlyFinishing = S.attendanceScriptUpdate?.state === "current";
-    const question = onlyFinishing
-      ? "확인한 최신 출결 기능을 이 컴퓨터의 준비 완료 기록에 남길까요?\n\nGoogle 자료는 바꾸지 않습니다."
-      : "기존 출결 Sheet의 Apps Script만 최신판으로 바꿀까요?\n\n" +
-        "학생 명단, 출결 내용, 설정, Google Chat 연결값은 바꾸지 않습니다. " +
-        "직접 고친 스크립트가 발견되면 자동으로 덮지 않습니다.";
-    if (!window.confirm(question)) return;
     S.attendanceScriptUpdating = true;
     render();
     try {
       S.attendanceScriptUpdate = await call("attendance_script_update_apply");
       if (S.attendanceScriptUpdate.state === "updated" || S.attendanceScriptUpdate.state === "current") {
+        S.attendanceScriptDialog = null;
+        S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
         S.chatStatus = null;
-        showToast(onlyFinishing
-          ? "출결 기능 확인을 마쳤어요"
-          : "출결 기능을 최신판으로 업데이트했어요");
+        // 마무리로 상태가 준비됨이 되면, 마법사에서는 시트 처음 설정 완료 확인이
+        // 이어서 돌아야 "기다리는 중…"이 풀린다 (검토 C6).
+        if (S.mode === "wizard") startAttendancePreparePoll();
+        showToast("출결 기능을 최신판으로 바꿨어요.");
+      } else {
+        S.attendanceScriptDialog = null;
       }
     } finally {
       S.attendanceScriptUpdating = false;
       render();
+      focusAttendanceScriptResolve();
     }
   },
   "new-attendance-go": async () => {
@@ -1708,7 +1943,10 @@ async function validateConnect() {
   if (blocking.length) {
     // 출결 탭을 보고 있어도 메신저 입력 문제면 메신저 탭으로 이동해 첫 문제 칸을 보여준다.
     const messengerIssue = blocking.find((row) => row.tab === "messenger");
-    if (messengerIssue && S.connectTab !== "messenger") S.connectTab = "messenger";
+    if (messengerIssue && S.connectTab !== "messenger") {
+      if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
+      S.connectTab = "messenger";
+    }
     // 이어지는 배너 render가 탭 이동과 첫 문제 입력칸 초점을 함께 적용한다.
     S.focusTarget = (messengerIssue || blocking[0]).target;
     return firstIssueMessage(blocking);
@@ -1773,7 +2011,7 @@ async function refreshSettingsStatus() {
   }
   render();
 }
-const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인 상태를 확인하지 못했어요. 다시 점검하고 인터넷 연결이나 학교 보안 정책을 확인해 주세요.";
+const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인을 다시 점검해 주세요.";
 const OAUTH_REPAIR_MESSAGES = {
   GWS_ACCOUNT_STORAGE_OUTSIDE_USER: {
     status: "Google 로그인 저장 위치가 현재 Windows 계정 폴더 밖이에요",
@@ -1821,7 +2059,7 @@ function googleLoginRowsHtml() {
   const g = S.google;
   if (!g) return `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>OAuth 로그인 준비</b><small>Google 로그인에 필요한 승인 정보를 확인해요</small></span><span class="st">확인 중이에요…</span></div>
-    <div class="row"><span class="nameblock"><b>Google 로그인</b><small>이 계정에 출결 업무를 준비해요</small></span><span class="st">확인 중이에요…</span></div>`;
+    <div class="row"><span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span><span class="st">확인 중이에요…</span></div>`;
   const loginError = fieldError("google-login");
   const update = S.gwsUpdate;
   const accountStorageProblem = g.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
@@ -1854,15 +2092,17 @@ function googleLoginRowsHtml() {
     status: "기존 준비와 설치판 준비가 서로 달라요",
     repair: "기존 Google 로그인 준비를 정리하거나 설치판과 같은 준비로 바꾼 뒤 다시 점검해 주세요.",
   } : null);
+  const oauthCleanable = String(g.error_code || "") === "OAUTH_CONFIG_CLIENT_INVALID";
   const oauthRight = oauthProblem
-    ? `<span class="st warn">${esc(oauthProblem.status)}</span><small>${esc(oauthProblem.repair)}</small>`
+    ? `<span class="st warn">${esc(oauthProblem.status)}</span><small>${esc(oauthProblem.repair)}</small>${oauthCleanable ? `<button class="btn-tonal" data-action="gws-repair-oauth" data-busy-text="정리 중…">정리하고 다시 점검</button>` : ""}`
     : g.oauth_client_ready
       ? `<span class="st ok">준비됐어요</span>`
       : `<span class="st warn">로그인 준비 파일이 없어요</span>`;
   const oauthRow = `<div class="row">${oauthBlock}<span class="row-actions">${oauthRight}</span></div>`;
-  const loginBlock = `<span class="nameblock"><b>Google 로그인</b><small>이 계정에 출결 업무를 준비해요</small></span>`;
+  const loginBlock = `<span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span>`;
   const authCheckFailed = googleAuthCheckFailed(g);
-  const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem && !authCheckFailed);
+  const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem);
+  const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button>`;
   const blockedReason = oauthProblem
     ? "OAuth 준비를 먼저 확인해 주세요"
     : !runtimeReady
@@ -1875,9 +2115,9 @@ function googleLoginRowsHtml() {
       : accountStorageProblem
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
       : authCheckFailed
-        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${GOOGLE_AUTH_CHECK_MESSAGE}</span></span></div>`
+        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${GOOGLE_AUTH_CHECK_MESSAGE}</span>${canLogin ? loginButton : ""}</span></div>`
       : canLogin
-        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button></span></div>`
+        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}${loginButton}</span></div>`
         : `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<span class="st warn">${esc(blockedReason)}</span></span></div>`;
   return `${cliRow}
     ${oauthRow}
@@ -1886,10 +2126,7 @@ function googleLoginRowsHtml() {
 function loginWaitHtml() {
   if (!S.login) return "";
   return `<div class="panel" style="margin-top:12px">
-      <p class="sub" style="margin:0 0 8px">브라우저가 자동으로 열렸어요.
-        <b class="login-account-em">반드시 경기도교육청 클라우드 계정(@goedu.kr)으로 로그인해 주세요.</b><br>
-        개인 계정 화면이 열리면 [다른 계정 사용]을 눌러 @goedu.kr 계정을 고르면 돼요.<br>
-        창이 열리지 않으면 취소한 뒤 다시 로그인해 주세요.</p>
+      <p class="sub" style="margin:0 0 8px">브라우저가 자동으로 열렸어요.</p>
       <div class="action-line"><button class="btn-quiet" data-action="login-cancel">취소</button></div>
     </div>`;
 }
@@ -2175,6 +2412,7 @@ bindActions({
       S.attendance = null;
     }
     S.attendanceScriptUpdate = null;
+    clearAttendanceScriptDialogState();
     S.chatStatus = null;
     S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
@@ -2628,6 +2866,7 @@ function windowHtml(title, body, big) {
    저장을 마친 뒤에만 닫힌다. 저장이 실패하면 창은 남고 배너에 이유가 적힌다. */
 async function closeWindow() {
   if (S.mode !== "edit" && S.mode !== "about") return true;
+  clearAttendanceScriptDialogState();
   await stopHotkeyRecording();
   let saved = false;
   try { saved = await flushEditSave(); } catch (error) { setBanner("error", error.message); return false; }
@@ -2780,7 +3019,16 @@ async function flushEditSave() {
   return await autoSaveEdit({ leaving: true });
 }
 for (const eventName of ["input", "change"]) {
-  document.addEventListener(eventName, () => {
+  document.addEventListener(eventName, (event) => {
+    const box = event.target;
+    // 학급 단톡방 이름은 치는 즉시 상태로 보관한다 — 폴링 render가 지우지 않게 (검토 C3)
+    if (box && box.name === "class-space-name") S.spaceDraftName = box.value;
+    if (S.mode === "wizard" && S.step >= 3 && S.step <= 5 && S.attendance
+        && (S.attendance.state === "ready" || S.attendance.state === "installing")) {
+      // 화면을 보기만 한 것은 변경이 아니다. 이 세 단계에서 실제 input/change가 난 뒤에만
+      // 이미 만드는/만든 출결 시트에는 자동 반영되지 않는다는 안내를 켠다.
+      S.attendanceStaleNotice = true;
+    }
     if (S.mode !== "edit") return;
     if (S.edit === "settings") { editDirty = true; return; }  // 저장은 설정 자체 감지가 한다
     if (!autoSaveScreen()) return;
@@ -2862,6 +3110,7 @@ async function loadForEdit(key) {
       S.attendance = null;
     }
     S.attendanceScriptUpdate = null;
+    clearAttendanceScriptDialogState();
     S.chatStatus = null;
     S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
@@ -2934,8 +3183,35 @@ document.addEventListener("click", (event) => {
 /* Esc로 닫기 — 단축키를 새로 누르는 중이면 위쪽의 잡기 전용 리스너가 녹음 취소만 하고
    preventDefault를 걸어 두므로(defaultPrevented), 그때는 창을 닫지 않는다. */
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Tab" && S.attendanceScriptDialog) {
+    const dialog = document.querySelector(".attendance-update-dialog");
+    const buttons = dialog ? Array.from(dialog.querySelectorAll("button:not([disabled])")) : [];
+    if (!buttons.length) { event.preventDefault(); return; }
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (!dialog.contains(document.activeElement)) {
+      event.preventDefault();
+      first.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+    return;
+  }
   if (event.key !== "Escape" || event.defaultPrevented) return;
   if (hotkeyCapture.active) return;
+  if (S.workspaceGuideOpen) { S.workspaceGuideOpen = false; render(); return; }
+  if (S.attendanceScriptDialog) {
+    // 취소 단추와 같은 규칙 — 실행 중에는 Esc로도 빠져나가지 못한다.
+    if (S.attendanceScriptUpdating) return;
+    clearAttendanceScriptDialogState();
+    render();
+    focusAttendanceScriptResolve();
+    return;
+  }
   if (S.mode !== "edit" && S.mode !== "about") return;
   closeWindow();
 });
@@ -2982,6 +3258,9 @@ function render() {
     S.focusTarget = "";
     if (el && el.focus) el.focus();
   }
+  // 실행 중에는 두 단추 모두 잠겨 있어 초점을 옮길 곳이 없다 — 취소로 포커스를
+  // 보내면(기존 버그) 실행 중에도 Enter 한 번으로 빠져나갈 수 있었다.
+  if (S.attendanceScriptDialog && !S.attendanceScriptUpdating) focusAttendanceScriptDialog();
 }
 
 /* ---------- 부팅 ---------- */

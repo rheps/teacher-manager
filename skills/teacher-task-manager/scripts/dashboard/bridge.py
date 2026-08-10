@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import subprocess
 import sys
 import threading
 from dataclasses import asdict, dataclass
@@ -89,9 +90,11 @@ class BridgeDeps:
     autostart_enable: object = None
     autostart_disable: object = None
     url_opener: object = None
+    edge_exe_url_opener: object = None
     edge_url_opener: object = None
     external_url_platform: object = None
     https_handler_available: object = None
+    edge_protocol_available: object = None
     dir_opener: object = None
     popen_factory: object = None
     folder_picker: object = None
@@ -120,14 +123,23 @@ class Api:
         self._gws_update_last_status = None
         self._gws_update_install_lock = threading.Lock()
         self._attendance_script_update_lock = threading.Lock()
+        self._attendance_prepare_lock = threading.Lock()
+        self._attendance_prepare_thread = None
+        self._attendance_prepare_result = None
+        # 완료 확인 폴링용 gws 경로 캐시 — 3초 폴마다 resolve_gws(동봉본 SHA-256 검증
+        # + 판 확인 실행)를 통째로 다시 돌리지 않는다(검토 C7). 승인된 갱신을 설치하면
+        # 실행 파일이 바뀔 수 있어 install_gws_update 성공 시 비운다.
+        self._attendance_gws_cache = None
 
     def _open_external_url(self, url) -> dict:
         return external_url.open_external_url(
             url,
             default_opener=self._deps.url_opener,
+            edge_exe_opener=self._deps.edge_exe_url_opener,
             edge_opener=self._deps.edge_url_opener,
             platform=self._deps.external_url_platform,
             https_handler_available=self._deps.https_handler_available,
+            edge_protocol_available=self._deps.edge_protocol_available,
         )
 
     # ----- setup-state -----
@@ -492,6 +504,104 @@ class Api:
             engine.save_attendance_status_cache(self._config_dir, status)
         return status
 
+    @guarded
+    def attendance_prepare_start(self, profile, grid, bridge_updates):
+        """메신저 탭 [다음] — 입력 저장 후 출결 준비를 뒤에서 시작한다. 여러 번 불려도 안전."""
+        self._require_safe_gws_account_storage()
+        # pywebview는 js_api 호출마다 새 스레드를 만든다 — [다음] 더블클릭이면
+        # is_alive 확인과 start() 사이(저장은 수백 ms~수 초)에 둘 다 지나가
+        # 준비 스레드가 2개 생기고, 진 쪽이 잠금 대기로 죽은 뒤 그 죽은 스레드가
+        # _attendance_prepare_thread에 남는다. 확인→저장→시작 전체를 직렬화한다.
+        with self._attendance_prepare_lock:
+            thread = self._attendance_prepare_thread
+            if thread is not None and thread.is_alive():
+                return {"started": True, "reason": "이미 준비하는 중이에요"}
+            save_deps = self._deps.apply_deps or engine.ApplyDeps(
+                run_command=self._attendance_remote_run()
+            )
+            try:
+                ok, reason = engine.save_wizard_inputs(
+                    self._config_dir, dict(profile), list(grid), dict(bridge_updates),
+                    deps=save_deps,
+                )
+            except RuntimeError as error:
+                # 로그인 문제(require_goedu_gws_session)는 guarded의 오류 응답이 아니라
+                # started=False + 사연으로 화면에 가야 배너를 띄울 수 있다.
+                return {"started": False, "reason": str(error)}
+            if not ok:
+                return {"started": False, "reason": reason}
+            att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
+                run_command=self._attendance_remote_run()
+            )
+
+            def _prepare():
+                # 예외로 조용히 죽으면 화면은 running=False + 사유 0글자만 본다.
+                # 성공이든 실패든 결과를 남겨 attendance_prepare_status가 보여준다.
+                try:
+                    status = asdict(
+                        engine.ensure_attendance(self._config_dir, deps=att_deps)
+                    )
+                    # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
+                    if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
+                        engine.save_attendance_status_cache(self._config_dir, status)
+                except Exception as error:  # noqa: BLE001 - 사람이 읽을 문장으로 바꾼다
+                    detail = str(error).strip() or engine.ATTENDANCE_ERROR_MESSAGES["setup"]
+                    status = asdict(engine.AttendanceStatus(
+                        state="failed", failed_service="setup",
+                        detail=detail[:engine.ATTENDANCE_DETAIL_LIMIT],
+                    ))
+                self._attendance_prepare_result = status
+
+            self._attendance_prepare_result = None
+            thread = threading.Thread(
+                target=_prepare, name="attendance-prepare", daemon=True
+            )
+            self._attendance_prepare_thread = thread
+            thread.start()
+            return {"started": True, "reason": ""}
+
+    @guarded
+    def attendance_prepare_status(self):
+        """뒤에서 도는 출결 준비의 진행 여부와 현재 출결 상태.
+
+        도는 동안에는 gws를 부르지 않는다 — 3초 폴마다 gws 3회 실행과 동봉본
+        SHA-256 해시가 쌓이기 때문. 로컬 진행 기록(attendance-setup-status)만 읽고,
+        끝난 뒤에는 준비 스레드가 남긴 결과를 그대로 보여준다.
+        """
+        thread = self._attendance_prepare_thread
+        if thread is not None and thread.is_alive():
+            setup = engine._read_setup_status(self._config_dir)
+            progress = setup.get("progress")
+            return {"running": True, "status": {
+                "state": "installing",
+                "progress": dict(progress) if isinstance(progress, dict) else {},
+            }}
+        result = self._attendance_prepare_result
+        if result is not None:
+            return {"running": False, "status": dict(result)}
+        # 이 창에서 준비를 돌린 적이 없을 때(재시작 등)만 실제 상태를 읽는다.
+        # 폴마다 부를 수 있는 네트워크 명령이므로 제한 시간 없는 self._run() 대신
+        # 자식 작업까지 제한 시간이 있는 감독 실행 경로를 쓴다(검토 C7).
+        self._require_safe_gws_account_storage()
+        status_value = engine.read_attendance_status(
+            self._config_dir, self._attendance_remote_run()
+        )
+        return {"running": False, "status": asdict(status_value)}
+
+    @guarded
+    def attendance_first_setup_status(self):
+        """시트의 [처음 설정 한 번에 끝내기] 완료 표시 — 마법사 출결 탭이 폴링한다."""
+        self._require_safe_gws_account_storage()
+        # 폴마다 부르는 네트워크 명령이므로 제한 시간 없는 self._run() 대신
+        # 자식 작업까지 제한 시간이 있는 감독 실행 경로를 쓴다.
+        run = self._attendance_remote_run()
+        if self._attendance_gws_cache is None:
+            # gws 경로 찾기(동봉본 검증 포함)는 폴마다가 아니라 한 번만(검토 C7).
+            self._attendance_gws_cache = str(engine.resolve_gws(run))
+        return engine.read_first_time_setup_done(
+            self._config_dir, run, self._attendance_gws_cache
+        )
+
     def _attendance_script_update(
         self,
         *,
@@ -537,9 +647,24 @@ class Api:
             )
 
             def script_runner(args, cwd):
-                return engine.attendance_remote_runner(
-                    args, cwd, environment=environment
-                )
+                try:
+                    return engine.attendance_remote_runner(
+                        args, cwd, environment=environment
+                    )
+                except subprocess.CalledProcessError as error:
+                    output = error.stderr or error.output or ""
+                    try:
+                        process_win.write_process_log(
+                            paths.logs_dir(self._config_dir),
+                            list(error.cmd)
+                            if isinstance(error.cmd, (list, tuple))
+                            else list(args),
+                            int(error.returncode),
+                            str(output),
+                        )
+                    except OSError:
+                        pass
+                    raise
         assets_dir = bundle_paths.bundle_root() / "assets"
         result = updater(
             record,
@@ -597,7 +722,7 @@ class Api:
         ):
             raise RuntimeError(
                 "기존 자료는 그대로 두었지만 출결 기능 확인 또는 업데이트가 먼저 필요해요. "
-                "출결 탭에서 [출결 기능 최신 상태 확인]을 눌러 주세요."
+                "출결 탭 위쪽의 한 줄 안내에 보이는 버튼을 눌러 주세요."
             )
 
     def _require_current_remote_attendance_script(
@@ -627,8 +752,8 @@ class Api:
         ):
             raise RuntimeError(
                 "현재 Google의 출결 기능을 안전하게 다시 확인하지 못해 "
-                "Chat 작업을 시작하지 않았어요. 출결 탭에서 "
-                "[출결 기능 최신 상태 확인]을 눌러 주세요."
+                "Chat 작업을 시작하지 않았어요. "
+                "출결 탭 위쪽의 한 줄 안내에 보이는 버튼을 눌러 주세요."
             )
 
     def _run_attendance_chat_action(self, action):
@@ -981,6 +1106,8 @@ class Api:
                 self._gws_update_offer = None
                 self._gws_update_offer_key = ""
                 self._gws_update_last_status["offer"] = None
+                # 실행 파일이 바뀌었을 수 있다 — 완료 확인 폴링의 gws 경로 캐시를 비운다.
+                self._attendance_gws_cache = None
             return result
         finally:
             self._gws_update_install_lock.release()
@@ -988,6 +1115,8 @@ class Api:
     @guarded
     def gws_login_start(self):
         run, gws = self._resolve_gws_or_fail()
+        # 로그인 시작 전에 gws가 남긴 반쪽 잔재를 먼저 치우고 다시 판정한다.
+        self._discard_broken_gws_config_client(self._gws_config_dir())
         base, config_dir, _bundled, selection = self._oauth_context()
         if not selection.ready:
             if selection.error_code == "OAUTH_CLIENT_CONFLICT":
@@ -1013,6 +1142,16 @@ class Api:
         )
         return self._login.snapshot()
 
+    def _discard_broken_gws_config_client(self, config_dir) -> None:
+        """gws가 로그인 실패로 남긴 반쪽짜리 client_secret.json만 치운다.
+        올바른 기존 로그인 준비 파일은 절대 건드리지 않는다."""
+        path = Path(config_dir) / gws_env.UPSTREAM_CLIENT_FILE_NAME
+        try:
+            if path.is_file() and not gws_env.is_valid_desktop_client_file(path):
+                path.unlink()
+        except OSError:
+            pass
+
     def _oauth_context(self):
         """화면 상태와 로그인 시작이 똑같은 OAuth 준비 판정을 함께 쓴다."""
         base = self._gws_base_environ()
@@ -1034,6 +1173,13 @@ class Api:
     @guarded
     def gws_login_cancel(self):
         return {"cancelled": self._login.cancel()}
+
+    @guarded
+    def gws_repair_oauth_client(self):
+        """사용자가 정리를 누르면 gws가 남긴 깨진 준비 파일만 치운다.
+        올바른 기존 준비 파일은 건드리지 않는다. 화면은 뒤이어 다시 점검한다."""
+        self._discard_broken_gws_config_client(self._gws_config_dir())
+        return {"cleared": True}
 
     def _resolve_gws_or_fail(self):
         self._require_safe_gws_account_storage()
