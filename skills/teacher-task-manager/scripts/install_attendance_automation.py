@@ -33,8 +33,19 @@ _PENDING_FOLDER_INTENT = "pending_folder_intent"
 _PENDING_TASK_TITLE = "pending_task_list_title"
 _PENDING_SCRIPT_TITLE = "pending_script_project_title"
 _PENDING_SCRIPT_VERSION_DESCRIPTION = "pending_script_version_description"
-_SCRIPT_TITLE_PREFIX = "출결 신고서 자동화 [설치표식 "
+# Apps Script 제목은 시트 승인 창(동의 화면)에 앱 이름으로 그대로 뜬다.
+# Google 검수(2026-08-11)에 맞춰 마법사·Chat 연결 동의 화면과 같은 이름으로 시작한다.
+_SCRIPT_TITLE_PREFIX = "Big-Silver Teacher Manager 출결 자동화 [설치표식 "
+# 이 접두로 만들던 시절에 끊긴 설치 기록을 이어받을 때만 쓴다.
+_LEGACY_SCRIPT_TITLE_PREFIXES = ("출결 신고서 자동화 [설치표식 ",)
 _VERSION_DESCRIPTION_PREFIX = "teacher-manager-attendance-version-"
+
+
+def _pending_script_title_suffix(title: str) -> str:
+    for prefix in (_SCRIPT_TITLE_PREFIX, *_LEGACY_SCRIPT_TITLE_PREFIXES):
+        if title.startswith(prefix) and title.endswith("]"):
+            return title[len(prefix):-1]
+    return ""
 
 
 class DeploymentRecoveryPendingError(RuntimeError):
@@ -1520,14 +1531,11 @@ def install_attendance_automation(
         if not created_ids.get("script_id"):
             pending_title = str(created_ids.get(_PENDING_SCRIPT_TITLE, "") or "")
             if pending_title:
-                if not (
-                    pending_title.startswith(_SCRIPT_TITLE_PREFIX)
-                    and pending_title.endswith("]")
-                ):
+                suffix = _pending_script_title_suffix(pending_title)
+                if not suffix:
                     raise CreationRecoveryPendingError(
                         "앞선 Apps Script 프로젝트 만들기 기록을 안전하게 확인할 수 없어요."
                     )
-                suffix = pending_title[len(_SCRIPT_TITLE_PREFIX):-1]
                 _intent_token(suffix, "", "Apps Script 프로젝트")
                 script_id = _recover_script_project(
                     runner,
