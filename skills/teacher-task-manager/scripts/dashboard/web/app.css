@@ -145,6 +145,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
   color:var(--tm-sub); background:var(--tm-surface); font-size:13px; line-height:1.6; }
 .chat-boundary b { color:var(--tm-ink); }
 .student-links { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:18px; }
+/* 색은 달라도 세 버튼(가입 안내·Chat 열기·나중에 설정)의 크기는 같게 */
+.student-links > button { padding:12px 24px; font-size:15px; border-radius:11px; }
 
 /* 내 정보 — 담임 학년·반 고정 행 */
 .homeroom-cell { align-items:center; }
@@ -206,7 +208,9 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
   color:var(--tm-faint); border-radius:7px; }
 .field-eye:hover { color:var(--tm-ink); background:var(--tm-fill); }
 .foot { display:flex; align-items:center; margin-top:28px; }
-.foot .btn { margin-left:auto; }
+.foot .btn, .foot .btn-quiet { margin-left:auto; }
+/* 8단계: 건너뛰기(조용한 버튼)도 본문 두 버튼과 같은 크기로 */
+.foot .btn-quiet { padding:12px 24px; font-size:15px; }
 
 /* 입력 */
 .field { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
