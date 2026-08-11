@@ -370,7 +370,9 @@ function wizardFootHtml() {
   const nextLocked = (S.step === 2 && !isGoeduGoogleStatus(S.google))
     || (S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
   const disabled = nextLocked ? " disabled" : "";
-  const next = nextLabel ? `<button class="btn" data-action="go-next" data-busy-text="확인 중…"${disabled}>${nextLabel}</button>` : "";
+  // 8단계의 핵심은 학생 가입·Chat 초대다 — 건너뛰기(다음)가 제일 눈에 띄면 안 된다.
+  const nextClass = S.step === 8 ? "btn-quiet" : "btn";
+  const next = nextLabel ? `<button class="${nextClass}" data-action="go-next" data-busy-text="확인 중…"${disabled}>${nextLabel}</button>` : "";
   return `<div class="foot">${back}${next}</div>`;
 }
 
@@ -1513,7 +1515,7 @@ function firstSetupCardHtml(a) {
     : "";
   return `<div class="first-setup-card">
     <div class="first-setup-head"><b>마지막 한 번 — 시트에서 처음 설정을 끝내 주세요</b>${status}</div>
-    <p>방금 만든 출결 시트를 열고, 위 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 눌러 주세요. 끝나면 이 화면이 저절로 완료로 바뀝니다.</p>
+    <p>방금 만든 출결 시트를 열고, 위 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 눌러 주세요. 처음 실행하면 Google 계정 선택과 권한 허용 창이 먼저 뜨고, 준비에 몇 분 정도 걸릴 수 있어요. 끝나면 시트에 결과를 정리한 안내 창이 뜨는데, [확인]을 누르고 잠시 기다리면 이 칸이 완료로 바뀝니다.</p>
     <div class="first-setup-acts">${open}</div>
   </div>`;
 }
@@ -2368,8 +2370,8 @@ function stepStudentAccounts() {
     </div>
     <div class="chat-boundary"><b>Teacher Manager가 하는 일:</b> 선생님이 고른 기존 학급 공간으로 안내를 보냅니다. 학생을 자동 가입시키거나, 초대하거나, 기존 방을 삭제하지 않습니다.<br><b>자료 보호:</b> 학생에게 출결 Google Sheet를 공유하거나 편집 권한을 주지 마세요. 학생은 Google Chat 학급 단체톡방에만 초대합니다.</div>
     <div class="student-links">
-      <button class="btn-quiet" data-action="link-open" data-url="https://www.goedu.kr/bbs/2/view/55">학생 가입 안내</button>
-      <button class="btn-tonal" data-action="link-open" data-url="https://chat.google.com/">Google Chat 열기</button>
+      <button class="btn-tonal" data-action="link-open" data-url="https://www.goedu.kr/bbs/2/view/55">학생 가입 안내</button>
+      <button class="btn" data-action="link-open" data-url="https://chat.google.com/">Google Chat 열기</button>
     </div>`;
 }
 stepBodies[8] = stepStudentAccounts;

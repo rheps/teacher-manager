@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
-from brity_bridge.oauth_client import OAuthClientFormatError, parse_desktop_oauth_bytes
+from brity_bridge.oauth_client import (
+    OAuthClientFormatError,
+    parse_desktop_oauth_bytes,
+    parse_gws_login_echo_bytes,
+)
 
 
 CLIENT_FILE_NAME = "gws-oauth-client.json"
@@ -251,6 +255,29 @@ def is_valid_desktop_client_file(path: Path) -> bool:
     return _read_desktop_client(Path(path)) is not None
 
 
+def _read_login_echo_client(path: Path) -> tuple[str, str] | None:
+    """gws auth login이 받아 적은 파일(빈 project_id 허용)에서 client 한 쌍을 읽는다."""
+    try:
+        client = parse_gws_login_echo_bytes(Path(path).read_bytes())
+    except (OSError, OAuthClientFormatError):
+        return None
+    return client.client_id, client.client_secret
+
+
+def is_gws_login_echo_of_client(path: Path, reference_path: Path | None) -> bool:
+    """파일이 기준 client(보통 Release 동봉본)와 같은 값을 받아 적은 것인지 판정한다.
+
+    값은 내보내지 않는다. 기준이 없거나 읽히지 않으면 False다.
+    """
+    if reference_path is None:
+        return False
+    reference = _read_desktop_client(Path(reference_path))
+    if reference is None:
+        return False
+    echo = _read_login_echo_client(Path(path))
+    return echo is not None and echo == reference
+
+
 def _selection(
     ready: bool,
     source: Literal[
@@ -298,6 +325,12 @@ def select_desktop_oauth_client(
     bundled_values = _read_desktop_client(bundled_path) if bundled_exists else None
 
     if config_exists and config_values is None:
+        # gws auth login은 건네받은 client를 자기 폴더에 받아 적으면서 project_id를
+        # 빈칸으로 남긴다. 동봉 client와 같은 값이면 고장이 아니라 직전 로그인의
+        # 흔적이므로 파일을 건드리지 않고 동봉 경로로 이어 간다.
+        echo = _read_login_echo_client(config_path)
+        if echo is not None and bundled_values is not None and echo == bundled_values:
+            return _selection(True, "bundled_client", values=bundled_values)
         # 조용히 설치판으로 넘어가지 않는다. web client·손상 파일은 사용자가
         # 의도했을 수 있어, 막고 알린 뒤 사용자가 정리를 누를 때만 치운다.
         return _selection(False, "invalid", error_code="OAUTH_CONFIG_CLIENT_INVALID")

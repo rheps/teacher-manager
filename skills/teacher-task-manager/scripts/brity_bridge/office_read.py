@@ -9,6 +9,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from brity_bridge import process_win
+
 OFFICE_REQUIRED_MESSAGE = "이 첨부파일을 읽으려면 Microsoft Office가 필요해요."
 BROKEN_MESSAGE = "첨부파일을 읽을 수 없어요. 파일의 암호나 상태를 확인해 주세요."
 
@@ -152,7 +154,7 @@ def _default_runner(script: str, timeout: float) -> tuple[int, str]:
         errors="replace",
         timeout=timeout,
         check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **process_win.hidden_process_kwargs(),
     )
     # 디코드 실패로 리더 스레드가 죽으면 stdout이 None일 수 있다.
     return completed.returncode, completed.stdout or ""

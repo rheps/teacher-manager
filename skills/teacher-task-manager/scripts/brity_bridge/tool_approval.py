@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Literal, Mapping
 from urllib.parse import urlparse
 
-from brity_bridge import component_lock
+from brity_bridge import component_lock, process_win
 from brity_bridge.tool_manifest import (
     BundledGwsSpec,
     ManagedNodeSpec,
@@ -317,6 +317,7 @@ def _verify_windows_authenticode(path: Path) -> AuthenticodeEvidence:
             env=environment,
             timeout=30,
             check=False,
+            **process_win.hidden_process_kwargs(),
         )
         if result.returncode != 0 or result.stderr.strip():
             _fail(f"WebView2 Authenticode 실제 확인이 실패했습니다: {result.stderr.strip()}")
@@ -356,6 +357,7 @@ def _read_windows_file_version(path: Path) -> str:
             env=environment,
             timeout=30,
             check=False,
+            **process_win.hidden_process_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         _fail(f"WebView2 Bootstrapper 실제 파일 버전을 읽지 못했습니다: {error}")

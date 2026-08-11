@@ -1144,25 +1144,32 @@ class Api:
 
     def _discard_broken_gws_config_client(self, config_dir) -> None:
         """gws가 로그인 실패로 남긴 반쪽짜리 client_secret.json만 치운다.
-        올바른 기존 로그인 준비 파일은 절대 건드리지 않는다."""
+        올바른 기존 로그인 준비 파일과, gws auth login이 동봉 client를
+        받아 적은 파일(빈 project_id)은 절대 건드리지 않는다."""
         path = Path(config_dir) / gws_env.UPSTREAM_CLIENT_FILE_NAME
         try:
-            if path.is_file() and not gws_env.is_valid_desktop_client_file(path):
-                path.unlink()
+            if not path.is_file() or gws_env.is_valid_desktop_client_file(path):
+                return
+            if gws_env.is_gws_login_echo_of_client(path, self._bundled_client_path()):
+                return
+            path.unlink()
         except OSError:
             pass
+
+    def _bundled_client_path(self):
+        """Release 동봉 OAuth client 파일 위치. 없으면 None."""
+        if self._deps.bundled_oauth_client_path is False:
+            return None
+        if self._deps.bundled_oauth_client_path is not None:
+            return Path(self._deps.bundled_oauth_client_path)
+        candidate = bundle_paths.bundle_root() / "assets" / gws_env.CLIENT_FILE_NAME
+        return candidate if candidate.is_file() else None
 
     def _oauth_context(self):
         """화면 상태와 로그인 시작이 똑같은 OAuth 준비 판정을 함께 쓴다."""
         base = self._gws_base_environ()
         config_dir = self._gws_config_dir(base)
-        if self._deps.bundled_oauth_client_path is False:
-            bundled = None
-        elif self._deps.bundled_oauth_client_path is not None:
-            bundled = Path(self._deps.bundled_oauth_client_path)
-        else:
-            candidate = bundle_paths.bundle_root() / "assets" / gws_env.CLIENT_FILE_NAME
-            bundled = candidate if candidate.is_file() else None
+        bundled = self._bundled_client_path()
         selection = gws_env.select_desktop_oauth_client(base, config_dir, bundled)
         return base, config_dir, bundled, selection
 

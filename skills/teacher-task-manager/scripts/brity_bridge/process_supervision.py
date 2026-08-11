@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+try:
+    from brity_bridge import process_win
+except ImportError:  # 개발 중에는 이 파일이 작업자 스크립트로 직접 실행된다
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from brity_bridge import process_win
+
 
 WORKER_SWITCH = "--ai-process-worker"
 TREE_NOT_STOPPED = 125
@@ -198,14 +204,14 @@ def _run_windows(
     job = None
     deadline = time.monotonic() + max(0.01, float(timeout))
     try:
-        worker = subprocess.Popen(
+        worker = process_win.popen_hidden(
             _worker_command(arguments),
+            popen=subprocess.Popen,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=str(cwd) if cwd is not None else None,
             env=dict(env) if env is not None else None,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         job = _WindowsJob()
         if not job.assign(worker):
@@ -312,10 +318,13 @@ def worker_main(argv: Sequence[str]) -> int:
     if gate != b"1":
         return TREE_NOT_STOPPED
     try:
+        # 작업자는 콘솔이 없는 TeacherManager.exe로 뜬다. 창 숨김을 넘기지 않으면
+        # Windows가 콘솔 프로그램인 gws.exe에 새 검은 창을 만들어 사용자에게 보여 준다.
         completed = subprocess.run(
             arguments,
             capture_output=True,
             check=False,
+            **process_win.hidden_process_kwargs(),
         )
     except OSError as error:
         _write_worker_output(str(error).encode("utf-8", errors="replace"))

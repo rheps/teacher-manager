@@ -87,6 +87,21 @@ def _safe_text(value, label: str) -> str:
 
 def parse_desktop_oauth_bytes(raw: bytes) -> DesktopOAuthClient:
     """비밀값을 오류에 넣지 않고 desktop client bytes를 엄격히 판정한다."""
+    return _parse_desktop_bytes(raw, allow_empty_project_id=False)
+
+
+def parse_gws_login_echo_bytes(raw: bytes) -> DesktopOAuthClient:
+    """``gws auth login``이 자기 폴더에 받아 적은 client bytes를 판정한다.
+
+    gws는 로그인 때 건네받은 client를 ``client_secret.json``으로 저장하면서
+    자신이 모르는 project_id를 빈 문자열로 적는다. 정확히 그 한 가지(빈
+    project_id)만 추가로 허용하며 나머지 검사는
+    :func:`parse_desktop_oauth_bytes`와 같다.
+    """
+    return _parse_desktop_bytes(raw, allow_empty_project_id=True)
+
+
+def _parse_desktop_bytes(raw: bytes, *, allow_empty_project_id: bool) -> DesktopOAuthClient:
     if not isinstance(raw, bytes) or not raw or len(raw) > MAX_OAUTH_BYTES:
         _fail("OAUTH_FILE_TOO_LARGE", "OAuth 입력은 1바이트 이상 64KiB 이하여야 합니다.")
     try:
@@ -111,11 +126,14 @@ def parse_desktop_oauth_bytes(raw: bytes) -> DesktopOAuthClient:
         _fail("OAUTH_SHAPE_INVALID", "OAuth installed 항목의 이름이 승인한 데스크톱 형식과 다릅니다.")
     client_id = _safe_text(installed["client_id"], "client_id")
     client_secret = _safe_text(installed["client_secret"], "client_secret")
-    project_id = _safe_text(installed["project_id"], "project_id")
+    if allow_empty_project_id and installed["project_id"] == "":
+        project_id = ""
+    else:
+        project_id = _safe_text(installed["project_id"], "project_id")
     auth_uri = _safe_text(installed["auth_uri"], "auth_uri")
     token_uri = _safe_text(installed["token_uri"], "token_uri")
     redirects = installed["redirect_uris"]
-    if not _CLIENT_ID.fullmatch(client_id) or not _PROJECT.fullmatch(project_id):
+    if not _CLIENT_ID.fullmatch(client_id) or (project_id and not _PROJECT.fullmatch(project_id)):
         _fail("OAUTH_VALUE_INVALID", "OAuth 앱 이름 또는 프로젝트 이름이 공식 데스크톱 형식과 다릅니다.")
     if auth_uri != "https://accounts.google.com/o/oauth2/auth" or token_uri != "https://oauth2.googleapis.com/token":
         _fail("OAUTH_VALUE_INVALID", "Google 인증 주소가 공식 고정 주소와 다릅니다.")
