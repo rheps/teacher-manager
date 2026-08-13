@@ -252,6 +252,14 @@ def build_config_rows(
             "AI 출결 입력이 쓰는 Gemini API 키입니다. 티처 매니저 연결 화면에 넣은 값이 자동으로 들어옵니다.",
             "자동 입력",
         ],
+        # Code.gs의 ATTENDANCE_AI_ALLOWED_SETTING/VALUE와 이름·값이 같아야 한다.
+        # 이 값이 있어야 새로 만든 시트에서 1행 AI 입력을 켤 수 있다(사본 이름 규칙의 예외).
+        [
+            "ATTENDANCE_AI_ALLOWED",
+            "예",
+            "이 시트에서 1행 AI 출결 입력을 켤 수 있는지입니다. 티처 매니저가 시트를 만들 때 자동으로 넣습니다.",
+            "자동 입력",
+        ],
     ]
 
 

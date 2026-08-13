@@ -70,6 +70,11 @@ const ATTENDANCE_AI_GEMINI_API_KEY_SETTING = 'GEMINI_API_KEY';
 // 출결 준비 프로그램이 만드는 사본 이름 조각이다.
 // prepare_attendance_copy.py의 copy_name과 항상 같아야 한다 — 테스트가 대조 검사함.
 const ATTENDANCE_AI_COPY_NAME_MARKER = ' - AI 입력 준비 사본 (';
+// 티처 매니저가 시트를 새로 만들 때 설정 탭에 적는 값이다. '예'면 이 시트에서 1행 AI 입력을 켤 수 있다.
+// 예전 판이 만든 원본 시트에는 이 값이 없으므로, 원본 보호(사본에서만 켜기)는 그대로 유지된다.
+// install_attendance_automation.build_config_rows와 이름·값이 같아야 한다.
+const ATTENDANCE_AI_ALLOWED_SETTING = 'ATTENDANCE_AI_ALLOWED';
+const ATTENDANCE_AI_ALLOWED_VALUE = '예';
 const ATTENDANCE_AI_EDIT_TRIGGER_HANDLER = 'onAttendanceAiEdit';
 const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 켜기';
 
@@ -674,6 +679,17 @@ function buildAttendanceAiGeminiRequest_(sentence, context) {
         category: ATTENDANCE_AI_CATEGORIES.slice(),
         kind: ATTENDANCE_AI_KINDS.slice(),
         period: ATTENDANCE_AI_PERIODS.slice()
+      },
+      reason_format: {
+        rule: (
+          'reason에는 출결의 원인이나 목적만 짧은 명사형으로 적고, ' +
+          '행동·서술어·문장 끝맺음은 넣지 마세요.'
+        ),
+        examples: [
+          { input: '체험학습 갔어', reason: '체험학습' },
+          { input: '감기로 쉬었어', reason: '감기' },
+          { input: '대회에 참가했어', reason: '대회 참가' }
+        ]
       }
     }),
     store: false,
@@ -730,6 +746,22 @@ function extractAttendanceAiGeminiPayload_(interactionResponse) {
   } catch (err) {
     return null;
   }
+}
+
+function normalizeAttendanceAiReason_(value) {
+  let reason = String(value === null || value === undefined ? '' : value).trim();
+  reason = reason.replace(/[.!?。！？]+$/g, '').trim();
+  const predicateEndings = [
+    /(?:\s*(?:을|를|에|으로|로))?\s*갔(?:어(?:요)?|습니다|다|음)$/,
+    /\s*다녀왔(?:어(?:요)?|습니다|다|음)$/,
+    /\s*했(?:어(?:요)?|습니다|다|음)$/,
+    /(?:\s*(?:때문에|으로|로))?\s*쉬었(?:어(?:요)?|습니다|다|음)$/
+  ];
+  for (let index = 0; index < predicateEndings.length; index++) {
+    const shortened = reason.replace(predicateEndings[index], '').trim();
+    if (shortened !== reason) return shortened;
+  }
+  return reason;
 }
 
 function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
@@ -828,7 +860,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
 
     const dateText = record.date;
     const studentText = record.student.trim();
-    const reason = record.reason.trim();
+    const reason = normalizeAttendanceAiReason_(record.reason);
     if (!studentText || !reason) {
       return null;
     }
@@ -1007,8 +1039,20 @@ function resetAttendanceAiInputRow_(sheet) {
     .setFontColor(MONTHLY_ATTENDANCE_AI_INPUT_HINT_COLOR);
 }
 
+// 조용히 건너뛴 이유를 실행 기록에 남긴다. 1행 입력 편집에서만 부르므로 잡음이 없다.
+// Apps Script에서는 실행 기록의 로그로, Node 시험에서는 stderr로 가서 결과 JSON을 더럽히지 않는다.
+function attendanceAiSkipLog_(reason) {
+  try {
+    if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error('AI 출결 입력 건너뜀 — ' + reason);
+    }
+  } catch (err) { /* 기록 실패는 동작에 영향 주지 않는다 */ }
+}
+
 function handleAttendanceAiEdit(e, testPorts) {
-  requireGoeduTeacherAccount_({ event: e, allowEffectiveUser: false });
+  // 설치형 감지기는 실제 편집자 주소가 숨겨질 수 있다. 주소가 보이면 Gmail 편집을
+  // 막고, 주소가 안 보여도 감지기를 만든 계정은 반드시 @goedu.kr인지 따로 확인한다.
+  requireGoeduTeacherAccount_({ event: e, requireEffectiveUser: true });
   if (
     !e
     || !e.source
@@ -1021,8 +1065,14 @@ function handleAttendanceAiEdit(e, testPorts) {
     || typeof e.range.getNumColumns !== 'function'
     || e.range.getRow() !== MONTHLY_ATTENDANCE_INPUT_ROW
     || e.range.getNumRows() !== 1
-    || !isAttendanceAiInputRange_(e.range.getColumn(), e.range.getNumColumns())
   ) {
+    // 1행이 아닌 보통 편집은 전부 여기로 온다 — 기록을 남기면 잡음이라 남기지 않는다.
+    return { status: 'ignored' };
+  }
+  if (!isAttendanceAiInputRange_(e.range.getColumn(), e.range.getNumColumns())) {
+    attendanceAiSkipLog_(
+      '1행이지만 입력칸 밖 편집(열 ' + e.range.getColumn() + ', 폭 ' + e.range.getNumColumns() + ')'
+    );
     return { status: 'ignored' };
   }
 
@@ -1038,7 +1088,10 @@ function handleAttendanceAiEdit(e, testPorts) {
       sentence = '';
     }
   }
-  if (!sentence.trim()) return { status: 'ignored' };
+  if (!sentence.trim()) {
+    attendanceAiSkipLog_('입력칸이 비어 있음(지우기 또는 빈 편집)');
+    return { status: 'ignored' };
+  }
 
   const sheet = e.range.getSheet();
   if (!sheet || typeof sheet.getName !== 'function') return { status: 'ignored' };
@@ -1094,10 +1147,21 @@ function handleAttendanceAiEdit(e, testPorts) {
     targetSpreadsheetId = String(ports.getTargetSpreadsheetId() || '').trim();
     apiKey = String(ports.getGeminiApiKey() || '').trim();
   } catch (err) {
+    attendanceAiSkipLog_('대상 시트/키를 읽지 못함: ' + (err && err.message ? err.message : err));
     return { status: 'check_required' };
   }
-  if (!targetSpreadsheetId || !apiKey) return { status: 'disabled' };
-  if (String(source.getId()) !== targetSpreadsheetId) return { status: 'ignored' };
+  if (!targetSpreadsheetId || !apiKey) {
+    attendanceAiSkipLog_(
+      !targetSpreadsheetId
+        ? 'AI 입력이 켜진 기록(대상 시트 번호)이 없음 — 처음 설정을 다시 실행 필요'
+        : 'Gemini API 키를 설정 탭에서 찾지 못함'
+    );
+    return { status: 'disabled' };
+  }
+  if (String(source.getId()) !== targetSpreadsheetId) {
+    attendanceAiSkipLog_('이 시트가 AI 입력 대상으로 기록된 시트와 다름');
+    return { status: 'ignored' };
+  }
 
   let sheetContext = testPorts && testPorts.context ? testPorts.context : null;
   if (!sheetContext) {
@@ -1115,7 +1179,10 @@ function handleAttendanceAiEdit(e, testPorts) {
         .map(name => name.trim())
         .filter(Boolean);
       const monthMatch = /^(\d{1,2})월$/.exec(sheet.getName());
-      if (!monthMatch) return { status: 'ignored' };
+      if (!monthMatch) {
+        attendanceAiSkipLog_('월 시트가 아님(시트 이름: ' + sheet.getName() + ')');
+        return { status: 'ignored' };
+      }
       sheetContext = {
         schoolYear: String(config.SCHOOL_YEAR || '').trim(),
         month: Number(monthMatch[1]),
@@ -1123,6 +1190,7 @@ function handleAttendanceAiEdit(e, testPorts) {
         rosterSheetName: String(config.ROSTER_SHEET_NAME || '학생명단').trim()
       };
     } catch (err) {
+      attendanceAiSkipLog_('설정 탭을 읽지 못함: ' + (err && err.message ? err.message : err));
       return { status: 'ignored' };
     }
   }
@@ -1134,11 +1202,15 @@ function handleAttendanceAiEdit(e, testPorts) {
     || sheetContext.configuredMonthNames.indexOf(monthName) < 0
     || monthName !== String(Number(sheetContext.month)) + '월'
   ) {
+    attendanceAiSkipLog_('시트 이름이 설정의 월 목록과 맞지 않음(시트: ' + monthName + ')');
     return { status: 'ignored' };
   }
   if (
     getAttendanceAiCalendarYear_(sheetContext.schoolYear, sheetContext.month) === null
   ) {
+    attendanceAiSkipLog_(
+      '설정 탭 SCHOOL_YEAR가 4자리 연도가 아님(지금 값: "' + sheetContext.schoolYear + '") — 설정 탭에서 2026처럼 고치면 됨'
+    );
     return { status: 'check_required' };
   }
   const expectedHeaders = INPUT_HEADERS.concat(MONTHLY_CHAT_RESULT_HEADERS);
@@ -1148,15 +1220,26 @@ function handleAttendanceAiEdit(e, testPorts) {
     && values.every((value, index) => value === expectedHeaders[index])
   );
   try {
-    if (!headersMatch(ports.readHeaderRow(sheet))) return { status: 'ignored' };
+    const actualHeaders = ports.readHeaderRow(sheet);
+    if (!headersMatch(actualHeaders)) {
+      attendanceAiSkipLog_(
+        '2행 제목 줄이 기대와 다름. 실제: ' + JSON.stringify(actualHeaders) +
+        ' / 기대: ' + JSON.stringify(expectedHeaders)
+      );
+      return { status: 'ignored' };
+    }
   } catch (err) {
+    attendanceAiSkipLog_('2행 제목 줄을 읽지 못함: ' + (err && err.message ? err.message : err));
     return { status: 'ignored' };
   }
 
   let lock = null;
   try {
     lock = ports.tryDocumentLock();
-    if (!lock) return { status: 'busy' };
+    if (!lock) {
+      attendanceAiSkipLog_('다른 처리가 도는 중(자물쇠 잡기 실패) — 잠시 뒤 다시 입력');
+      return { status: 'busy' };
+    }
     const requestContext = {
       schoolYear: sheetContext.schoolYear,
       month: sheetContext.month,
@@ -1167,7 +1250,12 @@ function handleAttendanceAiEdit(e, testPorts) {
     const payload = extractAttendanceAiGeminiPayload_(interaction);
     const rosterRows = ports.readRosterRows(source, sheetContext);
     const records = validateAttendanceAiRecords_(payload, rosterRows, requestContext);
-    if (!records) return { status: 'check_required' };
+    if (!records) {
+      attendanceAiSkipLog_(
+        '문장을 출결로 확정하지 못함 — 학생 이름이 학생명단과 정확히 일치하는지, 날짜의 달이 이 시트의 달과 같은지 확인'
+      );
+      return { status: 'check_required' };
+    }
 
     const writeState = ports.readWriteState(sheet);
     if (
@@ -1202,6 +1290,8 @@ function handleAttendanceAiEdit(e, testPorts) {
       startRow: Math.max(MONTHLY_ATTENDANCE_HEADER_ROW, writeState.lastDataRow) + 1
     };
   } catch (err) {
+    // Gemini HTTP 오류(키 불량 등)와 기록 단계 오류가 전부 여기로 온다 — 이유를 남긴다.
+    attendanceAiSkipLog_('처리 중 오류: ' + (err && err.message ? err.message : err));
     return { status: 'check_required' };
   } finally {
     if (lock && typeof lock.releaseLock === 'function') {
@@ -1279,6 +1369,11 @@ function attendanceAiWorkbookState_() {
     alreadyEnabledHere = '';
   }
   if (alreadyEnabledHere === spreadsheetId) {
+    return { ok: true, spreadsheetId: spreadsheetId, message: '' };
+  }
+  // 티처 매니저가 새로 만든 시트는 사본이 아니어도 켤 수 있다(2026-08-13 수정).
+  // 이 값이 없던 2.2까지의 새 설치 시트는 감지기가 영영 안 만들어져 1행 입력이 조용히 죽어 있었다.
+  if (readConfigValueReadOnly_(ATTENDANCE_AI_ALLOWED_SETTING) === ATTENDANCE_AI_ALLOWED_VALUE) {
     return { ok: true, spreadsheetId: spreadsheetId, message: '' };
   }
   if (name.indexOf(ATTENDANCE_AI_COPY_NAME_MARKER) < 0) {
@@ -2239,6 +2334,21 @@ function requireGoeduTeacherAccount_(options) {
       '이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 ' +
       '클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 다시 로그인해 주세요.'
     );
+  }
+  if (opts.requireEffectiveUser === true) {
+    let effectiveEmail = '';
+    try {
+      effectiveEmail = String(Session.getEffectiveUser().getEmail() || '').trim();
+    } catch (ignored) {
+      effectiveEmail = '';
+    }
+    if (!isExactGoeduEmail_(effectiveEmail)) {
+      throw new Error(
+        '이 감지기를 만든 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 ' +
+        '클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 AI 출결 입력을 다시 켜 주세요.'
+      );
+    }
+    return effectiveEmail;
   }
   return email;
 }
