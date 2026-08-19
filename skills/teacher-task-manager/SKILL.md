@@ -495,7 +495,7 @@ $installDir = (Get-ItemProperty -LiteralPath "HKCU:\Software\BigSilverEduLab\Tea
 - 기본 첨부파일 다운로드 폴더는 `C:\BrityWorks\BrityMessenger\download`이며 설정 화면에서 바꿀 수 있다.
 - 지원 첨부파일은 HWP/HWPX, PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, TXT/CSV, JPG/JPEG/PNG다. 구형 DOC/XLS/PPT는 Microsoft Office가 있어야 안정적으로 읽는다.
 - 메시지 본문과 읽어낸 첨부 내용은 Gemini로 전송된다. 사진과 스캔 PDF는 파일 화면도 함께 전송된다.
-- 단축키를 누른 뒤 다른 프로그램을 앞으로 띄우는 것은 괜찮다. 처리 알림이 뜰 때까지 브리티를 닫거나 최소화하거나 다른 대화방으로 바꾸지만 않는다.
+- 단축키를 누른 뒤 `메시지를 받아두었어요` 안내가 뜰 때까지만 현재 대화방을 그대로 둔다. 이 안내가 뜨면 다음 대화방으로 옮겨 단축키를 다시 눌러도 된다. 처리 중인 것까지 합쳐 최대 10건을 맡겨둘 수 있고, 도우미는 Google 등록을 안전하게 한 건씩 순서대로 끝낸다. 안내가 뜨기 전에도 다른 프로그램을 앞으로 띄우는 것은 괜찮지만, 브리티를 닫거나 최소화하거나 다른 대화방으로 바꾸지는 않는다.
 - 화면을 읽지 못하면 오른쪽 아래 알림으로 실패 이유와 다시 누르는 방법을 안내한다. 복사 방식으로 돌아가지 않는다.
 - 단축키가 다른 프로그램과 겹치면 설정 화면에서 원하는 조합을 직접 눌러 바꾼다.
 - 설정과 본문 없는 기록은 설정 폴더의 `brity-bridge` 아래에 있다: `settings.json`, `history.json`, `logs`. Gemini API key는 settings.json에만 저장하고 남과 공유하지 않는다. 입력이 제품 개선에 쓰일 수 있으므로 학생 개인정보가 담긴 메시지는 등록하지 않는다.

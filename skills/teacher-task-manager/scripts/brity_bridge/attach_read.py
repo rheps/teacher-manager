@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ SUPPORTED_SUFFIXES = {
 }
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024  # PDF와 같은 상한 — zip은 압축 해제 크기 기준
 _ZIP_SUFFIXES = {".hwpx", ".docx", ".xlsx", ".pptx"}
+_COPY_SUFFIX_RE = re.compile(r"\s+\(\d+\)$")
+_ELLIPSIS_RE = re.compile(r"(?:…|\.\.+)+$")
 
 
 def _zip_inflated_size(path: Path) -> int:
@@ -36,6 +40,16 @@ def _too_large(path: Path, suffix: str) -> bool:
     if path.stat().st_size > MAX_ATTACHMENT_BYTES:
         return True
     return suffix in _ZIP_SUFFIXES and _zip_inflated_size(path) > MAX_ATTACHMENT_BYTES
+
+
+@dataclass(frozen=True)
+class _AttachmentNameParts:
+    literal: str
+    compact: str
+    copy_literal: str
+    copy_compact: str
+    suffix: str
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -64,24 +78,80 @@ class AttachmentBlocked(Exception):
         self.message = message
 
 
+def _name_parts(value: str) -> _AttachmentNameParts:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    truncated = bool(_ELLIPSIS_RE.search(normalized))
+    normalized = _ELLIPSIS_RE.sub("", normalized).rstrip()
+    suffix = Path(normalized).suffix
+    if suffix not in SUPPORTED_SUFFIXES:
+        suffix = ""
+    base = normalized[:-len(suffix)] if suffix else normalized
+    truncated = truncated or bool(_ELLIPSIS_RE.search(base))
+    base = _ELLIPSIS_RE.sub("", base).strip()
+    literal = " ".join(base.split())
+    copy_literal = _COPY_SUFFIX_RE.sub("", literal).strip()
+    return _AttachmentNameParts(
+        literal=literal,
+        compact=re.sub(r"\s+", "", literal),
+        copy_literal=copy_literal,
+        copy_compact=re.sub(r"\s+", "", copy_literal),
+        suffix=suffix,
+        truncated=truncated,
+    )
+
+
 def find_attachment_file(download_dir: Path, screen_name: str) -> Path | None:
-    prefix = screen_name.strip().rstrip("…").strip()
-    if not prefix:
+    screen = _name_parts(screen_name)
+    if not screen.literal:
         return None
     try:
         children = [c for c in Path(download_dir).iterdir() if c.is_file()]
     except OSError:
         return None
-    best: Path | None = None
-    best_mtime = -1.0
+    matches: list[tuple[int, float, Path, _AttachmentNameParts]] = []
     for child in children:
-        # 화면 이름은 잘릴 수 있고(전방일치), 짧은 이름은 확장자까지 보일 수 있다(역방향).
-        if not (child.stem.startswith(prefix) or prefix.startswith(child.stem)):
+        candidate = _name_parts(child.name)
+        if screen.suffix and candidate.suffix != screen.suffix:
             continue
+
+        if candidate.literal == screen.literal:
+            match_rank = 0
+        elif candidate.copy_literal == screen.literal:
+            match_rank = 1
+        elif candidate.compact == screen.compact:
+            match_rank = 2
+        elif candidate.copy_compact == screen.compact:
+            match_rank = 3
+        elif (not screen.suffix or screen.truncated) and (
+            candidate.literal.startswith(screen.literal)
+            or candidate.copy_literal.startswith(screen.literal)
+        ):
+            match_rank = 4
+        elif (not screen.suffix or screen.truncated) and (
+            candidate.compact.startswith(screen.compact)
+            or candidate.copy_compact.startswith(screen.compact)
+        ):
+            match_rank = 5
+        else:
+            continue
+
         mtime = child.stat().st_mtime
-        if mtime > best_mtime:
-            best, best_mtime = child, mtime
-    return best
+        matches.append((match_rank, mtime, child, candidate))
+
+    if not matches:
+        return None
+    best_match_rank = min(item[0] for item in matches)
+    best_matches = [item for item in matches if item[0] == best_match_rank]
+    if len(best_matches) == 1:
+        return best_matches[0][2]
+
+    canonical_names = {
+        (candidate.copy_literal, candidate.suffix)
+        for _rank, _mtime, _path, candidate in best_matches
+    }
+    if len(canonical_names) != 1:
+        return None
+    return max(best_matches, key=lambda item: item[1])[2]
 
 
 def extract_hwpx_text(path: Path) -> str:
@@ -219,18 +289,24 @@ def _fingerprint(path: Path) -> str:
     return digest.hexdigest()
 
 
-def prepare_attachment_bundle(download_dir: Path, names: list[str]) -> AttachmentBundle:
+def resolve_attachment_files(download_dir: Path, names: list[str]) -> tuple[Path, ...]:
+    """화면을 바꾸기 전에 이번 메시지에 해당하는 실제 파일만 빠르게 고정한다."""
     matches = [(name, find_attachment_file(download_dir, name)) for name in names]
     missing = tuple(name for name, path in matches if path is None)
     if missing:
         raise AttachmentBlocked("missing", missing, "첨부파일을 먼저 내려받아 주세요.")
+    return tuple(Path(path) for _name, path in matches)
+
+
+def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBundle:
+    """이미 고정한 파일의 내용 읽기와 지문 계산을 차례대로 끝낸다."""
 
     sections: list[str] = []
     actual_names: list[str] = []
     fingerprints: list[str] = []
     media_parts: list[MediaPart] = []
-    for _screen_name, found in matches:
-        path = Path(found)
+    for path in paths:
+        path = Path(path)
         result = read_attachment(path)
         if not result.ok:
             raise AttachmentBlocked(result.reason, (path.name,), result.message)
@@ -247,6 +323,11 @@ def prepare_attachment_bundle(download_dir: Path, names: list[str]) -> Attachmen
         fingerprints=tuple(fingerprints),
         media_parts=tuple(media_parts),
     )
+
+
+def prepare_attachment_bundle(download_dir: Path, names: list[str]) -> AttachmentBundle:
+    resolved = resolve_attachment_files(download_dir, names)
+    return prepare_resolved_attachment_bundle(resolved)
 
 
 def build_attachment_block(download_dir: Path, names: list[str]) -> tuple[str, int]:

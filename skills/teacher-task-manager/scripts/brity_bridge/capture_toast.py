@@ -42,6 +42,7 @@ CS_DROPSHADOW = 0x20000
 WM_PAINT = 0x000F
 WM_DESTROY = 0x0002
 WM_TIMER = 0x0113
+WM_LBUTTONUP = 0x0202
 WM_APP_REFRESH = 0x8001
 WM_APP_CLOSE = 0x8002
 CLOSE_TIMER_ID = 1
@@ -91,6 +92,7 @@ if sys.platform == "win32":
     _user32.SetTimer.argtypes = [
         wintypes.HWND, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p,
     ]
+    _user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
     _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.UpdateWindow.argtypes = [wintypes.HWND]
     _user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
@@ -155,6 +157,7 @@ class CaptureToast:
     def __init__(self):
         self._lock = threading.Lock()
         self._text = ""
+        self._action = None
         self._hwnd = None
         self._thread: threading.Thread | None = None
         self._shown = threading.Event()
@@ -180,6 +183,11 @@ class CaptureToast:
         with self._lock:
             self._text = str(text)
         self._post(WM_APP_REFRESH, 0)
+
+    def set_action(self, action=None) -> None:
+        """창 전체를 눌렀을 때 할 일을 바꾼다. None이면 일반 상태창이다."""
+        with self._lock:
+            self._action = action
 
     def close(self, delay_seconds: float = 0.0) -> None:
         if sys.platform != "win32":
@@ -292,6 +300,9 @@ class CaptureToast:
     def _window_proc(self, hwnd, message_id, wparam, lparam):
         user32 = _user32
         if message_id == WM_APP_REFRESH:
+            # 앞 알림이 예약해 둔 닫기보다 새 상태가 우선이다. 여러 알림이 같은
+            # 창을 이어 쓸 때 예전 타이머가 새 내용을 갑자기 닫으면 안 된다.
+            user32.KillTimer(hwnd, CLOSE_TIMER_ID)
             user32.InvalidateRect(hwnd, None, True)
             return 0
         if message_id == WM_APP_CLOSE:
@@ -303,6 +314,23 @@ class CaptureToast:
             return 0
         if message_id == WM_TIMER:
             user32.DestroyWindow(hwnd)
+            return 0
+        if message_id == WM_LBUTTONUP:
+            with self._lock:
+                action = self._action
+                self._action = None
+            if action is not None:
+                def invoke_action() -> None:
+                    try:
+                        action()
+                    except Exception:  # noqa: BLE001 - 알림 클릭 실패가 상태창을 죽이면 안 된다
+                        pass
+
+                threading.Thread(
+                    target=invoke_action,
+                    name="status-toast-action",
+                    daemon=True,
+                ).start()
             return 0
         if message_id == WM_PAINT:
             try:

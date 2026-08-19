@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import queue
 import subprocess
 import sys
 import threading
@@ -32,6 +33,9 @@ WM_USER_TRAY = 0x8001  # WM_APP + 1
 SW_RESTORE = 9
 # 닫기 요청 시 진행 중인 캡처 저장을 기다려 주는 상한 — 넘으면 강제 진행.
 CLOSE_WAIT_SECONDS = 20.0
+# 화면에서 받아 둔 메시지와 처리 중인 메시지를 합친 상한. 사진·스캔 첨부는
+# 메모리에 들어 있으므로 무제한으로 쌓아 컴퓨터를 무겁게 만들지 않는다.
+MAX_PENDING_CAPTURES = 10
 
 # 대시보드(설치 마법사 포함) 창 제목 — dashboard/version.py BRANDING["name"]과 같아야 한다(테스트로 고정).
 DASHBOARD_WINDOW_TITLE = "Teacher Manager"
@@ -145,6 +149,19 @@ class MenuItem(NamedTuple):
     enabled: bool = True
 
 
+class QueuedCapture(NamedTuple):
+    sequence: int
+    capture: screen_read.ScreenCapture
+    attachment_paths: tuple[Path, ...]
+    preflight_message: str
+
+
+class StatusNotice(NamedTuple):
+    text: str
+    close_after: float | None
+    update_info: dict | None
+
+
 def app_label() -> str:
     """메뉴 맨 윗줄에 보이는 글자 — 'Teacher Manager 1.8'."""
     from dashboard import version  # 순환 임포트를 피해 여기서 부른다
@@ -223,7 +240,20 @@ class TrayApp:
     def __init__(self, config_dir: Path, toast_factory=None):
         self.config_dir = Path(config_dir)
         self.settings = settings_module.load_settings(paths.settings_path(self.config_dir))
+        # busy는 도우미 종료가 받아 둔 작업을 기다리는 표지다. 화면 읽기만
+        # 직렬화하는 잠금은 따로 두어, Google 등록 중에도 다음 메시지를 받는다.
         self.busy = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._queue_lock = threading.Lock()
+        self._capture_queue: queue.Queue[QueuedCapture] = queue.Queue(
+            maxsize=MAX_PENDING_CAPTURES
+        )
+        self._pending_captures = 0
+        self._queue_worker_running = False
+        self._batch_total = 0
+        self._batch_completed = 0
+        self._batch_failed = 0
+        self._batch_last_failure = ""
         self._icon_lock = threading.Lock()
         self.hwnd = None
         self._modifier_listener = None
@@ -231,9 +261,14 @@ class TrayApp:
         self._hotkey_paused_until = 0.0
         self._toast_factory = toast_factory or capture_toast.CaptureToast
         self._toast = None
+        # 여러 작업 실이 같은 우하단 창을 함께 쓴다. 한 안내의 표시와 닫기 예약을
+        # 한 묶음으로 보내야 앞 안내의 닫기 예약이 새 진행창을 닫지 않는다.
+        self._notice_lock = threading.RLock()
+        self._current_notice: StatusNotice | None = None
+        self._deferred_notice: StatusNotice | None = None
         self.on_ready = None  # 트레이 아이콘 등록 직후 한 번 부른다 (부팅 시 대시보드 동반 실행)
         self._dashboard_click_guard = 0.0
-        self._close_pending = False  # 캡처 저장을 기다리는 닫기 대기자 존재 여부
+        self._close_pending = False  # 받아 둔 작업을 기다리는 닫기 대기자 존재 여부
         self._close_forced = False  # 대기 상한 초과 — 다음 WM_CLOSE는 그대로 진행
         self._taskbar_created_message = 0  # 탐색기 재시작 알림 — 아이콘을 다시 등록해야 한다
         self._pending_update = None  # 알림으로 알린 새 버전 — 알림을 누르면 이걸로 시작한다
@@ -242,12 +277,116 @@ class TrayApp:
     # --- 알림 ---
 
     def notify(self, title: str, body: str) -> None:
-        # Shell_NotifyIcon 풍선 알림. 본문은 개인정보 없는 요약 문구만 넣는다.
-        # 알림 자리는 하나뿐이라 새 알림은 앞의 알림을 덮는다. 오전에 뜬 새 버전
-        # 알림 위로 오후에 '등록 완료'가 덮이면 화면에 보이는 알림은 그것이므로,
-        # 결과를 보려고 누른 것을 "업데이트해 달라"로 받아 설치를 시작하면 안 된다.
-        self._pending_update = None
-        self._modify_balloon(title[:60], body[:200])
+        """모든 일반 안내를 파란 왼쪽 줄 상태창 하나에서 보여 준다."""
+        simple_titles = {"", "Teacher Manager", "Brity 연결 도우미"}
+        clean_title = " ".join(str(title or "").split())
+        clean_body = " ".join(str(body or "").split())
+        if clean_title in simple_titles:
+            text = clean_body or clean_title
+        elif clean_body:
+            text = clean_title + "\n" + clean_body
+        else:
+            text = clean_title
+        self._display_notice(StatusNotice(text[:320], 4.0, None))
+
+    def _toast_is_closed(self, toast) -> bool:
+        waiter = getattr(toast, "wait_closed", None)
+        if waiter is None:
+            return False
+        try:
+            return bool(waiter(0))
+        except Exception:  # noqa: BLE001 - 상태창 확인 실패는 새 창 생성으로 복구한다
+            return True
+
+    def _ensure_toast_locked(self):
+        toast = self._toast
+        if toast is not None and self._toast_is_closed(toast):
+            toast = None
+            self._toast = None
+        new_toast = toast is None
+        if new_toast:
+            try:
+                toast = self._toast_factory()
+            except Exception:  # noqa: BLE001 - 상태창 실패가 도우미 기능을 막으면 안 된다
+                toast = None
+            self._toast = toast
+        return toast, new_toast
+
+    @staticmethod
+    def _set_toast_action(toast, action=None) -> None:
+        setter = getattr(toast, "set_action", None)
+        if setter is not None:
+            try:
+                setter(action)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _display_notice(self, notice: StatusNotice, defer_if_busy: bool = True) -> None:
+        with self._notice_lock:
+            with self._queue_lock:
+                active = (
+                    self._pending_captures > 0
+                    or self._queue_worker_running
+                    or self._capture_lock.locked()
+                )
+                if defer_if_busy and active:
+                    # 진행 숫자를 일반 안내가 덮지 않는다. 가장 최근 안내 하나만 작업 뒤에
+                    # 보여 주면 같은 우하단에 창이 쌓이지 않는다. 다만 새 버전 안내는
+                    # 눌러야 할 동작이 있으므로 뒤이어 온 일반 안내에 밀려 사라지지 않는다.
+                    if notice.update_info or not (
+                        self._deferred_notice is not None
+                        and self._deferred_notice.update_info
+                    ):
+                        self._deferred_notice = notice
+                    return
+                toast, new_toast = self._ensure_toast_locked()
+                self._current_notice = notice
+                self._pending_update = notice.update_info
+
+            if toast is None:
+                # 파란 상태창 자체를 만들 수 없는 특수 상황에서만 기존 Windows 안내를
+                # 안전망으로 쓴다. 정상 동작에서는 두 종류가 함께 뜨지 않는다.
+                self._modify_balloon("Teacher Manager", notice.text.replace("\n", " · ")[:200])
+                return
+            action = None
+            if notice.update_info:
+                bound_info = dict(notice.update_info)
+                action = lambda: self._update_balloon_clicked(bound_info)
+            self._set_toast_action(toast, action)
+            try:
+                if new_toast:
+                    toast.show(notice.text)
+                else:
+                    toast.update(notice.text)
+                if notice.close_after is not None:
+                    toast.close(delay_seconds=notice.close_after)
+            except Exception:  # noqa: BLE001 - 알림 실패가 실제 작업을 막으면 안 된다
+                pass
+
+    def _show_batch_text(self, text: str) -> None:
+        self._display_notice(StatusNotice(text, None, None), defer_if_busy=False)
+
+    def _show_update_notice(self, info: dict, title: str, body: str) -> None:
+        text = "\n".join(part for part in (str(title).strip(), str(body).strip()) if part)
+        self._display_notice(StatusNotice(text[:320], 15.0, dict(info)))
+
+    def _counts_locked(self) -> str:
+        processing = 1 if self._pending_captures > 0 else 0
+        waiting = max(0, self._pending_captures - processing)
+        return (
+            f"전체 {self._batch_total} · 완료 {self._batch_completed} · "
+            f"처리 {processing} · 대기 {waiting}"
+        )
+
+    def _update_batch_status(self, label: str) -> None:
+        with self._queue_lock:
+            counts = self._counts_locked()
+        self._show_batch_text(f"{label}\n{counts}")
+
+    def _show_later(self, notice: StatusNotice, delay_seconds: float = 4.0) -> None:
+        timer = threading.Timer(delay_seconds, self._display_notice, args=(notice,))
+        timer.daemon = True
+        timer.start()
 
     # --- 단축키 처리 ---
 
@@ -257,17 +396,50 @@ class TrayApp:
         self.on_hotkey()
 
     def on_hotkey(self) -> None:
-        if not self.busy.acquire(blocking=False):
-            self.notify("Brity 연결 도우미", "이미 처리 중입니다. 끝난 뒤 다시 눌러 주세요.")
+        # 현재 보이는 화면을 저장하는 아주 짧은 순간만 겹치지 않게 한다. 첨부파일
+        # 내용 읽기와 Google 등록은 이 잠금 밖의 대기열에서 차례로 처리한다.
+        if not self._capture_lock.acquire(blocking=False):
+            self._show_batch_text(
+                "앞 쪽지 화면 저장 중 · 이번 입력은 못 받았어요\n"
+                "잠시 후 단축키를 한 번만 다시 눌러 주세요"
+            )
             return
-        # 워커를 띄우기 전에 즉시 상태창부터 — "눌렸다"는 반응이 바로 보여야 한다.
-        toast = None
-        try:
-            toast = self._toast_factory()
-            toast.show(capture_toast.PRESSED_TEXT)
-        except Exception:  # noqa: BLE001 - 상태창 실패가 캡처를 막으면 안 된다
-            toast = None
-        self._toast = toast
+
+        rejection = ""
+        with self._queue_lock:
+            if self._pending_captures >= MAX_PENDING_CAPTURES:
+                rejection = (
+                    f"이미 {MAX_PENDING_CAPTURES}건을 맡아 이번 입력은 못 받았어요\n"
+                    "한 건이 끝난 뒤 단축키를 한 번만 눌러 주세요"
+                )
+                starting_batch = False
+            else:
+                # 마지막 항목이 막 끝난 찰나에 다음 단축키가 들어오면 같은 묶음으로
+                # 이어 붙인다. 완료 창을 닫는 짧은 틈 때문에 새 쪽지를 거절하지 않는다.
+                continuing_batch = self._batch_total > 0
+                starting_batch = (
+                    self._pending_captures == 0
+                    and not self._queue_worker_running
+                    and not continuing_batch
+                )
+                if starting_batch and not self.busy.acquire(blocking=False):
+                    rejection = "도우미가 앞 작업을 정리 중이에요\n잠시 뒤 단축키를 한 번만 눌러 주세요"
+                elif starting_batch:
+                    self._batch_total = 0
+                    self._batch_completed = 0
+                    self._batch_failed = 0
+                    self._batch_last_failure = ""
+                    if self._current_notice is not None and self._current_notice.update_info:
+                        self._deferred_notice = self._current_notice
+                    self._current_notice = None
+
+        if rejection:
+            self._capture_lock.release()
+            self._show_batch_text(rejection)
+            return
+
+        # 워커를 띄우기 전에 즉시 한 창에서 반응을 보여준다.
+        self._show_batch_text(capture_toast.PRESSED_TEXT)
         # non-daemon: 인터프리터 종료가 저장 중인 워커를 얼리지 않고 완료를 기다린다.
         threading.Thread(target=self._capture_once_locked, daemon=False).start()
 
@@ -278,7 +450,7 @@ class TrayApp:
         return False
 
     def _close_after_capture(self, hwnd, post=None, wait_seconds: float = CLOSE_WAIT_SECONDS) -> None:
-        # 캡처(저장 포함)가 끝나기를 기다렸다가 닫기를 다시 요청한다.
+        # 받아 둔 메시지 처리(저장 포함)가 끝나기를 기다렸다가 닫기를 다시 요청한다.
         if self.busy.acquire(timeout=wait_seconds):
             self.busy.release()
         else:
@@ -290,70 +462,236 @@ class TrayApp:
         post(hwnd, WM_CLOSE, 0, 0)
 
     def _capture_once_locked(self) -> None:
-        toast = self._toast
-        writer = capture_store.ProgressWriter(paths.bridge_state_dir(self.config_dir))
-
-        def emit(step: str, message: str = "") -> None:
-            writer.emit(step, message)
-            if toast is not None:
-                try:
-                    toast.update(capture_toast.stage_text(step, message))
-                except Exception:  # noqa: BLE001 - 상태창 실패가 캡처를 막으면 안 된다
-                    pass
-
-        emit("capture")
+        failure_message = ""
         try:
-            self._capture_once(emit)
+            capture = screen_read.capture_brity_text()
+            if not capture.ok:
+                failure_message = screen_read.capture_failure_message(capture.reason)
+            else:
+                attachment_paths = ()
+                preflight_message = ""
+                try:
+                    attachment_paths = attach_read.resolve_attachment_files(
+                        Path(self.settings.brity_download_dir), capture.attachments
+                    )
+                except attach_read.AttachmentBlocked as error:
+                    preflight_message = error.message or "첨부파일을 먼저 내려받아 주세요."
+                self._enqueue_capture(capture, attachment_paths, preflight_message)
         except Exception:  # noqa: BLE001 - 워커가 소리 없이 죽으면 안 된다
-            message = "처리 중 예상하지 못한 오류가 발생했습니다. 다시 시도해 주세요."
-            emit("fail", message)
-            self.notify("Brity 연결 도우미", message)
+            failure_message = "화면을 저장하는 중 예상하지 못한 오류가 발생했어요. 다시 시도해 주세요."
         finally:
-            if toast is not None:
+            self._capture_lock.release()
+
+        if failure_message:
+            self._finish_unaccepted_capture(failure_message)
+        else:
+            # 아주 짧은 메시지는 화면 저장 실이 잠금을 놓기 전에 대기열 처리가
+            # 끝날 수 있다. 그때도 마지막 완료 상태와 busy 해제가 빠지지 않게 한다.
+            self._finish_batch_if_idle()
+
+    def _finish_unaccepted_capture(self, message: str) -> None:
+        with self._notice_lock:
+            with self._queue_lock:
+                active_batch = self._pending_captures > 0 or self._queue_worker_running
+                has_finished_batch = self._batch_total > 0
+                counts = self._counts_locked() if active_batch or has_finished_batch else ""
+                deferred = None
+                if not active_batch:
+                    try:
+                        self.busy.release()
+                    except RuntimeError:
+                        pass
+                    deferred = self._deferred_notice
+                    self._deferred_notice = None
+                    self._batch_total = 0
+                    self._batch_completed = 0
+                    self._batch_failed = 0
+                    self._batch_last_failure = ""
+            text = message if not counts else f"{message}\n{counts}"
+            self._display_notice(StatusNotice(text, 4.0 if not active_batch else None, None), False)
+        if deferred is not None:
+            self._show_later(deferred)
+
+    def _enqueue_capture(
+        self,
+        capture: screen_read.ScreenCapture,
+        attachment_paths: tuple[Path, ...],
+        preflight_message: str,
+    ) -> None:
+        start_worker = False
+        with self._queue_lock:
+            self._batch_total += 1
+            sequence = self._batch_total
+            self._pending_captures += 1
+            queued = QueuedCapture(sequence, capture, attachment_paths, preflight_message)
+            self._capture_queue.put_nowait(queued)
+            if not self._queue_worker_running:
+                self._queue_worker_running = True
+                start_worker = True
+            counts = self._counts_locked()
+        self._show_batch_text(f"{sequence}번째 쪽지를 받아두었어요\n{counts}")
+        if start_worker:
+            # 실제 분석과 Google 등록은 한 줄로 처리해 중복 확인과 기록을 지킨다.
+            threading.Thread(target=self._drain_capture_queue, daemon=False).start()
+
+    def _drain_capture_queue(self) -> None:
+        while True:
+            with self._queue_lock:
                 try:
-                    toast.close(delay_seconds=4)  # 결과를 읽을 시간을 준 뒤 닫는다
-                except Exception:  # noqa: BLE001
+                    queued = self._capture_queue.get_nowait()
+                except queue.Empty:
+                    self._queue_worker_running = False
+                    queued = None
+            if queued is None:
+                self._finish_batch_if_idle()
+                return
+
+            writer = capture_store.ProgressWriter(paths.bridge_state_dir(self.config_dir))
+            writer.emit("capture")
+
+            def emit(step: str, message: str = "") -> None:
+                writer.emit(step, message)
+                if step in ("analyze", "register"):
+                    self._update_batch_status(
+                        f"{queued.sequence}번째 쪽지 · {capture_toast.stage_text(step, message)}"
+                    )
+
+            succeeded = False
+            result_message = ""
+            try:
+                if queued.preflight_message:
+                    result_message = queued.preflight_message
+                    pipeline.record_preflight_failure(
+                        self.config_dir,
+                        result_message,
+                        "등록하지 않음 · " + result_message,
+                    )
+                    emit("fail", result_message)
+                elif queued.capture.attachments:
+                    self._update_batch_status(f"{queued.sequence}번째 쪽지 · 첨부 읽는 중")
+                    try:
+                        record, note = screen_read.build_screen_record(
+                            queued.capture,
+                            Path(self.settings.brity_download_dir),
+                            attachment_paths=queued.attachment_paths,
+                        )
+                    except attach_read.AttachmentBlocked as error:
+                        result_message = error.message or "첨부파일을 읽지 못했어요."
+                        pipeline.record_preflight_failure(
+                            self.config_dir,
+                            result_message,
+                            "등록하지 않음 · " + result_message,
+                        )
+                        emit("fail", result_message)
+                    else:
+                        result = pipeline.run_capture_flow(
+                            pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
+                            self.config_dir,
+                            self.settings,
+                            record=record,
+                            progress=emit,
+                        )
+                        succeeded = bool(result.ok)
+                        result_message = result.message
+                        if note:
+                            result_message = result_message + "\n" + note
+                else:
+                    record, note = screen_read.build_screen_record(
+                        queued.capture,
+                        Path(self.settings.brity_download_dir),
+                        attachment_paths=(),
+                    )
+                    result = pipeline.run_capture_flow(
+                        pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
+                        self.config_dir,
+                        self.settings,
+                        record=record,
+                        progress=emit,
+                    )
+                    succeeded = bool(result.ok)
+                    result_message = result.message
+                    if note:
+                        result_message = result_message + "\n" + note
+            except Exception:  # noqa: BLE001 - 한 건의 실패가 뒤 메시지를 막으면 안 된다
+                result_message = "처리 중 예상하지 못한 오류가 발생했어요. 다음 쪽지는 계속 처리합니다."
+                emit("fail", result_message)
+            finally:
+                self._capture_queue.task_done()
+                self._complete_queued_capture(queued.sequence, succeeded, result_message)
+
+    def _complete_queued_capture(self, sequence: int, succeeded: bool, message: str) -> None:
+        failure_label = self._compact_failure_label(message) if not succeeded else ""
+        with self._queue_lock:
+            self._pending_captures -= 1
+            self._batch_completed += 1
+            if not succeeded:
+                self._batch_failed += 1
+                self._batch_last_failure = failure_label
+            counts = self._counts_locked()
+            pending = self._pending_captures
+        if pending > 0:
+            label = f"{sequence}번째 쪽지 완료"
+            if not succeeded:
+                label = f"{sequence}번째 쪽지 · {failure_label}"
+            self._show_batch_text(f"{label}\n{counts}")
+        elif message and not succeeded:
+            self._show_batch_text(f"{failure_label}\n{counts}")
+
+    @staticmethod
+    def _compact_failure_label(message: str) -> str:
+        """두 줄 상태창의 첫 줄에 들어갈 짧고 구체적인 실패 이유."""
+        clean = " ".join(str(message or "").split())
+        if "첨부파일을 먼저 내려받" in clean:
+            return "첨부파일 내려받기 필요"
+        if "첨부파일" in clean and ("읽지 못" in clean or "열지 못" in clean):
+            return "첨부파일 읽기 실패"
+        if "인터넷" in clean:
+            return "인터넷 연결 확인 필요"
+        return "처리 결과 확인 필요"
+
+    def _finish_batch_if_idle(self) -> None:
+        with self._notice_lock:
+            with self._queue_lock:
+                if (
+                    self._pending_captures > 0
+                    or self._queue_worker_running
+                    or self._capture_lock.locked()
+                    or self._batch_total <= 0
+                ):
+                    return
+                total = self._batch_total
+                completed = self._batch_completed
+                failed = self._batch_failed
+                last_failure = self._batch_last_failure
+                counts = self._counts_locked()
+                deferred = self._deferred_notice
+                self._deferred_notice = None
+                self._batch_total = 0
+                self._batch_completed = 0
+                self._batch_failed = 0
+                self._batch_last_failure = ""
+                try:
+                    self.busy.release()
+                except RuntimeError:
                     pass
-            self._toast = None
-            self.busy.release()
 
-    def _capture_once(self, emit) -> None:
-        capture = screen_read.capture_brity_text()
-        if not capture.ok:
-            message = screen_read.capture_failure_message(capture.reason)
-            emit("fail", message)
-            self.notify("Brity 연결 도우미", message)
-            return
-
-        try:
-            record, note = screen_read.build_screen_record(
-                capture, Path(self.settings.brity_download_dir)
-            )
-        except attach_read.AttachmentBlocked as error:
-            message = error.message or "첨부파일을 먼저 내려받아 주세요."
-            pipeline.record_preflight_failure(
-                self.config_dir,
-                message,
-                "등록하지 않음 · " + message,
-            )
-            file_names = "\n".join(error.names)
-            emit("fail", message)
-            self.notify(
-                "Brity 연결 도우미",
-                message + ("\n" + file_names if file_names else ""),
-            )
-            return
-        result = pipeline.run_capture_flow(
-            pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
-            self.config_dir,
-            self.settings,
-            record=record,
-            progress=emit,
-        )
-        body = result.message
-        if note:
-            body = body + "\n" + note
-        self.notify("Brity 연결 도우미", body)
+            if failed and total == 1:
+                label = last_failure or "처리 결과 확인 필요"
+            elif failed:
+                label = f"쪽지 {total}건 완료 · 확인 필요 {failed}건"
+            else:
+                label = f"쪽지 {completed}건 처리를 마쳤어요"
+            self._show_batch_text(f"{label}\n{counts}")
+            if deferred is None:
+                with self._queue_lock:
+                    toast = self._toast
+                if toast is not None:
+                    try:
+                        toast.close(delay_seconds=4)
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                self._show_later(deferred)
 
     # --- 트레이 메뉴 ---
 
@@ -383,12 +721,16 @@ class TrayApp:
 
         def _look() -> None:
             try:
+                notices = []
                 found = check_update_now(
-                    self.config_dir, _dt.date.today().isoformat(), notify=self.notify
+                    self.config_dir,
+                    _dt.date.today().isoformat(),
+                    notify=lambda title, body: notices.append((title, body)),
                 )
-                if found:
-                    # notify가 대기 중인 새 버전을 비우므로 이 대입은 그 뒤에 와야 한다.
-                    self._pending_update = found
+                if found and notices:
+                    self._show_update_notice(found, *notices[-1])
+                elif notices:
+                    self.notify(*notices[-1])
             except Exception:  # noqa: BLE001 - 확인이 실패해도 트레이는 계속 돈다
                 pass
             finally:
@@ -545,7 +887,7 @@ class TrayApp:
             self.on_command(wparam & 0xFFFF)
             return 0
         if message_id == WM_CLOSE and not self._close_forced and not self._capture_idle():
-            # 캡처 저장 도중 창을 파괴하면 메인 스레드 종료가 워커를 즉살해
+            # 받아 둔 메시지 저장 도중 창을 파괴하면 메인 스레드 종료가 워커를 즉살해
             # 잘린 파일이 남는다(재검증 9-F2). 저장이 끝난 뒤 다시 닫는다.
             if not self._close_pending:
                 self._close_pending = True
@@ -598,17 +940,16 @@ class TrayApp:
             self._icon_data.dwInfoFlags = NIIF_NONE
             ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._icon_data))
 
-    def _update_balloon_clicked(self) -> None:
-        """새 버전 알림을 눌렀다 — 바로 업데이트를 시작한다.
-
-        _pending_update는 새 버전 알림이 화면에 떠 있는 동안에만 차 있다(다른 알림이
-        그 자리를 덮으면 notify가 비운다). 비어 있으면 지금 눌린 알림은 새 버전
-        알림이 아니라는 뜻이라 아무 일도 하지 않는다.
-        """
-        info = self._pending_update
+    def _update_balloon_clicked(self, update_info=None) -> None:
+        """파란 상태창의 새 버전 안내를 눌렀다 — 바로 업데이트를 시작한다."""
+        info = dict(update_info or self._pending_update or {})
         if not info:
             return
         self._pending_update = None
+        self._display_notice(
+            StatusNotice("새 버전 설치를 준비하는 중이에요", None, None),
+            defer_if_busy=False,
+        )
         from dashboard import engine, version
 
         def _start() -> None:
@@ -666,25 +1007,15 @@ def version_particle(version_text: str, after_consonant: str, after_vowel: str) 
 
 
 def new_version_notice(latest: str) -> tuple:
-    """새 버전이 있을 때 띄우는 알림 (굵은 줄, 아랫줄).
-
-    직접 [새 버전 확인]을 눌렀을 때도, 하루 한 번 저절로 확인할 때도 같은 문구다 —
-    같은 일을 알리는데 문구가 갈리면 다른 일이 생긴 줄 안다. 굵은 줄에 프로그램
-    이름을 넣지 않는다. 알림 맨 위에 이미 'Teacher Manager'가 나온다.
-    """
+    """직접 확인과 하루 한 번 확인이 함께 쓰는 새 버전 안내 문구."""
     return (
         f"새 버전 v{latest}{version_particle(latest, '이', '가')} 나왔습니다",
-        "이 알림을 누르면 지금 설치합니다.",
+        "눌러서 지금 설치합니다.",
     )
 
 
 def up_to_date_notice(current: str) -> tuple:
-    """이미 최신일 때 띄우는 알림 (굵은 줄, 아랫줄) — 굵은 줄을 비워 한 줄로 보인다.
-
-    비우는 쪽이 아랫줄이 아닌 이유: 아랫줄(szInfo)에 빈 글자를 넘기는 것은
-    "이 알림을 치워라"라는 뜻으로 정해져 있어서, 그러면 알림이 아예 안 뜬다
-    (MSDN Shell_NotifyIcon NOTIFYICONDATA szInfo).
-    """
+    """이미 최신일 때 파란 상태창에 한 줄로 보이는 문구."""
     return (
         "",
         f"최신 버전인 v{current}{version_particle(current, '을', '를')} 쓰고 있습니다.",
@@ -780,12 +1111,14 @@ def update_watch_loop(tray_app, announce_first_round: bool = True, sleep=None,
     while True:
         if announce:
             try:
+                notices = []
                 found = update_watch_once(
-                    tray_app.config_dir, day(), notify=tray_app.notify
+                    tray_app.config_dir,
+                    day(),
+                    notify=lambda title, body: notices.append((title, body)),
                 )
-                if found:
-                    # notify가 대기 중인 새 버전을 비우므로 이 대입은 그 뒤에 와야 한다.
-                    tray_app._pending_update = found
+                if found and notices:
+                    tray_app._show_update_notice(found, *notices[-1])
             except Exception:  # noqa: BLE001 - 확인이 실패해도 트레이는 계속 돈다
                 pass
         announce = True  # 건너뛰는 것은 켤 때 한 바퀴뿐이다

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -71,14 +72,14 @@ def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
 class ProgressWriter:
     """캡처 1회의 진행 단계를 progress.json에 남긴다. 쓰기 실패가 캡처를 막으면 안 된다.
 
-    run_id는 시작 시각 기반이다 — 스펙의 source_hash 접두어는 캡처 시작 시점에 해시가
-    아직 없어 쓸 수 없고, 캡처는 busy 락으로 한 번에 하나만 돌아 시각으로 충분하다.
+    run_id는 시작 시각과 무작위 꼬리를 함께 쓴다. 맡겨 둔 메시지가 아주 빠르게
+    이어져 같은 초에 시작돼도 대시보드가 서로 다른 처리로 알아봐야 한다.
     """
 
     def __init__(self, state_dir: Path, now: datetime | None = None):
         self.state_dir = Path(state_dir)
         started = now or datetime.now()
-        self.run_id = f"cap-{int(started.timestamp())}"
+        self.run_id = f"cap-{int(started.timestamp())}-{uuid.uuid4().hex[:8]}"
 
     def emit(self, step: str, message: str = "", now: datetime | None = None) -> None:
         if step not in PROGRESS_STEPS:
