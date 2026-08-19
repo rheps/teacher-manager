@@ -505,6 +505,17 @@ class Api:
         return status
 
     @guarded
+    def consolidate_attendance(self):
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+        status = asdict(engine.consolidate_attendance(self._config_dir, deps=deps))
+        if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
+            engine.save_attendance_status_cache(self._config_dir, status)
+        return status
+
+    @guarded
     def attendance_prepare_start(self, profile, grid, bridge_updates):
         """메신저 탭 [다음] — 입력 저장 후 출결 준비를 뒤에서 시작한다. 여러 번 불려도 안전."""
         self._require_safe_gws_account_storage()

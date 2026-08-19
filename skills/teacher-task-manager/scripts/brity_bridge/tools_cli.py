@@ -260,7 +260,7 @@ def current_gws_account(
     environ: Mapping[str, str] | None = None,
 ) -> str:
     """호출자가 적은 계정이 아니라 제품 GWS의 현재 로그인 계정을 직접 읽는다."""
-    from verify_attendance_access import _current_gws_account
+    from brity_bridge.gws_account_status import current_gws_account as read_account
 
     base = dict(os.environ if environ is None else environ)
     if gws_env.unsafe_account_storage_overrides(base):
@@ -286,7 +286,7 @@ def current_gws_account(
             )
         return int(result.code), str(result.output)
 
-    return _current_gws_account(product_run, str(executable))
+    return read_account(product_run, str(executable))
 
 
 def _checked_goedu_account(account_resolver: Callable[[], str] | None = None) -> str:
@@ -486,139 +486,6 @@ def run_connect_attendance(
     return _print_result_with_exit(result, {"connected"})
 
 
-def run_prepare_attendance_copy(
-    argv: Sequence[str], *, prepare_func: Callable | None = None,
-    record_loader: Callable | None = None, expected_config_dir: Path | None = None,
-    account_resolver: Callable[[], str] = current_gws_account,
-    installed_account_loader: Callable[[Path], str] = installed_attendance_account,
-) -> int:
-    parser = _command_parser("prepare-attendance-copy", "기존 출결 원본을 지키며 AI 입력용 사본을 준비합니다.")
-    parser.add_argument("--config-dir", required=True)
-    parser.add_argument("--apply", action="store_true")
-    args = _parse(parser, argv)
-    if args is None:
-        return 2
-    if not args.apply:
-        return _approval_required("Google Drive에 사본을 만들려면 내용을 확인한 뒤 --apply를 붙여 주세요.")
-    config = _config_dir(args.config_dir, expected_config_dir)
-    current_account = _checked_goedu_account(account_resolver)
-    if not current_account:
-        return 2
-    installed_account = installed_account_loader(config)
-    if current_account.strip().casefold() != installed_account.strip().casefold():
-        _print_result({
-            "state": "account_mismatch",
-            "changes_applied": False,
-            "detail": "출결을 처음 준비한 Google 계정으로 다시 로그인해 주세요.",
-        })
-        return 2
-    if record_loader is None:
-        from attendance_install_record import load_attendance_install_record
-
-        record_loader = load_attendance_install_record
-    if prepare_func is None:
-        from prepare_attendance_copy import prepare_attendance_copy
-
-        prepare_func = prepare_attendance_copy
-    record = record_loader(config / "attendance-install.generated.json")
-    result = prepare_func(
-        config, record, current_account=current_account, installed_account=installed_account,
-    )
-    return _print_result_with_exit(result, {"complete"})
-
-
-def run_prepare_attendance_copy_script(
-    argv: Sequence[str], *, prepare_func: Callable | None = None,
-    account_resolver: Callable[[], str] | None = None,
-) -> int:
-    parser = _command_parser("prepare-attendance-copy-script", "사본의 Apps Script를 확인하고 승인 뒤 올립니다.")
-    parser.add_argument("--copied-spreadsheet-id", required=True)
-    parser.add_argument("--copied-script-id", required=True)
-    parser.add_argument("--apply", action="store_true")
-    args = _parse(parser, argv)
-    if args is None:
-        return 2
-    if not _checked_goedu_account(account_resolver):
-        return 2
-    if prepare_func is None:
-        from prepare_attendance_copy_script import prepare_attendance_copy_script
-
-        prepare_func = prepare_attendance_copy_script
-    result = prepare_func(
-        args.copied_spreadsheet_id,
-        args.copied_script_id,
-        assets_dir=bundle_paths.bundle_root() / "assets",
-        apply=bool(args.apply),
-    )
-    return _print_result_with_exit(result, {"ready_for_apply", "ready_for_task5"})
-
-
-def run_record_prepared_copy_script(
-    argv: Sequence[str], *, record_func: Callable | None = None,
-    expected_config_dir: Path | None = None,
-    account_resolver: Callable[[], str] | None = None,
-) -> int:
-    parser = _command_parser("record-prepared-copy-script", "확인한 사본 Apps Script 정보를 로컬 진행 기록에 남깁니다.")
-    parser.add_argument("--config-dir", required=True)
-    parser.add_argument("--copied-spreadsheet-id", required=True)
-    parser.add_argument("--copied-script-id", required=True)
-    parser.add_argument("--version-number", required=True, type=int)
-    parser.add_argument("--deployment-id", required=True)
-    parser.add_argument("--bundle-sha256", required=True)
-    parser.add_argument("--apply", action="store_true")
-    args = _parse(parser, argv)
-    if args is None:
-        return 2
-    if not args.apply:
-        return _approval_required("사본 진행 기록을 바꾸려면 확인 결과를 검토한 뒤 --apply를 붙여 주세요.")
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if not _checked_goedu_account(account_resolver):
-        return 2
-    if record_func is None:
-        from switch_attendance_connection import record_prepared_copy_script
-
-        record_func = record_prepared_copy_script
-    result = record_func(
-        config,
-        copy_spreadsheet_id=args.copied_spreadsheet_id,
-        copy_script_id=args.copied_script_id,
-        version_number=args.version_number,
-        deployment_id=args.deployment_id,
-        bundle_sha256=args.bundle_sha256,
-        assets_dir=bundle_paths.bundle_root() / "assets",
-    )
-    return _print_result_with_exit(result, {"recorded"})
-
-
-def run_switch_attendance_connection(
-    argv: Sequence[str], *, switch_func: Callable | None = None,
-    expected_config_dir: Path | None = None,
-    account_resolver: Callable[[], str] | None = None,
-) -> int:
-    parser = _command_parser("switch-attendance-connection", "모든 확인이 끝난 출결 사본으로 로컬 연결을 바꿉니다.")
-    parser.add_argument("--config-dir", required=True)
-    parser.add_argument("--new-script-id", required=True)
-    parser.add_argument("--new-deployment-id", required=True)
-    parser.add_argument("--apply", action="store_true")
-    args = _parse(parser, argv)
-    if args is None:
-        return 2
-    if not args.apply:
-        return _approval_required("출결 연결을 사본으로 바꾸려면 모든 확인 뒤 --apply를 붙여 주세요.")
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if not _checked_goedu_account(account_resolver):
-        return 2
-    if switch_func is None:
-        from switch_attendance_connection import switch_attendance_connection
-
-        switch_func = switch_attendance_connection
-    result = switch_func(
-        config,
-        new_script_id=args.new_script_id,
-        new_deployment_id=args.new_deployment_id,
-        assets_dir=bundle_paths.bundle_root() / "assets",
-    )
-    return _print_result_with_exit(result, {"complete"})
 
 
 def _default_handlers() -> dict[str, Callable[[Sequence[str]], int]]:
@@ -627,10 +494,6 @@ def _default_handlers() -> dict[str, Callable[[Sequence[str]], int]]:
         "parse-settings": run_parse_settings,
         "attendance-install": run_attendance_install,
         "connect-attendance": run_connect_attendance,
-        "prepare-attendance-copy": run_prepare_attendance_copy,
-        "prepare-attendance-copy-script": run_prepare_attendance_copy_script,
-        "record-prepared-copy-script": run_record_prepared_copy_script,
-        "switch-attendance-connection": run_switch_attendance_connection,
     }
 
 

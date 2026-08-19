@@ -28,8 +28,8 @@ SERVER_ERROR_MESSAGE = "발송 서버와 연결하지 못했어요. 인터넷 �
 # 서버가 답을 준 경우는 인터넷 탓이 아니다. 답에 적힌 뜻을 그대로 옮긴다 —
 # "인터넷을 확인하세요"라고만 하면 몇 번을 다시 눌러도 달라질 게 없다(2026-07-30 확인).
 SHEET_MOVED_MESSAGE = (
-    "Google Chat 발송은 새 출석부 사본으로 이미 옮겼어요. "
-    '이름에 "AI 입력 준비 사본"이 들어 있는 시트에서 보내 주세요.'
+    "Google Chat 발송은 새 정식 출석부로 이미 옮겼어요. "
+    "Teacher Manager에서 현재 출석부를 열어 보내 주세요."
 )
 SHEET_AUTH_REQUIRED_MESSAGE = (
     "이 출석부는 아직 발송 서버에 등록되지 않았어요. 출결 준비를 먼저 마쳐 주세요."
@@ -163,27 +163,9 @@ def _read_settings_rows(
 
 
 def _spreadsheet_in_use(config_dir: Path, record_spreadsheet_id: str = "") -> str:
-    """지금 실제로 쓰는 출석부를 고른다 — 사본 전환이 끝났으면 사본이다.
+    """평상시 기능은 설치 기록에서 받은 현재 출결 번호만 사용한다."""
 
-    옛 출석부의 설정 탭을 계속 읽으면, 발송 서버는 그 시트를 "사본으로 옮김"으로
-    알고 있어 409를 돌려준다. 연결은 멀쩡한데 화면에는 연결 실패로 보인다.
-
-    사본은 지금 기록의 사본일 때만 따라간다 — 새 출석부로 바뀐 뒤에 옛 사본
-    상태 파일이 남아 있으면 남의 설정 탭을 읽게 된다(2026-07-30).
-    """
-    import prepare_attendance_copy
-
-    path = prepare_attendance_copy.attendance_copy_status_path(Path(config_dir))
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(saved, dict) or saved.get("state") != "complete":
-        return ""  # 만들다 만 사본에는 설정 탭이 아직 없다
-    source = str(saved.get("source_spreadsheet_id", "") or "").strip()
-    if record_spreadsheet_id and source and source != str(record_spreadsheet_id):
-        return ""  # 다른 출석부의 사본이다
-    return str(saved.get("copy_spreadsheet_id", "") or "").strip()
+    return str(record_spreadsheet_id or "").strip()
 
 
 def read_central_config(

@@ -1,4 +1,4 @@
-"""중앙 Google Chat 발송 연결을 새 출결 사본으로 한 번만 옮긴다.
+"""중앙 Google Chat 발송 연결을 확인된 새 출결 후보로 한 번만 옮긴다.
 
 옮길 실제 연결이 없으면 서버 자료를 만들지도 바꾸지도 않고 `등록 없음`으로 끝낸다.
 결과가 불명확하면 같은 요청을 자동으로 다시 보내지 않는다.
@@ -41,7 +41,7 @@ class CentralMoveResult:
     outcome: str
     account: str
     source_spreadsheet_id: str
-    copy_spreadsheet_id: str
+    candidate_spreadsheet_id: str
     new_sheet_id: str = ""
 
 
@@ -156,14 +156,14 @@ def _default_http_post(url: str, path: str, payload: dict) -> dict:
 def _settings_value(rows: Any, key: str) -> str:
     """설정 시트에서 같은 이름이 정확히 한 번 나오는 값만 읽는다."""
 
-    _need(isinstance(rows, list), "사본 설정 시트 내용을 읽지 못했습니다.")
+    _need(isinstance(rows, list), "후보 설정 시트 내용을 읽지 못했습니다.")
     found: list[str] = []
     for row in rows:
         if not isinstance(row, list) or len(row) < 2:
             continue
         if str(row[0]).strip() == key:
             found.append(str(row[1]).strip())
-    _need(len(found) == 1, f"사본 설정 시트에서 {key} 값을 하나만 찾지 못했습니다.")
+    _need(len(found) == 1, f"후보 설정 시트에서 {key} 값을 하나만 찾지 못했습니다.")
     return found[0]
 
 
@@ -172,42 +172,42 @@ def _reply(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def _point_copy_at_new_sheet_id(
-    copy_spreadsheet_id: str,
+def _point_candidate_at_new_sheet_id(
+    candidate_spreadsheet_id: str,
     *,
     new_sheet_id: str,
     sheet_secret: str,
     read_rows: Callable[[str], list],
     update_setting: Callable[[str, list, str, str], Any],
 ) -> None:
-    """사본 설정 시트의 중앙 발송 시트 번호 한 칸만 새 값으로 맞춘다."""
+    """후보 설정 시트의 중앙 발송 시트 번호 한 칸만 새 값으로 맞춘다."""
 
     try:
-        rows = read_rows(copy_spreadsheet_id)
+        rows = read_rows(candidate_spreadsheet_id)
     except Exception as exc:
-        _hold("사본 설정 시트를 읽지 못했습니다.", cause=exc)
+        _hold("후보 설정 시트를 읽지 못했습니다.", cause=exc)
     _need(
         _settings_value(rows, SHEET_SECRET_KEY) == sheet_secret,
-        "사본 설정 시트의 발송 확인값이 기존 시트와 다릅니다.",
+        "후보 설정 시트의 발송 확인값이 기존 시트와 다릅니다.",
     )
     current = _settings_value(rows, SHEET_ID_KEY)
     if current == new_sheet_id:
         return
     try:
-        update_setting(copy_spreadsheet_id, rows, SHEET_ID_KEY, new_sheet_id)
+        update_setting(candidate_spreadsheet_id, rows, SHEET_ID_KEY, new_sheet_id)
     except Exception as exc:
-        _hold("사본 설정 시트의 중앙 발송 시트 번호를 바꾸지 못했습니다.", cause=exc)
+        _hold("후보 설정 시트의 중앙 발송 시트 번호를 바꾸지 못했습니다.", cause=exc)
     try:
-        rechecked = read_rows(copy_spreadsheet_id)
+        rechecked = read_rows(candidate_spreadsheet_id)
     except Exception as exc:
-        _hold("사본 설정 시트를 다시 읽지 못했습니다.", cause=exc)
+        _hold("후보 설정 시트를 다시 읽지 못했습니다.", cause=exc)
     _need(
         _settings_value(rechecked, SHEET_ID_KEY) == new_sheet_id,
-        "사본 설정 시트를 다시 읽은 중앙 발송 시트 번호가 다릅니다.",
+        "후보 설정 시트를 다시 읽은 중앙 발송 시트 번호가 다릅니다.",
     )
     _need(
         _settings_value(rechecked, SHEET_SECRET_KEY) == sheet_secret,
-        "사본 설정 시트를 다시 읽은 발송 확인값이 달라졌습니다.",
+        "후보 설정 시트를 다시 읽은 발송 확인값이 달라졌습니다.",
     )
 
 
@@ -216,19 +216,19 @@ def move_central_chat_connection(
     *,
     account: str,
     source_spreadsheet_id: str,
-    copy_spreadsheet_id: str,
+    candidate_spreadsheet_id: str,
     read_config: Callable[[Path], dict] | None = None,
     read_rows: Callable[[str], list] | None = None,
     update_setting: Callable[[str, list, str, str], Any] | None = None,
     http_post: Callable[[str, str, dict], dict] | None = None,
 ) -> CentralMoveResult:
-    """등록과 연결이 실제로 있는 사용자만 기존 발송 연결을 사본으로 옮긴다."""
+    """등록과 연결이 실제로 있는 사용자만 기존 발송 연결을 후보로 옮긴다."""
 
     config_dir = Path(config_dir)
     account = _email(account, "현재 Google 계정")
     source_id = _spreadsheet_id(source_spreadsheet_id, "원본 Sheet ID")
-    copy_id = _spreadsheet_id(copy_spreadsheet_id, "사본 Sheet ID")
-    _need(source_id != copy_id, "원본과 사본 Sheet ID가 같습니다.")
+    candidate_id = _spreadsheet_id(candidate_spreadsheet_id, "후보 Sheet ID")
+    _need(source_id != candidate_id, "원본과 후보 Sheet ID가 같습니다.")
 
     read_config = read_config or _default_read_config
     read_rows = read_rows or _default_read_rows
@@ -250,14 +250,14 @@ def move_central_chat_connection(
     sheet_id = _text(config.get("sheet_id"), "중앙 발송 시트 번호")
     sheet_secret = _text(config.get("sheet_secret"), "중앙 발송 확인값")
     suffix = _split_sheet_identity(sheet_id, source_id)
-    new_sheet_id = f"{copy_id}:{suffix}"
+    new_sheet_id = f"{candidate_id}:{suffix}"
 
     def _not_registered() -> CentralMoveResult:
         return CentralMoveResult(
             outcome="not_registered",
             account=account,
             source_spreadsheet_id=source_id,
-            copy_spreadsheet_id=copy_id,
+            candidate_spreadsheet_id=candidate_id,
         )
 
     try:
@@ -274,10 +274,10 @@ def move_central_chat_connection(
     except Exception as exc:
         _hold("중앙 발송 등록 상태를 확인하지 못했습니다.", cause=exc)
 
-    # 사본은 옛 시트의 중앙 발송 번호를 그대로 들고 있으면 안 된다.
-    # 등록이 없어도 사본이 자기 번호를 갖도록 이 한 칸은 항상 맞춘다.
-    _point_copy_at_new_sheet_id(
-        copy_id,
+    # 후보는 옛 시트의 중앙 발송 번호를 그대로 들고 있으면 안 된다.
+    # 등록이 없어도 후보가 자기 번호를 갖도록 이 한 칸은 항상 맞춘다.
+    _point_candidate_at_new_sheet_id(
+        candidate_id,
         new_sheet_id=new_sheet_id,
         sheet_secret=sheet_secret,
         read_rows=read_rows,
@@ -319,13 +319,13 @@ def move_central_chat_connection(
         return _not_registered()
     _need(
         _text(moved.get("newSheetId"), "옮긴 뒤 시트 번호") == new_sheet_id,
-        "옮긴 뒤 시트 번호가 이번 사본 번호와 다릅니다.",
+        "옮긴 뒤 시트 번호가 이번 후보 번호와 다릅니다.",
     )
     return CentralMoveResult(
         outcome="moved",
         account=account,
         source_spreadsheet_id=source_id,
-        copy_spreadsheet_id=copy_id,
+        candidate_spreadsheet_id=candidate_id,
         new_sheet_id=new_sheet_id,
     )
 

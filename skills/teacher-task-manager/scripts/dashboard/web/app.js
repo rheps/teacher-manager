@@ -51,6 +51,7 @@ const S = {
   attendanceScriptUpdate: null, // 사용자가 눌러 확인한 기존 출결 Apps Script 상태
   attendanceScriptDialog: null, // null | "update" | "finish"
   attendanceScriptUpdating: false,
+  attendanceTransitioning: false, // 정리·새 학년도 전환 중에는 화면을 다시 그려도 재실행 금지
   workspaceGuideOpen: false,   // 1단계 "화면에서 찾기"로 뜨는 구글 워크스페이스 위치 캡처
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
@@ -394,10 +395,18 @@ function saveDraft() { return call("save_setup_state", currentState()); }
    넘어가는 모든 길이 이 판정 하나를 지난다 — 준비 스레드와 9단계 apply_all의 겹침을 막는
    유일한 방어라 느슨하게 만들면 안 된다. */
 function attendanceWizardGateOpen() {
-  return Boolean(S.attendance && S.attendance.state === "ready" && S.firstSetupDone);
+  return Boolean(
+    S.attendance
+    && S.attendance.state === "ready"
+    && !S.attendance.consolidation_required
+    && S.firstSetupDone
+  );
 }
 function attendanceWizardGateMessage() {
   const state = S.attendance ? S.attendance.state : "";
+  if (S.attendance && S.attendance.consolidation_required) {
+    return "출결 시트 하나로 정리를 먼저 끝내 주세요.";
+  }
   if (state === "installing") return "출결 준비가 끝나야 다음으로 갈 수 있어요";
   if (state === "ready") return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
   if (state === "failed") return "출결 준비가 실패했어요. 출결 탭에서 [다시 시도]를 눌러 주세요.";
@@ -1317,19 +1326,26 @@ function classSpaceSubrowHtml(a) {
 function serviceOpenButtonHtml(entry, a) {
   // 기존 코드 확인이 끝나지 않아 Chat 쓰기를 잠가도, 선생님이 이미 가진
   // Sheet와 안내장 서식은 읽어 볼 수 있어야 한다.
-  const resourcesAvailable = ["ready", "script-check-required", "script-update-required"].includes(a.state);
+  const resourcesAvailable = [
+    "ready", "script-check-required", "script-update-required", "consolidation-required",
+  ].includes(a.state);
   if (!resourcesAvailable) return "";
   if (entry.service === "sheet") {
     const open = a.spreadsheet_url
       ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 열기</button>`
       : "";
-    // 처음 설정(마법사) 중에는 안 보인다 — 연 단위 관리 단추다.
-    // 보일 때도 학년도가 같으면 잠긴다 — 학년도를 바꾼 뒤에만 눌리는 단추다(설계 2026-07-31).
-    const make = S.mode === "edit" && a.state === "ready"
-      ? `<button class="btn-tonal" data-action="new-attendance-go"
-      data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch ? "" : "disabled"}>새 시트에 출석부 만들기</button>`
+    // 새 학년도 단추는 편집 화면에만 둔다. 다만 새 컴퓨터의 7단계에서 예전 Drive
+    // 출결표를 찾은 경우에는 그 자리에서 막히지 않도록 정리 단추를 바로 보여 준다.
+    const transitionDisabled = S.attendanceTransitioning ? "disabled" : "";
+    const consolidate = a.consolidation_required
+      ? `<button class="btn-tonal" data-action="consolidate-attendance-go"
+      data-busy-text="정리하는 중… (1~2분 걸릴 수 있어요)" ${transitionDisabled}>출결 시트 하나로 정리</button>`
       : "";
-    return make + open;  // [새 시트에 출석부 만들기] [열기] 순서 (2026-07-31)
+    const make = S.mode === "edit" && resourcesAvailable && !a.consolidation_required
+      ? `<button class="btn-tonal" data-action="new-attendance-go"
+      data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch && !S.attendanceTransitioning ? "" : "disabled"}>새 학년도 출석부 시작</button>`
+      : "";
+    return consolidate + make + open;
   }
   if (entry.service === "docs" && a.template_doc_url) {
     return `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.template_doc_url)}">${icon("external-link", "small")} 서식 열기</button>`;
@@ -1380,6 +1396,7 @@ function serviceStatusHtml(entry, a) {
     return `<span class="svc-status muted">준비 전</span>`;
   }
   if (entry.service === "sheet") {
+    if (a.state === "consolidation-required") return `<span class="svc-status warn">정리 필요</span>`;
     if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
@@ -1400,7 +1417,8 @@ function attendanceServiceRow(entry, a) {
     const guide = `<button class="btn-tonal youtube" data-action="chat-guide">${icon("youtube", "small")} 연결방법</button>`;
     chatActs = connect + guide;
   }
-  const note = a.state === "failed" && a.failed_service === entry.service
+  const note = (a.state === "failed" && a.failed_service === entry.service)
+      || (a.state === "consolidation-required" && entry.service === "sheet")
     ? `<span class="field-error">${esc(a.detail || "")}</span>` : "";
   return `<div class="svc-group">
     <div class="attendance-service">
@@ -1453,7 +1471,9 @@ function attendanceScriptUpdateHtml(a) {
     return `<div class="attendance-script-update warn"><span>직접 수정된 기능이라 자동으로 바꾸지 않아요.</span></div>`;
   }
   if (update?.state === "hold") {
-    return `<div class="attendance-script-update warn"><span>출결 기능 상태를 확인하지 못했어요.</span>
+    const detail = String(update.detail || "").trim()
+      || "출결 기능 상태를 확인하지 못했어요. 학생 자료는 그대로입니다.";
+    return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       <button class="btn-quiet" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   }
   if (update?.state === "current" || update?.state === "finishing_required") {
@@ -1549,6 +1569,7 @@ function attendanceTabHtml() {
   const scriptCheckRequired = a.state === "script-check-required";
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
+  const consolidationRequired = a.state === "consolidation-required";
   const pendingGuide = S.mode === "wizard"
     ? a.state === "installing"
       ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"
@@ -1576,7 +1597,7 @@ function attendanceTabHtml() {
       : ""}
     ${ready
       ? ""
-      : scriptAttentionRequired || S.mode === "wizard" ? ""
+      : scriptAttentionRequired || consolidationRequired || S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
     ${attendanceScriptUpdateDialogHtml()}`;
 }
@@ -1799,22 +1820,64 @@ bindActions({
     }
   },
   "new-attendance-go": async () => {
-    const data = await call("start_new_attendance");
-    S.attendance = data;
-    S.attendanceScriptUpdate = null;
-    // 새 출석부는 발송 연결·단톡방이 새로 시작된다 — 상태를 다시 확인한다.
-    S.chatStatus = null;
-    S.chatSpaces = undefined;
-    S.chatSpaceName = undefined;
-    stopChatConnectPoll();
-    if (data.state === "ready") {
-      showToast("새 출석부를 만들었어요");
-      // 만들었다는 말로 끝내지 않는다 — 새 시트를 바로 열어 눈으로 확인하게 한다(2026-07-30).
-      if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
-    } else {
-      setBanner("warn", data.detail || "새 출석부를 만들지 못했어요. 다시 시도해 주세요.");
-    }
+    const a = S.attendance || {};
+    const name = a.canonical_workbook_name || "새 학년도 정식 출석부";
+    if (!window.confirm(
+      `${name}\n\n새 학년도 출석부를 시작할까요?\n` +
+      "지금 출석부는 그대로 남습니다. 이전 학생·출결·쪽지·발송 기록은 새 파일에 넣지 않습니다."
+    )) return;
+    S.attendanceTransitioning = true;
     render();
+    try {
+      const data = await call("start_new_attendance");
+      S.attendance = data;
+      S.attendanceScriptUpdate = null;
+      S.chatStatus = null;
+      S.chatSpaces = undefined;
+      S.chatSpaceName = undefined;
+      stopChatConnectPoll();
+      if (data.state === "ready") {
+        S.firstSetupDone = false;
+        if (S.mode === "wizard") startAttendancePreparePoll();
+        showToast("새 학년도 출석부를 시작했어요");
+        if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
+      } else {
+        setBanner("warn", data.detail || "새 학년도 출석부를 시작하지 못했어요.");
+      }
+    } finally {
+      S.attendanceTransitioning = false;
+      render();
+    }
+  },
+  "consolidate-attendance-go": async () => {
+    const a = S.attendance || {};
+    const name = a.canonical_workbook_name || "새 정식 출석부";
+    if (!window.confirm(
+      `AI 입력이 작동하던 기존 출결 자료를 ${name} 파일 하나로 전부 복사합니다.\n\n` +
+      "기존 Google Sheet 두 개는 지우거나 이름을 바꾸지 않고 그대로 둡니다. 계속할까요?"
+    )) return;
+    S.attendanceTransitioning = true;
+    render();
+    try {
+      const data = await call("consolidate_attendance");
+      S.attendance = data;
+      S.attendanceScriptUpdate = null;
+      S.chatStatus = null;
+      S.chatSpaces = undefined;
+      S.chatSpaceName = undefined;
+      stopChatConnectPoll();
+      if (data.state === "ready") {
+        S.firstSetupDone = false;
+        if (S.mode === "wizard") startAttendancePreparePoll();
+        showToast("출결 시트를 새 정식 파일 하나로 정리했어요");
+        if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
+      } else {
+        setBanner("warn", data.detail || "출결 시트를 하나로 정리하지 못했어요.");
+      }
+    } finally {
+      S.attendanceTransitioning = false;
+      render();
+    }
   },
   "chat-connect": async () => {
     await call("attendance_chat_connect");

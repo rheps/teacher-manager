@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -16,11 +17,24 @@ from typing import Any, Mapping, Sequence
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
-# 2026-08-06에 공개 저장소 rheps/teacher-manager의 각 tag/commit에서
+# 2026-08-13에 공개 저장소 rheps/teacher-manager의 각 tag/commit에서
 # ``skills/teacher-task-manager/assets/Code.gs``와 ``appsscript.json``을 raw로
 # 읽고, 아래 ``canonical_bundle_sha256`` 규칙을 별도 PowerShell/.NET 계산으로
 # 대조했다. raw 파일을 다시 확인하지 못한 더 오래된 설치본은 일부러 넣지 않는다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    (
+        "40661e5bf63a8133" "fe6b6a19709327ff"
+        "5063b0a3624925c0" "8306e09335841bae"
+    ): (
+        ("v2.3", "18732fd2b919ca8f037b" "d4c0e2862f1b954d1d8d"),
+    ),
+    (
+        "99db84f2c93e73a9" "045f865ef4cdd60f"
+        "4444b688bec052c7" "419b4e3f1ab7566f"
+    ): (
+        ("v2.2", "dffc1ce85af6ece581dd" "2966ac09c7805242903d"),
+        ("v2.1", "d0edaf6da3503d128705" "dc93feab5915bc6bb3aa"),
+    ),
     (
         "b1b45e67c5f6f12e" "fdbc229ca134b9ce"
         "1e928684c7d91083" "608650994d7ad9e1"
@@ -48,6 +62,29 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
     ),
 }
 TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
+
+# 공개 전 표준테스트PC에 Teacher Manager가 올린 것으로 원문까지 회수해 확인한
+# 중간판이다. 공개 v2.3(d7fd551)의 appsscript.json과 같고, Code.gs에서는 마지막
+# AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
+# 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
+TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    (
+        "593edd0c752548e8" "36d0828ec946bd00"
+        "7edbd4a815086a0a" "de2b0ccdb19cc36c"
+    ): (
+        ("2.3-standard-test-pc", "d7fd551-before-final-ai-fixes"),
+    ),
+}
+TRUSTED_PRERELEASE_BUNDLE_SHA256 = frozenset(
+    TRUSTED_PRERELEASE_BUNDLE_PROVENANCE
+)
+
+
+def _is_trusted_teacher_manager_bundle(bundle_sha256: str) -> bool:
+    return (
+        bundle_sha256 in TRUSTED_PUBLIC_BUNDLE_SHA256
+        or bundle_sha256 in TRUSTED_PRERELEASE_BUNDLE_SHA256
+    )
 
 
 @dataclass(frozen=True)
@@ -141,8 +178,8 @@ def canonical_bundle_sha256(files: Sequence[Mapping[str, Any]]) -> str:
     """기존 설치 코드와 같은 이름·종류·내용 묶음 지문을 계산한다.
 
     각 파일은 ``이름\0종류\0LF로 맞춘 내용``이며 파일 사이에도 NUL 한 글자를
-    둔다. 정확한 두 정식 파일에서는 기존 ``prepare_attendance_copy_script``가
-    저장해 온 값과 같고, 추가 파일이 있으면 그 파일까지 지문에 들어간다.
+    둔다. 정확한 두 정식 파일에서는 예전 설치판이 저장한 값과 같고, 추가 파일이
+    있으면 그 파일까지 지문에 들어간다.
     """
 
     checked = _validated_files(list(files))
@@ -347,6 +384,10 @@ def _verified_prepared_version(runner, gws: str, script: str, target_sha: str) -
         bundle = _bundle_from_reply(_content(runner, gws, script, version), script)
         if not bundle.has_extra_files and bundle.sha256 == target_sha:
             return version
+    _need(
+        not candidates,
+        "같은 이름으로 만든 출결 기능 판의 내용을 확인할 수 없어요.",
+    )
     return 0
 
 
@@ -439,33 +480,54 @@ def inspect_attendance_script_update(
         )
 
         if head.sha256 != fixed.sha256 or head.has_extra_files != fixed.has_extra_files:
-            prepared_version = 0
-            if (
+            head_is_official = (
                 head.sha256 == target_sha
+                or _is_trusted_teacher_manager_bundle(head.sha256)
+            )
+            fixed_is_official = _is_trusted_teacher_manager_bundle(fixed.sha256)
+            _need(
+                head_is_official
+                and fixed_is_official
                 and not head.has_extra_files
-                and fixed.sha256 in TRUSTED_PUBLIC_BUNDLE_SHA256
-                and not fixed.has_extra_files
-            ):
+                and not fixed.has_extra_files,
+                "현재 편집본과 실제 배포 중인 버전이 달라요.",
+            )
+            if head.sha256 == target_sha:
+                # 업로드 뒤 판 만들기나 배포 연결 전에 앱이 꺼졌어도 같은 시트에서
+                # 이어간다. 판이 이미 있으면 그 번호를 쓰고, 없으면 적용 버튼에서
+                # 현재 HEAD를 다시 대조한 뒤 새 판 하나만 만든다.
                 prepared_version = _verified_prepared_version(
                     runner, gws, script, target_sha
                 )
-            _need(
-                prepared_version > 0,
-                "현재 편집본과 실제 배포 중인 버전이 달라요.",
-            )
-            return replace(
-                _result(
-                    "finishing_required",
-                    verified=True,
-                    sheet=sheet,
-                    script=script,
-                    deployment=deployment,
-                    current_sha=target_sha,
-                    target_sha=target_sha,
-                    deployed_version=deployed_version,
-                    detail="새 기능은 준비됐고 마지막 연결만 남았습니다. 학생 자료는 그대로입니다.",
-                ),
-                updated_version_number=prepared_version,
+                return replace(
+                    _result(
+                        "finishing_required",
+                        verified=True,
+                        sheet=sheet,
+                        script=script,
+                        deployment=deployment,
+                        current_sha=target_sha,
+                        target_sha=target_sha,
+                        deployed_version=deployed_version,
+                        detail=(
+                            "새 기능은 준비됐고 같은 시트의 마지막 연결만 남았습니다. "
+                            "학생 자료는 그대로입니다."
+                        ),
+                    ),
+                    updated_version_number=prepared_version,
+                )
+            # 편집본과 배포판이 서로 달라도 둘 다 공개한 정식 파일이면, 중간에
+            # 멈춘 예전 업데이트다. 사용자가 누른 업데이트에서 현재 편집본을
+            # 백업한 뒤 같은 Script와 같은 배포를 최신판으로 맞출 수 있다.
+            return _result(
+                "update_available",
+                verified=True,
+                sheet=sheet,
+                script=script,
+                deployment=deployment,
+                current_sha=head.sha256,
+                target_sha=target_sha,
+                deployed_version=deployed_version,
             )
         if head.has_extra_files:
             return _result(
@@ -480,7 +542,7 @@ def inspect_attendance_script_update(
             )
         if current_sha == target_sha:
             state, verified = "current", True
-        elif current_sha in TRUSTED_PUBLIC_BUNDLE_SHA256:
+        elif _is_trusted_teacher_manager_bundle(current_sha):
             state, verified = "update_available", True
         else:
             state, verified = "customized", False
@@ -611,13 +673,6 @@ def _safe_head_read(runner, gws: str, script: str) -> None:
         pass
 
 
-def _safe_deployment_read(runner, gws: str, script: str, deployment: str) -> None:
-    try:
-        _deployment(runner, gws, script, deployment)
-    except Exception:
-        pass
-
-
 def _updated_result(
     inspected: AttendanceScriptUpdateResult,
     updated_version: int,
@@ -633,10 +688,50 @@ def _updated_result(
     )
 
 
+def _confirm_deployment_after_update(
+    runner,
+    gws: str,
+    script: str,
+    deployment: str,
+    previous_version: int,
+    updated_version: int,
+    update_description: str,
+    sleeper,
+) -> tuple[str, Exception | None]:
+    """Google 반영 지연 동안 쓰기는 반복하지 않고 같은 배포만 다시 읽는다."""
+
+    saw_previous = False
+    last_error: Exception | None = None
+    for delay in (0.0, 1.0, 2.0, 4.0):
+        if delay:
+            sleeper(delay)
+        try:
+            version, description = _check_deployment_base(
+                _deployment(runner, gws, script, deployment), script, deployment
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if version == updated_version and description == update_description:
+            return "updated", None
+        if version == previous_version:
+            saw_previous = True
+            last_error = _Hold("기존 배포가 새 버전을 가리키지 않아요.")
+            continue
+        return (
+            "hold",
+            _Hold("확인하는 사이 기존 배포가 다른 버전으로 바뀌었어요."),
+        )
+    if saw_previous:
+        return "previous", last_error
+    return "hold", last_error or _Hold("기존 배포를 다시 확인하지 못했어요.")
+
+
 def _finish_existing_verified_version(
     inspected: AttendanceScriptUpdateResult,
     runner,
     gws: str,
+    sleeper,
 ) -> AttendanceScriptUpdateResult:
     """준비된 판을 같은 배포에 한 번만 연결하고, 모호하면 읽기만 한다."""
 
@@ -675,43 +770,68 @@ def _finish_existing_verified_version(
     except Exception as exc:
         error = exc
 
+    confirmation, confirmation_error = _confirm_deployment_after_update(
+        runner,
+        gws,
+        script,
+        deployment,
+        previous_version,
+        updated_version,
+        update_description,
+        sleeper,
+    )
+    if confirmation == "updated":
+        return _updated_result(inspected, updated_version)
+    if confirmation == "previous":
+        # Google가 아직 옛 연결을 보여 주면 쓰기를 되풀이하지 않는다. 다음 실행은
+        # 이미 만든 정확한 판을 찾아 같은 배포 연결만 안전하게 이어간다.
+        return inspected
+    if confirmation_error is not None:
+        error = confirmation_error
     if error is not None:
-        try:
-            confirmed_version, confirmed_description = _check_deployment_base(
-                _deployment(runner, gws, script, deployment), script, deployment
-            )
-            if (
-                confirmed_version == updated_version
-                and confirmed_description == update_description
-            ):
-                return _updated_result(inspected, updated_version)
-            if confirmed_version == previous_version:
-                return inspected
-        except Exception as confirm_exc:
-            error = confirm_exc
         return replace(
             inspected,
             state="hold",
             verified=False,
             detail=_public_failure_detail(error),
         )
+    return replace(
+        inspected,
+        state="hold",
+        verified=False,
+        detail="기존 배포를 다시 확인하지 못했어요.",
+    )
 
+
+def _create_missing_target_version(
+    inspected: AttendanceScriptUpdateResult,
+    runner,
+    gws: str,
+) -> AttendanceScriptUpdateResult:
+    """이미 올라간 정식 HEAD를 다시 확인하고 빠진 불변 판 하나만 만든다."""
+
+    script = inspected.script_id
+    target_sha = inspected.target_bundle_sha256
+    update_description = "attendance-update-" + target_sha[:16]
     try:
-        _check_updated_deployment(
-            _deployment(runner, gws, script, deployment),
-            script,
-            deployment,
-            updated_version,
-            update_description,
+        # 상태 확인 뒤 다른 편집이 끼어들었으면 어떤 판도 만들지 않는다.
+        _require_bundle(_content(runner, gws, script), script, target_sha)
+        updated_version = _create_version(
+            runner, gws, script, update_description
+        )
+        _require_bundle(
+            _content(runner, gws, script, updated_version), script, target_sha
         )
     except Exception as exc:
+        # versions.create 답이 사라진 경우 같은 쓰기를 반복하지 않는다. 다음 버튼
+        # 실행의 읽기 단계가 실제로 생긴 판을 찾아 이어간다.
         return replace(
             inspected,
             state="hold",
             verified=False,
             detail=_public_failure_detail(exc),
         )
-    return _updated_result(inspected, updated_version)
+    return replace(inspected, updated_version_number=updated_version)
 
 
 def apply_attendance_script_update(
@@ -723,8 +843,13 @@ def apply_attendance_script_update(
     runner=None,
     gws_executable: str | None = None,
     temp_parent=None,
+    sleeper=None,
 ) -> AttendanceScriptUpdateResult:
     """검증된 옛 공개본만 백업한 뒤 같은 배포 ID를 새 버전으로 바꾼다."""
+
+    actual_sleeper = time.sleep if sleeper is None else sleeper
+    if not callable(actual_sleeper):
+        return _result("hold", detail="다시 확인할 방법이 없어요.")
 
     inspected = inspect_attendance_script_update(
         spreadsheet_id,
@@ -735,17 +860,24 @@ def apply_attendance_script_update(
         gws_executable=gws_executable,
     )
     if inspected.state == "finishing_required" and inspected.verified:
+        if inspected.updated_version_number <= 0:
+            inspected = _create_missing_target_version(
+                inspected,
+                runner,
+                _clean_id(gws_executable),
+            )
+            if inspected.state == "hold" or not inspected.verified:
+                return inspected
         return _finish_existing_verified_version(
             inspected,
             runner,
             _clean_id(gws_executable),
+            actual_sleeper,
         )
     if inspected.state != "update_available" or not inspected.verified:
         return inspected
 
-    sheet = inspected.spreadsheet_id
     script = inspected.script_id
-    deployment = inspected.deployment_id
     gws = _clean_id(gws_executable)
     old_sha = inspected.current_bundle_sha256
     target_sha = inspected.target_bundle_sha256
@@ -817,78 +949,17 @@ def apply_attendance_script_update(
             detail=_public_failure_detail(exc),
         )
 
-    update_body = {
-        "deploymentConfig": {
-            "scriptId": script,
-            "versionNumber": updated_version,
-            "manifestFileName": "appsscript",
-            "description": update_description,
-        }
-    }
-    try:
-        # 새 편집본을 준비하는 사이 다른 창이 같은 배포를 바꿨다면 그 선택을 덮지
-        # 않는다. 처음 확인한 고정 버전을 아직 가리킬 때만 같은 배포 ID를 갱신한다.
-        live_version, _live_description = _check_deployment_base(
-            _deployment(runner, gws, script, deployment), script, deployment
-        )
-        _need(
-            live_version == inspected.deployment_version_number,
-            "확인하는 사이 기존 배포가 다른 버전으로 바뀌었어요.",
-        )
-        update_reply = _call(
-            runner,
-            gws,
-            ["script", "projects", "deployments", "update"],
-            {
-                "scriptId": script,
-                "deploymentId": deployment,
-            },
-            update_body,
-        )
-        _check_updated_deployment(
-            update_reply, script, deployment, updated_version, update_description
-        )
-    except Exception as exc:
-        # 같은 배포를 읽어 결과만 확인한다. 모호한 update 명령은 절대 다시 보내지 않는다.
-        _safe_deployment_read(runner, gws, script, deployment)
-        return replace(
+    return _finish_existing_verified_version(
+        replace(
             inspected,
-            state="hold",
-            verified=False,
+            state="finishing_required",
+            verified=True,
             backup_version_number=backup_version,
             updated_version_number=updated_version,
-            detail=_public_failure_detail(exc),
-        )
-
-    try:
-        _check_updated_deployment(
-            _deployment(runner, gws, script, deployment),
-            script,
-            deployment,
-            updated_version,
-            update_description,
-        )
-    except Exception as exc:
-        return replace(
-            inspected,
-            state="hold",
-            verified=False,
-            backup_version_number=backup_version,
-            updated_version_number=updated_version,
-            detail=_public_failure_detail(exc),
-        )
-
-    return AttendanceScriptUpdateResult(
-        state="updated",
-        verified=True,
-        spreadsheet_id=sheet,
-        script_id=script,
-        deployment_id=deployment,
-        current_bundle_sha256=target_sha,
-        target_bundle_sha256=target_sha,
-        deployment_version_number=updated_version,
-        backup_version_number=backup_version,
-        updated_version_number=updated_version,
+        ),
+        runner,
+        gws,
+        actual_sleeper,
     )
 
 

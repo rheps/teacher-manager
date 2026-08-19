@@ -16,12 +16,14 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import install_attendance_automation
 import attendance_script_update
+import attendance_workbook_identity
+import attendance_workbook_transition
 import parse_settings
 from attendance_install_record import (
     AttendanceInstallRecordError,
@@ -309,56 +311,9 @@ def choose_attachment_folder(current_path: str = "") -> str:
 
 
 def _attendance_sheet_for_gemini_key(config_dir: Path) -> str:
-    """Gemini 키를 넣을 시트를 고른다. AI 출결 입력을 실제로 쓰는 곳은 사본이다."""
-    config_dir = Path(config_dir)
+    """Gemini 키를 넣을 현재 출결 시트 번호를 설치 기록에서만 읽는다."""
 
-    def _sheet_id_in(path: Path, key: str) -> str:
-        # 파일이 없거나 깨진 것만 넘어간다. 그 밖의 잘못은 감추지 않고 드러낸다.
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            return ""
-        try:
-            saved = _json.loads(text)
-        except ValueError:
-            return ""
-        if not isinstance(saved, dict):
-            return ""
-        return str(saved.get(key, "") or "").strip()
-
-    import prepare_attendance_copy
-
-    copy_id = _sheet_id_in(
-        prepare_attendance_copy.attendance_copy_status_path(config_dir),
-        "copy_spreadsheet_id",
-    )
-    if copy_id:
-        return copy_id
-    return _sheet_id_in(
-        paths.attendance_install_record_path(config_dir), "spreadsheet_id"
-    )
-
-
-def _attendance_copy_url(config_dir: Path, record_spreadsheet_id: str = "") -> str:
-    """사본 전환이 끝났으면 사본 시트 주소를 돌려준다. 아니면 빈 문자열.
-
-    사본은 **지금 기록의 사본일 때만** 따라간다. 새 출석부로 바뀐 뒤에도 옛 사본
-    상태 파일이 남아 있을 수 있는데, 그때 [열기]가 옛 사본을 열면 안 된다(2026-07-30).
-    """
-    import prepare_attendance_copy
-
-    path = prepare_attendance_copy.attendance_copy_status_path(Path(config_dir))
-    try:
-        saved = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(saved, dict) or saved.get("state") != "complete":
-        return ""  # 만들다 만 사본은 아직 쓰는 시트가 아니다
-    source = str(saved.get("source_spreadsheet_id", "") or "").strip()
-    if record_spreadsheet_id and source and source != str(record_spreadsheet_id):
-        return ""  # 다른 출석부의 사본이다
-    url = str(saved.get("copy_spreadsheet_url", "") or "").strip()
-    return url if url.startswith("https://docs.google.com/spreadsheets/d/") else ""
+    return attendance_workbook_identity.current_attendance_spreadsheet_id(config_dir)
 
 
 def push_gemini_key_to_attendance_sheet(
@@ -670,7 +625,7 @@ def reset_attendance_record(config_dir: Path) -> bool:
 
 @dataclass(frozen=True)
 class AttendanceStatus:
-    state: str             # ready | script-check-required | script-update-required | not-ready | gws-required | login-required | account-required | auth-error | profile-required | failed
+    state: str             # ready | script-check-required | script-update-required | consolidation-required | not-ready | gws-required | login-required | account-required | auth-error | profile-required | failed
     account: str = ""      # 처음 준비할 때 사용한 계정
     current_user: str = ""  # 지금 로그인한 계정
     spreadsheet_url: str = ""
@@ -681,6 +636,8 @@ class AttendanceStatus:
     school_year: str = ""  # 기록에 새긴 학년도 — 도장이 없으면 지금 학년도로 본다
     workbook_name: str = ""  # 화면에 보여줄 출석부 이름 — 없으면 옛 고정 이름
     year_mismatch: bool = False  # 프로필 학년도와 기록 학년도가 다르면 새 출석부 단추가 풀린다
+    consolidation_required: bool = False  # 옛 두 갈래 기록이면 한 번의 정리 단추를 보인다
+    canonical_workbook_name: str = ""  # 정리·새 학년도 확인창에 보여줄 새 정식 이름
 
 
 ATTENDANCE_ERROR_MESSAGES = {
@@ -888,11 +845,6 @@ def read_attendance_status(
                 failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
             )
         spreadsheet_url = str(record.get("spreadsheet_url", "") or "")
-        # 사본 전환이 끝났으면 실제로 쓰는 시트는 사본이다. 원본 주소를 그대로 열면
-        # 더 이상 쓰지 않는 옛 시트가 열린다(central_chat._spreadsheet_in_use와 같은 규칙).
-        copy_url = _attendance_copy_url(config_dir, str(record.get("spreadsheet_id", "") or ""))
-        if copy_url:
-            spreadsheet_url = copy_url
         template_doc_url = str(record.get("template_doc_url", "") or "")
         valid_sheet_url = spreadsheet_url.startswith(
             "https://docs.google.com/spreadsheets/d/"
@@ -909,6 +861,29 @@ def read_attendance_status(
             or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
         )
         year_mismatch = profile_year != record_year
+        profile = _read_json_dict(paths.profile_path(config_dir)) or {}
+        canonical_workbook_name = (
+            attendance_workbook_identity.attendance_workbook_name(profile)
+        )
+        record_grade = str(record.get("homeroom_grade", "") or "").strip()
+        record_class = str(record.get("homeroom_class", "") or "").strip()
+        recorded_workbook_name = (
+            attendance_workbook_identity.attendance_workbook_name(
+                {
+                    "school": {"year": record_year},
+                    "homeroom": {
+                        "enabled": bool(record_grade and record_class),
+                        "grade": record_grade,
+                        "class": record_class,
+                    },
+                }
+            )
+        )
+        consolidation_required = (
+            str(record.get("workbook_role", "") or "")
+            != attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
+            or workbook_name != recorded_workbook_name
+        )
         if valid_sheet_url:
             script_update_required = record.get("script_update_required") is True
             if script_update_required:
@@ -935,16 +910,48 @@ def read_attendance_status(
                 spreadsheet_url=spreadsheet_url, template_doc_url=template_doc_url,
                 detail=script_detail,
                 school_year=record_year, workbook_name=workbook_name, year_mismatch=year_mismatch,
+                consolidation_required=consolidation_required,
+                canonical_workbook_name=canonical_workbook_name,
             )
         return AttendanceStatus(
             state="failed", account=account, current_user=current_user,
             spreadsheet_url=spreadsheet_url, template_doc_url=template_doc_url,
             failed_service="setup", detail=ATTENDANCE_RECORD_BROKEN_MESSAGE,
             school_year=record_year, workbook_name=workbook_name, year_mismatch=year_mismatch,
+            consolidation_required=consolidation_required,
+            canonical_workbook_name=canonical_workbook_name,
         )
     profile_error = _attendance_profile_error(config_dir)
     if profile_error:
         return AttendanceStatus(state="profile-required", current_user=current_user, detail=profile_error)
+    if setup_status.get("state") == "consolidation-required":
+        if account and current_user and account != current_user:
+            return AttendanceStatus(
+                state="failed",
+                account=account,
+                current_user=current_user,
+                failed_service="setup",
+                detail=ATTENDANCE_ACCOUNT_MESSAGE,
+            )
+        profile = _read_json_dict(paths.profile_path(config_dir)) or {}
+        return AttendanceStatus(
+            state="consolidation-required",
+            account=account or current_user,
+            current_user=current_user,
+            spreadsheet_url=str(
+                setup_status.get("spreadsheet_url", "") or ""
+            ),
+            detail=str(setup_status.get("detail", "") or ""),
+            school_year=_profile_school_year(config_dir),
+            workbook_name=str(
+                setup_status.get("workbook_name", "")
+                or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
+            ),
+            consolidation_required=True,
+            canonical_workbook_name=(
+                attendance_workbook_identity.attendance_workbook_name(profile)
+            ),
+        )
     if setup_status.get("state") == "failed":
         return AttendanceStatus(
             state="failed", account=account, current_user=current_user,
@@ -2615,6 +2622,9 @@ class AttendanceDeps:
     attendance_runner: object = attendance_remote_runner
     attendance_installer: object = install_attendance_automation.install_attendance_automation
     write_record: object = install_attendance_automation.write_install_record
+    transition_deps_factory: object = attendance_workbook_transition.make_transition_deps
+    workbook_consolidator: object = attendance_workbook_transition.consolidate_attendance_workbooks
+    new_school_year_starter: object = attendance_workbook_transition.start_new_school_year_workbook
     gws_resolver: object = tool_runtime.resolve_gws_executable
 
 
@@ -2809,6 +2819,45 @@ def _ensure_attendance_once(
         # 쓰던 시트를 찾았을 때의 안내는 시트 주소와 비어 있는 값 이름까지 담기므로
         # 200자에서 자르면 정작 필요한 뒷부분이 잘려 나간다.
         detail = message[:ATTENDANCE_DETAIL_LIMIT]
+        if isinstance(
+            error,
+            install_attendance_automation.LegacyAttendanceConsolidationRequired,
+        ):
+            candidates = list(error.candidates)
+            single = candidates[0] if len(candidates) == 1 else {}
+            spreadsheet_url = str(single.get("webViewLink", "") or "").strip()
+            if not spreadsheet_url and str(single.get("id", "") or "").strip():
+                spreadsheet_url = (
+                    "https://docs.google.com/spreadsheets/d/"
+                    + str(single["id"]).strip()
+                    + "/edit"
+                )
+            workbook_name = str(
+                single.get("name", "")
+                or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
+            )
+            profile = _read_json_dict(Path(profile_json)) or {}
+            saved = {
+                "state": "consolidation-required",
+                "account": current_user,
+                "detail": detail,
+                "spreadsheet_url": spreadsheet_url,
+                "workbook_name": workbook_name,
+            }
+            _write_setup_status(config_dir, saved)
+            return AttendanceStatus(
+                state="consolidation-required",
+                account=current_user,
+                current_user=current_user,
+                spreadsheet_url=spreadsheet_url,
+                detail=detail,
+                school_year=_profile_school_year(config_dir),
+                workbook_name=workbook_name,
+                consolidation_required=True,
+                canonical_workbook_name=(
+                    attendance_workbook_identity.attendance_workbook_name(profile)
+                ),
+            )
         _write_setup_status(config_dir, {
             "state": "failed", "account": current_user, "failed_service": failed_service,
             "detail": detail, "progress": saved_progress,
@@ -2847,59 +2896,143 @@ def _ensure_attendance_once(
     )
 
 
-def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
-    """새 학년도용 새 출석부 — 기존 기록은 지우지 않고 보관한 뒤 처음부터 다시 만든다.
+def consolidate_attendance(
+    config_dir: Path, deps: AttendanceDeps | None = None
+) -> AttendanceStatus:
+    """갈라진 옛 출결 자료를 후보에 완성한 뒤 현재 Sheet 번호를 마지막에 바꾼다."""
 
-    기존 출석부(시트·문서·폴더)는 Drive에 그대로 남는다. 로그인·프로필 준비가
-    안 됐으면 아무것도 옮기지 않고 그 상태만 알려준다. 기록이 이미 없으면
-    (직전 시도 실패 등) 보관 없이 이어서 설치한다 — 진행 기록으로 재개된다.
-    """
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
-    # 보관 폴더와 잠금 파일보다 계정 확인이 먼저다. 잘못 로그인한 상태에서는
-    # 기존 기록뿐 아니라 로컬 파일도 한 글자도 바꾸지 않는다.
     gws = str(deps.gws_resolver())
+    usable_states = {
+        "ready",
+        "script-check-required",
+        "script-update-required",
+        "consolidation-required",
+    }
     preflight = read_attendance_status(
         config_dir, deps.run_command, gws_executable=gws
     )
-    if preflight.state in (
-        "gws-required", "login-required", "account-required", "auth-error", "profile-required"
-    ):
+    if preflight.state not in usable_states or not preflight.consolidation_required:
         return preflight
+
     with attendance_setup_lock(config_dir):
-        status = read_attendance_status(
+        current = read_attendance_status(
             config_dir, deps.run_command, gws_executable=gws
         )
-        if status.state in (
-            "gws-required", "login-required", "account-required", "auth-error", "profile-required"
-        ):
-            return status
-        record_path = paths.attendance_install_record_path(config_dir)
-        if record_path.exists():
-            # 새로 만드는 출석부 이름에는 학년도가 새겨진다(attendance_workbook_name) —
-            # 옛 기록의 이름을 바꿔 둘 필요 없이, 쓰던 기록만 보관하면 이름이 저절로 갈린다.
-            _archive_attendance_files(
-                config_dir,
-                (record_path, paths.attendance_setup_status_path(config_dir)),
+        if current.state not in usable_states or not current.consolidation_required:
+            return current
+        transition_deps = deps.transition_deps_factory(
+            runner=deps.attendance_runner,
+            gws_executable=gws,
+            account=current.current_user,
+        )
+        result = deps.workbook_consolidator(
+            config_dir, deps=transition_deps
+        )
+        if str(getattr(result, "state", "") or "") != "complete":
+            detail = str(getattr(result, "detail", "") or "")
+            return replace(
+                current,
+                state="failed",
+                detail=detail or "출결 시트를 하나로 정리하지 못했어요.",
+                failed_service="sheet",
+                created=False,
             )
-        return _ensure_attendance_once(config_dir, deps, gws)
+
+        final = read_attendance_status(
+            config_dir, deps.run_command, gws_executable=gws
+        )
+        expected_url = str(getattr(result, "spreadsheet_url", "") or "")
+        if (
+            final.state not in usable_states
+            or final.consolidation_required
+            or (expected_url and final.spreadsheet_url != expected_url)
+        ):
+            return replace(
+                final,
+                state="failed",
+                detail="새 정식 출석부로 연결된 결과를 다시 확인하지 못했어요.",
+                failed_service="sheet",
+                created=False,
+            )
+        return replace(final, created=True)
 
 
-def _archive_attendance_files(config_dir: Path, sources) -> None:
-    archive_dir = Path(config_dir) / "attendance-archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    from datetime import datetime
+def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
+    """학년도가 달라졌을 때 후보를 완성한 뒤 현재 Sheet 번호를 마지막에 바꾼다."""
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    for source in sources:
-        if not source.exists():
-            continue
-        target = archive_dir / f"{source.stem}-{stamp}{source.suffix}"
-        counter = 0
-        while target.exists():  # 같은 초에 두 번 눌러도 보관본을 덮지 않는다
-            counter += 1
-            target = archive_dir / f"{source.stem}-{stamp}-{counter}{source.suffix}"
-        source.rename(target)
+    deps = deps or AttendanceDeps()
+    config_dir = Path(config_dir)
+    gws = str(deps.gws_resolver())
+    usable_states = {"ready", "script-check-required", "script-update-required"}
+    preflight = read_attendance_status(
+        config_dir, deps.run_command, gws_executable=gws
+    )
+    if preflight.state not in usable_states:
+        return preflight
+    if preflight.consolidation_required:
+        return replace(
+            preflight,
+            state="failed",
+            failed_service="sheet",
+            detail="먼저 `출결 시트 하나로 정리`를 끝내 주세요.",
+        )
+    if not preflight.year_mismatch:
+        return preflight
+
+    with attendance_setup_lock(config_dir):
+        current = read_attendance_status(
+            config_dir, deps.run_command, gws_executable=gws
+        )
+        if current.state not in usable_states:
+            return current
+        if current.consolidation_required:
+            return replace(
+                current,
+                state="failed",
+                failed_service="sheet",
+                detail="먼저 `출결 시트 하나로 정리`를 끝내 주세요.",
+            )
+        if not current.year_mismatch:
+            return current
+
+        transition_deps = deps.transition_deps_factory(
+            runner=deps.attendance_runner,
+            gws_executable=gws,
+            account=current.current_user,
+        )
+        result = deps.new_school_year_starter(
+            config_dir, deps=transition_deps
+        )
+        if str(getattr(result, "state", "") or "") != "complete":
+            detail = str(getattr(result, "detail", "") or "")
+            return replace(
+                current,
+                state="failed",
+                detail=detail or "새 학년도 출석부를 시작하지 못했어요.",
+                failed_service="sheet",
+                created=False,
+            )
+
+        final = read_attendance_status(
+            config_dir, deps.run_command, gws_executable=gws
+        )
+        expected_url = str(getattr(result, "spreadsheet_url", "") or "")
+        if (
+            final.state not in usable_states
+            or final.consolidation_required
+            or final.year_mismatch
+            or (expected_url and final.spreadsheet_url != expected_url)
+        ):
+            return replace(
+                final,
+                state="failed",
+                detail="새 학년도 출석부로 연결된 결과를 다시 확인하지 못했어요.",
+                failed_service="sheet",
+                created=False,
+            )
+        return replace(final, created=True)
 
 
 def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates: dict,

@@ -67,11 +67,8 @@ const ATTENDANCE_AI_GEMINI_API_KEY_PROPERTY = 'ATTENDANCE_AI_GEMINI_API_KEY';
 // 컴퓨터의 티처 매니저 연결 화면에 넣은 키가 설정 탭 이 이름으로 들어온다.
 // install_attendance_automation.build_config_rows / central_chat._upsert_settings_value와 같은 이름이어야 한다.
 const ATTENDANCE_AI_GEMINI_API_KEY_SETTING = 'GEMINI_API_KEY';
-// 출결 준비 프로그램이 만드는 사본 이름 조각이다.
-// prepare_attendance_copy.py의 copy_name과 항상 같아야 한다 — 테스트가 대조 검사함.
-const ATTENDANCE_AI_COPY_NAME_MARKER = ' - AI 입력 준비 사본 (';
-// 티처 매니저가 시트를 새로 만들 때 설정 탭에 적는 값이다. '예'면 이 시트에서 1행 AI 입력을 켤 수 있다.
-// 예전 판이 만든 원본 시트에는 이 값이 없으므로, 원본 보호(사본에서만 켜기)는 그대로 유지된다.
+// Teacher Manager 정식 출석부의 설정 탭에 적는 값이다. '예'면 이 시트에서
+// 1행 AI 입력을 켤 수 있다. 파일 이름은 권한 근거로 사용하지 않는다.
 // install_attendance_automation.build_config_rows와 이름·값이 같아야 한다.
 const ATTENDANCE_AI_ALLOWED_SETTING = 'ATTENDANCE_AI_ALLOWED';
 const ATTENDANCE_AI_ALLOWED_VALUE = '예';
@@ -431,6 +428,7 @@ function ensureConfigSheet_(ss) {
     ['CHAT_LOG_SHEET_NAME', DEFAULT_CONFIG.CHAT_LOG_SHEET_NAME, '교육청 메신저 발송 기록 시트 이름입니다.', '발송기록'],
     ['PERSONAL_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_PERSONAL_SHEET_NAME, '개인에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 개인톡 내용'],
     ['CLASS_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_CLASS_SHEET_NAME, '학급 전체에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 단체톡 내용'],
+    ['ATTENDANCE_AI_ALLOWED', ATTENDANCE_AI_ALLOWED_VALUE, 'Teacher Manager 정식 출석부에서 AI 입력을 켤 수 있게 하는 값입니다.', '예'],
     ['SCRIPT_ID', DEFAULT_CONFIG.SCRIPT_ID, '이 시트에 연결된 Apps Script 프로젝트 ID입니다. 설치/점검 때 자동 기록되어, 설치 기록 파일이 없는 컴퓨터나 사본 시트에서도 스크립트를 찾을 수 있습니다.', '자동 입력']
   ];
 
@@ -1316,7 +1314,7 @@ function handleAttendanceAiEdit(e, testPorts) {
 }
 
 /*************************************************
- * 새 출결 사본에서만 1행 AI 입력 켜기
+ * Teacher Manager 정식 출석부에서 1행 AI 입력 켜기
  *************************************************/
 
 /** 설정 시트를 새로 만들지 않고 값 하나만 읽는다. 읽지 못하면 빈 값으로 본다. */
@@ -1332,16 +1330,14 @@ function readConfigValueReadOnly_(key) {
 }
 
 /**
- * 지금 열려 있는 파일이 1행 AI 입력을 켤 수 있는 사본인지 확인한다.
+ * 지금 열려 있는 파일이 1행 AI 입력을 켤 수 있는 정식 출석부인지 확인한다.
  * 확인하지 못하면 켤 수 없다고 본다.
  */
 function attendanceAiWorkbookState_() {
   let spreadsheetId = '';
-  let name = '';
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     spreadsheetId = String(ss.getId() || '').trim();
-    name = String(ss.getName() || '');
   } catch (err) {
     return {
       ok: false,
@@ -1371,33 +1367,18 @@ function attendanceAiWorkbookState_() {
   if (alreadyEnabledHere === spreadsheetId) {
     return { ok: true, spreadsheetId: spreadsheetId, message: '' };
   }
-  // 티처 매니저가 새로 만든 시트는 사본이 아니어도 켤 수 있다(2026-08-13 수정).
-  // 이 값이 없던 2.2까지의 새 설치 시트는 감지기가 영영 안 만들어져 1행 입력이 조용히 죽어 있었다.
+  // Teacher Manager가 정식으로 만든 시트는 설정값으로만 알아본다.
+  // 파일 이름은 사용자가 바꿀 수 있으므로 AI 허용 근거로 쓰지 않는다.
   if (readConfigValueReadOnly_(ATTENDANCE_AI_ALLOWED_SETTING) === ATTENDANCE_AI_ALLOWED_VALUE) {
     return { ok: true, spreadsheetId: spreadsheetId, message: '' };
   }
-  if (name.indexOf(ATTENDANCE_AI_COPY_NAME_MARKER) < 0) {
-    return {
-      ok: false,
-      spreadsheetId: spreadsheetId,
-      message:
-        'AI 출결 입력은 티처 매니저가 만든 출결 사본에서만 켤 수 있습니다.\n\n' +
-        '지금 열려 있는 파일: ' + name + '\n' +
-        '사본 파일 이름에는 "' + ATTENDANCE_AI_COPY_NAME_MARKER.trim() + '"가 들어 있습니다.\n\n' +
-        '원래 쓰던 출결 시트에서는 켜지 않습니다.'
-    };
-  }
-  const centralSheetId = readConfigValueReadOnly_('CENTRAL_CHAT_SHEET_ID');
-  if (!centralSheetId || centralSheetId.indexOf(spreadsheetId + ':') !== 0) {
-    return {
-      ok: false,
-      spreadsheetId: spreadsheetId,
-      message:
-        '이 사본은 아직 출결 연결 바꾸기가 끝나지 않았습니다.\n\n' +
-        '컴퓨터의 티처 매니저에서 출결 연결 바꾸기를 끝낸 다음 이 메뉴를 다시 눌러 주세요.'
-    };
-  }
-  return { ok: true, spreadsheetId: spreadsheetId, message: '' };
+  return {
+    ok: false,
+    spreadsheetId: spreadsheetId,
+    message:
+      '이 파일을 Teacher Manager 정식 출석부로 확인하지 못했습니다.\n\n' +
+      '컴퓨터의 Teacher Manager에서 출결 시트를 하나로 정리하거나 처음 출결 준비를 끝낸 뒤 다시 눌러 주세요.'
+  };
 }
 
 /**
@@ -2488,13 +2469,12 @@ function sendCentralClassChat_(spaceName, text, meta) {
   });
 }
 
-// 발송을 새 사본으로 옮긴 뒤 옛 시트에서 연결하거나 보내려 할 때 서버가 주는 답.
+// 발송을 새 정식 출석부로 옮긴 뒤 옛 시트에서 보내려 할 때 서버가 주는 답.
 // 코드 글자를 그대로 보여주면 선생님은 고장 난 줄 알게 된다.
 const CENTRAL_SHEET_MOVED_CODE = 'SHEET_MOVED';
 const CENTRAL_SHEET_MOVED_MESSAGE =
-  '이 시트의 Google Chat 발송은 새 출결 사본으로 옮겼습니다.\n\n' +
-  '보내실 때는 사본 시트를 열어서 보내 주세요.\n' +
-  '사본 이름에는 "AI 입력 준비 사본"이 들어 있습니다.\n\n' +
+  '이 시트의 Google Chat 발송은 새 정식 출석부로 옮겼습니다.\n\n' +
+  'Teacher Manager에서 현재 출석부를 열어 보내 주세요.\n\n' +
   '이 시트에서는 더 이상 보내지지 않습니다.';
 
 /** 중앙 발송소 오류를 선생님이 읽을 문장으로 바꾼다. 모르는 오류는 그대로 둔다. */

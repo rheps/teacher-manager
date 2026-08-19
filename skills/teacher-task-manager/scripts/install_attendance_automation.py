@@ -18,6 +18,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import apps_script_version
 import attendance_script_update
+import attendance_workbook_identity
 from brity_bridge import bundle_paths, gws_env, process_win, tool_runtime
 
 
@@ -39,6 +40,16 @@ _SCRIPT_TITLE_PREFIX = "Big-Silver Teacher Manager 출결 자동화 [설치표�
 # 이 접두로 만들던 시절에 끊긴 설치 기록을 이어받을 때만 쓴다.
 _LEGACY_SCRIPT_TITLE_PREFIXES = ("출결 신고서 자동화 [설치표식 ",)
 _VERSION_DESCRIPTION_PREFIX = "teacher-manager-attendance-version-"
+ATTENDANCE_CREATION_FIRST_SETUP = "first-setup"
+ATTENDANCE_CREATION_SPLIT_REPAIR = "split-repair"
+ATTENDANCE_CREATION_NEW_SCHOOL_YEAR = "new-school-year"
+ATTENDANCE_CREATION_REASONS = frozenset(
+    {
+        ATTENDANCE_CREATION_FIRST_SETUP,
+        ATTENDANCE_CREATION_SPLIT_REPAIR,
+        ATTENDANCE_CREATION_NEW_SCHOOL_YEAR,
+    }
+)
 
 
 def _pending_script_title_suffix(title: str) -> str:
@@ -86,6 +97,7 @@ class AttendanceInstallResult:
     # 지금 프로그램에 들어 있는 Code.gs와 원격 배포판이 정확히 같다고 확인한
     # 경우에만 남긴다. 프로그램이 바뀌면 지문도 달라져 다시 읽기 확인을 거친다.
     script_bundle_sha256: str = ""
+    workbook_role: str = attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
 
 
 def default_runner(args: Sequence[str], cwd: Path) -> str:
@@ -815,23 +827,11 @@ ATTENDANCE_LEGACY_SHEET_NAME = "출결신고서 자동화"
 
 
 def current_school_year(today=None) -> str:
-    """한국 학년도 — 3월 1일에 새 학년도가 시작한다."""
-    import datetime
-
-    day = today or datetime.date.today()
-    return str(day.year if day.month >= 3 else day.year - 1)
+    return attendance_workbook_identity.current_school_year(today)
 
 
 def attendance_workbook_name(profile: dict, today=None) -> str:
-    """프로필로 시트 이름을 만든다 — 학년도가 제목에 새겨져 연결 근거가 된다."""
-    school = profile.get("school") or {}
-    year = str(school.get("year", "") or "").strip() or current_school_year(today)
-    homeroom = profile.get("homeroom") or {}
-    grade = str(homeroom.get("grade", "") or "").strip()
-    klass = str(homeroom.get("class", "") or "").strip()
-    if homeroom.get("enabled") and grade and klass:
-        return f"{year}학년도 {grade}학년 {klass}반 출석부"
-    return f"{year}학년도 출석부"
+    return attendance_workbook_identity.attendance_workbook_name(profile, today)
 
 
 SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
@@ -839,6 +839,16 @@ SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 class ExistingAttendanceSheetError(RuntimeError):
     """내 드라이브에 이미 출결 시트가 있어 새로 만들지 않고 멈춘다."""
+
+
+class LegacyAttendanceConsolidationRequired(ExistingAttendanceSheetError):
+    """로컬 기록은 없지만 Drive에 한 번 정리해야 할 예전 출결표가 있다."""
+
+    def __init__(self, candidates: Sequence[dict]):
+        self.candidates = tuple(
+            dict(item) for item in candidates if isinstance(item, dict)
+        )
+        super().__init__(_legacy_consolidation_message(self.candidates))
 
 
 def _sheet_lines(files: Sequence[dict]) -> list[str]:
@@ -892,6 +902,24 @@ def _read_existing_settings(
     spreadsheet_id: str,
     gws_executable: str,
 ) -> dict[str, str]:
+    rows = _read_existing_setting_rows(
+        runner, workdir, spreadsheet_id, gws_executable
+    )
+    settings: dict[str, str] = {}
+    for row in rows:
+        if len(row) >= 2:
+            key = str(row[0]).strip()
+            if key and key not in settings:
+                settings[key] = str(row[1]).strip()
+    return settings
+
+
+def _read_existing_setting_rows(
+    runner: CommandRunner,
+    workdir: Path,
+    spreadsheet_id: str,
+    gws_executable: str,
+) -> list[list[str]]:
     reply = run_json(
         runner,
         [
@@ -911,14 +939,14 @@ def _read_existing_settings(
         workdir,
     )
     rows = reply.get("values") if isinstance(reply, dict) else None
-    settings: dict[str, str] = {}
+    normalized: list[list[str]] = []
     if isinstance(rows, list):
         for row in rows:
-            if isinstance(row, list) and len(row) >= 2:
-                key = str(row[0]).strip()
-                if key and key not in settings:
-                    settings[key] = str(row[1]).strip()
-    return settings
+            if isinstance(row, list):
+                normalized.append(
+                    [str(value if value is not None else "") for value in row[:4]]
+                )
+    return normalized
 
 
 def _require_new_enough_script(
@@ -1100,6 +1128,92 @@ def find_existing_attendance_sheets(
     return files
 
 
+def find_canonical_attendance_sheets(
+    runner: CommandRunner,
+    workdir: Path,
+    dry_run: bool,
+    school_year: str,
+    gws_executable: str,
+) -> list[dict]:
+    """이름과 상관없이 정식 표식·학년도가 같은 내 출결 파일을 찾는다."""
+
+    if dry_run:
+        return []
+    role_key = attendance_workbook_identity.ATTENDANCE_ROLE_PROPERTY
+    role_value = attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
+    year_key = attendance_workbook_identity.ATTENDANCE_SCHOOL_YEAR_PROPERTY
+    query = (
+        f"appProperties has {{ key='{role_key}' and value='{role_value}' }} and "
+        f"appProperties has {{ key='{year_key}' and value='{school_year}' }} and "
+        f"mimeType = '{SPREADSHEET_MIME}' and trashed = false and 'me' in owners"
+    )
+    files = _drive_files_all(
+        runner,
+        workdir,
+        {
+            "q": query,
+            "fields": (
+                "nextPageToken,incompleteSearch,"
+                "files(id,name,mimeType,ownedByMe,appProperties,webViewLink)"
+            ),
+            "pageSize": 1000,
+            "supportsAllDrives": True,
+        },
+        gws_executable,
+    )
+    for item in files:
+        properties = item.get("appProperties")
+        if not (
+            str(item.get("id", "") or "").strip()
+            and item.get("mimeType") == SPREADSHEET_MIME
+            and item.get("ownedByMe") is True
+            and isinstance(properties, dict)
+            and properties.get(role_key) == role_value
+            and properties.get(year_key) == school_year
+        ):
+            raise CreationRecoveryPendingError(
+                "정식 출결 시트 목록 응답을 안전하게 확인할 수 없어요. "
+                "새 시트는 만들지 않았습니다."
+            )
+    return files
+
+
+def find_legacy_attendance_sheets(
+    runner: CommandRunner,
+    workdir: Path,
+    dry_run: bool,
+    names: Sequence[str],
+    gws_executable: str,
+) -> list[dict]:
+    """두 갈래 정리 대상으로만 쓰는 예전 이름의 출결 파일을 찾는다."""
+
+    found: list[dict] = []
+    seen_ids: set[str] = set()
+    for name in dict.fromkeys(str(value or "").strip() for value in names):
+        if not name:
+            continue
+        for item in find_existing_attendance_sheets(
+            runner, workdir, dry_run, name, gws_executable
+        ):
+            item_id = str(item.get("id", "") or "").strip()
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                found.append(item)
+    return found
+
+
+def _legacy_consolidation_message(files: Sequence[dict]) -> str:
+    return "\n".join(
+        [
+            "예전 이름의 출결 시트를 찾았어요.",
+            "새 시트를 자동으로 만들면 다시 두 갈래가 되므로 만들지 않았습니다.",
+            "Teacher Manager에서 `출결 시트 하나로 정리`를 눌러 한 파일로 이어 주세요.",
+            "",
+        ]
+        + _sheet_lines(files)
+    )
+
+
 def with_dry_run_fallback(response: dict, fallback: dict, dry_run: bool) -> dict:
     if not dry_run:
         return response
@@ -1174,6 +1288,10 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
         "homeroom_grade": str(homeroom.get("grade", "") or "").strip(),
         "homeroom_class": str(homeroom.get("class", "") or "").strip(),
         "workbook_name": result.workbook_name,
+        "workbook_role": str(
+            getattr(result, "workbook_role", "")
+            or attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
+        ),
     }
     if result.script_update_required:
         record["script_update_required"] = True
@@ -1219,6 +1337,406 @@ def copy_assets_to_workdir(asset_root: Path, workdir: Path) -> Path:
     return script_dir
 
 
+def _require_attendance_creation_reason(reason: str) -> str:
+    checked = str(reason or "").strip()
+    if checked not in ATTENDANCE_CREATION_REASONS:
+        raise ValueError(
+            "새 출결 시트를 만들 수 없는 요청입니다. 처음 설정, 출결 시트 하나로 "
+            "정리, 새 학년도 시작에서만 만들 수 있습니다."
+        )
+    return checked
+
+
+def create_canonical_attendance_workbook(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    profile: dict,
+    workbook_name: str,
+    intent: str,
+    creation_reason: str,
+    source_spreadsheet_id: str = "",
+    existing_sheet: dict | None = None,
+    dry_run: bool,
+    gws_executable: str,
+) -> dict:
+    """승인된 세 경우에만 정식 출결 Google Sheet를 만드는 유일한 문."""
+
+    _require_attendance_creation_reason(creation_reason)
+    dry = ["--dry-run"] if dry_run else []
+    source_id = str(source_spreadsheet_id or "").strip()
+    if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR and not source_id:
+        raise ValueError("두 갈래 정리 원본 출결 시트 번호가 없습니다.")
+    if existing_sheet is not None:
+        sheet = dict(existing_sheet)
+    else:
+        create_args = [
+            gws_executable,
+            "drive",
+            "files",
+            "create",
+            *dry,
+            "--json",
+            json.dumps(
+                {
+                    "name": workbook_name,
+                    "mimeType": SPREADSHEET_MIME,
+                    "appProperties": {
+                        _DRIVE_INTENT_PROPERTY: intent,
+                        **attendance_workbook_identity.attendance_workbook_app_properties(
+                            profile
+                        ),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        ]
+        if creation_reason != ATTENDANCE_CREATION_SPLIT_REPAIR:
+            create_args.extend(
+                [
+                    "--upload",
+                    ".\\attendance-workbook.xlsx",
+                    "--upload-content-type",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ]
+            )
+        create_args.extend(["--format", "json"])
+        sheet = run_json(
+            runner,
+            create_args,
+            workdir,
+        )
+        sheet = with_dry_run_fallback(
+            sheet,
+            {
+                "id": "dry-run-spreadsheet-id",
+                "webViewLink": (
+                    "https://docs.google.com/spreadsheets/d/dry-run-spreadsheet-id/edit"
+                ),
+            },
+            dry_run,
+        )
+    if creation_reason != ATTENDANCE_CREATION_SPLIT_REPAIR or dry_run:
+        return sheet
+
+    destination_id = str(sheet.get("id", "") or "").strip()
+    if not destination_id:
+        raise CreationRecoveryPendingError(
+            "정리 후보 시트 번호를 확인하지 못해 원본 탭을 복사하지 않았어요."
+        )
+
+    def read_sheet_properties(spreadsheet_id: str) -> list[dict]:
+        response = run_json(
+            runner,
+            [
+                gws_executable,
+                "sheets",
+                "spreadsheets",
+                "get",
+                "--params",
+                json.dumps({"spreadsheetId": spreadsheet_id}, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        raw = response.get("sheets") if isinstance(response, dict) else None
+        if not isinstance(raw, list) or not raw:
+            raise CreationRecoveryPendingError(
+                "출결 시트 탭 목록을 안전하게 확인하지 못했어요."
+            )
+        properties: list[dict] = []
+        for item in raw:
+            value = item.get("properties") if isinstance(item, dict) else None
+            sheet_id = value.get("sheetId") if isinstance(value, dict) else None
+            title = str(value.get("title", "") or "").strip() if isinstance(value, dict) else ""
+            if not isinstance(sheet_id, int) or isinstance(sheet_id, bool) or not title:
+                raise CreationRecoveryPendingError(
+                    "출결 시트 탭 목록을 안전하게 확인하지 못했어요."
+                )
+            properties.append(dict(value))
+        if len({item["title"] for item in properties}) != len(properties):
+            raise CreationRecoveryPendingError(
+                "같은 이름의 출결 탭이 여러 개 보여 자동으로 복사하지 않았어요."
+            )
+        return sorted(properties, key=lambda item: int(item.get("index", 0)))
+
+    def copied_shape(properties: dict) -> dict:
+        return {
+            "title": properties.get("title"),
+            "hidden": properties.get("hidden") is True,
+            "sheetType": str(properties.get("sheetType", "GRID") or "GRID"),
+            "gridProperties": dict(properties.get("gridProperties") or {}),
+        }
+
+    def copied_content_shape(properties: dict) -> dict:
+        """제목을 빼고, 복사된 탭이 원본과 같은 탭인지 확인한다."""
+
+        shape = copied_shape(properties)
+        shape.pop("title", None)
+        return shape
+
+    def rename_destination_sheet(sheet_id: int, title: str) -> None:
+        run_json(
+            runner,
+            [
+                gws_executable,
+                "sheets",
+                "spreadsheets",
+                "batchUpdate",
+                "--params",
+                json.dumps({"spreadsheetId": destination_id}, ensure_ascii=False),
+                "--json",
+                json.dumps(
+                    {
+                        "requests": [
+                            {
+                                "updateSheetProperties": {
+                                    "properties": {
+                                        "sheetId": sheet_id,
+                                        "title": title,
+                                    },
+                                    "fields": "title",
+                                }
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+
+    source_sheets = read_sheet_properties(source_id)
+    source_titles = [item["title"] for item in source_sheets]
+    safe_intent = "".join(character for character in intent if character.isalnum())[-24:]
+    reserved_title = f"__TM_EMPTY_{safe_intent}__"
+    if reserved_title in source_titles:
+        raise CreationRecoveryPendingError(
+            "원본에 설치용 빈 탭 표식과 같은 이름이 있어 자동으로 복사하지 않았어요."
+        )
+
+    destination_sheets = read_sheet_properties(destination_id)
+    reserved = [
+        item for item in destination_sheets if item["title"] == reserved_title
+    ]
+    if len(reserved) > 1:
+        raise CreationRecoveryPendingError(
+            "정리 후보의 설치용 빈 탭이 여러 개라 자동으로 이어가지 않았어요."
+        )
+    if not reserved:
+        present_titles = [item["title"] for item in destination_sheets]
+        already_complete = (
+            present_titles == source_titles
+            and [copied_shape(item) for item in destination_sheets]
+            == [copied_shape(item) for item in source_sheets]
+        )
+        if already_complete:
+            return sheet
+        # 생성 직후의 탭 한 개만 이 이름으로 바꾼다. 이 표식이 생기기 전에는
+        # 원본 탭 복사를 시작하지 않으므로, 재시도에서 지워도 되는 탭이 분명하다.
+        if len(destination_sheets) != 1:
+            raise CreationRecoveryPendingError(
+                "정리 후보의 빈 탭을 분명하게 찾지 못해 자동으로 이어가지 않았어요."
+            )
+        initial = destination_sheets[0]
+        rename_destination_sheet(initial["sheetId"], reserved_title)
+        destination_sheets = read_sheet_properties(destination_id)
+        reserved = [
+            item for item in destination_sheets if item["title"] == reserved_title
+        ]
+        if len(reserved) != 1:
+            raise CreationRecoveryPendingError(
+                "정리 후보의 설치용 빈 탭 표식을 다시 확인하지 못했어요."
+            )
+
+    # Google Sheets의 copyTo는 다른 파일로 옮긴 탭을 `Copy of 원래제목`으로
+    # 먼저 만든다. 이전 코드는 제목이 그대로 복사된다고 잘못 가정해 후보 파일에
+    # 이 임시 제목들을 남겼다. 현재 후보에 그런 탭이 있으면 모양을 전부 확인한
+    # 뒤에만 원래 제목으로 되돌린다. 이 과정은 기존 원본에는 손대지 않는다.
+    destination_sheets = read_sheet_properties(destination_id)
+    pending_renames: list[tuple[int, str]] = []
+    for source_sheet in source_sheets:
+        source_title = source_sheet["title"]
+        copied_title = f"Copy of {source_title}"
+        exact_matches = [
+            item for item in destination_sheets if item["title"] == source_title
+        ]
+        copied_matches = [
+            item for item in destination_sheets if item["title"] == copied_title
+        ]
+        if len(exact_matches) > 1 or len(copied_matches) > 1:
+            raise CreationRecoveryPendingError(
+                f"정리 후보에 `{source_title}` 탭이 여러 개라 자동으로 이어가지 않았어요."
+            )
+        if exact_matches and copied_matches:
+            raise CreationRecoveryPendingError(
+                f"정리 후보에 `{source_title}` 탭과 복사 중인 탭이 함께 있어 자동으로 이어가지 않았어요."
+            )
+        if not exact_matches and copied_matches:
+            copied_match = copied_matches[0]
+            if copied_content_shape(copied_match) != copied_content_shape(source_sheet):
+                raise CreationRecoveryPendingError(
+                    f"정리 후보의 `{source_title}` 복사 탭 모양이 원본과 달라 연결을 바꾸지 않았어요."
+                )
+            pending_renames.append((copied_match["sheetId"], source_title))
+
+    for copied_sheet_id, source_title in pending_renames:
+        rename_destination_sheet(copied_sheet_id, source_title)
+
+    for source_sheet in source_sheets:
+        destination_sheets = read_sheet_properties(destination_id)
+        matches = [
+            item
+            for item in destination_sheets
+            if item["title"] == source_sheet["title"]
+        ]
+        if len(matches) > 1:
+            raise CreationRecoveryPendingError(
+                f"정리 후보에 `{source_sheet['title']}` 탭이 여러 개라 자동으로 이어가지 않았어요."
+            )
+        if matches:
+            if copied_shape(matches[0]) != copied_shape(source_sheet):
+                raise CreationRecoveryPendingError(
+                    f"정리 후보의 `{source_sheet['title']}` 탭 모양이 원본과 달라 연결을 바꾸지 않았어요."
+                )
+            continue
+        copied = run_json(
+            runner,
+            [
+                gws_executable,
+                "sheets",
+                "spreadsheets",
+                "sheets",
+                "copyTo",
+                "--params",
+                json.dumps(
+                    {
+                        "spreadsheetId": source_id,
+                        "sheetId": source_sheet["sheetId"],
+                    },
+                    ensure_ascii=False,
+                ),
+                "--json",
+                json.dumps(
+                    {"destinationSpreadsheetId": destination_id},
+                    ensure_ascii=False,
+                ),
+                "--format",
+                "json",
+            ],
+            workdir,
+        )
+        copied_sheet_id = copied.get("sheetId") if isinstance(copied, dict) else None
+        if not isinstance(copied_sheet_id, int) or isinstance(copied_sheet_id, bool):
+            raise CreationRecoveryPendingError(
+                f"정리 후보에 복사한 `{source_sheet['title']}` 탭 번호를 확인하지 못했어요. 다시 누르면 이어서 확인합니다."
+            )
+        rename_destination_sheet(copied_sheet_id, source_sheet["title"])
+
+    destination_sheets = read_sheet_properties(destination_id)
+    allowed_titles = set(source_titles) | {reserved_title}
+    unexpected = [
+        item["title"] for item in destination_sheets
+        if item["title"] not in allowed_titles
+    ]
+    if unexpected:
+        raise CreationRecoveryPendingError(
+            "정리 후보에 원본에 없는 탭이 있어 자동으로 지우지 않았어요: "
+            + ", ".join(unexpected)
+        )
+    reserved = [
+        item for item in destination_sheets if item["title"] == reserved_title
+    ]
+    if len(reserved) != 1:
+        raise CreationRecoveryPendingError(
+            "정리 후보의 설치용 빈 탭을 마지막에 한 개로 확인하지 못했어요."
+        )
+    run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "batchUpdate",
+            "--params",
+            json.dumps({"spreadsheetId": destination_id}, ensure_ascii=False),
+            "--json",
+            json.dumps(
+                {
+                    "requests": [
+                        {"deleteSheet": {"sheetId": item["sheetId"]}}
+                        for item in reserved
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    copied_sheets = read_sheet_properties(destination_id)
+    copied_titles = [item["title"] for item in copied_sheets]
+    if copied_titles != source_titles:
+        raise CreationRecoveryPendingError(
+            "정리 후보의 탭 이름과 순서가 원본과 달라 연결을 바꾸지 않았어요."
+        )
+    if [copied_shape(item) for item in copied_sheets] != [
+        copied_shape(item) for item in source_sheets
+    ]:
+        raise CreationRecoveryPendingError(
+            "정리 후보의 탭 모양이 원본과 달라 연결을 바꾸지 않았어요."
+        )
+    return sheet
+
+
+def merge_attendance_config_rows(
+    existing_rows: Sequence[Sequence[Any]],
+    desired_rows: Sequence[Sequence[Any]],
+    *,
+    overwrite_keys: set[str] | frozenset[str],
+) -> list[list[str]]:
+    """사용자 행은 보존하고 연결에 필요한 설정값만 새 후보 값으로 바꾼다."""
+
+    def normalized(row: Sequence[Any]) -> list[str]:
+        values = [str(value if value is not None else "") for value in row[:4]]
+        return values + [""] * (4 - len(values))
+
+    desired = [normalized(row) for row in desired_rows]
+    if not desired or desired[0][0].strip() != "설정키":
+        raise ValueError("새 출결 설정의 제목 줄을 확인하지 못했어요.")
+    desired_by_key: dict[str, list[str]] = {}
+    for row in desired[1:]:
+        key = row[0].strip()
+        if not key or key in desired_by_key:
+            raise ValueError("새 출결 설정에 빈 키나 중복 키가 있어 적용하지 않았어요.")
+        desired_by_key[key] = row
+
+    existing = [normalized(row) for row in existing_rows]
+    header = existing[0] if existing and existing[0][0].strip() == "설정키" else desired[0]
+    body = existing[1:] if existing and existing[0][0].strip() == "설정키" else existing
+    merged: list[list[str]] = [header]
+    seen: set[str] = set()
+    for row in body:
+        key = row[0].strip()
+        if key:
+            if key in seen:
+                raise ValueError(f"출결 설정에 같은 키가 두 번 있습니다: {key}")
+            seen.add(key)
+        if key in overwrite_keys and key in desired_by_key:
+            merged.append(list(desired_by_key[key]))
+        else:
+            merged.append(row)
+    for row in desired[1:]:
+        key = row[0].strip()
+        if key not in seen:
+            merged.append(list(row))
+    return merged
+
+
 def install_attendance_automation(
     profile_json: Path,
     runner: CommandRunner = default_runner,
@@ -1231,7 +1749,17 @@ def install_attendance_automation(
     gemini_api_key: str = "",
     *,
     gws_executable: str,
+    creation_reason: str = ATTENDANCE_CREATION_FIRST_SETUP,
+    source_spreadsheet_id: str = "",
+    write_record_on_success: bool = True,
 ) -> AttendanceInstallResult:
+    creation_reason = _require_attendance_creation_reason(creation_reason)
+    source_spreadsheet_id = str(source_spreadsheet_id or "").strip()
+    if (
+        creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR
+        and not source_spreadsheet_id
+    ):
+        raise ValueError("두 갈래 정리 원본 출결 시트 번호가 없습니다.")
     profile_json = Path(profile_json)
     asset_root = bundle_paths.bundle_root() / "assets"
     profile = load_profile(profile_json)
@@ -1250,22 +1778,73 @@ def install_attendance_automation(
         workdir = Path(temp_name)
         copy_assets_to_workdir(asset_root, workdir)
         dry = ["--dry-run"] if dry_run else []
+        source_setting_rows: list[list[str]] = []
+        source_settings: dict[str, str] = {}
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+            source_setting_rows = _read_existing_setting_rows(
+                runner,
+                workdir,
+                source_spreadsheet_id,
+                gws_executable,
+            )
+            for row in source_setting_rows:
+                if len(row) >= 2:
+                    key = str(row[0]).strip()
+                    if key and key not in source_settings:
+                        source_settings[key] = str(row[1]).strip()
+            required_source_values = {
+                "template_doc_id": "TEMPLATE_DOC_ID",
+                "folder_id": "DEST_FOLDER_ID",
+                "task_list_id": "TASK_LIST_ID",
+            }
+            missing_source_values = [
+                key
+                for key in required_source_values.values()
+                if not source_settings.get(key)
+            ]
+            if missing_source_values:
+                raise ExistingAttendanceSheetError(
+                    "정리 원본의 설정 탭에 이어 쓸 연결값이 없습니다: "
+                    + ", ".join(missing_source_values)
+                )
+            for result_key, setting_key in required_source_values.items():
+                created_ids.setdefault(result_key, source_settings[setting_key])
+            created_ids.setdefault(
+                "template_doc_url",
+                "https://docs.google.com/document/d/"
+                + created_ids["template_doc_id"]
+                + "/edit",
+            )
+            source_task_title = str(
+                source_settings.get("TASK_LIST_TITLE", "") or ""
+            ).strip()
+            if source_task_title:
+                attendance_task_list_title = source_task_title
 
-        # 아무것도 만들기 전에 쓰던 시트가 있는지 먼저 본다. 설치 기록이 사라졌다고
-        # 같은 이름의 시트를 또 만들면, 선생님은 쓰던 시트를 그대로 두고
-        # 프로그램만 빈 시트를 보게 된다. 하나면 그 시트에 연결하고, 여럿이면 멈춘다.
+        # 설치 기록이 없는 컴퓨터만 정식 Drive 표식으로 되찾는다. 이름은 사용자가
+        # 바꿀 수 있으므로 연결 근거로 쓰지 않는다. 예전 이름만 있으면 새 파일을
+        # 만들지 않고 사용자가 확인하는 한 번의 정리 절차로 넘긴다.
         if (
+            creation_reason == ATTENDANCE_CREATION_FIRST_SETUP
+            and
             not created_ids.get("spreadsheet_id")
             and not created_ids.get(_PENDING_SHEET_INTENT)
         ):
-            existing = find_existing_attendance_sheets(
-                runner, workdir, dry_run, workbook_name, gws_executable
+            school = profile.get("school") or {}
+            school_year = (
+                str(school.get("year", "") or "").strip() or current_school_year()
+            )
+            existing = find_canonical_attendance_sheets(
+                runner, workdir, dry_run, school_year, gws_executable
             )
             if len(existing) > 1:
                 raise ExistingAttendanceSheetError(_too_many_sheets_message(existing, workbook_name))
             if len(existing) == 1:
+                existing_name = str(existing[0].get("name", "") or "").strip()
+                if existing_name != workbook_name:
+                    raise LegacyAttendanceConsolidationRequired(existing)
                 reused = reuse_existing_attendance_sheet(
-                    runner, workdir, existing[0], workbook_name, gws_executable
+                    runner, workdir, existing[0], existing_name, gws_executable
                 )
                 created_ids.update(
                     {
@@ -1283,6 +1862,22 @@ def install_attendance_automation(
                 # 진행 기록"으로 남기면 로컬 기록 저장 실패 뒤 재시도에서 기존
                 # Sheet의 설정을 새 설치값으로 덮어쓸 수 있으므로 기록하지 않는다.
                 return reused
+            legacy = find_legacy_attendance_sheets(
+                runner,
+                workdir,
+                dry_run,
+                (
+                    ATTENDANCE_LEGACY_SHEET_NAME,
+                    attendance_workbook_identity.legacy_year_workbook_name(profile),
+                    attendance_workbook_identity.previous_attendance_workbook_name(
+                        profile
+                    ),
+                    workbook_name,
+                ),
+                gws_executable,
+            )
+            if legacy:
+                raise LegacyAttendanceConsolidationRequired(legacy)
 
         if not created_ids.get("template_doc_id"):
             intent = str(created_ids.get(_PENDING_TEMPLATE_INTENT, "") or "")
@@ -1363,43 +1958,36 @@ def install_attendance_automation(
                     label="출결 시트",
                     gws_executable=gws_executable,
                 )
+                if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+                    # 후보 파일 만들기 응답이나 탭 복사 응답이 끊긴 재시도다.
+                    # 같은 설치표식 후보 안에서 이미 복사된 탭을 확인하고 빠진 탭만
+                    # 이어 간다. 여기서 새 Google Sheet를 다시 만들지는 않는다.
+                    sheet = create_canonical_attendance_workbook(
+                        runner,
+                        workdir,
+                        profile=profile,
+                        workbook_name=workbook_name,
+                        intent=intent,
+                        creation_reason=creation_reason,
+                        source_spreadsheet_id=source_spreadsheet_id,
+                        existing_sheet=sheet,
+                        dry_run=dry_run,
+                        gws_executable=gws_executable,
+                    )
             else:
                 intent = _new_drive_intent("sheet")
                 created_ids[_PENDING_SHEET_INTENT] = intent
                 report_progress()
-                sheet = run_json(
+                sheet = create_canonical_attendance_workbook(
                     runner,
-                    [
-                        gws_executable,
-                        "drive",
-                        "files",
-                        "create",
-                        *dry,
-                        "--json",
-                        json.dumps(
-                            {
-                                "name": workbook_name,
-                                "mimeType": SPREADSHEET_MIME,
-                                "appProperties": {_DRIVE_INTENT_PROPERTY: intent},
-                            },
-                            ensure_ascii=False,
-                        ),
-                        "--upload",
-                        ".\\attendance-workbook.xlsx",
-                        "--upload-content-type",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        "--format",
-                        "json",
-                    ],
                     workdir,
-                )
-                sheet = with_dry_run_fallback(
-                    sheet,
-                    {
-                        "id": "dry-run-spreadsheet-id",
-                        "webViewLink": "https://docs.google.com/spreadsheets/d/dry-run-spreadsheet-id/edit",
-                    },
-                    dry_run,
+                    profile=profile,
+                    workbook_name=workbook_name,
+                    intent=intent,
+                    creation_reason=creation_reason,
+                    source_spreadsheet_id=source_spreadsheet_id,
+                    dry_run=dry_run,
+                    gws_executable=gws_executable,
                 )
             spreadsheet_id = str(sheet.get("id", "") or "").strip()
             if not spreadsheet_id:
@@ -1779,7 +2367,13 @@ def install_attendance_automation(
             "script_id": created_ids["script_id"],
             "deployment_id": created_ids["deployment_id"],
         }
-        central_chat = build_central_chat_defaults(created_ids["spreadsheet_id"], central_chat_sender_url)
+        source_sender_url = str(
+            source_settings.get("CENTRAL_CHAT_SENDER_URL", "") or ""
+        ).strip()
+        central_chat = build_central_chat_defaults(
+            created_ids["spreadsheet_id"],
+            source_sender_url or central_chat_sender_url,
+        )
         config_rows = build_config_rows(
             profile,
             ids,
@@ -1787,6 +2381,26 @@ def install_attendance_automation(
             central_chat,
             gemini_api_key=gemini_api_key,
         )
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+            config_rows = merge_attendance_config_rows(
+                source_setting_rows,
+                config_rows,
+                overwrite_keys=frozenset(
+                    {
+                        "SCHOOL_NAME",
+                        "SCHOOL_YEAR",
+                        "GRADE",
+                        "CLASS_NUMBER",
+                        "CLASS_LABEL",
+                        "TEACHER_NAME",
+                        "SCRIPT_ID",
+                        "DEPLOYMENT_ID",
+                        "CENTRAL_CHAT_SENDER_URL",
+                        "CENTRAL_CHAT_SHEET_ID",
+                        "ATTENDANCE_AI_ALLOWED",
+                    }
+                ),
+            )
         values_body = {
             "majorDimension": "ROWS",
             "values": config_rows,
@@ -1982,7 +2596,7 @@ def install_attendance_automation(
             workbook_name=workbook_name,
             script_bundle_sha256=script_bundle_sha256,
         )
-        if not dry_run:
+        if not dry_run and write_record_on_success:
             write_install_record(profile_json, result)
         return result
 
