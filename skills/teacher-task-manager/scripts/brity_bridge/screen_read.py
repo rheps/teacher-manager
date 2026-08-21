@@ -345,6 +345,7 @@ def build_screen_record(
         attachment_count=bundle.count,
         attachment_names=bundle.names,
         media_parts=bundle.media_parts,
+        local_attachment_names=bundle.local_names,
     )
     note = ""
     if bundle.skipped_names:

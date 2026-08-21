@@ -13,6 +13,14 @@ PROGRESS_STEPS = ("capture", "analyze", "register", "done", "fail")
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 ACTIVE_MAX_AGE = timedelta(minutes=3)
 FINISHED_LINGER = timedelta(seconds=10)
+CHECK_DUE_SUMMARY = "할 일 날짜를 확인하지 못함"
+CHECK_DUE_REASON = (
+    "할 일 날짜를 올바르게 해석하지 못해 안전하게 중단했습니다. "
+    "아무것도 등록하지 않았어요."
+)
+CHECK_GENERIC_SUMMARY = "등록할 내용을 확인하지 못함"
+CHECK_GENERIC_REASON = "등록할 내용을 안전하게 확인하지 못해 아무것도 등록하지 않았어요."
+CHECK_RETRY = "이 메시지를 Brity에서 다시 선택하고 단축키를 눌러 주세요."
 
 
 def captures_path(state_dir: Path) -> Path:
@@ -61,13 +69,48 @@ def _capture_rows(state_dir: Path):
                 yield parsed
 
 
+def _display_capture(row: dict) -> dict:
+    """Hide legacy validator wording without modifying the saved history file."""
+
+    if row.get("stage") != "check":
+        return row
+    shown = dict(row)
+    legacy_text = " ".join(
+        str(row.get(field, "")) for field in ("summary", "reason")
+    )
+    due_problem = any(
+        marker in legacy_text
+        for marker in ("due 형식", "RFC3339", "할 일 날짜")
+    )
+    shown["summary"] = CHECK_DUE_SUMMARY if due_problem else CHECK_GENERIC_SUMMARY
+    shown["reason"] = CHECK_DUE_REASON if due_problem else CHECK_GENERIC_REASON
+    shown["retry"] = CHECK_RETRY
+    return shown
+
+
 def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
     wanted = max(0, int(limit))
     if wanted == 0:
         return []
     rows = deque(maxlen=wanted)
-    rows.extend(_capture_rows(state_dir))
+    rows.extend(_display_capture(row) for row in _capture_rows(state_dir))
     return list(reversed(rows))
+
+
+def latest_successful_done(state_dir: Path, source_hash: str) -> dict | None:
+    """Return the newest successful completed capture for a message hash."""
+
+    if not source_hash:
+        return None
+    latest = None
+    for row in _capture_rows(state_dir):
+        if (
+            row.get("source_hash") == source_hash
+            and row.get("ok") is True
+            and row.get("stage") == "done"
+        ):
+            latest = row
+    return latest
 
 
 def read_capture_page(state_dir: Path, page: int = 1, page_size: int = 10) -> dict:
@@ -79,7 +122,7 @@ def read_capture_page(state_dir: Path, page: int = 1, page_size: int = 10) -> di
     newest_end = total - ((current - 1) * size)
     newest_start = max(0, newest_end - size)
     selected = [
-        row for index, row in enumerate(_capture_rows(state_dir))
+        _display_capture(row) for index, row in enumerate(_capture_rows(state_dir))
         if newest_start <= index < newest_end
     ]
     selected.reverse()

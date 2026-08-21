@@ -35,6 +35,31 @@ class TransitionResult:
     spreadsheet_url: str = ""
 
 
+class TransitionUserError(RuntimeError):
+    """Only fixed, user-readable transition guidance may use this exception."""
+
+
+CONSOLIDATION_FAILURE = (
+    "출결 파일을 하나로 정리하지 못했어요. 기존 출결 자료와 현재 연결은 바꾸지 않았습니다. "
+    "Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+)
+NEW_SCHOOL_YEAR_FAILURE = (
+    "새 학년도 출석부를 시작하지 못했어요. 기존 출결 자료와 현재 연결은 바꾸지 않았습니다. "
+    "Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+)
+
+
+def _candidate_names(candidates) -> list[str]:
+    names = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        name = " ".join(str(candidate.get("name", "") or "").split())[:120]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def find_split_repair_sources(profile, runner, workdir: Path, gws_executable: str):
     """AI가 쓰던 고정 이름을 우선하고, 없을 때만 잘못 갈린 이름을 본다."""
 
@@ -276,7 +301,7 @@ def consolidate_attendance_workbooks(
         record = _read_dict(record_path) if record_path.exists() else {}
         current_id = str(record.get("spreadsheet_id", "") or "").strip()
         if record_path.exists() and not current_id:
-            raise ValueError("현재 출결 시트 번호가 없습니다.")
+            raise TransitionUserError("현재 출석부 연결을 확인하지 못했어요.")
         candidates = list(
             deps.source_finder(
                 profile,
@@ -288,16 +313,21 @@ def consolidate_attendance_workbooks(
         )
         if len(candidates) != 1:
             if candidates:
-                raise ValueError(
-                    "예전 `출결신고서 자동화` 원본이 여러 개라 자동으로 고르지 않았어요."
+                names = _candidate_names(candidates)
+                shown = ", ".join(names) if names else "이름을 읽지 못한 출석부"
+                raise TransitionUserError(
+                    "예전에 쓰던 출석부가 여러 개라 자동으로 고르지 않았어요. "
+                    f"파일 이름: {shown}. Google Drive에서 파일 이름으로 열어 확인한 뒤 "
+                    "사용할 파일 하나만 남기고 다시 시도해 주세요."
                 )
-            raise ValueError(
-                "예전 `출결신고서 자동화` 원본을 한 개로 확인하지 못했어요."
+            raise TransitionUserError(
+                "예전에 쓰던 출석부를 한 개로 확인하지 못했어요. "
+                "Google Drive에서 기존 출석부가 열리는지 확인해 주세요."
             )
         source = candidates[0]
         source_id = str(source.get("id", "") or "").strip()
         if not source_id:
-            raise ValueError("정리 원본 출결 시트 번호가 없습니다.")
+            raise TransitionUserError("정리할 기존 출석부의 연결을 확인하지 못했어요.")
 
         saved_state: dict = {}
         if state_path.exists():
@@ -351,8 +381,8 @@ def consolidate_attendance_workbooks(
             gws_executable=deps.gws_executable,
         )
         if not _candidate_ok(result, profile, source_id, current_id):
-            raise ValueError(
-                "새 정식 출결 후보의 Sheet·Script·이름을 모두 확인하지 못했어요."
+            raise TransitionUserError(
+                "새 정식 출석부와 자동 기능, 파일 이름을 모두 확인하지 못했어요."
             )
         candidate_id = str(result.spreadsheet_id)
         if transition_state["central_complete"] is not True:
@@ -367,7 +397,7 @@ def consolidate_attendance_workbooks(
                 "moved",
                 "not_registered",
             }:
-                raise ValueError("Google Chat 연결 이동 결과를 확인하지 못했어요.")
+                raise TransitionUserError("학급 단톡방 연결을 옮긴 결과를 확인하지 못했어요.")
             transition_state["central_complete"] = True
 
         # 이 진행 기록까지 완성한 뒤 현재 연결번호를 바꾼다. 아래 교체 뒤에는 다른
@@ -393,8 +423,10 @@ def consolidate_attendance_workbooks(
             spreadsheet_id=candidate_id,
             spreadsheet_url=str(result.spreadsheet_url),
         )
-    except Exception as error:  # noqa: BLE001 - 기존 연결을 유지하고 쉬운 문장으로 돌려준다
+    except TransitionUserError as error:
         return TransitionResult(state="failed", detail=str(error))
+    except Exception:  # noqa: BLE001 - 외부 원문은 화면에 보내지 않는다
+        return TransitionResult(state="failed", detail=CONSOLIDATION_FAILURE)
 
 
 def start_new_school_year_workbook(
@@ -413,18 +445,18 @@ def start_new_school_year_workbook(
         record = _read_dict(record_path)
         current_id = str(record.get("spreadsheet_id", "") or "").strip()
         if not current_id:
-            raise ValueError("현재 출결 시트 번호가 없습니다.")
+            raise TransitionUserError("현재 출석부 연결을 확인하지 못했어요.")
         school_year = str((profile.get("school") or {}).get("year", "") or "").strip()
         record_year = str(record.get("school_year", "") or "").strip()
         if not school_year or not record_year:
-            raise ValueError("현재 학년도와 새 학년도를 모두 확인하지 못했어요.")
+            raise TransitionUserError("현재 학년도와 새 학년도를 모두 확인하지 못했어요.")
         if school_year == record_year:
-            raise ValueError("학년도가 같아서 새 출석부를 만들지 않았어요.")
+            raise TransitionUserError("학년도가 같아서 새 출석부를 만들지 않았어요.")
         if (
             str(record.get("workbook_role", "") or "")
             != attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
         ):
-            raise ValueError("먼저 `출결 시트 하나로 정리`를 끝내 주세요.")
+            raise TransitionUserError("먼저 출결 시트 하나로 정리를 끝내 주세요.")
 
         reusable = {
             key: str(record.get(key, "") or "").strip()
@@ -441,9 +473,14 @@ def start_new_school_year_workbook(
             if not reusable[key]
         ]
         if missing:
-            raise ValueError(
-                "기존 Docs·폴더·Tasks 연결값이 없어 새 학년도 파일을 만들지 않았어요: "
-                + ", ".join(missing)
+            labels = {
+                "template_doc_id": "결석 신고서 양식",
+                "folder_id": "출결 파일 보관 폴더",
+                "task_list_id": "할 일 목록",
+            }
+            raise TransitionUserError(
+                "기존 자료에서 다시 사용할 연결을 찾지 못해 새 학년도 출석부를 만들지 않았어요. "
+                "확인할 항목: " + ", ".join(labels[key] for key in missing)
             )
 
         saved_state: dict = {}
@@ -502,8 +539,8 @@ def start_new_school_year_workbook(
             write_record_on_success=False,
         )
         if not _candidate_ok(result, profile, current_id, current_id):
-            raise ValueError(
-                "새 학년도 출석부 후보의 Sheet·Script·이름을 모두 확인하지 못했어요."
+            raise TransitionUserError(
+                "새 학년도 출석부와 자동 기능, 파일 이름을 모두 확인하지 못했어요."
             )
         candidate_id = str(result.spreadsheet_id)
         transition_state.update(
@@ -526,8 +563,10 @@ def start_new_school_year_workbook(
             spreadsheet_id=candidate_id,
             spreadsheet_url=str(result.spreadsheet_url),
         )
-    except Exception as error:  # noqa: BLE001 - 기존 연결을 유지하고 쉬운 문장으로 돌려준다
+    except TransitionUserError as error:
         return TransitionResult(state="failed", detail=str(error))
+    except Exception:  # noqa: BLE001 - 외부 원문은 화면에 보내지 않는다
+        return TransitionResult(state="failed", detail=NEW_SCHOOL_YEAR_FAILURE)
 
 
 __all__ = [

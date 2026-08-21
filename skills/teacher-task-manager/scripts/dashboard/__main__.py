@@ -34,6 +34,36 @@ DEV_RESET_WARNING_MESSAGE = (
     "설정 준비 중 문제가 있었지만 실행은 계속해요.\n"
     "옮기던 설정은 백업 폴더에 그대로 보존됩니다."
 )
+INITIAL_WINDOW_WIDTH = 980
+INITIAL_WINDOW_HEIGHT_FALLBACK = 700
+INITIAL_WINDOW_HEIGHT_RATIO = 0.88
+MINIMUM_WINDOW_WIDTH = 900
+MINIMUM_WINDOW_HEIGHT = 640
+
+
+def _usable_screen_height() -> int | None:
+    """Windows 작업표시줄을 뺀 기본 화면의 세로 길이를 읽는다."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        work_area = wintypes.RECT()
+        success = ctypes.windll.user32.SystemParametersInfoW(
+            0x0030, 0, ctypes.byref(work_area), 0
+        )
+        height = work_area.bottom - work_area.top
+        return height if success and height > 0 else None
+    except Exception:  # noqa: BLE001 - 화면 크기를 못 읽어도 기존 크기로 열 수 있다
+        return None
+
+
+def _initial_window_height() -> int:
+    usable_height = _usable_screen_height()
+    if usable_height is None:
+        return INITIAL_WINDOW_HEIGHT_FALLBACK
+    return max(1, round(usable_height * INITIAL_WINDOW_HEIGHT_RATIO))
 
 
 def _default_notify(title: str, body: str) -> None:
@@ -186,13 +216,17 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
         threading.Thread(target=worker, daemon=True).start()
 
     try:
+        initial_height = _initial_window_height()
         window = webview_module.create_window(
             app_name,
             url=str(WEB_INDEX),
             js_api=api,
-            width=980,
-            height=700,
-            min_size=(900, 640),
+            width=INITIAL_WINDOW_WIDTH,
+            height=initial_height,
+            min_size=(
+                MINIMUM_WINDOW_WIDTH,
+                min(MINIMUM_WINDOW_HEIGHT, initial_height),
+            ),
         )
         try:
             window.events.shown += _apply_window_icon

@@ -145,7 +145,7 @@ const FIELD_MESSAGES = {
   "학사일정캘린더ID": "학사 일정을 등록할 Calendar를 골라 주세요.",
   "업무Tasks목록ID": "개인 업무를 등록할 Tasks 목록을 골라 주세요.",
   "담임안내Tasks목록ID": "조종례 전달사항을 등록할 Tasks 목록을 골라 주세요.",
-  "gemini_api_key": "Gemini API key가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
+  "gemini_api_key": "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
   "google-login": "Google 로그인이 필요해요. 설정에서 경기도교육청 클라우드 계정(@goedu.kr)으로 로그인해 주세요.",
 };
 // 사용자가 직접 고치는 입력칸의 name — 편집 중엔 저장된 점검 대신 현재 입력을 본다.
@@ -821,11 +821,11 @@ function validateTimetable() { syncGridFields(); return ""; }
 
 /* ---------- 연결·설정 공통 ---------- */
 const KEY_MESSAGES = {
-  ok: "key가 정상이에요",
-  missing: "Gemini API key가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
-  invalid: "Gemini API key가 맞지 않아요. AI Studio에서 다시 복사해 주세요.",
+  ok: "연결 키가 정상이에요",
+  missing: "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
+  invalid: "Gemini 연결 키가 맞지 않아요. Google AI Studio에서 다시 복사해 주세요.",
   "rate-limited": "현재 사용 한도에 도달했어요. 잠시 뒤 다시 확인해 주세요.",
-  network: "인터넷 연결을 확인한 뒤 Gemini API key를 다시 확인해 주세요.",
+  network: "인터넷 연결을 확인한 뒤 Gemini 연결 키를 다시 확인해 주세요.",
 };
 const PROBE_MESSAGES = {
   available: "사용할 수 있어요",
@@ -1688,12 +1688,16 @@ bindActions({
       S.updateInfo = update && update.available ? update : null;
       S.updateCheck = update && update.status ? update.status : "failed";
       if (S.updateCheck === "failed") {
-        showToast((update && update.reason) || "업데이트 확인을 하지 못했어요");
+        showToast(updateFailureText(
+          update && update.reason,
+          "업데이트 확인을 하지 못했어요.",
+          "업데이트 다시 확인"
+        ));
       }
     } catch (error) {
       S.updateInfo = null;
       S.updateCheck = "failed";
-      showToast("업데이트 확인을 하지 못했어요");
+      showToast(updateFailureText("", "업데이트 확인을 하지 못했어요.", "업데이트 다시 확인"));
     }
     render();
   },
@@ -1704,11 +1708,11 @@ bindActions({
     try {
       // 화면이 이미 아는 주소를 넘겨 재조회 없이 받는다(통신 깜빡임 오안내 방지).
       const result = await call("start_update", S.updateInfo.url, S.updateInfo.latest, S.updateInfo.sha256);
-      if (!result.started) { S.updating = false; showToast(result.reason || "업데이트를 시작하지 못했어요"); render(); return; }
+      if (!result.started) { S.updating = false; showToast(updateFailureText(result.reason, "업데이트를 시작하지 못했어요.", "지금 업데이트")); render(); return; }
       setTimeout(() => { call("quit_app").catch(() => {}); }, 300);
       showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
     } catch (error) {
-      S.updating = false; showToast("업데이트를 시작하지 못했어요"); render();
+      S.updating = false; showToast(updateFailureText("", "업데이트를 시작하지 못했어요.", "지금 업데이트")); render();
     }
   },
   "ai-connect": async () => {
@@ -2083,26 +2087,34 @@ async function refreshSettingsStatus() {
   render();
 }
 const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인을 다시 점검해 주세요.";
+function updateFailureText(reason, fallback, buttonLabel) {
+  const base = String(reason || fallback || "").trim();
+  if (base.includes(`'${buttonLabel}'`)) return base;
+  const action = buttonLabel === "지금 업데이트"
+    ? "인터넷 연결을 확인한 뒤 '지금 업데이트'를 다시 눌러 주세요."
+    : "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요.";
+  return `${base} ${action}`;
+}
 const OAUTH_REPAIR_MESSAGES = {
   GWS_ACCOUNT_STORAGE_OUTSIDE_USER: {
-    status: "Google 로그인 저장 위치가 현재 Windows 계정 폴더 밖이에요",
-    repair: "공용 또는 다른 계정의 환경 설정을 지운 뒤 Teacher Manager를 다시 열어 주세요.",
+    status: "Google 로그인을 안전하게 사용할 수 없는 상태예요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
   },
   OAUTH_CLIENT_ENV_INCOMPLETE: {
-    status: "Windows 로그인 준비값이 한쪽만 있어요",
-    repair: "두 항목을 함께 넣거나 둘 다 지운 뒤 다시 점검해 주세요.",
+    status: "Google 로그인 준비를 확인해야 해요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
   },
   OAUTH_CONFIG_CLIENT_INVALID: {
     status: "기존 Google 로그인 준비 파일이 올바르지 않아요",
-    repair: "기존 준비 파일을 다시 받거나 지운 뒤 다시 점검해 주세요.",
+    repair: "아래 '정리하고 다시 점검'을 눌러 주세요. 같은 문제가 계속되면 Teacher Manager 설치 파일을 다시 실행해 주세요.",
   },
   OAUTH_BUNDLED_CLIENT_INVALID: {
-    status: "설치판의 Google 로그인 준비 파일이 손상됐어요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
+    status: "Google 로그인 준비를 확인해야 해요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
   },
   OAUTH_CLIENT_CONFLICT: {
-    status: "기존 준비와 설치판 준비가 서로 달라요",
-    repair: "기존 Google 로그인 준비를 정리하거나 설치판과 같은 준비로 바꾼 뒤 다시 점검해 주세요.",
+    status: "Google 로그인 준비를 확인해야 해요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
   },
 };
 function oauthRepairMessage(g) {
@@ -2120,16 +2132,16 @@ function computerSectionHtml(includeGoogle) {
   if (!c) return `<div class="panel"><div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div></div>`;
   return `<div class="section-h section-head"><span>컴퓨터 준비</span>${settingsRefreshButtonHtml()}</div>
     <div class="panel">
-      ${readinessRow("Python", "Teacher Manager를 실행해요", c.python)}
-      ${readinessRow("문서 읽기 도구", "PDF와 첨부 문서를 읽어요", c.documents)}
-      ${readinessRow("Microsoft Edge WebView2", "Teacher Manager 화면을 보여줘요", c.screen)}
+      ${readinessRow("프로그램 실행 기능", "Teacher Manager를 실행해요", c.python)}
+      ${readinessRow("문서 읽기 기능", "PDF와 첨부 문서를 읽어요", c.documents)}
+      ${readinessRow("화면 표시 기능", "Teacher Manager 화면을 보여줘요", c.screen)}
     </div>
     ${includeGoogle ? googleAccountSectionHtml(false) : ""}`;
 }
 function googleLoginRowsHtml() {
   const g = S.google;
-  if (!g) return `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
-    <div class="row"><span class="nameblock"><b>OAuth 로그인 준비</b><small>Google 로그인에 필요한 승인 정보를 확인해요</small></span><span class="st">확인 중이에요…</span></div>
+  if (!g) return `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
+    <div class="row"><span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span><span class="st">확인 중이에요…</span></div>`;
   const loginError = fieldError("google-login");
   const update = S.gwsUpdate;
@@ -2156,12 +2168,12 @@ function googleLoginRowsHtml() {
     : runtimeReady
     ? `<span class="st ok">준비됐어요${versionLabel}</span>${updateButton}`
     : `<span class="st warn">설치 파일이 손상됐어요 · 설치 파일을 다시 실행해 주세요</span>`;
-  const cliRow = `<div class="row"><span class="nameblock"><b>Google Workspace CLI</b><small>Calendar·Tasks·Sheet를 연결해요${offerExplanationHtml}</small></span><span class="row-actions">${cliRight}</span></div>`;
-  const oauthBlock = `<span class="nameblock"><b>OAuth 로그인 준비</b><small>Google 로그인에 필요한 승인 정보를 확인해요</small></span>`;
+  const cliRow = `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요${offerExplanationHtml}</small></span><span class="row-actions">${cliRight}</span></div>`;
+  const oauthBlock = `<span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span>`;
   // 예전 화면 다리에서 오류 글자 없이 충돌 여부만 돌려줘도 로그인은 막는다.
   const oauthProblem = oauthRepairMessage(g) || (g.oauth_client_conflict ? {
-    status: "기존 준비와 설치판 준비가 서로 달라요",
-    repair: "기존 Google 로그인 준비를 정리하거나 설치판과 같은 준비로 바꾼 뒤 다시 점검해 주세요.",
+    status: "Google 로그인 준비를 확인해야 해요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
   } : null);
   const oauthCleanable = String(g.error_code || "") === "OAUTH_CONFIG_CLIENT_INVALID";
   const oauthRight = oauthProblem
@@ -2175,10 +2187,10 @@ function googleLoginRowsHtml() {
   const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem);
   const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button>`;
   const blockedReason = oauthProblem
-    ? "OAuth 준비를 먼저 확인해 주세요"
+    ? "Google 로그인 준비를 먼저 확인해 주세요"
     : !runtimeReady
-      ? "Google Workspace CLI를 먼저 준비해 주세요"
-      : "OAuth 로그인 준비 파일이 필요해요";
+      ? "Google 연결 기능을 먼저 준비해 주세요"
+      : "Google 로그인 준비 파일이 필요해요";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
     : g.logged_in
@@ -2214,10 +2226,10 @@ function accountAvatar(user) {
 }
 function lockedGoogleServicesHtml() {
   const rows = [
-    ["CAL", "Calendar", "업무 일정 등록"],
-    ["TSK", "Tasks", "업무·전달사항 등록"],
-    ["SHT", "Sheet·Docs", "출결 자료와 결석 신고서"],
-    ["CHT", "Google Chat", "학급 공간 연결과 메시지 발송"],
+    ["일정", "일정 (Google Calendar)", "업무 일정 등록"],
+    ["할 일", "할 일 (Google Tasks)", "업무·전달사항 등록"],
+    ["출결", "학생 안내표·결석 신고서", "출결 자료 준비"],
+    ["단톡", "학급 단톡방 (Google Chat)", "학급 공간 연결과 메시지 발송"],
   ];
   return `<div class="locked-services" aria-label="잠긴 Google 기능">${rows.map(([mark, name, note]) =>
     `<div class="service-row"><span class="service-mark">${mark}</span><span class="service-copy"><b>${name}</b><span>${note}</span></span><span class="lock-label">계정 확인 필요</span></div>`
@@ -2240,9 +2252,9 @@ function googleAccountDecisionHtml() {
   return `${account}<div class="decision-banner success">
       <h3>@goedu.kr 계정으로 Google Workspace에 로그인을 성공했습니다.</h3>
     </div><div class="success-next">
-      <div><b>Calendar·Tasks</b><span>업무와 전달사항을 넣을 곳을 고릅니다.</span></div>
-      <div><b>Sheet·Docs</b><span>출결 DB와 결석 신고서를 준비합니다.</span></div>
-      <div><b>Google Chat</b><span>쓸 선생님만 학급 공간을 연결합니다.</span></div>
+      <div><b>일정 (Google Calendar)·할 일 (Google Tasks)</b><span>업무와 전달사항을 넣을 곳을 고릅니다.</span></div>
+      <div><b>학생 안내표·결석 신고서</b><span>출결 자료와 결석 신고서를 준비합니다.</span></div>
+      <div><b>학급 단톡방 (Google Chat)</b><span>쓸 선생님만 학급 공간을 연결합니다.</span></div>
     </div>`;
 }
 function googleAccountSectionHtml(includeRefresh) {
@@ -2290,7 +2302,7 @@ function stepGoogleLogin() {
       : "Google Workspace에 로그인해 주세요";
   const lead = g && g.logged_in && !isGoeduGoogleStatus(g)
     ? "Teacher Manager 앱은 @goedu.kr 계정 전용입니다."
-    : "Calendar·Tasks·Sheet·Docs·Chat을 사용할 경기도교육청 계정으로 로그인해 주세요.";
+    : "일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 경기도교육청 계정으로 로그인해 주세요.";
   return `<h1>${title}</h1><p class="sub">${lead}</p>${googleAccountSectionHtml(true)}`;
 }
 async function validateGoogleLogin() {
@@ -2303,9 +2315,9 @@ async function validateGoogleLogin() {
     const problem = OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER;
     return `${problem.status}. ${problem.repair}`;
   }
-  if (!S.google.gws_runtime_ready) return "Google Workspace CLI를 준비해 주세요.";
-  if (S.google.oauth_client_conflict) return "기존 Google 로그인 준비와 설치판 준비가 서로 달라요.";
-  if (!S.google.oauth_client_ready) return "OAuth 로그인 준비 파일이 필요해요.";
+  if (!S.google.gws_runtime_ready) return "Google 연결 기능을 준비해 주세요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+  if (S.google.oauth_client_conflict) return "Google 로그인 준비를 확인해야 해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+  if (!S.google.oauth_client_ready) return "Google 로그인 준비 파일이 필요해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return FIELD_MESSAGES["google-login"];
   if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
@@ -2733,9 +2745,10 @@ function groupedItemsHtml(cap) {
     const rows = items.map((it) => {
       const [label, cls] = resultLabel(it);
       const when = it.kind === "calendar" ? fmtShort(it.when) : "";
+      const detail = it.detail ? `<div class="item-detail">${esc(it.detail)}</div>` : "";
       return `<div class="item"><span class="t">${esc(when)}</span>` +
         `<span class="title">${esc(it.target)} — ${esc(it.title)}</span>` +
-        `<span class="res ${cls}">${esc(label)}</span></div>`;
+        `<span class="res ${cls}">${esc(label)}</span></div>${detail}`;
     }).join("");
     const guide = group.kind === "notice"
       ? `<div class="sheet-guide">아직 학생에게 보내지 않았어요. Google Sheet에서 대상과 내용을 확인한 뒤 발송 대기로 바꿔 주세요.</div>`
@@ -2745,8 +2758,36 @@ function groupedItemsHtml(cap) {
 }
 function attachmentResultLead(cap) {
   const count = Number(cap.attachment_count || 0);
-  if (!count) return "";
-  return `<div class="attachment-result-lead">메시지 본문과 첨부파일 ${count}개를 함께 읽었어요.</div>`;
+  const names = Array.isArray(cap.attachment_names) ? cap.attachment_names.filter(Boolean) : [];
+  const read = count ? `메시지 본문과 첨부파일 ${count}개를 함께 읽었어요.` : "";
+  const files = names.length ? ` ${names.map(esc).join(", ")}` : "";
+  const status = cap.attachment_link_status || "";
+  let linked = "";
+  if (status === "confirmed") linked = `일정에 연결 확인:${files}`;
+  else if (status === "failed") linked = `첨부파일을 일정에 연결했는지 확인하지 못했어요.${files}`;
+  else if (status === "no-calendar") linked = `첨부파일을 읽었지만 연결할 일정이 없었어요.${files}`;
+  else if (status === "not-registered") linked = `등록이 중단되어 첨부파일을 일정에 연결하지 않았어요.${files}`;
+  else if (names.length) linked = `첨부파일:${files}`;
+  if (!read && !linked) return "";
+  return `<div class="attachment-result-lead">${esc(read)}${read && linked ? "<br>" : ""}${linked}</div>`;
+}
+function captureMessageLead(cap) {
+  const sender = String(cap.message_sender || "").trim();
+  const sentAt = String(cap.message_sent_at || "").trim();
+  const preview = String(cap.message_preview || "").trim();
+  if (sender || sentAt || preview) {
+    const meta = [sender, sentAt ? fmtShort(sentAt) : ""].filter(Boolean).join(" · ");
+    return `<div class="capture-context"><b>메시지</b>${meta ? ` · ${esc(meta)}` : ""}` +
+      `${preview ? `<div>${esc(preview)}</div>` : ""}</div>`;
+  }
+  if (!cap.ok || cap.stage === "duplicate") {
+    return '<div class="capture-context"><b>메시지</b> · 이전 기록이라 어떤 메시지였는지 확인할 수 없어요.</div>';
+  }
+  return "";
+}
+function captureOriginalLead(cap) {
+  if (!cap.original_when) return "";
+  return `<div class="capture-context">처음 등록 · ${esc(fmtShort(cap.original_when))}</div>`;
 }
 const EMPTY_ITEM_LINES = {
   done: "분석 결과 일정·할 일이 없어 아무것도 만들지 않았어요.",
@@ -2761,15 +2802,16 @@ function capHtml(cap) {
     : '<span class="dot bad">✗</span>';
   const fresh = S.freshWhen && cap.when === S.freshWhen ? '<span class="badge b">방금</span>' : "";
   const trial = cap.mode === "trial" ? '<span class="badge y">시험</span>' : "";
-  const items = attachmentResultLead(cap) + groupedItemsHtml(cap);
+  const items = captureMessageLead(cap) + captureOriginalLead(cap) + attachmentResultLead(cap) + groupedItemsHtml(cap);
   const emptyLine = !(cap.items || []).length && cap.ok
     ? `<div class="item"><span class="none">${esc(EMPTY_ITEM_LINES[cap.stage] || "만든 항목이 없어요.")}</span></div>` : "";
   const reason = cap.reason ? `<div class="cap-reason">${esc(cap.reason)}</div>` : "";
+  const retry = cap.retry ? `<div class="capture-retry">${esc(cap.retry)}</div>` : "";
   return `<div class="cap${open}">
     <button class="cap-row" data-action="cap-toggle" data-key="${esc(key)}">
       ${dot}<span class="cap-when">${esc(fmtShort(cap.when))}</span><span class="cap-sum">${esc(cap.summary || "")}</span>${fresh}${trial}<span class="chev">▶</span>
     </button>
-    <div class="cap-items">${items}${emptyLine}</div>${reason}</div>`;
+    <div class="cap-items">${items}${emptyLine}${retry}</div>${reason}</div>`;
 }
 const CAP_PAGE_SIZE = 10;
 function capturePageNumbers(current, total) {
@@ -3428,7 +3470,7 @@ async function askUpdateOnStart() {
       const result = await call("start_update", offer.url, offer.latest, offer.sha256);
       if (!result.started) {
         S.updating = false;
-        showToast(result.reason || "업데이트를 시작하지 못했어요");
+        showToast(updateFailureText(result.reason, "업데이트를 시작하지 못했어요.", "지금 업데이트"));
         render();
         return;
       }
@@ -3436,7 +3478,7 @@ async function askUpdateOnStart() {
       showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
     } catch (error) {
       // call()은 실패하면 던진다 — 감싸지 않으면 화면이 '받는 중…'에 멈춘 채 남는다.
-      S.updating = false; showToast("업데이트를 시작하지 못했어요"); render();
+      S.updating = false; showToast(updateFailureText("", "업데이트를 시작하지 못했어요.", "지금 업데이트")); render();
     }
     return;
   }

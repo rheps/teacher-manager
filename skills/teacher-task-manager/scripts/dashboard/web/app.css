@@ -361,11 +361,15 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .item .res.ok { color:var(--tm-green); }
 .item .res.dup { color:var(--tm-faint); }
 .item .res.bad { color:var(--tm-red); }
+.item-detail { margin:-1px 0 6px 104px; color:var(--tm-red); font-size:12.5px; line-height:1.45; }
 .result-group + .result-group { border-top:1px solid var(--tm-line); }
 .result-group-head { padding:12px 0 5px; color:#333D4B; font-size:13px; font-weight:700; }
 .res.review { color:var(--tm-amber); font-weight:700; }
 .sheet-guide { margin:8px 0 13px; padding:10px 12px; border-radius:10px; background:var(--tm-amber-soft); color:#8A5A10; font-size:12.5px; line-height:1.5; }
 .attachment-result-lead { margin:8px 0 4px; color:var(--tm-faint); font-size:13px; }
+.capture-context { margin:7px 0; color:#4B5563; font-size:13px; line-height:1.5; }
+.capture-context b { color:#333D4B; }
+.capture-retry { margin:10px 0 2px; padding:9px 11px; border-radius:9px; background:var(--tm-blue-soft); color:var(--tm-blue); font-size:12.8px; line-height:1.45; }
 .cap-reason { display:none; padding:0 0 14px 36px; font-size:13.5px; color:var(--tm-red); }
 .cap.open .cap-reason { display:block; }
 .cap-pages { display:flex; align-items:center; justify-content:center; gap:6px; margin:12px 0 2px; }

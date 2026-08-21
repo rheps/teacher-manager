@@ -46,16 +46,84 @@ _V1_STEP_TO_V2 = {1: 1, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 9}
 _ATTENDANCE_AUTH_BLOCKED_STATES = {
     "gws-required", "login-required", "account-required", "auth-error"
 }
+_DEFAULT_SCREEN_FAILURE = (
+    "작업을 마치지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요."
+)
+_SCREEN_FAILURES = {
+    "get_app_info": (
+        "프로그램을 여는 데 필요한 정보를 읽지 못했어요. "
+        "Teacher Manager를 다시 시작해 주세요."
+    ),
+    "save_setup_state": "처음 설정 내용을 저장하지 못했어요. 프로그램을 다시 시작한 뒤 다시 시도해 주세요.",
+    "finish_setup": "처음 설정을 마무리하지 못했어요. @goedu.kr Google 로그인과 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
+    "restart_setup": "처음 설정 안내를 다시 열지 못했어요. Teacher Manager를 다시 시작해 주세요.",
+    "read_profile": "이 컴퓨터에 저장된 내 정보를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
+    "read_grid": "이 컴퓨터에 저장된 시간표를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
+    "get_messenger_settings": "이 컴퓨터에 저장된 메신저 설정을 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
+    "save_profile_grid": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
+    "save_messenger": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
+    "apply_all": "이 컴퓨터 설정을 저장하고 적용하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
+    "choose_attachment_folder": (
+        "첨부파일 폴더를 열지 못했어요. 폴더 위치를 직접 입력하거나 "
+        "Teacher Manager를 다시 시작해 주세요."
+    ),
+    "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요. 폴더 위치를 다시 확인해 주세요.",
+    "attendance_status": "출결 상태를 확인하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
+    "ensure_attendance": "출결 자료를 준비하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "consolidate_attendance": "출결 자료를 하나로 정리하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "start_new_attendance": "새 학년도 출석부를 시작하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_prepare_start": "출결 준비를 시작하지 못했어요. 이 컴퓨터 설정과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_prepare_status": "출결 준비 상태를 확인하지 못했어요. 설정에서 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_first_setup_status": "출석부의 처음 설정 상태를 확인하지 못했어요. 출석부가 열리는지 확인한 뒤 다시 시도해 주세요.",
+    "attendance_script_update_status": "출결 기능 상태를 확인하지 못했어요. 처음 준비하던 @goedu.kr Google 계정으로 로그인한 뒤 다시 시도해 주세요. 기존 자료는 그대로입니다.",
+    "attendance_script_update_apply": "출결 기능을 바꾸지 못했어요. 처음 준비하던 @goedu.kr Google 계정으로 로그인한 뒤 다시 시도해 주세요. 기존 자료는 그대로입니다.",
+    "attendance_chat_status": "학급 단톡방 상태를 확인하지 못했어요. 출결 준비와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_chat_connect": "학급 단톡방 연결을 시작하지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_chat_spaces": "학급 단톡방 목록을 가져오지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
+    "google_status": "Google 연결 상태를 확인하지 못했어요. 현재 Windows 계정의 설정과 인터넷 연결을 확인해 주세요.",
+    "list_calendars": "캘린더 목록을 가져오지 못했어요. 현재 Windows 계정의 @goedu.kr Google 로그인을 확인해 주세요.",
+    "list_tasklists": "할 일 목록을 가져오지 못했어요. 현재 Windows 계정의 @goedu.kr Google 로그인을 확인해 주세요.",
+    "gws_login_start": "Google 로그인 준비 파일을 확인하지 못했어요. 현재 Windows 계정의 설정을 점검한 뒤 다시 시도해 주세요.",
+    "gws_login_status": "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검해 주세요.",
+    "gws_logout": "Google 로그아웃을 마치지 못했어요. 현재 Windows 계정의 Google 도구 상태를 점검해 주세요.",
+    "ensure_calendar_named": "캘린더를 만들지 못했어요. 이름과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "ensure_tasklist_named": "할 일 목록을 만들지 못했어요. 이름과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "open_logs": "기록 폴더를 열지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요.",
+    "open_url": "안전한 https 주소만 열 수 있어요. 주소를 다시 확인해 주세요.",
+}
+
+
+class ScreenSafeError(RuntimeError):
+    """A fixed Korean sentence intentionally prepared for the screen."""
 
 
 def _ok(data):
     return {"ok": True, "data": data}
 
 
-def _fail(error):
-    reply = {"ok": False, "error": str(error) or "알 수 없는 오류가 났어요"}
+def _fail(error, operation: str = ""):
+    message = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
+    reply = {"ok": False, "error": message}
     if isinstance(error, external_url.ExternalUrlOpenError):
+        reply["error"] = str(error)
         reply["code"] = external_url.NO_EXTERNAL_BROWSER
+    elif isinstance(
+        error,
+        (ScreenSafeError, gws_env.GwsAccountStorageError, engine.AttendanceRemoteWorkBusyError),
+    ):
+        reply["error"] = str(error)
+    else:
+        try:
+            from dashboard import central_chat
+
+            if isinstance(error, central_chat.CentralChatError):
+                reply["error"] = central_chat._safe_central_error_detail(error)
+        except ImportError:
+            pass
     return reply
 
 
@@ -65,7 +133,7 @@ def guarded(method):
         try:
             return _ok(method(self, *args, **kwargs))
         except Exception as error:  # noqa: BLE001 - JS에는 한국어 한 문장만 보낸다
-            return _fail(error)
+            return _fail(error, method.__name__)
 
     return wrapper
 
@@ -535,10 +603,16 @@ class Api:
                     self._config_dir, dict(profile), list(grid), dict(bridge_updates),
                     deps=save_deps,
                 )
-            except RuntimeError as error:
+            except RuntimeError:
                 # 로그인 문제(require_goedu_gws_session)는 guarded의 오류 응답이 아니라
                 # started=False + 사연으로 화면에 가야 배너를 띄울 수 있다.
-                return {"started": False, "reason": str(error)}
+                return {
+                    "started": False,
+                    "reason": (
+                        "이 컴퓨터 설정을 저장하지 못했어요. 현재 Windows 계정의 "
+                        "@goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요."
+                    ),
+                }
             if not ok:
                 return {"started": False, "reason": reason}
             att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
@@ -556,9 +630,9 @@ class Api:
                     if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
                         engine.save_attendance_status_cache(self._config_dir, status)
                 except Exception as error:  # noqa: BLE001 - 사람이 읽을 문장으로 바꾼다
-                    detail = str(error).strip() or engine.ATTENDANCE_ERROR_MESSAGES["setup"]
+                    failed_service, detail = engine.friendly_attendance_error(error)
                     status = asdict(engine.AttendanceStatus(
-                        state="failed", failed_service="setup",
+                        state="failed", failed_service=failed_service,
                         detail=detail[:engine.ATTENDANCE_DETAIL_LIMIT],
                     ))
                 self._attendance_prepare_result = status
@@ -702,7 +776,7 @@ class Api:
                 or payload.get("target_bundle_sha256") != expected_sha256
                 or payload.get("current_bundle_sha256") != expected_sha256
             ):
-                raise RuntimeError(
+                raise ScreenSafeError(
                     "확인한 출결 기능이 지금 프로그램에 든 파일과 달라서 준비 완료로 바꾸지 않았어요."
                 )
             # 업데이트를 시작할 때 읽은 기록이 지금도 정확히 같을 때만 증명을 쓰고
@@ -731,7 +805,7 @@ class Api:
                 record, engine.current_attendance_script_bundle_sha256()
             )
         ):
-            raise RuntimeError(
+            raise ScreenSafeError(
                 "기존 자료는 그대로 두었지만 출결 기능 확인 또는 업데이트가 먼저 필요해요. "
                 "출결 탭 위쪽의 한 줄 안내에 보이는 버튼을 눌러 주세요."
             )
@@ -761,7 +835,7 @@ class Api:
             and payload.get("current_bundle_sha256") == expected_sha256
             and payload.get("target_bundle_sha256") == expected_sha256
         ):
-            raise RuntimeError(
+            raise ScreenSafeError(
                 "현재 Google의 출결 기능을 안전하게 다시 확인하지 못해 "
                 "Chat 작업을 시작하지 않았어요. "
                 "출결 탭 위쪽의 한 줄 안내에 보이는 버튼을 눌러 주세요."
@@ -799,7 +873,7 @@ class Api:
                 if resolved is None:
                     # 파일이 없다고 본 직후 다른 과정이 새 연결을 놓은 드문 경우다.
                     # 그 새 연결을 이 버튼이 우연히 이어 쓰지 않고 다시 눌러 확인시킨다.
-                    raise RuntimeError(
+                    raise ScreenSafeError(
                         "출결 연결이 방금 바뀌었어요. 현재 출결 상태를 다시 확인해 주세요."
                     )
                 run, gws = resolved
@@ -826,7 +900,7 @@ class Api:
                             or current.sha256 != record_snapshot.sha256
                         )
                 if changed:
-                    raise RuntimeError(
+                    raise ScreenSafeError(
                         "Chat 작업 중 다른 창에서 출결 연결이 바뀌었어요. "
                         "새 연결에는 결과를 쓰지 않았습니다. 현재 출결 상태를 다시 확인해 주세요."
                     )
@@ -841,7 +915,7 @@ class Api:
     def attendance_script_update_apply(self):
         # 화면의 별도 확인창을 통과해 여기로 왔을 때만 쓰기 동작을 허용한다.
         if not self._attendance_script_update_lock.acquire(blocking=False):
-            raise RuntimeError("출결 기능을 이미 업데이트하고 있어요. 잠시만 기다려 주세요.")
+            raise ScreenSafeError("출결 기능을 이미 업데이트하고 있어요. 잠시만 기다려 주세요.")
         try:
             # 다른 대시보드 창과 새 학년도 출결 준비도 같은 기록과 Google Script를
             # 만질 수 있다. 공용 잠금 안에서 계정부터 다시 확인하고 한 번씩 실행한다.
@@ -1137,15 +1211,15 @@ class Api:
         base, config_dir, _bundled, selection = self._oauth_context()
         if not selection.ready:
             if selection.error_code == "OAUTH_CLIENT_CONFLICT":
-                raise RuntimeError(
+                raise ScreenSafeError(
                     "기존 Google 로그인 설정과 Teacher Manager의 로그인 설정이 서로 달라요. "
                     "로그인 설정을 확인해 주세요."
                 )
             if selection.error_code == "OAUTH_CLIENT_MISSING":
-                raise RuntimeError(
+                raise ScreenSafeError(
                     "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
                 )
-            raise RuntimeError("Google 로그인 준비 파일을 안전하게 읽지 못했어요.")
+            raise ScreenSafeError("Google 로그인 준비 파일을 안전하게 읽지 못했어요.")
         child_env = gws_env.login_environ(
             base,
             selection,
@@ -1210,7 +1284,7 @@ class Api:
         run = self._run()
         gws = engine.resolve_gws(run)
         if not gws:
-            raise RuntimeError("gws 도구가 아직 없어요. 먼저 설치해 주세요")
+            raise ScreenSafeError("Google 연결 도구가 아직 없어요. 설정에서 준비해 주세요.")
         return run, gws
 
     def _resolve_goedu_gws_or_fail(self):
@@ -1225,12 +1299,12 @@ class Api:
         run = self._attendance_remote_run()
         gws = engine.resolve_gws(run)
         if not gws:
-            raise RuntimeError("gws 도구가 아직 없어요. 먼저 설치해 주세요")
+            raise ScreenSafeError("Google 연결 도구가 아직 없어요. 설정에서 준비해 주세요.")
         current = engine.require_goedu_gws_session(run, gws)
         saved = engine._read_setup_status(self._config_dir)
         owner = str(saved.get("account", "") or "").strip()
         if owner and owner.casefold() != current.casefold():
-            raise RuntimeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+            raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
         return run, gws
 
     @guarded
@@ -1246,7 +1320,7 @@ class Api:
         run, gws = self._resolve_gws_or_fail()
         made_id = engine.ensure_calendar(run, gws, name)
         if not made_id:
-            raise RuntimeError(f"'{name}' 캘린더를 만들지 못했어요. 잠시 뒤 다시 시도해 주세요")
+            raise ScreenSafeError("캘린더를 만들지 못했어요. 이름을 확인하고 잠시 뒤 다시 시도해 주세요.")
         return {"id": made_id, "name": name}
 
     @guarded
@@ -1257,7 +1331,7 @@ class Api:
         run, gws = self._resolve_gws_or_fail()
         made_id = engine.ensure_tasklist(run, gws, name)
         if not made_id:
-            raise RuntimeError(f"'{name}' 할일 목록을 만들지 못했어요. 잠시 뒤 다시 시도해 주세요")
+            raise ScreenSafeError("할 일 목록을 만들지 못했어요. 이름을 확인하고 잠시 뒤 다시 시도해 주세요.")
         return {"id": made_id, "name": name}
 
     @guarded

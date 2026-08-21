@@ -153,6 +153,26 @@ class _InstallError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
+_USER_ACTION_FAILURES = {
+    "COMPONENT_DISK_FULL": "저장 공간이 부족해 Google 연결 기능을 갱신하지 못했어요. 공간을 확보한 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+    "COMPONENT_FILE_LOCKED": "다른 프로그램이 Google 연결 기능 갱신 파일을 사용하고 있어요. 다른 작업을 마친 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+    "COMPONENT_SECURITY_BLOCKED": "학교 보안 프로그램이 Google 연결 기능 갱신을 막았어요. 학교 전산 담당자에게 문의해 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+    "COMPONENT_DIR_NOT_WRITABLE": "Google 연결 기능을 저장하지 못했어요. Teacher Manager를 다시 실행한 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+    "COMPONENT_UPDATE_BUSY": "다른 설치나 갱신이 끝난 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+}
+
+
+def user_update_failure_detail(code: str) -> str:
+    """내부 파일명·형식·주소를 숨긴 화면용 Google 연결 기능 안내."""
+
+    safe_code = str(code or "")
+    if safe_code in _USER_ACTION_FAILURES:
+        return _USER_ACTION_FAILURES[safe_code]
+    if safe_code.startswith("NETWORK_") or safe_code.startswith("GWS_DOWNLOAD_"):
+        return "Google 공식 파일을 지금 받지 못했어요. 인터넷 연결을 확인한 뒤 잠시 후 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요."
+    return "공식 파일이 안전 확인 정보와 일치하지 않아 적용하지 않았어요. 현재 기능은 그대로 사용할 수 있어요. 잠시 뒤 다시 눌러 주세요."
+
+
 def _text(raw: Mapping[str, object], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -532,7 +552,7 @@ def check_gws_update(
             result = GwsUpdateCheck(False, code, detail, None, day)
             return result
     except _InstallError as error:
-        return GwsUpdateCheck(False, error.code, error.detail, None, day)
+        return GwsUpdateCheck(False, error.code, user_update_failure_detail(error.code), None, day)
     except (OSError, TimeoutError):
         return GwsUpdateCheck(
             False,
@@ -1296,7 +1316,12 @@ def _failure_result(
     error: _InstallError,
     resolution: tool_runtime.GwsResolution | None,
 ) -> GwsUpdateResult:
-    return GwsUpdateResult(False, error.code, error.detail, resolution)
+    return GwsUpdateResult(
+        False,
+        error.code,
+        user_update_failure_detail(error.code),
+        resolution,
+    )
 
 
 def _current_resolution(

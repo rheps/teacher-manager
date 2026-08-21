@@ -17,10 +17,12 @@ from brity_bridge import (
     capture_toast,
     hotkey,
     hotkey_win,
+    local_attachment_server,
     paths,
     pipeline,
     screen_read,
     settings as settings_module,
+    status_log,
 )
 
 WM_CLOSE = 0x0010
@@ -237,7 +239,7 @@ class WNDCLASSW(ctypes.Structure):
 
 
 class TrayApp:
-    def __init__(self, config_dir: Path, toast_factory=None):
+    def __init__(self, config_dir: Path, toast_factory=None, attachment_server_factory=None):
         self.config_dir = Path(config_dir)
         self.settings = settings_module.load_settings(paths.settings_path(self.config_dir))
         # busy는 도우미 종료가 받아 둔 작업을 기다리는 표지다. 화면 읽기만
@@ -266,6 +268,12 @@ class TrayApp:
         self._notice_lock = threading.RLock()
         self._current_notice: StatusNotice | None = None
         self._deferred_notice: StatusNotice | None = None
+        self._attachment_server_factory = (
+            attachment_server_factory or local_attachment_server.LocalAttachmentServer
+        )
+        self._attachment_server = None
+        self._attachment_link_ready = False
+        self._attachment_link_failure = ""
         self.on_ready = None  # 트레이 아이콘 등록 직후 한 번 부른다 (부팅 시 대시보드 동반 실행)
         self._dashboard_click_guard = 0.0
         self._close_pending = False  # 받아 둔 작업을 기다리는 닫기 대기자 존재 여부
@@ -466,7 +474,8 @@ class TrayApp:
         try:
             capture = screen_read.capture_brity_text()
             if not capture.ok:
-                failure_message = screen_read.capture_failure_message(capture.reason)
+                retry = screen_read.capture_failure_message(capture.reason)
+                self._enqueue_capture(capture, (), retry)
             else:
                 attachment_paths = ()
                 preflight_message = ""
@@ -477,8 +486,16 @@ class TrayApp:
                 except attach_read.AttachmentBlocked as error:
                     preflight_message = error.message or "첨부파일을 먼저 내려받아 주세요."
                 self._enqueue_capture(capture, attachment_paths, preflight_message)
-        except Exception:  # noqa: BLE001 - 워커가 소리 없이 죽으면 안 된다
-            failure_message = "화면을 저장하는 중 예상하지 못한 오류가 발생했어요. 다시 시도해 주세요."
+        except Exception:  # noqa: BLE001 - 외부 원문은 기록·화면에 내보내지 않는다
+            capture = screen_read.ScreenCapture(False, "unexpected", "", [])
+            unexpected_retry = (
+                "화면을 저장하는 중 예상하지 못한 오류가 발생했어요. "
+                "Teacher Manager를 다시 시작한 뒤 같은 메시지에서 단축키를 다시 눌러 주세요."
+            )
+            try:
+                self._enqueue_capture(capture, (), unexpected_retry)
+            except Exception:
+                failure_message = unexpected_retry
         finally:
             self._capture_lock.release()
 
@@ -561,11 +578,17 @@ class TrayApp:
             try:
                 if queued.preflight_message:
                     result_message = queued.preflight_message
-                    pipeline.record_preflight_failure(
-                        self.config_dir,
-                        result_message,
-                        "등록하지 않음 · " + result_message,
-                    )
+                    if queued.capture.ok:
+                        pipeline.record_preflight_failure(
+                            self.config_dir,
+                            result_message,
+                            "등록하지 않음 · " + result_message,
+                            capture=queued.capture,
+                        )
+                    else:
+                        pipeline.record_screen_failure(
+                            self.config_dir, queued.capture, result_message
+                        )
                     emit("fail", result_message)
                 elif queued.capture.attachments:
                     self._update_batch_status(f"{queued.sequence}번째 쪽지 · 첨부 읽는 중")
@@ -581,6 +604,7 @@ class TrayApp:
                             self.config_dir,
                             result_message,
                             "등록하지 않음 · " + result_message,
+                            capture=queued.capture,
                         )
                         emit("fail", result_message)
                     else:
@@ -590,6 +614,8 @@ class TrayApp:
                             self.settings,
                             record=record,
                             progress=emit,
+                            attachment_link_ready=self._attachment_link_ready,
+                            attachment_link_failure=self._attachment_link_failure,
                         )
                         succeeded = bool(result.ok)
                         result_message = result.message
@@ -607,6 +633,8 @@ class TrayApp:
                         self.settings,
                         record=record,
                         progress=emit,
+                        attachment_link_ready=self._attachment_link_ready,
+                        attachment_link_failure=self._attachment_link_failure,
                     )
                     succeeded = bool(result.ok)
                     result_message = result.message
@@ -614,6 +642,10 @@ class TrayApp:
                         result_message = result_message + "\n" + note
             except Exception:  # noqa: BLE001 - 한 건의 실패가 뒤 메시지를 막으면 안 된다
                 result_message = "처리 중 예상하지 못한 오류가 발생했어요. 다음 쪽지는 계속 처리합니다."
+                try:
+                    pipeline.record_unexpected_failure(self.config_dir, queued.capture)
+                except Exception:  # noqa: BLE001 - 기록 실패도 다음 쪽지를 막으면 안 된다
+                    pass
                 emit("fail", result_message)
             finally:
                 self._capture_queue.task_done()
@@ -645,6 +677,8 @@ class TrayApp:
             return "첨부파일 내려받기 필요"
         if "첨부파일" in clean and ("읽지 못" in clean or "열지 못" in clean):
             return "첨부파일 읽기 실패"
+        if "예상하지 못한" in clean:
+            return "예상하지 못한 오류 · 기록 확인 필요"
         if "인터넷" in clean:
             return "인터넷 연결 확인 필요"
         return "처리 결과 확인 필요"
@@ -820,9 +854,65 @@ class TrayApp:
             except Exception:  # noqa: BLE001 - 재등록 실패가 캡처를 막으면 안 된다
                 pass
 
+    def _start_attachment_server(self) -> None:
+        if self._attachment_server is not None:
+            return
+
+        def current_download_dir() -> Path:
+            current = settings_module.load_settings(paths.settings_path(self.config_dir))
+            return Path(current.brity_download_dir)
+
+        server = None
+        self._attachment_link_ready = False
+        self._attachment_link_failure = ""
+        try:
+            server = self._attachment_server_factory(current_download_dir)
+            server.start()
+        except Exception as error:  # noqa: BLE001 - 파일 링크 실패가 단축키·메시지 처리를 막으면 안 된다
+            failure_message = status_log.attachment_link_start_failure_message(error)
+            self._attachment_link_failure = failure_message
+            if server is not None:
+                try:
+                    server.stop()
+                except Exception:  # noqa: BLE001 - 실패한 시작 정리가 트레이를 막으면 안 된다
+                    pass
+            try:
+                status_log.append_log(
+                    paths.logs_dir(self.config_dir),
+                    False,
+                    "attachment-link",
+                    "",
+                    detail=status_log.attachment_link_start_failure_detail(error),
+                )
+                status_log.write_last_status(
+                    paths.bridge_state_dir(self.config_dir),
+                    {
+                        "ok": False,
+                        "stage": "attachment-link",
+                        "message": failure_message,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - 기록 실패도 트레이 시작을 막으면 안 된다
+                pass
+            return
+        self._attachment_server = server
+        self._attachment_link_ready = True
+
+    def _stop_attachment_server(self) -> None:
+        server = self._attachment_server
+        self._attachment_server = None
+        self._attachment_link_ready = False
+        if server is None:
+            return
+        try:
+            server.stop()
+        except Exception:  # noqa: BLE001 - 서버 종료 실패가 아이콘·단축키 정리를 막으면 안 된다
+            pass
+
     def run(self) -> None:
         user32 = ctypes.windll.user32
         self._setup_window_and_icon()
+        self._start_attachment_server()
 
         # 도우미 창이 이미 있으므로, 여기서 뜨는 대시보드가 도우미를 또 띄우지 않는다.
         if self.on_ready is not None:
@@ -834,7 +924,7 @@ class TrayApp:
         try:
             spec = hotkey.parse_hotkey(self.settings.hotkey)
         except ValueError:
-            self.notify("Brity 연결 도우미", "settings.json의 단축키 형식이 잘못돼 트레이 메뉴만 동작합니다.")
+            self.notify("Brity 연결 도우미", "저장된 단축키 설정이 올바르지 않아 트레이 메뉴만 동작합니다.")
         else:
             if spec.modifier_only:
                 self._modifier_listener = hotkey_win.ModifierHotkeyListener(spec, self._dispatch_hotkey)
@@ -896,6 +986,7 @@ class TrayApp:
                 ).start()
             return 0
         if message_id == WM_DESTROY:
+            self._stop_attachment_server()
             with self._icon_lock:
                 ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._icon_data))
             if self._modifier_listener is not None:

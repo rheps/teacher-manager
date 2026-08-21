@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -33,11 +34,40 @@ class MessageRecord:
     attachment_count: int = 0
     attachment_names: tuple[str, ...] = ()
     media_parts: tuple[MediaPart, ...] = ()
+    local_attachment_names: tuple[str, ...] = ()
 
 
 def compute_source_hash(sender: str, sent_at: str, plain_text: str) -> str:
     joined = "\n".join([sender, sent_at, plain_text])
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _display_text(value: str, limit: int) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = "".join(
+        " " if character.isspace() else character
+        for character in normalized
+        if character.isspace() or not unicodedata.category(character).startswith("C")
+    )
+    compact = " ".join(cleaned.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
+def message_identity(record: MessageRecord) -> dict[str, str]:
+    """Return only the short, local display fields needed to identify a message."""
+
+    sent_at = _display_text(record.sent_at, 64)
+    try:
+        datetime.fromisoformat(sent_at)
+    except (TypeError, ValueError):
+        sent_at = ""
+    return {
+        "sender": _display_text(record.sender, 40),
+        "sent_at": sent_at,
+        "preview": _display_text(record.plain_text, 60),
+    }
 
 
 def build_cf_html_bytes(fragment_html: str) -> bytes:

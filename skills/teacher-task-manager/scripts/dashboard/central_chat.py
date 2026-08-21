@@ -55,6 +55,20 @@ SERVER_ANSWER_MESSAGES = {
     "SPACE_CREATE_FAILED": SPACE_CREATE_FAILED_MESSAGE,
     "GOEDU_ACCOUNT_REQUIRED": GOEDU_ACCOUNT_REQUIRED_MESSAGE,
 }
+UNKNOWN_SERVER_ANSWER_MESSAGE = (
+    "발송 서버가 요청을 처리하지 못했어요. 잠시 뒤 다시 시도해 주세요."
+)
+CHAT_STATUS_FAILURE_MESSAGE = (
+    "학급 단톡방 상태를 확인하지 못했어요. 잠시 뒤 다시 확인해 주세요."
+)
+_SAFE_CENTRAL_MESSAGES = {
+    NOT_PREPARED_MESSAGE,
+    CONFIG_BROKEN_MESSAGE,
+    SERVER_ERROR_MESSAGE,
+    UNKNOWN_SERVER_ANSWER_MESSAGE,
+    CHAT_STATUS_FAILURE_MESSAGE,
+    *SERVER_ANSWER_MESSAGES.values(),
+}
 
 _KEY_MAP = {
     "CENTRAL_CHAT_SENDER_URL": "url",
@@ -75,7 +89,7 @@ class CentralChatError(RuntimeError):
 def _resolved_gws_executable(gws_executable: str | None = None) -> str:
     executable = str(gws_executable or tool_runtime.resolve_gws_executable())
     if not executable or not Path(executable).is_absolute():
-        raise CentralChatError("Google Workspace CLI 실행 파일의 전체 경로를 읽지 못했어요.")
+        raise CentralChatError("Google 연결 도구를 찾지 못했어요. 설정에서 다시 점검해 주세요.")
     return executable
 
 
@@ -232,9 +246,15 @@ def _server_answer_message(code: str, error) -> str:
     known = SERVER_ANSWER_MESSAGES.get(code)
     if known:
         return known
-    # 모르는 답이면 감추지 않는다. 상태 번호가 있어야 무엇을 물어볼지 정할 수 있다.
-    tail = f" ({code})" if code else ""
-    return f"발송 서버가 처리하지 못했어요 — 서버 응답 {getattr(error, 'code', '?')}{tail}."
+    return UNKNOWN_SERVER_ANSWER_MESSAGE
+
+
+def _safe_central_error_detail(error, fallback: str = UNKNOWN_SERVER_ANSWER_MESSAGE) -> str:
+    code = str(getattr(error, "server_code", "") or "")
+    if code in SERVER_ANSWER_MESSAGES:
+        return SERVER_ANSWER_MESSAGES[code]
+    detail = str(error or "")
+    return detail if detail in _SAFE_CENTRAL_MESSAGES else fallback
 
 
 UNIFIED_TASK_LIST_TITLE = "조종례시 담임학급 안내사항"
@@ -508,7 +528,7 @@ def create_class_space(
             "displayName": name,
         })
     except CentralChatError as error:
-        detail = str(error)
+        detail = _safe_central_error_detail(error)
         # 번역 문구가 아니라 서버가 준 원 코드로 가른다 — 문구에 맥락이 덧붙어도 안 샌다.
         state = "blocked" if getattr(error, "server_code", "") == "SPACE_CREATE_FORBIDDEN" else "failed"
         return {"state": state, "space_name": "", "display_name": name, "detail": detail}
@@ -532,8 +552,9 @@ def create_class_space(
     except CentralChatError as error:
         # 방은 만들어졌다. 만든 이름을 함께 돌려주어, 같은 이름으로 또 만들려다
         # SPACE_NAME_TAKEN을 만나지 않게 한다.
+        reason = _safe_central_error_detail(error)
         return {"state": "failed", "space_name": space_name, "display_name": shown,
-                "detail": f"방은 만들었어요. 다만 골라 두지 못했어요 — {error}"}
+                "detail": "방은 만들었어요. 다만 학급 단톡방으로 저장하지 못했어요. " + reason}
     return {"state": "ok", "space_name": space_name, "display_name": shown, "detail": ""}
 
 
@@ -580,7 +601,16 @@ def chat_status(
         })
     except CentralChatError as error:
         return {"connected": False, "registered": False, "account": "",
-                "class_space_name": "", "reason": str(error)}
+                "class_space_name": "", "reason": _safe_central_error_detail(
+                    error, CHAT_STATUS_FAILURE_MESSAGE
+                )}
+    reason_code = str(response.get("reasonCode", "") or "")
+    reason = SERVER_ANSWER_MESSAGES.get(reason_code)
+    if not reason:
+        supplied = str(response.get("reason", "") or "")
+        reason = supplied if supplied in _SAFE_CENTRAL_MESSAGES else (
+            CHAT_STATUS_FAILURE_MESSAGE if supplied or reason_code else ""
+        )
     return {
         "connected": bool(response.get("connected")),
         "registered": bool(response.get("registered")),
@@ -592,5 +622,5 @@ def chat_status(
             if str(config.get("class_space_id", "") or "").strip()
             else ""
         ),
-        "reason": str(response.get("reason", "") or ""),
+        "reason": reason,
     }

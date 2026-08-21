@@ -90,9 +90,9 @@ def _timetable_check(config_dir: Path) -> CheckResult:
 
 
 _READINESS_ROWS = [
-    ("python", "Python"),
-    ("documents", "문서 읽기 도구"),
-    ("screen", "화면 표시"),
+    ("python", "프로그램 실행 기능"),
+    ("documents", "문서 읽기 기능"),
+    ("screen", "화면 표시 기능"),
 ]
 
 # 출결 준비 상태를 홈 점검 한 건으로 바꾸는 규칙 — 로그인·개인 설정 문제는
@@ -316,6 +316,12 @@ def _attendance_sheet_for_gemini_key(config_dir: Path) -> str:
     return attendance_workbook_identity.current_attendance_spreadsheet_id(config_dir)
 
 
+ATTENDANCE_SHEET_PUSH_FAILURE = (
+    "이 컴퓨터 저장은 마쳤지만 출결표에는 반영하지 못했어요. "
+    "Google 로그인과 인터넷 연결을 확인한 뒤 다시 저장해 주세요."
+)
+
+
 def push_gemini_key_to_attendance_sheet(
     config_dir: Path,
     run_command=None,
@@ -333,10 +339,10 @@ def push_gemini_key_to_attendance_sheet(
     config_dir = Path(config_dir)
     key = str(load_settings(paths.settings_path(config_dir)).gemini_api_key or "").strip()
     if not key:
-        return {"state": "skipped", "detail": "아직 Gemini API key를 넣지 않았어요."}
+        return {"state": "skipped", "detail": "아직 인공지능 연결 키를 넣지 않았어요."}
     spreadsheet_id = _attendance_sheet_for_gemini_key(config_dir)
     if not spreadsheet_id:
-        return {"state": "skipped", "detail": "아직 출결 시트를 만들지 않았어요."}
+        return {"state": "skipped", "detail": "아직 출석부를 만들지 않았어요."}
     runner = run_command or central_chat._default_run_command
     try:
         gws = str(gws_executable or resolve_gws(runner))
@@ -345,9 +351,9 @@ def push_gemini_key_to_attendance_sheet(
         central_chat._upsert_settings_value(
             spreadsheet_id, rows, "GEMINI_API_KEY", key, runner, gws
         )
-    except Exception as error:  # noqa: BLE001 - 화면에는 한국어 한 문장만 보인다
-        return {"state": "failed", "detail": f"출결 시트에 넣지 못했어요: {error}"[:200]}
-    return {"state": "ok", "detail": "출결 시트 설정 탭에도 넣었어요."}
+    except Exception:  # noqa: BLE001 - 외부 원문은 화면에 보내지 않는다
+        return {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+    return {"state": "ok", "detail": "출석부의 설정 화면에도 반영했어요."}
 
 
 def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: str) -> dict:
@@ -476,8 +482,12 @@ def save_messenger_settings(
             pusher = push_key or push_gemini_key_to_attendance_sheet
             try:
                 sheet_push = pusher(Path(config_dir))
-            except Exception as error:  # noqa: BLE001 - 저장 자체는 이미 끝났다
-                sheet_push = {"state": "failed", "detail": str(error)[:200]}
+                if not isinstance(sheet_push, dict):
+                    sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+                elif sheet_push.get("state") == "failed":
+                    sheet_push = {**sheet_push, "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+            except Exception:  # noqa: BLE001 - 저장 자체는 이미 끝났다
+                sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
         return {
             "saved": True,
             "hotkey": candidate.hotkey,
@@ -646,7 +656,7 @@ ATTENDANCE_ERROR_MESSAGES = {
     "tasks": "Google Tasks 목록을 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
     "setup": "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
 }
-ATTENDANCE_GWS_MESSAGE = "Google Workspace CLI가 아직 준비되지 않았어요. 설정에서 준비해 주세요."
+ATTENDANCE_GWS_MESSAGE = "Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
 ATTENDANCE_LOGIN_MESSAGE = "설정에서 학교 Google 계정으로 로그인해 주세요."
 ATTENDANCE_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
 ATTENDANCE_AUTH_STATUS_MESSAGE = (
@@ -674,12 +684,56 @@ def current_attendance_script_bundle_sha256() -> str:
     )
 
 
+def _existing_attendance_guidance(error) -> str:
+    if isinstance(
+        error, install_attendance_automation.LegacyAttendanceConsolidationRequired
+    ):
+        names = []
+        for candidate in error.candidates:
+            name = " ".join(str(candidate.get("name", "") or "").split())[:120]
+            if name and name not in names:
+                names.append(name)
+        if len(error.candidates) > 1:
+            shown = ", ".join(names) if names else "이름을 읽지 못한 출석부"
+            return (
+                "예전에 쓰던 출석부가 여러 개라 자동으로 고르지 않았어요. "
+                f"파일 이름: {shown}. Google Drive에서 파일 이름으로 열어 확인한 뒤 "
+                "출결 시트 하나로 정리를 다시 시작해 주세요."
+            )
+        shown = names[0] if names else "예전에 쓰던 출석부"
+        return (
+            f"예전에 쓰던 출석부를 찾았어요: {shown}. 기존 자료는 바꾸지 않았습니다. "
+            "화면의 출석부 열기 버튼으로 확인한 뒤 출결 시트 하나로 정리를 시작해 주세요."
+        )
+
+    raw = str(error or "")
+    labels = []
+    for marker, label in (
+        ("SCRIPT_ID", "자동 기능 연결"),
+        ("DEPLOYMENT_ID", "자동 기능 배포 연결"),
+        ("TEMPLATE_DOC_ID", "결석 신고서 양식"),
+        ("FOLDER_ID", "출결 파일 보관 폴더"),
+        ("TASK_LIST_ID", "할 일 목록"),
+    ):
+        if marker in raw and label not in labels:
+            labels.append(label)
+    if "여러 개" in raw:
+        return (
+            "같은 이름의 기존 출석부가 여러 개라 자동으로 고르지 않았어요. "
+            "Google Drive에서 파일 이름으로 열어 확인한 뒤 사용할 파일 하나만 남겨 주세요."
+        )
+    checks = ", ".join(labels) if labels else "비어 있는 연결 항목"
+    return (
+        "쓰시던 출석부를 찾았지만 연결 준비가 비어 있어 이어서 사용하지 않았어요. "
+        "기존 출석부는 바꾸지 않았습니다. 출석부의 설정 화면에서 확인할 항목: "
+        f"{checks}. 확인한 뒤 다시 시도해 주세요."
+    )
+
+
 def friendly_attendance_error(error) -> tuple[str, str]:
     """설치 실패를 (실패한 서비스, 화면에 보여줄 쉬운 문장)으로 바꾼다."""
-    # 쓰던 시트 때문에 멈춘 경우는 이유가 시트마다 다르다. 뭉뚱그린 문장으로 바꾸면
-    # 무엇을 고쳐야 할지 알 수 없으므로 적어 둔 문장을 그대로 보여준다.
     if isinstance(error, install_attendance_automation.ExistingAttendanceSheetError):
-        return "sheet", str(error)
+        return "sheet", _existing_attendance_guidance(error)
     service = "setup"
     cmd = getattr(error, "cmd", None) or []
     tokens = [str(part) for part in cmd]
@@ -1051,10 +1105,14 @@ def write_timetable_grid(config_dir: Path, grid: list[list[str]]) -> Path:
 
 def run_parser(config_dir: Path, *, require_links: bool = True) -> tuple[bool, str]:
     try:
-        output = parse_settings.parse_config_dir(Path(config_dir), require_links=require_links)
+        parse_settings.parse_config_dir(Path(config_dir), require_links=require_links)
     except ValueError as error:
-        return False, str(error)
-    return True, str(output)
+        raw = str(error or "")
+        missing = [name for name in PROFILE_FIELD_ORDER if name in raw]
+        if missing:
+            return False, "입력하지 않은 항목을 확인해 주세요: " + ", ".join(missing)
+        return False, "저장한 내용을 확인하지 못했어요. 내 정보와 시간표를 다시 확인해 주세요."
+    return True, "입력한 설정을 확인했어요."
 
 
 # SKILL.md의 전체 scope 그대로 — 축소 로그인이 Calendar/Tasks를 깨뜨린 전례가 있다.
@@ -1108,8 +1166,8 @@ def install_gws(run_command=_default_run_command) -> tuple[bool, str]:
     del run_command  # GWS는 npm으로 설치하지 않고 제품 안의 검증된 파일만 쓴다.
     try:
         executable = resolve_gws()
-    except tool_runtime.GwsRuntimeError as error:
-        return False, str(error)
+    except tool_runtime.GwsRuntimeError:
+        return False, "Google 연결 기능을 준비하지 못했어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
     return True, executable
 
 
@@ -1196,7 +1254,11 @@ def read_gws_update_status(
     exact_offer = check.offer if check.success and check.offer is not None else None
     status_success = bool(check.success)
     status_code = str(check.code)
-    status_detail = str(check.detail)
+    status_detail = (
+        str(check.detail)
+        if check.success
+        else component_update.user_update_failure_detail(check.code)
+    )
     # 오늘 받은 승인 제안이 cache에 남아 있어도 이미 그 판(또는 더 최신 판)을
     # 실제로 쓰고 있으면 다시 갱신 단추를 보여 주지 않는다.
     if (
@@ -1261,7 +1323,11 @@ def apply_gws_update(
         and runtime["current_source"] == "approved-update"
     )
     code = str(result.code)
-    detail = str(result.detail or "Google 도구 갱신을 끝내지 못했습니다.")
+    detail = (
+        str(result.detail or "Google 연결 기능 갱신을 끝내지 못했습니다.")
+        if result.success
+        else component_update.user_update_failure_detail(result.code)
+    )
     if result.success and not selected_new_version:
         code = "COMPONENT_RESOLUTION_FAILED"
         detail = "새 Google 도구를 적용한 뒤 실제 실행 판을 확인하지 못했습니다."
@@ -1321,7 +1387,7 @@ def require_goedu_gws_session(run_command, gws: str) -> str:
     """실제 Google 자료를 읽거나 쓰기 직전에 학교 계정을 다시 확인한다."""
 
     if not gws:
-        raise RuntimeError("Google Workspace CLI가 아직 준비되지 않았어요")
+        raise RuntimeError("Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요.")
     auth = gws_auth_status(run_command, gws)
     if not auth.get("logged_in"):
         if auth.get("login_state") == "error":
@@ -1334,7 +1400,7 @@ def require_goedu_gws_session(run_command, gws: str) -> str:
 
 def gws_logout(run_command, gws: str) -> tuple[bool, str]:
     if not gws:
-        return False, "Google Workspace CLI가 아직 준비되지 않았어요"
+        return False, "Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
     code, output = run_command([gws, "auth", "logout"])
     return code == 0, output.strip()[-300:]
 
@@ -1601,14 +1667,17 @@ def check_update(current: str, fetch=None) -> dict:
     except ValueError:
         return _empty_update("failed", "배포 정보의 버전 모양이 올바르지 않아요.")
     except Exception:  # noqa: BLE001 - 실행은 계속하되 화면에는 확인 실패를 정확히 알린다
-        return _empty_update("failed", "업데이트 확인을 하지 못했어요. 인터넷 연결을 확인해 주세요.")
+        return _empty_update(
+            "failed",
+            "업데이트 확인을 하지 못했어요. 인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요.",
+        )
 
     if not newer:
         return _empty_update("latest", "", latest)
     if not _valid_https_update_url(url):
-        return _empty_update("failed", "업데이트 주소가 공식 배포 주소(GitHub https)가 아니에요.", latest)
+        return _empty_update("failed", "업데이트 주소가 공식 배포 주소가 아니어서 안전하게 중단했어요.", latest)
     if not sha256:
-        return _empty_update("failed", "설치 파일 확인값이 없어 업데이트할 수 없어요.", latest)
+        return _empty_update("failed", "설치 파일의 안전 확인 정보가 없어 업데이트를 중단했어요.", latest)
     return {
         "status": "available",
         "available": True,
@@ -2931,7 +3000,11 @@ def consolidate_attendance(
             config_dir, deps=transition_deps
         )
         if str(getattr(result, "state", "") or "") != "complete":
-            detail = str(getattr(result, "detail", "") or "")
+            detail = (
+                str(result.detail or "")
+                if isinstance(result, attendance_workbook_transition.TransitionResult)
+                else attendance_workbook_transition.CONSOLIDATION_FAILURE
+            )
             return replace(
                 current,
                 state="failed",
@@ -2976,7 +3049,7 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
             preflight,
             state="failed",
             failed_service="sheet",
-            detail="먼저 `출결 시트 하나로 정리`를 끝내 주세요.",
+            detail="먼저 출결 시트 하나로 정리를 끝내 주세요.",
         )
     if not preflight.year_mismatch:
         return preflight
@@ -2992,7 +3065,7 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
                 current,
                 state="failed",
                 failed_service="sheet",
-                detail="먼저 `출결 시트 하나로 정리`를 끝내 주세요.",
+                detail="먼저 출결 시트 하나로 정리를 끝내 주세요.",
             )
         if not current.year_mismatch:
             return current
@@ -3006,7 +3079,11 @@ def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -
             config_dir, deps=transition_deps
         )
         if str(getattr(result, "state", "") or "") != "complete":
-            detail = str(getattr(result, "detail", "") or "")
+            detail = (
+                str(result.detail or "")
+                if isinstance(result, attendance_workbook_transition.TransitionResult)
+                else attendance_workbook_transition.NEW_SCHOOL_YEAR_FAILURE
+            )
             return replace(
                 current,
                 state="failed",
@@ -3048,10 +3125,10 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     require_goedu_gws_session(deps.run_command, gws)
 
     write_profile_values(config_dir, profile_values)
-    results.append(StepResult("csv", "선생님·학교 저장", "done", "teacher-profile.csv"))
+    results.append(StepResult("csv", "선생님·학교 저장", "done", "이 컴퓨터에 저장함"))
 
     write_timetable_grid(config_dir, grid)
-    results.append(StepResult("xlsx", "시간표 저장", "done", "weekly-timetable.xlsx"))
+    results.append(StepResult("xlsx", "시간표 저장", "done", "이 컴퓨터에 저장함"))
 
     parse_ok, parse_detail = run_parser(config_dir)
     results.append(StepResult("parse", "설정 파서", "done" if parse_ok else "failed", parse_detail))
@@ -3068,12 +3145,12 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     save_bridge_settings(config_dir, bridge)
     if bridge_updates.get("autostart"):
         deps.enable_autostart()
-    results.append(StepResult("bridge", "도우미 설정 저장", "done", "brity-bridge/settings.json"))
+    results.append(StepResult("bridge", "도우미 설정 저장", "done", "이 컴퓨터에 저장함"))
 
     if deps.stop_helper() and deps.start_helper():
         results.append(StepResult("helper", "도우미 재시작", "done", "새 설정으로 실행 중"))
     else:
-        results.append(StepResult("helper", "도우미 재시작", "failed", "doctor를 실행해 주세요"))
+        results.append(StepResult("helper", "도우미 재시작", "failed", "Teacher Manager를 다시 시작해 주세요"))
     return results
 
 

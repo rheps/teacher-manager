@@ -58,6 +58,7 @@ class AttachmentBundle:
     count: int
     names: tuple[str, ...]
     fingerprints: tuple[str, ...]
+    local_names: tuple[str, ...]
     media_parts: tuple[MediaPart, ...] = ()
     skipped_names: tuple[str, ...] = ()
 
@@ -301,6 +302,7 @@ def resolve_attachment_files(download_dir: Path, names: list[str]) -> tuple[Path
 
 def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBundle:
     """이미 고정한 파일의 내용 읽기와 지문 계산을 차례대로 끝낸다."""
+    local_names = tuple(Path(path).name for path in paths)
 
     sections: list[str] = []
     actual_names: list[str] = []
@@ -326,6 +328,7 @@ def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBun
         count=len(actual_names),
         names=tuple(actual_names),
         fingerprints=tuple(fingerprints),
+        local_names=local_names,
         media_parts=tuple(media_parts),
         skipped_names=tuple(skipped_names),
     )

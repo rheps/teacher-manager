@@ -22,6 +22,25 @@ TASK_NOTE_MARK = "BRITY-BRIDGE:"
 PERSONAL_QUEUE_SHEET = "메신저 개인톡 내용"
 CLASS_QUEUE_SHEET = "메신저 단체톡 내용"
 _QUEUE_DATE_RE = re.compile(r"^(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\.?$")
+_LOCAL_ATTACHMENT_HEADER = "📎 첨부파일 (컴퓨터에서만 열림)"
+_LOCAL_ATTACHMENT_URL_PREFIX = "http://127.0.0.1:49271/open?name="
+TOOL_PREPARATION_FAILURE_DETAIL = (
+    "Google 등록 도구를 준비하지 못했습니다. Teacher Manager를 다시 열고 다시 시도해 주세요."
+)
+LOGIN_FAILURE_DETAIL = "Google 로그인을 다시 확인해 주세요."
+LOGIN_STORAGE_FAILURE_DETAIL = (
+    "Google 로그인 정보를 안전하게 확인하지 못했습니다. Teacher Manager를 다시 열고 로그인해 주세요."
+)
+PERMISSION_FAILURE_DETAIL = "이 항목을 등록할 Google 권한을 확인해 주세요."
+NETWORK_FAILURE_DETAIL = "인터넷 연결을 확인해 주세요. 잠시 뒤 다시 시도해 주세요."
+GENERAL_FAILURE_DETAIL = "Google에서 이 항목을 처리하지 못했습니다. 잠시 뒤 다시 시도해 주세요."
+RESULT_RECORD_FAILURE_DETAIL = (
+    "Google에 이미 만들었을 수 있으니 같은 메시지를 다시 누르지 말고 기록에서 확인해 주세요."
+)
+NOTICE_PREFLIGHT_FAILURE_DETAIL = (
+    "학생 안내표의 출결 기능 확인이 필요합니다. 출결 탭 위쪽 안내를 확인해 주세요."
+)
+NOTICE_SETUP_FAILURE_DETAIL = "학생 안내표가 준비되지 않았어요 · 처음 설정 필요"
 
 
 @dataclass
@@ -30,6 +49,7 @@ class ActionResult:
     status: str  # created | duplicate | failed
     google_id: str = ""
     detail: str = ""
+    retry_allowed: bool = True
 
 
 @dataclass
@@ -105,6 +125,37 @@ def _run_json(runner, args: list[str]) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _safe_google_failure(error: BaseException) -> str:
+    """Map external diagnostics to a fixed message that is safe for the UI."""
+
+    text = str(error or "").casefold()
+    if any(marker in text for marker in ("permission", "forbidden", "access denied", "403", "권한")):
+        return PERMISSION_FAILURE_DETAIL
+    if any(
+        marker in text
+        for marker in (
+            "invalid_grant", "unauthenticated", "authentication", "oauth",
+            "credential", "token", "login", "401", "로그인",
+        )
+    ):
+        return LOGIN_FAILURE_DETAIL
+    if any(
+        marker in text
+        for marker in (
+            "timeout", "timed out", "network", "connection", "dns", "internet",
+            "unreachable", "socket", "reset", "인터넷", "연결",
+        )
+    ):
+        return NETWORK_FAILURE_DETAIL
+    return GENERAL_FAILURE_DETAIL
+
+
+def _preparation_failures(actions: list, detail: str) -> ExecutionReport:
+    return ExecutionReport(
+        results=[ActionResult(action, "failed", "", detail) for action in actions]
+    )
+
+
 def _require_goedu_account(runner, gws_command: list[str]) -> str:
     """자료를 읽거나 쓰기 직전에 현재 로그인 계정을 한 번 확인한다."""
 
@@ -127,6 +178,33 @@ def _probe_calendar_duplicate(runner, gws_command, action) -> str:
     return items[0].get("id", "") if items else ""
 
 
+def _get_calendar_event(runner, gws_command, action, event_id: str) -> dict:
+    args = gws_command + [
+        "calendar", "events", "get",
+        "--params", json.dumps(
+            {"calendarId": action.google_id, "eventId": event_id}, ensure_ascii=False
+        ),
+        "--format", "json",
+    ]
+    return _run_json(runner, args)
+
+
+def _requires_local_link_verification(action) -> bool:
+    description = str(action.payload.get("description", ""))
+    return (
+        _LOCAL_ATTACHMENT_HEADER in description
+        and _LOCAL_ATTACHMENT_URL_PREFIX in description
+    )
+
+
+def _calendar_response_preserves_local_links(action, event: dict) -> bool:
+    if not _requires_local_link_verification(action):
+        return True
+    expected = str(action.payload.get("description", "")).replace("\r\n", "\n")
+    actual = str((event or {}).get("description", "")).replace("\r\n", "\n")
+    return actual == expected
+
+
 def _probe_task_duplicate(runner, gws_command, action) -> str:
     params = {"tasklist": action.google_id, "showCompleted": True, "maxResults": 100}
     args = gws_command + [
@@ -141,15 +219,18 @@ def _probe_task_duplicate(runner, gws_command, action) -> str:
     return ""
 
 
-def _insert_calendar(runner, gws_command, action) -> str:
+def _insert_calendar(runner, gws_command, action) -> dict:
     body = dict(action.payload)
     body["extendedProperties"] = {"private": {DUPLICATE_KEY_PROPERTY: action.action_key}}
+    params = {"calendarId": action.google_id}
+    if body.get("attachments"):
+        params["supportsAttachments"] = True
     args = gws_command + [
         "calendar", "events", "insert",
-        "--params", json.dumps({"calendarId": action.google_id}, ensure_ascii=False),
+        "--params", json.dumps(params, ensure_ascii=False),
         "--json", json.dumps(body, ensure_ascii=False),
     ]
-    return _run_json(runner, args).get("id", "")
+    return _run_json(runner, args)
 
 
 def _insert_task(runner, gws_command, action) -> str:
@@ -254,38 +335,34 @@ def execute_actions(
     source_hash: str = "",
     *,
     gws_executable: str | None = None,
-    notice_unavailable_message: str = "학생 안내 시트가 준비되지 않았어요 · 처음 설정 필요",
+    notice_unavailable_message: str = "학생 안내표가 준비되지 않았어요 · 처음 설정 필요",
     expected_account: str = "",
     notice_preflight=None,
 ) -> ExecutionReport:
     runtime_run_command = None
-    if runner is None:
-        # 실행 파일을 고르는 --version 확인도 GWS 명령이다. 다른 계정 저장소를
-        # 발견하면 resolver보다 먼저 끝내고, 정상일 때도 현재 계정용 환경만 준다.
-        base = dict(os.environ)
-        try:
+    try:
+        if runner is None:
+            # 실행 파일을 고르는 --version 확인도 GWS 명령이다. 다른 계정 저장소를
+            # 발견하면 resolver보다 먼저 끝내고, 정상일 때도 현재 계정용 환경만 준다.
+            base = dict(os.environ)
             if gws_env.unsafe_account_storage_overrides(base):
                 raise gws_env.GwsAccountStorageError(
                     gws_env.ACCOUNT_STORAGE_ERROR_MESSAGE
                 )
             runtime_environment = gws_env.gws_environ(base)
-        except gws_env.GwsAccountStorageError as error:
-            detail = str(error) or gws_env.ACCOUNT_STORAGE_ERROR_MESSAGE
-            return ExecutionReport(
-                results=[
-                    ActionResult(action, "failed", "", detail)
-                    for action in actions
-                ]
-            )
 
-        def runtime_run_command(args):
-            return process_win.run_captured(args, env=runtime_environment)
+            def runtime_run_command(args):
+                return process_win.run_captured(args, env=runtime_environment)
 
-    gws_command = resolve_gws_command(
-        list(gws_command or []),
-        gws_executable=gws_executable,
-        runtime_run_command=runtime_run_command,
-    )
+        gws_command = resolve_gws_command(
+            list(gws_command or []),
+            gws_executable=gws_executable,
+            runtime_run_command=runtime_run_command,
+        )
+    except gws_env.GwsAccountStorageError:
+        return _preparation_failures(actions, LOGIN_STORAGE_FAILURE_DETAIL)
+    except Exception:  # noqa: BLE001 - 실행 도구·경로 원문은 화면에 내보내지 않는다
+        return _preparation_failures(actions, TOOL_PREPARATION_FAILURE_DETAIL)
     runner = runner or _default_runner
     known_keys = history.completed_keys(source_hash) if source_hash else set()
     results = []
@@ -297,17 +374,40 @@ def execute_actions(
         if action.action_key in known_keys:
             entry = history.entry(source_hash) or {}
             recorded = entry.get("actions", {}).get(action.action_key, {})
+            recorded_id = recorded.get("google_id", "")
+            if action.kind == "calendar" and _requires_local_link_verification(action):
+                try:
+                    current_account = _require_goedu_account(runner, gws_command)
+                    owner = str(expected_account or "").strip()
+                    if owner and current_account.casefold() != owner.casefold():
+                        raise RuntimeError("처음 준비하던 Google 계정으로 다시 로그인해 주세요.")
+                    event = _get_calendar_event(runner, gws_command, action, recorded_id)
+                except Exception:  # noqa: BLE001 - 원격 원문은 사용자 화면에 내보내지 않는다
+                    results.append(
+                        ActionResult(action, "failed", recorded_id, "기존 일정의 첨부 연결을 확인하지 못했습니다.")
+                    )
+                    continue
+                if not _calendar_response_preserves_local_links(action, event):
+                    results.append(
+                        ActionResult(action, "failed", recorded_id, "일정은 있지만 첨부 연결이 확인되지 않았습니다.")
+                    )
+                    continue
             results.append(
-                ActionResult(action, "duplicate", recorded.get("google_id", ""), "이미 등록된 항목")
+                ActionResult(action, "duplicate", recorded_id, "이미 등록된 항목")
             )
             continue
         if action.kind == "notice" and not action.google_id:
+            blocked_detail = (
+                NOTICE_PREFLIGHT_FAILURE_DETAIL
+                if "출결 기능" in str(notice_unavailable_message or "")
+                else NOTICE_SETUP_FAILURE_DETAIL
+            )
             results.append(
                 ActionResult(
                     action,
                     "failed",
                     "",
-                    str(notice_unavailable_message or "학생 안내 시트가 준비되지 않았어요 · 처음 설정 필요"),
+                    blocked_detail,
                 )
             )
             continue
@@ -315,10 +415,14 @@ def execute_actions(
             account_checked = True
             try:
                 current_account = _require_goedu_account(runner, gws_command)
-            except gws_env.GwsAccountStorageError as error:
-                account_error = str(error) or gws_env.ACCOUNT_STORAGE_ERROR_MESSAGE
-            except Exception:  # noqa: BLE001 - 계정·명령 원문을 사용자 화면에 내보내지 않는다
-                account_error = GOEDU_ACCOUNT_REQUIRED_MESSAGE
+            except gws_env.GwsAccountStorageError:
+                account_error = LOGIN_STORAGE_FAILURE_DETAIL
+            except Exception as error:  # noqa: BLE001 - 계정·명령 원문을 사용자 화면에 내보내지 않는다
+                account_error = (
+                    GOEDU_ACCOUNT_REQUIRED_MESSAGE
+                    if str(error) == GOEDU_ACCOUNT_REQUIRED_MESSAGE
+                    else _safe_google_failure(error)
+                )
             else:
                 owner = str(expected_account or "").strip()
                 if owner and current_account.casefold() != owner.casefold():
@@ -330,9 +434,39 @@ def execute_actions(
             if action.kind == "calendar":
                 existing = _probe_calendar_duplicate(runner, gws_command, action)
                 if existing:
+                    if source_hash:
+                        try:
+                            history.record_action(source_hash, action.action_key, action.kind, existing)
+                            history.save()
+                        except Exception:
+                            pass  # 원격 중복 조회가 다음 실행에서도 안전하게 다시 막는다
+                    if _requires_local_link_verification(action):
+                        try:
+                            event = _get_calendar_event(runner, gws_command, action, existing)
+                        except Exception:  # noqa: BLE001 - 원격 원문은 사용자 화면에 내보내지 않는다
+                            results.append(
+                                ActionResult(
+                                    action,
+                                    "failed",
+                                    existing,
+                                    "기존 일정의 첨부 연결을 확인하지 못했습니다.",
+                                )
+                            )
+                            continue
+                        if not _calendar_response_preserves_local_links(action, event):
+                            results.append(
+                                ActionResult(
+                                    action,
+                                    "failed",
+                                    existing,
+                                    "일정은 있지만 첨부 연결이 확인되지 않았습니다.",
+                                )
+                            )
+                            continue
                     results.append(ActionResult(action, "duplicate", existing, "Google에 같은 항목이 있음"))
                     continue
-                created_id = _insert_calendar(runner, gws_command, action)
+                created_event = _insert_calendar(runner, gws_command, action)
+                created_id = str(created_event.get("id", ""))
             elif action.kind == "task":
                 existing = _probe_task_duplicate(runner, gws_command, action)
                 if existing:
@@ -351,7 +485,7 @@ def execute_actions(
                     except Exception:  # noqa: BLE001 - 모호하면 쓰지 않는 쪽으로 멈춘다
                         ok, detail = False, ""
                     if not ok:
-                        notice_preflight_error = str(detail or notice_unavailable_message)
+                        notice_preflight_error = NOTICE_PREFLIGHT_FAILURE_DETAIL
                 if notice_preflight_error:
                     results.append(
                         ActionResult(action, "failed", "", notice_preflight_error)
@@ -359,14 +493,43 @@ def execute_actions(
                     continue
                 status = _append_notice(runner, gws_command, action)
                 if status == "duplicate":
-                    results.append(ActionResult(action, "duplicate", "", "시트에 같은 안내가 있음"))
+                    results.append(ActionResult(action, "duplicate", "", "학생 안내표에 같은 안내가 있음"))
                     continue
                 created_id = ""  # 시트 줄이라 Google ID 없음
-        except Exception as error:  # noqa: BLE001 - 개별 항목 실패는 보고서로 넘긴다
-            results.append(ActionResult(action, "failed", "", str(error)))
+        except Exception as error:  # noqa: BLE001 - 외부 원문은 사용자 화면에 내보내지 않는다
+            results.append(ActionResult(action, "failed", "", _safe_google_failure(error)))
+            continue
+        if action.kind in {"calendar", "task"} and not created_id:
+            results.append(
+                ActionResult(
+                    action, "failed", "", RESULT_RECORD_FAILURE_DETAIL, retry_allowed=False
+                )
+            )
+            continue
+        if source_hash:
+            try:
+                history.record_action(source_hash, action.action_key, action.kind, created_id)
+                history.save()
+            except Exception:  # noqa: BLE001 - 저장 경로·원문은 사용자 화면에 내보내지 않는다
+                results.append(
+                    ActionResult(
+                        action,
+                        "failed",
+                        created_id,
+                        RESULT_RECORD_FAILURE_DETAIL,
+                        retry_allowed=False,
+                    )
+                )
+                continue
+        if action.kind == "calendar" and not _calendar_response_preserves_local_links(action, created_event):
+            results.append(
+                ActionResult(
+                    action,
+                    "failed",
+                    created_id,
+                    "일정은 만들었지만 첨부 연결이 확인되지 않았습니다.",
+                )
+            )
             continue
         results.append(ActionResult(action, "created", created_id))
-        if source_hash:
-            history.record_action(source_hash, action.action_key, action.kind, created_id)
-            history.save()
     return ExecutionReport(results=results)

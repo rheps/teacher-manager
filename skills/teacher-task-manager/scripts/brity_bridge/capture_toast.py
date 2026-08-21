@@ -56,10 +56,29 @@ DI_NORMAL = 3
 TRANSPARENT = 1
 
 _BG_COLOR = 0x00FFFFFF        # 흰 배경 (COLORREF는 BGR)
-_BORDER_COLOR = 0x00DFDFDF    # 옅은 회색 테두리
+_BORDER_COLOR = 0x00EBE8E5    # 본 화면의 옅은 구분선 #E5E8EB
 _ACCENT_COLOR = 0x00F68231    # 브랜드 블루 #3182F6 — 왼쪽 세로 띠
-_TITLE_COLOR = 0x00222222
-_BODY_COLOR = 0x00444444
+_TITLE_COLOR = 0x00281F19     # 본 화면 제목색 #191F28
+_BODY_COLOR = 0x0084766B      # 본 화면 설명색 #6B7684
+_CORNER_RADIUS = 14
+
+
+def apply_rounded_window_shape(hwnd, width: int, height: int, scale: float,
+                               *, user32=None, gdi32=None) -> bool:
+    """본 화면 카드처럼 상태창 바깥을 둥글게 잘라 낸다."""
+    user32 = user32 or _user32
+    gdi32 = gdi32 or _gdi32
+    radius = max(1, int(_CORNER_RADIUS * scale))
+    region = gdi32.CreateRoundRectRgn(
+        0, 0, int(width) + 1, int(height) + 1, radius, radius
+    )
+    if not region:
+        return False
+    if user32.SetWindowRgn(hwnd, region, True):
+        # 성공하면 영역 핸들은 Windows가 가져간다.
+        return True
+    gdi32.DeleteObject(region)
+    return False
 
 _WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM
@@ -97,6 +116,8 @@ if sys.platform == "win32":
     _user32.UpdateWindow.argtypes = [wintypes.HWND]
     _user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
     _user32.DestroyWindow.argtypes = [wintypes.HWND]
+    _user32.SetWindowRgn.restype = ctypes.c_int
+    _user32.SetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
     _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
     _user32.BeginPaint.restype = wintypes.HDC
     _user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
@@ -111,6 +132,11 @@ if sys.platform == "win32":
         wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
     ]
     _gdi32.CreateSolidBrush.restype = ctypes.c_void_p
+    _gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+    _gdi32.CreateRoundRectRgn.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int,
+    ]
     _gdi32.CreateFontW.restype = ctypes.c_void_p
     _gdi32.SelectObject.restype = ctypes.c_void_p
     _gdi32.SelectObject.argtypes = [wintypes.HDC, ctypes.c_void_p]
@@ -281,6 +307,7 @@ class CaptureToast:
         if not hwnd:
             raise ctypes.WinError()
         self._hwnd = hwnd
+        apply_rounded_window_shape(hwnd, width, height, scale)
         user32.SetTimer(hwnd, SAFETY_TIMER_ID, SAFETY_LIFETIME_MS, None)
         user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
         user32.UpdateWindow(hwnd)
