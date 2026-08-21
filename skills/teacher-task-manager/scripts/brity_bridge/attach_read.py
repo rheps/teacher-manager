@@ -1,6 +1,6 @@
 """첨부파일 내용 읽기 — 화면에서 감지한 파일명을 다운로드 폴더와 맞춰 텍스트를 뽑는다.
 
-읽는 형식: .hwpx(ZIP+XML), .hwp(hwp_text), .xlsx(ZIP+XML). 나머지는 파일명만.
+읽는 형식: .hwpx(ZIP+XML), .hwp(hwp_text), .xlsx(ZIP+XML). 지원하지 않는 형식은 제외 목록에 남긴다.
 무료 등급 토큰·메모리 보호를 위해 파일당 50MB 상한을 둔다 — zip 형식은
 압축 해제 크기 기준이라 zip bomb도 부풀리기 전에 거절된다.
 """
@@ -59,6 +59,7 @@ class AttachmentBundle:
     names: tuple[str, ...]
     fingerprints: tuple[str, ...]
     media_parts: tuple[MediaPart, ...] = ()
+    skipped_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -305,10 +306,14 @@ def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBun
     actual_names: list[str] = []
     fingerprints: list[str] = []
     media_parts: list[MediaPart] = []
+    skipped_names: list[str] = []
     for path in paths:
         path = Path(path)
         result = read_attachment(path)
         if not result.ok:
+            if result.reason == "unsupported":
+                skipped_names.append(path.name)
+                continue
             raise AttachmentBlocked(result.reason, (path.name,), result.message)
         content = result.text.strip() if result.text else "(파일 화면을 함께 읽음)"
         sections.append(f"[첨부파일: {path.name}]\n{content}")
@@ -322,6 +327,7 @@ def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBun
         names=tuple(actual_names),
         fingerprints=tuple(fingerprints),
         media_parts=tuple(media_parts),
+        skipped_names=tuple(skipped_names),
     )
 
 

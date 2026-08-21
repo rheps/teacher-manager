@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -1737,6 +1738,188 @@ def merge_attendance_config_rows(
     return merged
 
 
+def _restore_candidate_student_dropdowns(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    spreadsheet_id: str,
+    sheet_info: dict,
+    config_rows: Sequence[Sequence[Any]],
+    gws_executable: str,
+) -> None:
+    """새 정식 후보의 월별 학생 선택 규칙을 새 학생명단에 다시 연결한다."""
+
+    settings = {
+        str(row[0]).strip(): str(row[1]).strip()
+        for row in config_rows
+        if len(row) >= 2 and str(row[0]).strip()
+    }
+    roster_title = settings.get("ROSTER_SHEET_NAME", "학생명단") or "학생명단"
+    dropdown_range = (
+        settings.get("STUDENT_DROPDOWN_RANGE", "C2:C200") or "C2:C200"
+    )
+    range_match = re.fullmatch(
+        r"\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)",
+        dropdown_range,
+        flags=re.IGNORECASE,
+    )
+    if not range_match:
+        raise CreationRecoveryPendingError(
+            "새 정식 출석부 후보의 학생 선택 범위를 확인하지 못했어요."
+        )
+    start_col, start_row, end_col, end_row = range_match.groups()
+    if start_col.upper() == "A" and end_col.upper() == "A":
+        start_col = end_col = "C"
+    formula = (
+        f"='{roster_title}'!${start_col.upper()}${start_row}:"
+        f"${end_col.upper()}${end_row}"
+    )
+
+    properties = [
+        dict(item.get("properties") or {})
+        for item in (sheet_info.get("sheets") or [])
+        if isinstance(item, dict)
+    ]
+    titles = {str(item.get("title", "") or "") for item in properties}
+    if roster_title not in titles:
+        raise CreationRecoveryPendingError(
+            "새 정식 출석부 후보에서 학생명단 탭을 확인하지 못했어요."
+        )
+
+    configured_months = [
+        value.strip()
+        for value in settings.get("MONTH_SHEET_NAMES", "").split(",")
+        if value.strip()
+    ]
+    month_properties = [
+        item for item in properties if str(item.get("title", "") or "") in configured_months
+    ]
+    if not month_properties:
+        raise CreationRecoveryPendingError(
+            "새 정식 출석부 후보에서 월별 출결 탭을 확인하지 못했어요."
+        )
+
+    requests = []
+    for item in month_properties:
+        sheet_id = item.get("sheetId")
+        row_count = (item.get("gridProperties") or {}).get("rowCount")
+        if (
+            not isinstance(sheet_id, int)
+            or isinstance(sheet_id, bool)
+            or not isinstance(row_count, int)
+            or isinstance(row_count, bool)
+            or row_count < 3
+        ):
+            raise CreationRecoveryPendingError(
+                "새 정식 출석부 후보의 월별 입력 범위를 확인하지 못했어요."
+            )
+        requests.append(
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 2,
+                        "endRowIndex": row_count,
+                        "startColumnIndex": 1,
+                        "endColumnIndex": 2,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_RANGE",
+                            "values": [{"userEnteredValue": formula}],
+                        },
+                        "strict": False,
+                        "showCustomUi": True,
+                    },
+                }
+            }
+        )
+
+    run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "batchUpdate",
+            "--params",
+            json.dumps({"spreadsheetId": spreadsheet_id}, ensure_ascii=False),
+            "--json",
+            json.dumps({"requests": requests}, ensure_ascii=False),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+
+    expected_rows = {
+        str(item["title"]): int((item.get("gridProperties") or {})["rowCount"]) - 2
+        for item in month_properties
+    }
+    checked = run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "get",
+            "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet_id,
+                    "includeGridData": True,
+                    "ranges": [
+                        f"'{title}'!B3:B{row_count + 2}"
+                        for title, row_count in expected_rows.items()
+                    ],
+                    "fields": (
+                        "sheets(properties(title,gridProperties(rowCount)),"
+                        "data(startRow,startColumn,rowData(values(dataValidation))))"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    checked_sheets = {
+        str((item.get("properties") or {}).get("title", "") or ""): item
+        for item in (checked.get("sheets") or [])
+        if isinstance(item, dict)
+    }
+    for title, row_count in expected_rows.items():
+        item = checked_sheets.get(title)
+        data_blocks = item.get("data") if isinstance(item, dict) else None
+        row_data = []
+        for block in data_blocks or []:
+            if isinstance(block, dict):
+                row_data.extend(block.get("rowData") or [])
+        if len(row_data) != row_count:
+            raise CreationRecoveryPendingError(
+                f"새 정식 출석부 후보의 `{title}` 학생 선택 연결을 끝까지 확인하지 못했어요."
+            )
+        for row in row_data:
+            values = row.get("values") if isinstance(row, dict) else None
+            validation = (
+                (values[0].get("dataValidation") or {})
+                if isinstance(values, list) and values and isinstance(values[0], dict)
+                else {}
+            )
+            condition = validation.get("condition") or {}
+            formula_values = condition.get("values") or []
+            found_formula = (
+                str(formula_values[0].get("userEnteredValue", "") or "")
+                if formula_values and isinstance(formula_values[0], dict)
+                else ""
+            )
+            if condition.get("type") != "ONE_OF_RANGE" or found_formula != formula:
+                raise CreationRecoveryPendingError(
+                    f"새 정식 출석부 후보의 `{title}` 학생 선택 연결이 끊겨 있어 현재 출석부를 바꾸지 않았어요."
+                )
+
+
 def install_attendance_automation(
     profile_json: Path,
     runner: CommandRunner = default_runner,
@@ -2469,6 +2652,15 @@ def install_attendance_automation(
             workdir,
         )
         current_titles = spreadsheet_titles(sheet_info)
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+            _restore_candidate_student_dropdowns(
+                runner,
+                workdir,
+                spreadsheet_id=created_ids["spreadsheet_id"],
+                sheet_info=sheet_info,
+                config_rows=config_rows,
+                gws_executable=gws_executable,
+            )
         missing_titles = [
             title for title in MESSAGE_LEDGER_HEADERS if title not in current_titles
         ]

@@ -659,6 +659,7 @@ function getAttendanceAiCalendarYear_(schoolYear, month) {
 function buildAttendanceAiGeminiRequest_(sentence, context) {
   const recordProperties = {
     date: { type: 'string', format: 'date' },
+    end_date: { type: 'string', format: 'date' },
     student: { type: 'string', minLength: 1 },
     category: { type: 'string', enum: ATTENDANCE_AI_CATEGORIES.slice() },
     kind: { type: 'string', enum: ATTENDANCE_AI_KINDS.slice() },
@@ -668,7 +669,12 @@ function buildAttendanceAiGeminiRequest_(sentence, context) {
   return {
     model: ATTENDANCE_AI_MODEL,
     input: JSON.stringify({
-      instruction: '출결 문장에서 요청한 학생별 출결 자료만 JSON으로 추출하세요.',
+      instruction: (
+        '출결 문장에서 요청한 학생별 출결 자료만 JSON으로 추출하세요. ' +
+        'date는 시작일, end_date는 마지막 날이며 둘 다 포함합니다. ' +
+        '하루뿐이면 두 날짜를 같게 적고, 기간은 날짜별로 나누지 말고 한 건으로 적으세요. ' +
+        'requested_student_count에는 서로 다른 학생 수를 적으세요.'
+      ),
       sentence: sentence,
       school_year: String(context.schoolYear),
       calendar_year: getAttendanceAiCalendarYear_(context.schoolYear, context.month),
@@ -706,7 +712,7 @@ function buildAttendanceAiGeminiRequest_(sentence, context) {
               type: 'object',
               additionalProperties: false,
               properties: recordProperties,
-              required: ['date','student','category','kind','reason','period']
+              required: ['date','end_date','student','category','kind','reason','period']
             }
           }
         },
@@ -762,7 +768,7 @@ function normalizeAttendanceAiReason_(value) {
   return reason;
 }
 
-function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
+function validateAttendanceAiRecords_(payload, rosterRows, sheetContext, holidayDateKeys) {
   const isPlainObject = value => (
     value !== null && typeof value === 'object' && !Array.isArray(value)
   );
@@ -774,7 +780,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
       && actual.every((key, index) => key === wanted[index]);
   };
   const topKeys = ['requested_student_count','records'];
-  const recordKeys = ['date','student','category','kind','reason','period'];
+  const recordKeys = ['date','end_date','student','category','kind','reason','period'];
   if (!hasExactKeys(payload, topKeys)) return null;
   if (
     typeof payload.requested_student_count !== 'number'
@@ -782,7 +788,6 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
     || payload.requested_student_count < 1
     || !Array.isArray(payload.records)
     || payload.records.length < 1
-    || payload.records.length !== payload.requested_student_count
     || !Array.isArray(rosterRows)
     || !isPlainObject(sheetContext)
     || typeof sheetContext.sentence !== 'string'
@@ -796,6 +801,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
   const month = Number(sheetContext.month);
   const calendarYear = getAttendanceAiCalendarYear_(schoolYear, month);
   if (calendarYear === null) return null;
+  const holidays = holidayDateKeys instanceof Set ? holidayDateKeys : new Set();
 
   const roster = rosterRows.map(row => {
     if (!Array.isArray(row)) return null;
@@ -823,11 +829,15 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
 
       const tail = sentence.slice(foundAt + identity.length);
       if (blockedSuffixes.some(suffix => tail.indexOf(suffix) === 0)) continue;
-      if (!isIdentityCharacter(tail.charAt(0))) return true;
-      if (particles.some(particle => (
-        tail.indexOf(particle) === 0
-        && !isIdentityCharacter(tail.charAt(particle.length))
-      ))) {
+      const hasBoundaryOrParticle = value => (
+        !isIdentityCharacter(value.charAt(0))
+        || particles.some(particle => (
+          value.indexOf(particle) === 0
+          && !isIdentityCharacter(value.charAt(particle.length))
+        ))
+      );
+      if (hasBoundaryOrParticle(tail)) return true;
+      if (tail.indexOf('학생') === 0 && hasBoundaryOrParticle(tail.slice(2))) {
         return true;
       }
     }
@@ -849,7 +859,8 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
       || numberPattern.test(sentence);
   };
 
-  const seenStudents = new Set();
+  const matchedStudents = new Set();
+  const seenRows = new Set();
   const validated = [];
   for (let index = 0; index < payload.records.length; index++) {
     const record = payload.records[index];
@@ -857,6 +868,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
     if (recordKeys.some(key => typeof record[key] !== 'string')) return null;
 
     const dateText = record.date;
+    const endDateText = record.end_date;
     const studentText = record.student.trim();
     const reason = normalizeAttendanceAiReason_(record.reason);
     if (!studentText || !reason) {
@@ -871,7 +883,6 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
     if (
       matches.length !== 1
       || !studentAppearsInSentence(matches[0])
-      || seenStudents.has(matches[0].combined)
     ) {
       return null;
     }
@@ -884,31 +895,68 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext) {
     }
 
     const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);
-    if (!dateMatch) return null;
+    const endDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(endDateText);
+    if (!dateMatch || !endDateMatch) return null;
     const year = Number(dateMatch[1]);
     const dateMonth = Number(dateMatch[2]);
     const day = Number(dateMatch[3]);
+    const endYear = Number(endDateMatch[1]);
+    const endMonth = Number(endDateMatch[2]);
+    const endDay = Number(endDateMatch[3]);
     const parsedDate = new Date(Date.UTC(year, dateMonth - 1, day));
+    const parsedEndDate = new Date(Date.UTC(endYear, endMonth - 1, endDay));
     if (
       year !== calendarYear
       || dateMonth !== month
+      || endYear !== calendarYear
+      || endMonth !== month
       || parsedDate.getUTCFullYear() !== year
       || parsedDate.getUTCMonth() + 1 !== dateMonth
       || parsedDate.getUTCDate() !== day
+      || parsedEndDate.getUTCFullYear() !== endYear
+      || parsedEndDate.getUTCMonth() + 1 !== endMonth
+      || parsedEndDate.getUTCDate() !== endDay
+      || parsedEndDate.getTime() < parsedDate.getTime()
     ) {
       return null;
     }
 
-    seenStudents.add(matches[0].combined);
-    validated.push({
-      date: dateText,
-      rosterCombined: matches[0].combined,
-      category: record.category,
-      kind: record.kind,
-      reason: reason,
-      period: record.period
-    });
+    matchedStudents.add(matches[0].combined);
+    for (
+      let cursor = parsedDate.getTime();
+      cursor <= parsedEndDate.getTime();
+      cursor += 86400000
+    ) {
+      const current = new Date(cursor);
+      const currentDate = [
+        String(current.getUTCFullYear()).padStart(4, '0'),
+        String(current.getUTCMonth() + 1).padStart(2, '0'),
+        String(current.getUTCDate()).padStart(2, '0')
+      ].join('-');
+      const weekday = current.getUTCDay();
+      if (weekday === 0 || weekday === 6 || holidays.has(currentDate)) continue;
+      const rowKey = [
+        currentDate,
+        matches[0].combined,
+        record.category,
+        record.kind,
+        reason,
+        record.period
+      ].join('\u0000');
+      if (seenRows.has(rowKey)) return null;
+      seenRows.add(rowKey);
+      validated.push({
+        date: currentDate,
+        rosterCombined: matches[0].combined,
+        category: record.category,
+        kind: record.kind,
+        reason: reason,
+        period: record.period
+      });
+    }
   }
+  if (matchedStudents.size !== payload.requested_student_count) return null;
+  validated.sort((left, right) => left.date.localeCompare(right.date));
   return validated;
 }
 
@@ -1112,6 +1160,23 @@ function handleAttendanceAiEdit(e, testPorts) {
       if (!rosterSheet || rosterSheet.getLastRow() < 2) return [];
       return rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 4).getValues();
     },
+    readHolidayDateKeys: (spreadsheet, calendarYear) => {
+      const holidaySheet = spreadsheet.getSheetByName(getHolidaySheetName_());
+      if (!holidaySheet) return null;
+      const holidays = loadHolidaySet_(spreadsheet);
+      const yearPrefix = String(calendarYear) + '-';
+      const hasCurrentYear = Array.from(holidays).some(
+        value => String(value).indexOf(yearPrefix) === 0
+      );
+      return hasCurrentYear ? holidays : null;
+    },
+    showMessage: message => {
+      try {
+        source.toast(String(message), 'AI 출결 입력', 7);
+      } catch (err) {
+        // 화면 안내가 막혀도 출결행 안전 판단은 그대로 유지한다.
+      }
+    },
     callGemini: (request, apiKey) => {
       const response = UrlFetchApp.fetch(ATTENDANCE_AI_INTERACTIONS_URL, {
         method: 'post',
@@ -1243,15 +1308,61 @@ function handleAttendanceAiEdit(e, testPorts) {
       month: sheetContext.month,
       sentence: sentence
     };
+    const calendarYear = getAttendanceAiCalendarYear_(
+      requestContext.schoolYear,
+      requestContext.month
+    );
+    const holidayDateKeys = ports.readHolidayDateKeys(source, calendarYear);
+    if (!(holidayDateKeys instanceof Set)) {
+      attendanceAiSkipLog_(
+        '휴일 탭에서 이 학년도의 휴일을 확인하지 못함 — 휴일 탭을 확인한 뒤 다시 입력'
+      );
+      ports.showMessage('휴일 탭에서 이 학년도의 휴일을 확인하지 못했습니다.');
+      return { status: 'check_required' };
+    }
     const request = buildAttendanceAiGeminiRequest_(sentence, requestContext);
     const interaction = ports.callGemini(request, apiKey);
     const payload = extractAttendanceAiGeminiPayload_(interaction);
+    const crossesIntoAnotherMonth = (
+      payload
+      && Array.isArray(payload.records)
+      && payload.records.some(record => {
+        if (!record || typeof record.date !== 'string' || typeof record.end_date !== 'string') {
+          return false;
+        }
+        const start = /^(\d{4})-(\d{2})-(\d{2})$/.exec(record.date);
+        const end = /^(\d{4})-(\d{2})-(\d{2})$/.exec(record.end_date);
+        if (!start || !end) return false;
+        return Number(start[1]) === calendarYear
+          && Number(start[2]) === Number(requestContext.month)
+          && (
+            Number(end[1]) !== calendarYear
+            || Number(end[2]) !== Number(requestContext.month)
+          );
+      })
+    );
+    if (crossesIntoAnotherMonth) {
+      ports.showMessage(
+        '기간이 다음 달까지 이어집니다. 각 월 시트에서 나누어 입력해 주세요.'
+      );
+      return { status: 'check_required' };
+    }
     const rosterRows = ports.readRosterRows(source, sheetContext);
-    const records = validateAttendanceAiRecords_(payload, rosterRows, requestContext);
+    const records = validateAttendanceAiRecords_(
+      payload,
+      rosterRows,
+      requestContext,
+      holidayDateKeys
+    );
     if (!records) {
       attendanceAiSkipLog_(
         '문장을 출결로 확정하지 못함 — 학생 이름이 학생명단과 정확히 일치하는지, 날짜의 달이 이 시트의 달과 같은지 확인'
       );
+      return { status: 'check_required' };
+    }
+    if (!records.length) {
+      attendanceAiSkipLog_('입력한 기간에 수업일이 없음');
+      ports.showMessage('입력한 기간에 수업일이 없습니다.');
       return { status: 'check_required' };
     }
 

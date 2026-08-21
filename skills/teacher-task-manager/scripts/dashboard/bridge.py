@@ -1047,6 +1047,12 @@ class Api:
         return capture_store.read_captures(paths.bridge_state_dir(self._config_dir), int(limit))
 
     @guarded
+    def capture_history_page(self, page=1, page_size=10):
+        return capture_store.read_capture_page(
+            paths.bridge_state_dir(self._config_dir), int(page), int(page_size)
+        )
+
+    @guarded
     def capture_progress(self):
         return capture_store.read_progress(paths.bridge_state_dir(self._config_dir))
 

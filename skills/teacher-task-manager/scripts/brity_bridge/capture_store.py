@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from brity_bridge import atomic_io
 
 # 리치 기록(등록 항목 제목 포함)과 진행 상태는 설정폴더 로컬 파일에만 남는다. 외부 전송 없음.
-MAX_CAPTURES = 200
 PROGRESS_STEPS = ("capture", "analyze", "register", "done", "fail")
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 ACTIVE_MAX_AGE = timedelta(minutes=3)
@@ -35,7 +35,7 @@ def _tail_missing_newline(path: Path) -> bool:
         return False
 
 
-def append_capture(state_dir: Path, entry: dict, keep: int = MAX_CAPTURES) -> Path:
+def append_capture(state_dir: Path, entry: dict) -> Path:
     path = captures_path(state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     # 크래시로 잘린 꼬리(개행 없음)에 새 기록이 한 줄로 병합되면 새 기록이
@@ -43,30 +43,53 @@ def append_capture(state_dir: Path, entry: dict, keep: int = MAX_CAPTURES) -> Pa
     lead = "\n" if _tail_missing_newline(path) else ""
     with path.open("a", encoding="utf-8") as handle:
         handle.write(lead + json.dumps(entry, ensure_ascii=False) + "\n")
-    # 절단이 한글 문자 중간(다중바이트)에 걸렸을 수 있다 — strict 디코드면
-    # 이 지점부터 모든 캡처·기록 화면이 영구 오류가 된다.
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    if len(lines) > keep:
-        atomic_io.atomic_write_text(path, "\n".join(lines[-keep:]) + "\n")
     return path
 
 
-def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
+def _capture_rows(state_dir: Path):
     try:
-        lines = captures_path(state_dir).read_text(encoding="utf-8", errors="replace").splitlines()
+        handle = captures_path(state_dir).open("r", encoding="utf-8", errors="replace")
     except OSError:
+        return
+    with handle:
+        for line in handle:
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue  # 깨진 줄은 그 줄만 건너뛴다
+            if isinstance(parsed, dict):
+                yield parsed
+
+
+def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
+    wanted = max(0, int(limit))
+    if wanted == 0:
         return []
-    rows: list[dict] = []
-    for line in reversed(lines):
-        if len(rows) >= max(0, int(limit)):
-            break
-        try:
-            parsed = json.loads(line)
-        except ValueError:
-            continue  # 깨진 줄은 그 줄만 건너뛴다
-        if isinstance(parsed, dict):
-            rows.append(parsed)
-    return rows
+    rows = deque(maxlen=wanted)
+    rows.extend(_capture_rows(state_dir))
+    return list(reversed(rows))
+
+
+def read_capture_page(state_dir: Path, page: int = 1, page_size: int = 10) -> dict:
+    size = max(1, int(page_size))
+    total = sum(1 for _ in _capture_rows(state_dir))
+    total_pages = (total + size - 1) // size
+    current = min(max(1, int(page)), total_pages or 1)
+
+    newest_end = total - ((current - 1) * size)
+    newest_start = max(0, newest_end - size)
+    selected = [
+        row for index, row in enumerate(_capture_rows(state_dir))
+        if newest_start <= index < newest_end
+    ]
+    selected.reverse()
+    return {
+        "items": selected,
+        "page": current,
+        "page_size": size,
+        "total": total,
+        "total_pages": total_pages,
+    }
 
 
 class ProgressWriter:

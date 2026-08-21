@@ -368,6 +368,13 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attachment-result-lead { margin:8px 0 4px; color:var(--tm-faint); font-size:13px; }
 .cap-reason { display:none; padding:0 0 14px 36px; font-size:13.5px; color:var(--tm-red); }
 .cap.open .cap-reason { display:block; }
+.cap-pages { display:flex; align-items:center; justify-content:center; gap:6px; margin:12px 0 2px; }
+.cap-pages button { min-width:34px; min-height:34px; border:1px solid var(--tm-line); border-radius:9px; background:var(--tm-surface); color:#4B5563; font-family:inherit; font-size:13.5px; cursor:pointer; }
+.cap-pages button:hover:not(:disabled) { border-color:var(--tm-blue); color:var(--tm-blue); }
+.cap-pages button.current { border-color:var(--tm-blue); background:var(--tm-blue); color:white; font-weight:700; }
+.cap-pages button:disabled { opacity:.4; cursor:default; }
+.cap-page-move { padding:0 10px; }
+.cap-page-gap { min-width:20px; text-align:center; color:var(--tm-faint); }
 
 /* 연결 두 탭 (시안: 밑줄형 두 칸 탭) */
 /* 탭 세 개 — 폭은 글자 길이대로, 무조건 한 줄 (셋째 탭이 아랫줄로 떨어지면 안 된다) */

@@ -328,7 +328,7 @@ def build_screen_record(
     download_dir: Path,
     attachment_paths: tuple[Path, ...] | None = None,
 ) -> tuple[MessageRecord, str]:
-    """캡처 결과를 본문과 완전한 첨부 묶음이 포함된 기록으로 만든다."""
+    """캡처 결과를 본문과 읽을 수 있는 첨부 묶음이 포함된 기록으로 만든다."""
     if attachment_paths is None:
         bundle = attach_read.prepare_attachment_bundle(Path(download_dir), capture.attachments)
     else:
@@ -346,4 +346,7 @@ def build_screen_record(
         attachment_names=bundle.names,
         media_parts=bundle.media_parts,
     )
-    return record, ""
+    note = ""
+    if bundle.skipped_names:
+        note = "읽을 수 없는 첨부파일은 제외하고 처리했습니다: " + ", ".join(bundle.skipped_names)
+    return record, note

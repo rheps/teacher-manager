@@ -40,6 +40,9 @@ const S = {
   lastLiveStep: null,        // 실패 시 어느 단계에서 멈췄는지 표시용
   doneShown: "",             // 결과 카드를 이미 보여준 run_id
   caps: null,                // recent_captures 목록 (null=미로딩)
+  capsPage: 1,
+  capsTotalPages: 0,
+  capsLoading: false,
   capsOpen: {},              // 펼친 기록 줄 key -> true
   freshWhen: "",             // "방금" 배지를 달 기록의 when
   fieldIssues: {},           // target -> {key, target, message, tab}
@@ -2768,6 +2771,33 @@ function capHtml(cap) {
     </button>
     <div class="cap-items">${items}${emptyLine}</div>${reason}</div>`;
 }
+const CAP_PAGE_SIZE = 10;
+function capturePageNumbers(current, total) {
+  if (total <= 1) return [];
+  const wanted = new Set([1, total]);
+  let start = Math.max(1, current - 2);
+  let end = Math.min(total, current + 2);
+  if (current <= 3) end = Math.min(total, 5);
+  if (current >= total - 2) start = Math.max(1, total - 4);
+  for (let page = start; page <= end; page += 1) wanted.add(page);
+  return [...wanted].sort((a, b) => a - b);
+}
+function capPagesHtml() {
+  const total = S.capsTotalPages || 0;
+  if (total <= 1) return "";
+  const current = S.capsPage || 1;
+  const pages = capturePageNumbers(current, total);
+  const numbered = [];
+  pages.forEach((page, index) => {
+    if (index && page - pages[index - 1] > 1) numbered.push('<span class="cap-page-gap">…</span>');
+    numbered.push(`<button class="cap-page-number${page === current ? " current" : ""}" data-action="cap-page" data-page="${page}"${page === current ? ' aria-current="page"' : ""}>${page}</button>`);
+  });
+  return `<nav class="cap-pages" aria-label="처리한 메시지 페이지">
+    <button class="cap-page-move" data-action="cap-page" data-page="${current - 1}"${current === 1 ? " disabled" : ""}>이전</button>
+    ${numbered.join("")}
+    <button class="cap-page-move" data-action="cap-page" data-page="${current + 1}"${current === total ? " disabled" : ""}>다음</button>
+  </nav>`;
+}
 function capListHtml() {
   if (S.caps === null) {
     return `<div class="panel"><div class="row"><span class="st">기록을 불러오는 중이에요…</span></div></div>`;
@@ -2779,13 +2809,51 @@ function capListHtml() {
     }
     return `<div class="panel"><div class="row"><span class="st">아직 처리한 메시지가 없어요 — Brity 메시지에서 단축키를 눌러 보세요.</span></div></div>`;
   }
-  return `<div class="panel">${S.caps.map(capHtml).join("")}</div>`;
+  return `<div class="panel">${S.caps.map(capHtml).join("")}</div>${capPagesHtml()}`;
+}
+function applyCapturePage(data) {
+  S.caps = Array.isArray(data.items) ? data.items : [];
+  S.capsPage = Number(data.page || 1);
+  S.capsTotalPages = Number(data.total_pages || 0);
+  S.capsError = false;
+}
+async function loadCapturePage(page, options = {}) {
+  if (S.capsLoading) return;
+  S.capsLoading = true;
+  try {
+    let data = await call("capture_history_page", page, CAP_PAGE_SIZE);
+    // 오래된 화면 시험 도구와 함께 열렸을 때는 기존 최근 목록 응답도 받아들인다.
+    if (!data || !Array.isArray(data.items)) {
+      const rows = await call("recent_captures");
+      data = {
+        items: rows.slice(0, CAP_PAGE_SIZE), page: 1, page_size: CAP_PAGE_SIZE,
+        total: rows.length, total_pages: Math.ceil(rows.length / CAP_PAGE_SIZE),
+      };
+    }
+    applyCapturePage(data);
+    S.capsOpen = {};
+    if (options.markFresh) S.freshWhen = S.caps.length ? S.caps[0].when : "";
+  } catch (error) {
+    if (!options.quiet) {
+      S.caps = [];
+      S.capsPage = 1;
+      S.capsTotalPages = 0;
+      S.capsError = true;
+    }
+  } finally {
+    S.capsLoading = false;
+    if (S.mode === "home") render();
+  }
 }
 bindActions({
   "cap-toggle": (el) => {
     const key = el.dataset.key;
     S.capsOpen[key] = !S.capsOpen[key];
     render();
+  },
+  "cap-page": (el) => {
+    const page = Number(el.dataset.page || 1);
+    if (page >= 1 && page <= S.capsTotalPages && page !== S.capsPage) loadCapturePage(page);
   },
 });
 
@@ -2826,11 +2894,7 @@ function applyProgress(p) {
   render();
   setTimeout(async () => {
     S.progress = null; S.lastLiveStep = null;
-    try {
-      S.caps = await call("recent_captures");
-      S.freshWhen = S.caps.length ? S.caps[0].when : "";
-    } catch (error) { /* 기록 갱신 실패는 다음 진입 때 */ }
-    if (S.mode === "home") render();
+    await loadCapturePage(1, { quiet: true, markFresh: true });
   }, 2500);
 }
 
@@ -2920,9 +2984,7 @@ function renderHome() {
   if (shouldAutoRefreshChecks()) refreshChecks();
   if (!S.profileCache) call("read_profile").then((p) => { S.profileCache = p; render(); }).catch(() => {});
   if (S.caps === null) {
-    call("recent_captures")
-      .then((rows) => { S.caps = rows; S.capsError = false; render(); })
-      .catch(() => { S.caps = []; S.capsError = true; render(); });
+    loadCapturePage(1);
   }
   startCapturePoll();
 }
