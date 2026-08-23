@@ -1813,6 +1813,9 @@ bindActions({
         S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
         S.chatStatus = null;
+        // 홈 점검 결과도 같이 다시 읽는다 — 안 읽으면 연결 카드의 `확인 필요`와
+        // 출결 탭의 빨간 숫자가 프로그램을 다시 켤 때까지 그대로 남는다.
+        refreshChecks().catch(() => {});
         // 마무리로 상태가 준비됨이 되면, 마법사에서는 시트 처음 설정 완료 확인이
         // 이어서 돌아야 "기다리는 중…"이 풀린다 (검토 C6).
         if (S.mode === "wizard") startAttendancePreparePoll();

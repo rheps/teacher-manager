@@ -278,12 +278,14 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .hero { display:flex; align-items:center; margin-bottom:20px; }
 .hero .hi { font-size:22px; font-weight:700; }
 .hero .pill { margin-left:auto; }
-.tiles { display:grid; grid-template-columns:1fr 1fr; gap:13px; }
+/* minmax(0,1fr)이라야 칸이 내용보다 작게 줄어든다 — 1fr만 두면 `확인 필요`와
+   `4/5 정상` 딱지가 함께 붙었을 때 창 너비 375에서 홈이 옆으로 밀린다. */
+.tiles { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:13px; }
 .tile { border:1px solid var(--tm-line); border-radius:18px; padding:16px 18px; background:#fff; box-shadow:0 2px 8px rgba(25,31,40,.05); display:flex; gap:13px; align-items:flex-start; text-align:left; font-family:inherit; cursor:pointer; }
 .tile:hover { border-color:var(--tm-frame); }
 .tile.warn { border:1.5px solid var(--tm-amber-line); background:#FFFDF7; }
 .tile .tx { flex:1; min-width:0; }
-.tile .tt { display:flex; align-items:center; gap:8px; font-size:15.5px; font-weight:700; margin:1px 0 4px; }
+.tile .tt { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:15.5px; font-weight:700; margin:1px 0 4px; }
 .tile .tt .badge { margin-left:auto; }
 .tile .tt .badge + .badge { margin-left:0; }
 .tile .ds { font-size:13px; color:var(--tm-faint); }

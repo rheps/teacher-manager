@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
@@ -14,8 +15,9 @@ from attendance_script_update import (
     inspect_attendance_script_update,
     target_bundle_sha256,
 )
-from brity_bridge import bundle_paths, capture_store, paths, status_log
+from brity_bridge import bundle_paths, capture_store, message_archive, paths, status_log
 from brity_bridge.gemini_analyze import AnalysisError, run_gemini_analysis
+from brity_bridge.rules_loader import load_analysis_rules
 from brity_bridge.gws_exec import (
     RESULT_RECORD_FAILURE_DETAIL,
     ExecutionReport,
@@ -171,6 +173,76 @@ def _action_title(action) -> str:
     return action.payload.get("content", "")  # notice
 
 
+def _app_version() -> str:
+    """판 번호를 못 읽어도 기록은 남아야 하므로 예외를 내지 않는다."""
+    try:
+        from dashboard.version import APP_VERSION
+
+        return str(APP_VERSION or "")
+    except Exception:
+        return ""
+
+
+def _rules_hash() -> str:
+    """판단 규칙 글 전체는 너무 길어 기록에 넣지 않고 앞 12글자 지문만 남긴다."""
+    try:
+        text = load_analysis_rules(paths.skill_root())
+    except (OSError, ValueError):
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _profile_snapshot(profile) -> dict:
+    if not isinstance(profile, dict):
+        return {}
+    return {
+        "homeroom_enabled": bool((profile.get("homeroom") or {}).get("enabled")),
+        "class_minutes": (profile.get("school") or {}).get("class_minutes"),
+        "period_times": profile.get("period_times") or {},
+        "afternoon_homeroom_times": profile.get("afternoon_homeroom_times") or {},
+    }
+
+
+def _new_run() -> dict:
+    return {
+        "app_version": _app_version(),
+        "rules_hash": _rules_hash(),
+        "profile_snapshot": {},
+        "analysis_input_text": "",
+        "proposal": {},
+        "checked_actions": [],
+        "check_problems": [],
+        "created": [],
+    }
+
+
+def _checked_action_rows(actions) -> list:
+    return [
+        {
+            "kind": action.kind,
+            "target": action.target,
+            "container_id": action.google_id,   # calendarId / tasklist / 학생 안내표 id
+            "action_key": action.action_key,
+            "payload": action.payload,
+        }
+        for action in (actions or [])
+    ]
+
+
+def _created_rows(report: ExecutionReport) -> list:
+    return [
+        {
+            "action_key": row.action.action_key,
+            "kind": row.action.kind,
+            "target": row.action.target,
+            "google_id": row.google_id,
+            "status": row.status,
+            "detail": row.detail,
+        }
+        for row in report.results
+    ]
+
+
 def _items_from_report(report: ExecutionReport, profile) -> list:
     return [
         {
@@ -258,6 +330,7 @@ def _finish(
     attachment_skipped_names: tuple[str, ...] = (),
     attachment_link_status: str = "",
     attachment_link_detail: str = "",
+    run: dict | None = None,
 ) -> FlowResult:
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -306,6 +379,18 @@ def _finish(
         capture_store.append_capture(paths.bridge_state_dir(config_dir), entry)
     except (OSError, ValueError):
         pass  # 기록 실패가 처리 자체를 실패시키면 안 된다 (UnicodeDecodeError=ValueError 포함)
+    if run is not None:
+        run["when"] = now_text
+        run["outcome"] = {
+            "ok": result.ok,
+            "stage": result.stage,
+            "message": result.message,
+            "detail": detail,
+        }
+        try:
+            message_archive.add_run(paths.bridge_state_dir(config_dir), source_hash, run)
+        except (OSError, ValueError):
+            pass  # 기록 실패가 처리 자체를 실패시키면 안 된다
     if progress is not None:
         progress("done" if result.ok else "fail", result.message)
     return result
@@ -649,6 +734,12 @@ def run_capture_flow(
     attachment_names = tuple(getattr(record, "local_attachment_names", ()) or ())
     attachment_analyzed_names, attachment_skipped_names = _split_attachment_names(record)
     identity = message_identity(record)
+    message_archive.begin(
+        paths.bridge_state_dir(config_dir),
+        record,
+        getattr(bridge_settings, "brity_download_dir", ""),
+    )
+    run = _new_run()
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
     if history.is_completed(record.source_hash):
@@ -674,6 +765,7 @@ def run_capture_flow(
             ),
             attachment_link_status=str((original or {}).get("attachment_link_status", "")),
             attachment_link_detail=str((original or {}).get("attachment_link_detail", "")),
+            run=run,
         )
 
     if progress is not None:
@@ -697,11 +789,19 @@ def run_capture_flow(
             attachment_analyzed_names=attachment_analyzed_names,
             attachment_skipped_names=attachment_skipped_names,
             attachment_link_status="not-registered" if attachment_names else "",
+            run=run,
         )
 
+    run["profile_snapshot"] = _profile_snapshot(profile)
+
     try:
+        def remember_analysis_text(text: str) -> None:
+            run["analysis_input_text"] = str(text or "")
+
         proposal = run_gemini_analysis(
-            record, profile, bridge_settings, paths.skill_root(), transport=gemini_transport, now=now
+            record, profile, bridge_settings, paths.skill_root(),
+            transport=gemini_transport, now=now,
+            on_analysis_text=remember_analysis_text,
         )
     except AnalysisError as error:
         message = GEMINI_FAILURE_MESSAGES.get(error.reason, GEMINI_FAILURE_MESSAGES["shape"])
@@ -719,7 +819,10 @@ def run_capture_flow(
             attachment_analyzed_names=attachment_analyzed_names,
             attachment_skipped_names=attachment_skipped_names,
             attachment_link_status="not-registered" if attachment_names else "",
+            run=run,
         )
+
+    run["proposal"] = proposal
 
     notice_sheet_id, notice_unavailable_message = _load_notice_sheet(config_dir)
 
@@ -731,8 +834,10 @@ def run_capture_flow(
         actions = _remove_calendar_time_lines(actions)
         actions = add_local_attachment_links(actions, record.local_attachment_names)
         actions = _add_calendar_registration_time(actions, now)
+        run["checked_actions"] = _checked_action_rows(actions)
     except CheckError as error:
         due_problem = any("due 형식" in problem for problem in error.problems)
+        run["check_problems"] = list(error.problems)
         if due_problem:
             message = capture_store.CHECK_DUE_REASON
             summary = capture_store.CHECK_DUE_SUMMARY
@@ -755,6 +860,7 @@ def run_capture_flow(
             attachment_analyzed_names=attachment_analyzed_names,
             attachment_skipped_names=attachment_skipped_names,
             attachment_link_status="not-registered" if attachment_names else "",
+            run=run,
         )
 
     if not actions:
@@ -768,6 +874,7 @@ def run_capture_flow(
             attachment_analyzed_names=attachment_analyzed_names,
             attachment_skipped_names=attachment_skipped_names,
             attachment_link_status="no-calendar" if attachment_names else "",
+            run=run,
         )
 
     if progress is not None:
@@ -796,6 +903,7 @@ def run_capture_flow(
     )
     summary = _summarize_report(report)
     items = _items_from_report(report, profile)
+    run["created"] = _created_rows(report)
     notice_note = _notice_created_note(report)
     blocked_note = _notice_blocked_note(report)
     account_note = _account_blocked_note(report)
@@ -841,6 +949,7 @@ def run_capture_flow(
             attachment_skipped_names=attachment_skipped_names,
             attachment_link_status=link_status,
             attachment_link_detail=link_detail,
+            run=run,
         )
 
     retry_blocked = any(
@@ -874,4 +983,5 @@ def run_capture_flow(
         attachment_link_status=_attachment_link_status(
             attachment_names, report, link_ready=attachment_link_ready
         ),
+        run=run,
     )

@@ -356,6 +356,7 @@ def run_gemini_analysis(
     transport=None,
     now: datetime | None = None,
     media_uploader=None,
+    on_analysis_text=None,
 ) -> dict:
     api_key = (bridge_settings.gemini_api_key or "").strip()
     if not api_key:
@@ -377,6 +378,9 @@ def run_gemini_analysis(
                 + summaries
             ),
         )
+    if on_analysis_text is not None:
+        # 긴 메시지는 요약해서 보내므로 실제로 보낸 글을 기록해 둬야 나중에 다시 만들 수 있다
+        on_analysis_text(analysis_record.plain_text)
     prompt = build_analysis_prompt(analysis_record, profile, now, rules_text)
     try:
         prepared = gemini_files.prepare_media_parts(

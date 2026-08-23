@@ -8,6 +8,8 @@ import json as _json
 import os
 import platform
 import re
+import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -18,6 +20,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+import urllib.error
 from urllib.parse import unquote, urlsplit
 
 import install_attendance_automation
@@ -1654,6 +1657,47 @@ def _require_https_response(response, requested_url: str) -> None:
         raise ValueError("unsafe final update URL")
 
 
+# 원인을 뭉뚱그려 "인터넷 연결을 확인하세요"라고만 쓰면, 인터넷이 멀쩡한
+# 컴퓨터에서 선생님이 엉뚱한 곳을 들여다보게 된다. component_update와 같은
+# 갈래로 나눠 실제 이유를 그대로 알린다.
+_UPDATE_CHECK_RETRY = "잠시 뒤 '업데이트 다시 확인'을 눌러 주세요."
+_UPDATE_CHECK_OFFLINE = (
+    "인터넷에 연결되지 않아 업데이트를 확인하지 못했어요. "
+    "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요."
+)
+
+
+def _update_check_failure_reason(error: BaseException) -> str:
+    if isinstance(error, (ssl.SSLCertVerificationError, ssl.CertificateError)):
+        return (
+            "보안 인증서를 확인하지 못해 업데이트 확인을 멈췄어요. "
+            "학교 보안 프로그램이나 컴퓨터의 날짜·시간을 확인해 주세요."
+        )
+    if isinstance(error, urllib.error.HTTPError) and error.code == 407:
+        return f"학교나 기관의 인터넷 인증이 필요해 업데이트를 확인하지 못했어요. {_UPDATE_CHECK_RETRY}"
+    if isinstance(error, urllib.error.HTTPError):
+        # 서버가 HTTP 응답을 돌려줬으니 인터넷이 없는 상황은 아니다.
+        return f"배포 서버가 응답했지만 업데이트 확인을 마치지 못했어요. {_UPDATE_CHECK_RETRY}"
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return f"인터넷 응답을 기다리는 시간이 지났어요. {_UPDATE_CHECK_RETRY}"
+    if isinstance(error, urllib.error.URLError):
+        reason = error.reason
+        if isinstance(reason, (ssl.SSLCertVerificationError, ssl.CertificateError)):
+            return (
+                "보안 인증서를 확인하지 못해 업데이트 확인을 멈췄어요. "
+                "학교 보안 프로그램이나 컴퓨터의 날짜·시간을 확인해 주세요."
+            )
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return f"인터넷 응답을 기다리는 시간이 지났어요. {_UPDATE_CHECK_RETRY}"
+        return _UPDATE_CHECK_OFFLINE
+    if isinstance(error, OSError):
+        return _UPDATE_CHECK_OFFLINE
+    return (
+        "업데이트 확인을 하지 못했어요. "
+        "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요."
+    )
+
+
 def check_update(current: str, fetch=None) -> dict:
     """새 버전, 최신 상태, 확인 실패를 서로 다른 값으로 알려준다."""
     fetch = fetch or _fetch_update_json
@@ -1664,13 +1708,14 @@ def check_update(current: str, fetch=None) -> dict:
         notes = str(data.get("notes", "") or "")
         sha256 = _valid_update_sha256(data.get("sha256", ""))
         newer = _is_newer(latest, current)
+    except (ssl.SSLError, ssl.CertificateError) as error:
+        # SSLCertVerificationError는 ValueError를 물려받는다. 아래 ValueError보다
+        # 먼저 잡지 않으면 인증서 문제가 `버전 모양이 올바르지 않아요`로 나온다.
+        return _empty_update("failed", _update_check_failure_reason(error))
     except ValueError:
         return _empty_update("failed", "배포 정보의 버전 모양이 올바르지 않아요.")
-    except Exception:  # noqa: BLE001 - 실행은 계속하되 화면에는 확인 실패를 정확히 알린다
-        return _empty_update(
-            "failed",
-            "업데이트 확인을 하지 못했어요. 인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요.",
-        )
+    except Exception as error:  # noqa: BLE001 - 실행은 계속하되 화면에는 확인 실패를 정확히 알린다
+        return _empty_update("failed", _update_check_failure_reason(error))
 
     if not newer:
         return _empty_update("latest", "", latest)

@@ -26,6 +26,7 @@ BLOCKED_MESSAGE = "안전을 위해 이 파일은 자동으로 열지 않습니�
 CANNOT_OPEN_MESSAGE = "이 첨부파일 링크를 열 수 없습니다."
 CANCELLED_MESSAGE = "파일 열기를 취소했습니다. 이 탭은 닫아도 됩니다."
 CONFIRMATION_TTL_SECONDS = 120.0
+_DRAIN_LIMIT_BYTES = 64 * 1024
 
 
 def _open_with_windows(path: Path) -> None:
@@ -86,7 +87,29 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
     def _reply(self, status: int, message: str) -> None:
         self._reply_html(status, "<p>" + html.escape(message) + "</p>")
 
+    _body_drained = False
+
+    def _drain_request_body(self) -> None:
+        """닫기 전에 아직 안 읽은 요청 본문을 비운다.
+
+        Windows는 받을 데이터가 남은 채로 소켓을 닫으면 연결을 끊어 버린다.
+        그러면 이미 써 보낸 거절 안내조차 브라우저에 닿지 않고 통신 오류만 남는다.
+        """
+        if self._body_drained:
+            return
+        self._body_drained = True
+        declared = self.headers.get("Content-Length", "")
+        if not declared.isascii() or not declared.isdigit():
+            return
+        remaining = min(int(declared), _DRAIN_LIMIT_BYTES)
+        while remaining > 0:
+            block = self.rfile.read(min(remaining, 4096))
+            if not block:
+                return
+            remaining -= len(block)
+
     def _reply_html(self, status: int, content: str) -> None:
+        self._drain_request_body()
         body = (
             "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
             "<title>Teacher Manager</title></head><body>"
@@ -169,6 +192,7 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             raw_body = self.rfile.read(int(content_length)).decode("ascii")
+            self._body_drained = True
             form = parse_qs(raw_body, keep_blank_values=True, strict_parsing=True)
         except (UnicodeDecodeError, ValueError):
             self._reply(400, CANNOT_OPEN_MESSAGE)
