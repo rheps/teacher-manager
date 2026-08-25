@@ -64,7 +64,9 @@
 # v2.8: Brity 메시지 원문과 판단 근거를 메시지별 파일로 남겨 과거 등록분을 되짚을 수 있게 함
 # v2.9: 같은 이름의 출결 자료를 새 정본 하나로 안전하게 합치고 현재 연결·AI 입력 연결을 고정 ·
 #       자동 업데이트 실패 때 공식 GitHub Release 직접 설치 안내를 문장 전체 링크로 제공
-APP_VERSION = "2.9"
+# v3.0: Brity 재시도 성공 기록을 최종 결과로 합치고 Calendar 첨부파일을 짧은 한 주소로 안전하게 연결 ·
+#       VirtualBox 기반 깨끗한 Windows 촬영 안내 추가
+APP_VERSION = "3.0"
 
 BRANDING = {
     "name": "Teacher Manager",

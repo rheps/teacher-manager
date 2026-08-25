@@ -144,7 +144,9 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
     ))
 
     attendance = read_attendance_status(config_dir, doctor_deps.run_command)
-    attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state)
+    # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
+    # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
+    attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
     results.append(CheckResult(
         "connect.attendance", "출결 시트", attendance_ok,
         attendance.detail or "출결 업무 준비가 끝났어요",
@@ -836,6 +838,15 @@ def load_attendance_status_cache(config_dir: Path) -> dict | None:
         return None
     if not isinstance(saved, dict) or not saved.get("state"):
         return None
+    if saved.get("state") == "recovery-required":
+        current_transition = (
+            attendance_workbook_transition.read_resumable_transition_status(config_dir)
+        )
+        if (
+            current_transition is None
+            or current_transition.state != "recovery-required"
+        ):
+            return None
     if saved.get("state") == "ready":
         record_path = paths.attendance_install_record_path(config_dir)
         try:

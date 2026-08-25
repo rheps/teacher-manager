@@ -866,7 +866,10 @@ class TrayApp:
         self._attachment_link_ready = False
         self._attachment_link_failure = ""
         try:
-            server = self._attachment_server_factory(current_download_dir)
+            server = self._attachment_server_factory(
+                current_download_dir,
+                state_dir_provider=lambda: paths.bridge_state_dir(self.config_dir),
+            )
             server.start()
         except Exception as error:  # noqa: BLE001 - 파일 링크 실패가 단축키·메시지 처리를 막으면 안 된다
             failure_message = status_log.attachment_link_start_failure_message(error)

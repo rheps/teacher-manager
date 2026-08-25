@@ -22,8 +22,8 @@ TASK_NOTE_MARK = "BRITY-BRIDGE:"
 PERSONAL_QUEUE_SHEET = "메신저 개인톡 내용"
 CLASS_QUEUE_SHEET = "메신저 단체톡 내용"
 _QUEUE_DATE_RE = re.compile(r"^(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\.?$")
-_LOCAL_ATTACHMENT_HEADER = "📎 첨부파일 (컴퓨터에서만 열림)"
-_LOCAL_ATTACHMENT_URL_PREFIX = "http://127.0.0.1:49271/open?name="
+_LOCAL_ATTACHMENT_HEADER = "📎 첨부파일"
+_LOCAL_ATTACHMENT_URL_PREFIX = "http://127.0.0.1:49271/a/"
 TOOL_PREPARATION_FAILURE_DETAIL = (
     "Google 등록 도구를 준비하지 못했습니다. Teacher Manager를 다시 열고 다시 시도해 주세요."
 )

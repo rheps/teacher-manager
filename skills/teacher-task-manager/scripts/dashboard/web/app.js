@@ -1373,11 +1373,20 @@ function serviceSubrowsHtml(entry, a) {
 }
 /* 서비스 줄 맨 오른쪽 상태 칸 — 글자 색만, 모든 줄 같은 폭(.svc-status, 설계 2026-07-31).
    배경·테두리·둥근 모서리는 칠하지 않는다 — 알약 모양은 2026-07-30에 질책받았다. */
+function attendanceTransitionNeedsAttention(state) {
+  return [
+    "ai-action-required", "record-switch-in-flight", "record-switched",
+    "cleanup-required", "recovery-required",
+  ].includes(state);
+}
 function serviceStatusHtml(entry, a) {
   const scriptCheck = a.state === "script-check-required";
   const scriptUpdate = a.state === "script-update-required";
   const scriptAttention = scriptCheck || scriptUpdate;
   if (scriptAttention) return `<span class="svc-status" aria-hidden="true"></span>`;
+  if (attendanceTransitionNeedsAttention(a.state)) {
+    return `<span class="svc-status warn">확인 필요</span>`;
+  }
   // 뒤에서 준비가 도는 동안에도 이미 만들어진 자료는 그 줄부터 바로 켠다.
   // engine이 progress에 실제 Google 자료 번호를 하나씩 남기므로 화면에서 추측하지 않는다.
   if (a.state === "installing") {
@@ -1902,10 +1911,7 @@ function attendanceTabHtml() {
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
   const consolidationRequired = a.consolidation_required === true;
-  const transitionAttentionRequired = [
-    "ai-action-required", "record-switch-in-flight", "record-switched",
-    "cleanup-required", "recovery-required",
-  ].includes(a.state);
+  const transitionAttentionRequired = attendanceTransitionNeedsAttention(a.state);
   const pendingGuide = S.mode === "wizard"
     ? a.state === "installing"
       ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"

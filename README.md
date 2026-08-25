@@ -31,12 +31,12 @@ Teacher Manager가 학생 가입이나 Chat 초대를 대신하지는 않습니�
 
 ## 내려받기
 
-이번 **2.8 공개판은 아직 남은 문제를 찾기 위한 공개 현장시험판**입니다.
+이번 **3.0 공개판은 아직 남은 문제를 찾기 위한 공개 현장시험판**입니다.
 일반 배포가 모두 확인된 판은 아니며, **Setup 설치 파일 하나만** 제공합니다.
 
 **[최신 Teacher Manager 내려받기](https://github.com/rheps/teacher-manager/releases/latest)**
 
-Release 페이지에서 `TeacherManager-Setup-2.8.exe`를 받습니다.
+Release 페이지에서 `TeacherManager-Setup-3.0.exe`를 받습니다.
 `Portable ZIP`, `MSIX`, Microsoft Store 설치판은 현재 제공하지 않습니다.
 
 ## 설치 순서

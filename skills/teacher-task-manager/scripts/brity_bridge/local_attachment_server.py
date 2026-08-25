@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
+from brity_bridge import message_archive
 from brity_bridge.local_attachment_links import (
     LOCAL_ATTACHMENT_HOST,
     LOCAL_ATTACHMENT_PORT,
@@ -38,6 +39,7 @@ class _AttachmentHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     download_dir_provider: Callable[[], Path]
+    state_dir_provider: Callable[[], Path] | None
     opener: Callable[[Path], None]
     expected_host: str
     expected_origin: str
@@ -156,6 +158,43 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
         )
         self._reply_html(200, content)
 
+    def _reply_attachment_choices(self, names: tuple[str, ...]) -> None:
+        server = self.server
+        if not isinstance(server, _AttachmentHTTPServer):
+            self._reply(500, CANNOT_OPEN_MESSAGE)
+            return
+        rows = ["<h1>컴퓨터에서 열 첨부파일을 선택하세요</h1>"]
+        openable = 0
+        for name in names:
+            try:
+                target = resolve_local_attachment(server.download_dir_provider(), name)
+            except InvalidAttachmentName:
+                rows.append("<p>열 수 없는 첨부파일입니다.</p>")
+                continue
+            except AttachmentNotFound:
+                rows.append(
+                    "<p>" + html.escape(name) + " — " + html.escape(MISSING_MESSAGE) + "</p>"
+                )
+                continue
+            except BlockedAttachmentType:
+                rows.append(
+                    "<p>" + html.escape(name) + " — " + html.escape(BLOCKED_MESSAGE) + "</p>"
+                )
+                continue
+            token = server.issue_confirmation(target.name)
+            rows.append(
+                "<form method=\"post\" action=\"/confirm\"><span>"
+                + html.escape(target.name)
+                + "</span> <input type=\"hidden\" name=\"token\" value=\""
+                + html.escape(token, quote=True)
+                + "\"><button type=\"submit\">컴퓨터에서 열기</button></form>"
+            )
+            openable += 1
+        if not openable:
+            self._reply_html(404, "".join(rows))
+            return
+        self._reply_html(200, "".join(rows))
+
     def do_HEAD(self) -> None:
         self._reply(405, CANNOT_OPEN_MESSAGE)
 
@@ -231,9 +270,6 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             self._reply(500, CANNOT_OPEN_MESSAGE)
             return
         parsed = urlsplit(self.path)
-        if parsed.path != "/open":
-            self._reply(405, CANNOT_OPEN_MESSAGE)
-            return
         if (
             self.client_address[0] != LOCAL_ATTACHMENT_HOST
             or self.headers.get("Host") != server.expected_host
@@ -246,6 +282,43 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             or self.headers.get("Sec-Fetch-User") not in (None, "?1")
         ):
             self._reply(403, CANNOT_OPEN_MESSAGE)
+            return
+        if parsed.path.startswith("/a/"):
+            if parsed.query:
+                self._reply(400, CANNOT_OPEN_MESSAGE)
+                return
+            short_id = parsed.path.removeprefix("/a/")
+            if server.state_dir_provider is None:
+                self._reply(404, CANNOT_OPEN_MESSAGE)
+                return
+            document = message_archive.load_by_short_id(
+                server.state_dir_provider(), short_id
+            )
+            message = document.get("message") if isinstance(document, dict) else None
+            raw_names = message.get("local_attachment_names") if isinstance(message, dict) else None
+            names = tuple(name for name in (raw_names or ()) if isinstance(name, str) and name)
+            if not names:
+                self._reply(404, CANNOT_OPEN_MESSAGE)
+                return
+            if len(names) > 1:
+                self._reply_attachment_choices(names)
+                return
+            try:
+                target = resolve_local_attachment(server.download_dir_provider(), names[0])
+            except InvalidAttachmentName:
+                self._reply(400, CANNOT_OPEN_MESSAGE)
+                return
+            except AttachmentNotFound:
+                self._reply_with_filename(404, names[0], MISSING_MESSAGE)
+                return
+            except BlockedAttachmentType:
+                self._reply_with_filename(403, names[0], BLOCKED_MESSAGE)
+                return
+            token = server.issue_confirmation(target.name)
+            self._reply_confirmation(target.name, token)
+            return
+        if parsed.path != "/open":
+            self._reply(405, CANNOT_OPEN_MESSAGE)
             return
         try:
             query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
@@ -277,6 +350,7 @@ class LocalAttachmentServer:
         opener: Callable[[Path], None] | None = None,
         host: str = LOCAL_ATTACHMENT_HOST,
         port: int = LOCAL_ATTACHMENT_PORT,
+        state_dir_provider: Callable[[], Path] | None = None,
     ):
         if host != LOCAL_ATTACHMENT_HOST:
             raise ValueError("local attachment server must use IPv4 loopback")
@@ -284,6 +358,7 @@ class LocalAttachmentServer:
         self._opener = opener or _open_with_windows
         self._host = host
         self._port = port
+        self._state_dir_provider = state_dir_provider
         self._server: _AttachmentHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -308,6 +383,7 @@ class LocalAttachmentServer:
                 )
                 host, port = server.server_address[:2]
                 server.download_dir_provider = self._download_dir_provider
+                server.state_dir_provider = self._state_dir_provider
                 server.opener = self._opener
                 server.expected_host = f"{host}:{port}"
                 server.expected_origin = f"http://{host}:{port}"

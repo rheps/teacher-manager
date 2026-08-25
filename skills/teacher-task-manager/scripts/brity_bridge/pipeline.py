@@ -25,7 +25,6 @@ from brity_bridge.gws_exec import (
 )
 from brity_bridge.history import HistoryStore
 from brity_bridge.local_attachment_links import (
-    LOCAL_ATTACHMENT_HEADER,
     add_local_attachment_links,
 )
 from brity_bridge.message_parse import (
@@ -123,16 +122,7 @@ def _add_calendar_registration_time(actions: list, now: datetime) -> list:
             continue
         payload = dict(action.payload)
         description = _without_calendar_time_lines(payload.get("description", ""))
-        if LOCAL_ATTACHMENT_HEADER in description:
-            body, marker, attachment_tail = description.partition(LOCAL_ATTACHMENT_HEADER)
-            body = body.rstrip()
-            description = (
-                f"{body}\n\n{time_line}\n\n{marker}{attachment_tail}"
-                if body
-                else f"{time_line}\n\n{marker}{attachment_tail}"
-            )
-        else:
-            description = f"{description}\n\n{time_line}" if description else time_line
+        description = f"{description}\n\n{time_line}" if description else time_line
         if len(description) > BODY_MAX:
             raise CheckError(["등록한 시각을 넣으면 일정 설명이 너무 길어짐"])
         payload["description"] = description
@@ -1053,7 +1043,9 @@ def run_capture_flow(
         )
         actions = add_work_task_copies(actions, profile)
         actions = _remove_calendar_time_lines(actions)
-        actions = add_local_attachment_links(actions, record.local_attachment_names)
+        actions = add_local_attachment_links(
+            actions, record.local_attachment_names, record.source_hash
+        )
         actions = _add_calendar_registration_time(actions, now)
         run["checked_actions"] = _checked_action_rows(actions)
     except CheckError as error:

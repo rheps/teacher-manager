@@ -21,7 +21,7 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # ``skills/teacher-task-manager/assets/Code.gs``와 ``appsscript.json``을 raw로
 # 읽고, 아래 ``canonical_bundle_sha256`` 규칙을 별도 PowerShell/.NET 계산으로
 # 대조했다. raw 파일을 다시 확인하지 못한 더 오래된 설치본은 일부러 넣지 않는다.
-# v2.4~v2.7 네 판은 2026-08-22에 같은 방법으로 다시 읽어 더했다. 이 값이 빠져
+# v2.4~v2.8 다섯 판은 공개 태그에서 같은 방법으로 다시 읽어 더했다. 이 값이 빠져
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
@@ -29,8 +29,15 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         "1ecfbdcf9d5903e6" "a58a2e38c8893a67"
         "b7a1fee07003ca3f" "4bd9fe11db9bb35c"
     ): (
+        ("v2.8", "38953806f799a13bfcc8" "e99e3f667f4dfd20213e"),
         ("v2.7", "245f582c4d2836ee6cba" "83b41231f26623255410"),
         ("v2.6", "465b843e901069c0aba0" "81dda6a3beaaf1dd3ceb"),
+    ),
+    (
+        "c47bbf6dcf4b5602" "53fd1b2cf8759848"
+        "db68c7e4ace8beca" "03c082bcdd2e9491"
+    ): (
+        ("v2.9", "3b88d94a83fad8ba7cdd" "000f2d7ff70b9acfa035"),
     ),
     (
         "726c78ba658c88dc" "5045ddb4ea7f87b9"

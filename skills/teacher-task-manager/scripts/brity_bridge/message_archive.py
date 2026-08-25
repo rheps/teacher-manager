@@ -7,6 +7,7 @@ captures.jsonl은 대시보드가 열 때마다 통째로 읽으므로 원문을
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from brity_bridge import atomic_io
 
 RECORD_VERSION = 1
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+SHORT_LINK_ID_LENGTH = 16
+_SHORT_ID_RE = re.compile(rf"^[0-9a-f]{{{SHORT_LINK_ID_LENGTH}}}$")
+_FULL_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def messages_dir(state_dir: Path) -> Path:
@@ -56,6 +60,30 @@ def load(state_dir: Path, source_hash: str) -> dict | None:
     if not source_hash:
         return None
     return _read(message_path(Path(state_dir), source_hash))
+
+
+def load_by_short_id(state_dir: Path, short_id: str) -> dict | None:
+    """짧은 일정 링크가 가리키는 저장 메시지를 충돌 없이 찾는다."""
+    short_id = _text(short_id).casefold()
+    if not _SHORT_ID_RE.fullmatch(short_id):
+        return None
+    try:
+        matches = [
+            path
+            for path in messages_dir(Path(state_dir)).iterdir()
+            if path.is_file()
+            and path.suffix.casefold() == ".json"
+            and _FULL_HASH_RE.fullmatch(path.stem)
+            and path.stem.startswith(short_id)
+        ]
+    except OSError:
+        return None
+    if len(matches) != 1:
+        return None
+    document = _read(matches[0])
+    if document is None or _text(document.get("source_hash")).casefold() != matches[0].stem:
+        return None
+    return document
 
 
 def begin(state_dir: Path, record, attachment_dir: str = "") -> None:

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urlencode
 
 from brity_bridge.proposal_check import BODY_MAX, CheckError, CheckedAction
 
-LOCAL_ATTACHMENT_HEADER = "📎 첨부파일 (컴퓨터에서만 열림)"
+LOCAL_ATTACHMENT_HEADER = "📎 첨부파일"
 LOCAL_ATTACHMENT_HOST = "127.0.0.1"
 LOCAL_ATTACHMENT_PORT = 49271
+SHORT_LINK_ID_LENGTH = 16
+_SOURCE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHORT_LINK_RE = re.compile(r"^https?://127\.0\.0\.1:49271/a/[0-9a-f]{16}$")
+_LEGACY_LINK_PREFIX = f"http://{LOCAL_ATTACHMENT_HOST}:{LOCAL_ATTACHMENT_PORT}/open?name="
 WINDOWS_PACKAGE_SUFFIXES = {
     ".appinstaller", ".appx", ".appxbundle", ".appxupload",
     ".msix", ".msixbundle", ".msixupload",
@@ -37,9 +41,31 @@ class BlockedAttachmentType(Exception):
     pass
 
 
-def build_local_attachment_url(name: str) -> str:
-    query = urlencode({"name": name})
-    return f"http://{LOCAL_ATTACHMENT_HOST}:{LOCAL_ATTACHMENT_PORT}/open?{query}"
+def build_local_attachment_url(source_hash: str) -> str:
+    normalized = str(source_hash or "").casefold()
+    if not _SOURCE_HASH_RE.fullmatch(normalized):
+        raise ValueError("invalid source hash")
+    short_id = normalized[:SHORT_LINK_ID_LENGTH]
+    return f"http://{LOCAL_ATTACHMENT_HOST}:{LOCAL_ATTACHMENT_PORT}/a/{short_id}"
+
+
+def _without_existing_attachment_lines(description: object, names: tuple[str, ...]) -> str:
+    exact_names = {str(name) for name in names}
+    kept: list[str] = []
+    for line in str(description or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(LOCAL_ATTACHMENT_HEADER):
+            continue
+        if stripped in exact_names:
+            continue
+        if stripped.startswith("- ") and stripped[2:].strip() in exact_names:
+            continue
+        if stripped.startswith(_LEGACY_LINK_PREFIX) or _SHORT_LINK_RE.fullmatch(stripped):
+            continue
+        if not stripped and (not kept or not kept[-1].strip()):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept).rstrip()
 
 
 def resolve_local_attachment(download_dir: Path, name: str) -> Path:
@@ -84,15 +110,20 @@ def resolve_local_attachment(download_dir: Path, name: str) -> Path:
 
 
 def add_local_attachment_links(
-    actions: list[CheckedAction], names: tuple[str, ...]
+    actions: list[CheckedAction], names: tuple[str, ...], source_hash: str
 ) -> list[CheckedAction]:
     if not names:
         return list(actions)
     if not any(action.kind == "calendar" for action in actions):
         return list(actions)
+    try:
+        link = build_local_attachment_url(source_hash)
+    except ValueError as error:
+        raise CheckError(["첨부파일 연결 주소를 만들 수 없음"]) from error
+    unique_names = tuple(dict.fromkeys(str(name) for name in names))
     attachment_lines = [LOCAL_ATTACHMENT_HEADER]
-    for name in names:
-        attachment_lines.extend((name, build_local_attachment_url(name)))
+    attachment_lines.extend(f"- {name}" for name in unique_names)
+    attachment_lines.append(link)
     attachment_block = "\n".join(attachment_lines)
     result: list[CheckedAction] = []
     for action in actions:
@@ -100,7 +131,9 @@ def add_local_attachment_links(
             result.append(action)
             continue
         payload = dict(action.payload)
-        old_description = str(payload.get("description", "")).rstrip()
+        old_description = _without_existing_attachment_lines(
+            payload.get("description", ""), unique_names
+        )
         payload["description"] = (
             f"{old_description}\n\n{attachment_block}"
             if old_description

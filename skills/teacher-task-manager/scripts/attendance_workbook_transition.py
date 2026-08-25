@@ -19,7 +19,7 @@ import attendance_canonical_rebuild
 import attendance_central_move
 import attendance_script_update
 import attendance_workbook_identity
-from attendance_install_record import load_attendance_install_record
+from attendance_install_record import CONNECTION_FIELDS, load_attendance_install_record
 
 
 @dataclass
@@ -336,8 +336,20 @@ def make_transition_deps(*, runner, gws_executable: str, account: str) -> Transi
     )
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"{key} 항목이 두 번 적혀 있습니다.")
+        value[key] = item
+    return value
+
+
 def _read_dict(path: Path) -> dict:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_strict_json_object,
+    )
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} 내용이 자료 묶음이 아닙니다.")
     return value
@@ -1480,6 +1492,17 @@ _SWITCH_TRANSITION_KEYS = frozenset({
     "cleanup_approval",
 })
 
+_COMPLETED_LEGACY_SPLIT_REPAIR_KEYS = frozenset({
+    "state",
+    "reason",
+    "source_spreadsheet_id",
+    "school_year",
+    "progress",
+    "central_complete",
+    "spreadsheet_id",
+    "spreadsheet_url",
+})
+
 
 def _valid_new_school_year_transition_state(value: Mapping[str, Any]) -> bool:
     """같은 파일을 쓰는 알려진 옛 새 학년도 진행 모양만 명시적으로 인정한다."""
@@ -1522,6 +1545,45 @@ def _valid_new_school_year_transition_state(value: Mapping[str, Any]) -> bool:
             == _canonical_spreadsheet_url(candidate_id)
         )
     return True
+
+
+def _valid_completed_legacy_split_repair_state(value: Mapping[str, Any]) -> bool:
+    """연결 교체 직전까지 끝낸 옛 정리 기록의 정확한 모양만 인정한다."""
+
+    if not isinstance(value, Mapping) or set(value) != (
+        _COMPLETED_LEGACY_SPLIT_REPAIR_KEYS
+    ):
+        return False
+    source_id = value.get("source_spreadsheet_id")
+    candidate_id = value.get("spreadsheet_id")
+    school_year = value.get("school_year")
+    progress = value.get("progress")
+    canonical_url = (
+        _canonical_spreadsheet_url(candidate_id)
+        if isinstance(candidate_id, str)
+        else ""
+    )
+    return bool(
+        value.get("state") == "candidate-verified"
+        and value.get("reason")
+        == install_attendance_automation.ATTENDANCE_CREATION_SPLIT_REPAIR
+        and value.get("central_complete") is True
+        and isinstance(source_id, str)
+        and _GOOGLE_ID_PATTERN.fullmatch(source_id) is not None
+        and not source_id.startswith("AIza")
+        and isinstance(candidate_id, str)
+        and _GOOGLE_ID_PATTERN.fullmatch(candidate_id) is not None
+        and not candidate_id.startswith("AIza")
+        and source_id != candidate_id
+        and isinstance(school_year, str)
+        and (not school_year or re.fullmatch(r"20[0-9]{2}", school_year) is not None)
+        and isinstance(progress, dict)
+        and set(progress) == CONNECTION_FIELDS
+        and _valid_install_progress(progress, (source_id,))
+        and progress.get("spreadsheet_id") == candidate_id
+        and progress.get("spreadsheet_url") == canonical_url
+        and value.get("spreadsheet_url") == canonical_url
+    )
 
 
 def _valid_switch_transition_state(value: Mapping[str, Any]) -> bool:
@@ -1751,6 +1813,48 @@ def _validated_local_transition_record(
         return None
 
 
+def _completed_legacy_split_repair_points_to_current(
+    config_dir: Path,
+    *,
+    expected_account: str,
+) -> bool:
+    """옛 완료 기록과 현재 정본 연결이 서로 정확히 맞을 때만 정상으로 본다."""
+
+    try:
+        state = _read_dict(
+            Path(config_dir) / "attendance-workbook-transition.generated.json"
+        )
+    except Exception:
+        return False
+    if not _valid_completed_legacy_split_repair_state(state):
+        return False
+    candidate_id = str(state.get("spreadsheet_id", "") or "")
+    record = _validated_local_transition_record(
+        config_dir,
+        allowed_spreadsheet_ids=(candidate_id,),
+        expected_account=expected_account,
+    )
+    transition_year = str(state.get("school_year", "") or "").strip()
+    record_year = (
+        str(record.get("school_year", "") or "").strip()
+        if record is not None
+        else ""
+    )
+    return bool(
+        record is not None
+        and all(record.get(key) == state["progress"].get(key) for key in CONNECTION_FIELDS)
+        and record.get("spreadsheet_id") == candidate_id
+        and record.get("spreadsheet_url") == _canonical_spreadsheet_url(candidate_id)
+        and record.get("workbook_role")
+        == attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
+        and (
+            not transition_year
+            or not record_year
+            or transition_year == record_year
+        )
+    )
+
+
 def read_resumable_transition_status(
     config_dir: Path,
     *,
@@ -1763,6 +1867,10 @@ def read_resumable_transition_status(
         config_dir / "attendance-workbook-transition.generated.json"
     )
     if invalid:
+        if _completed_legacy_split_repair_points_to_current(
+            config_dir, expected_account=expected_account
+        ):
+            return None
         return ResumableTransitionStatus(state="recovery-required")
     if not state:
         return None
