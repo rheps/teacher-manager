@@ -55,6 +55,8 @@ const S = {
   attendanceScriptDialog: null, // null | "update" | "finish"
   attendanceScriptUpdating: false,
   attendanceTransitioning: false, // 정리·새 학년도 전환 중에는 화면을 다시 그려도 재실행 금지
+  attendanceConsolidation: null, // null | 미리보기·권한·진행·결과 화면
+  attendanceConsolidationLoginStarted: false,
   workspaceGuideOpen: false,   // 1단계 "화면에서 찾기"로 뜨는 구글 워크스페이스 위치 캡처
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
@@ -323,6 +325,10 @@ function googleStatusKey(status) {
 }
 function clearGoogleDependentState() {
   clearAttendanceScriptDialogState();
+  if (!preserveAttendanceConsolidationMutationForAccountChange()) {
+    invalidateAttendanceConsolidationFlow();
+  }
+  stopAttendancePreparePoll();
   S.attendance = null;
   S.attendanceScriptUpdate = null;
   S.firstSetupDone = false;   // 계정이 바뀌면 다른 시트의 완료 표시일 수 있다
@@ -1331,6 +1337,8 @@ function serviceOpenButtonHtml(entry, a) {
   // Sheet와 안내장 서식은 읽어 볼 수 있어야 한다.
   const resourcesAvailable = [
     "ready", "script-check-required", "script-update-required", "consolidation-required",
+    "ai-action-required", "record-switch-in-flight", "record-switched",
+    "cleanup-required", "recovery-required",
   ].includes(a.state);
   if (!resourcesAvailable) return "";
   if (entry.service === "sheet") {
@@ -1466,10 +1474,326 @@ function loadAttendanceStatus() {
     })
     .finally(() => { S.attendanceLoading = false; render(); });
 }
+const ATTENDANCE_CONSOLIDATION_STAGES = [
+  "자료 읽기", "새 정본 만들기", "기록 옮기기", "AI 입력 연결",
+  "연결 교체", "기존 파일 휴지통 이동",
+];
+const ATTENDANCE_CONSOLIDATION_ACCOUNT_CHANGED_MESSAGE =
+  "Google 로그인 계정이 바뀌었어요. 현재 연결과 출석부는 그대로입니다. 처음 사용한 계정으로 로그인한 뒤 다시 시작해 주세요.";
+const ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE =
+  "작업이 이미 시작되었거나 완료되었습니다. 원래 Google 계정으로 돌아가 상태를 다시 확인하세요.";
+let attendanceConsolidationLoginTimer = null;
+let attendanceConsolidationGeneration = 0;
+function stopAttendanceConsolidationLoginPoll() {
+  if (attendanceConsolidationLoginTimer) {
+    clearTimeout(attendanceConsolidationLoginTimer);
+    attendanceConsolidationLoginTimer = null;
+  }
+}
+function attendanceConsolidationAccount() {
+  const account = S.google?.user || S.attendance?.current_user || S.attendance?.account || "";
+  return String(account).trim().toLowerCase();
+}
+function attendanceConsolidationFlowActive(flow, expectedViews) {
+  const current = S.attendanceConsolidation;
+  const expected = Array.isArray(expectedViews) ? expectedViews : null;
+  return Boolean(
+    flow && current
+    && flow.generation === attendanceConsolidationGeneration
+    && current.generation === flow.generation
+    && current.account === flow.account
+    && (!expected || expected.includes(current.view))
+  );
+}
+function invalidateAttendanceConsolidationFlow() {
+  attendanceConsolidationGeneration += 1;
+  stopAttendanceConsolidationLoginPoll();
+  S.attendanceConsolidationLoginStarted = false;
+  S.attendanceConsolidation = null;
+  S.attendanceTransitioning = false;
+}
+function attendanceConsolidationMutationBackendState(data) {
+  const state = String(data?.state || data?.backend_state || "");
+  return [
+    "complete", "cleanup-required", "ai-action-required", "refresh-required",
+    "permission-required", "record-switch-in-flight", "record-switched",
+    "recovery-required",
+  ].includes(state) ? state : "unknown";
+}
+function preserveAttendanceConsolidationMutationForAccountChange(data) {
+  const current = S.attendanceConsolidation;
+  if (!current?.mutationDispatched) return false;
+  const source = data || current.result || {};
+  const backendState = attendanceConsolidationMutationBackendState(source);
+  stopAttendanceConsolidationLoginPoll();
+  S.attendanceConsolidationLoginStarted = false;
+  S.attendanceConsolidation = {
+    view: "result",
+    result: {
+      state: "account-changed-after-mutation",
+      backend_state: backendState,
+      detail: ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE,
+    },
+    generation: current.generation,
+    account: current.account,
+    mutationDispatched: true,
+    mutationPending: backendState === "unknown" && current.mutationPending === true,
+    accountChangedAfterMutation: true,
+  };
+  return true;
+}
+function markAttendanceConsolidationMutationDispatched(flow) {
+  if (!attendanceConsolidationFlowActive(flow)) return false;
+  flow.mutationDispatched = true;
+  flow.mutationPending = true;
+  S.attendanceConsolidation = {
+    ...(S.attendanceConsolidation || {}),
+    generation: flow.generation,
+    account: flow.account,
+    mutationDispatched: true,
+    mutationPending: true,
+  };
+  return true;
+}
+function attendanceConsolidationMutationResponseExpected(flow) {
+  const current = S.attendanceConsolidation;
+  return Boolean(
+    flow?.mutationDispatched && current?.mutationDispatched
+    && flow.generation === attendanceConsolidationGeneration
+    && current.generation === flow.generation
+    && current.account === flow.account
+  );
+}
+async function reconcileAttendanceConsolidationMutationResult(flow, data) {
+  if (!attendanceConsolidationMutationResponseExpected(flow)) return false;
+  let accountChanged = S.attendanceConsolidation?.accountChangedAfterMutation === true;
+  if (!accountChanged) {
+    try {
+      const identity = await call("attendance_google_identity");
+      const actualAccount = String(identity?.account || "").trim().toLowerCase();
+      accountChanged = !actualAccount || Boolean(flow.account && actualAccount !== flow.account);
+    } catch (_) {
+      // 백엔드 결과는 이미 받았다. 추가 계정 확인 실패만으로 그 결과를 버리지 않는다.
+    }
+  }
+  if (!attendanceConsolidationMutationResponseExpected(flow)) return false;
+  accountChanged = accountChanged
+    || S.attendanceConsolidation?.accountChangedAfterMutation === true;
+  if (!accountChanged) return true;
+  preserveAttendanceConsolidationMutationForAccountChange(data);
+  S.attendanceTransitioning = false;
+  render();
+  return false;
+}
+function beginAttendanceConsolidationFlow(view) {
+  invalidateAttendanceConsolidationFlow();
+  const flow = {
+    view,
+    generation: attendanceConsolidationGeneration,
+    account: attendanceConsolidationAccount(),
+  };
+  S.attendanceConsolidation = flow;
+  return flow;
+}
+function stopAttendanceConsolidationForAccountChange(flow, expectedViews) {
+  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
+  invalidateAttendanceConsolidationFlow();
+  setBanner("warn", ATTENDANCE_CONSOLIDATION_ACCOUNT_CHANGED_MESSAGE);
+  return false;
+}
+async function attendanceConsolidationLiveAccountMatches(flow, expectedViews) {
+  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
+  let identity;
+  try {
+    identity = await call("attendance_google_identity");
+  } catch (_) {
+    if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
+    return stopAttendanceConsolidationForAccountChange(flow, expectedViews);
+  }
+  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
+  const actualAccount = String(identity?.account || "").trim().toLowerCase();
+  if (!actualAccount || (flow.account && actualAccount !== flow.account)) {
+    return stopAttendanceConsolidationForAccountChange(flow, expectedViews);
+  }
+  if (!flow.account) {
+    flow.account = actualAccount;
+    S.attendanceConsolidation = {
+      ...(S.attendanceConsolidation || {}),
+      generation: flow.generation,
+      account: actualAccount,
+    };
+  }
+  return attendanceConsolidationFlowActive(flow, expectedViews);
+}
+function scheduleAttendanceConsolidationLoginPoll(flow) {
+  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+  stopAttendanceConsolidationLoginPoll();
+  attendanceConsolidationLoginTimer = setTimeout(() => {
+    attendanceConsolidationLoginTimer = null;
+    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+    pollAttendanceConsolidationLoginOnce(flow, false).catch((error) => {
+      if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+      S.attendanceConsolidation = {
+        view: "failed", detail: error.message || "Google 권한 허용을 확인하지 못했어요.",
+        generation: flow.generation, account: flow.account,
+      };
+      S.attendanceConsolidationLoginStarted = false;
+      render();
+    });
+  }, 500);
+}
+async function pollAttendanceConsolidationLoginOnce(flow, startLogin) {
+  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+  let snap;
+  if (startLogin && !S.attendanceConsolidationLoginStarted) {
+    S.attendanceConsolidationLoginStarted = true;
+    snap = await call("gws_login_start");
+    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+  } else {
+    snap = await call("gws_login_status");
+    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+  }
+  if (snap.ok === true) {
+    stopAttendanceConsolidationLoginPoll();
+    S.attendanceConsolidationLoginStarted = false;
+    if (!await attendanceConsolidationLiveAccountMatches(flow, ["permission"])) return;
+    const preview = await call("attendance_consolidation_preview");
+    if (!await attendanceConsolidationLiveAccountMatches(flow, ["permission"])) return;
+    S.attendanceConsolidation = {
+      ...preview,
+      view: preview.state === "ready" ? "preview" : "failed",
+      generation: flow.generation,
+      account: flow.account,
+    };
+    render();
+    return;
+  }
+  if (snap.ok === false) {
+    stopAttendanceConsolidationLoginPoll();
+    S.attendanceConsolidationLoginStarted = false;
+    S.attendanceConsolidation = {
+      view: "failed",
+      detail: snap.detail || "Google 권한 허용이 끝나지 않았어요. 다시 시도해 주세요.",
+      generation: flow.generation,
+      account: flow.account,
+    };
+    render();
+    return;
+  }
+  S.attendanceConsolidation = {
+    ...(S.attendanceConsolidation || {}), view: "permission", login: snap,
+    generation: flow.generation, account: flow.account,
+  };
+  render();
+  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
+  scheduleAttendanceConsolidationLoginPoll(flow);
+}
+function attendanceConsolidationDialogHtml() {
+  const flow = S.attendanceConsolidation;
+  if (!flow) return "";
+  const result = flow.result || {};
+  const safeBackendState = result.state === "account-changed-after-mutation"
+    ? ` data-backend-state="${esc(result.backend_state || "unknown")}"`
+    : "";
+  const close = `<button class="btn-quiet" data-action="attendance-consolidation-close">닫기</button>`;
+  let content = "";
+  if (flow.view === "loading-preview") {
+    content = `<h3>정리할 자료 확인</h3><p>같은 이름의 출석부와 줄 수를 읽고 있어요.</p>
+      <div class="attendance-consolidation-actions">${close}</div>`;
+  } else if (flow.view === "permission") {
+    const url = flow.login?.url || "";
+    content = `<h3>Google 권한 허용</h3>
+      <p>기존 자료는 바꾸지 않고, 정리에 필요한 Google 권한을 한 번 확인합니다.</p>
+      ${url ? linkRow(url) : ""}
+      <div class="attendance-consolidation-actions">
+        <button class="btn-quiet" data-action="attendance-consolidation-login-cancel">취소</button>
+      </div>`;
+  } else if (flow.view === "preview") {
+    const files = Array.isArray(flow.files) ? flow.files : [];
+    const rows = files.map((file) => `<li>
+      <b>${esc(file.name)}</b><small>${esc(file.created_time)}</small>
+      <span>출결 ${Number(file.attendance_rows || 0)}줄</span>
+      <span>개인톡 ${Number(file.personal_chat_rows || 0)}줄</span>
+      <span>단체톡 ${Number(file.group_chat_rows || 0)}줄</span>
+      <span>발송 ${Number(file.send_rows || 0)}줄</span>
+      <strong>합계 ${Number(file.total_rows || 0)}줄</strong>
+    </li>`).join("");
+    content = `<h3>정리할 자료 확인</h3>
+      <ul class="attendance-consolidation-files">${rows}</ul>
+      <p class="attendance-consolidation-total">출석부 ${files.length}개 · 전체 ${Number(flow.total_rows || 0)}줄</p>
+      <p class="attendance-consolidation-warning">완료 뒤 이전 같은 이름 출석부는 Google Drive 휴지통으로 이동하며 복원할 수 있습니다</p>
+      <div class="attendance-consolidation-actions">${close}
+        <button class="btn" data-action="attendance-consolidation-confirm">새 정본으로 정리하기</button>
+      </div>`;
+  } else if (flow.view === "progress") {
+    content = `<h3>출석부를 하나로 정리하고 있어요</h3>
+      <ol class="attendance-consolidation-stages">${ATTENDANCE_CONSOLIDATION_STAGES.map(
+        (stage) => `<li><span>•</span><b>${stage}</b></li>`,
+      ).join("")}</ol>`;
+  } else if (flow.view === "result" && result.state === "account-changed-after-mutation") {
+    content = `<h3>Google 계정이 바뀌었어요</h3>
+      <p>${esc(ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE)}</p>
+      <div class="attendance-consolidation-actions">${close}</div>`;
+  } else if (flow.view === "result" && result.state === "ai-action-required") {
+    content = `<h3>AI 입력 연결 확인이 필요해요</h3>
+      <p>새 정본을 열고 출결 업무 자동화 메뉴에서 <b>AI 출결 입력 연결 확인</b>을 한 번 눌러 주세요.</p>
+      <div class="attendance-consolidation-actions">
+        <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
+        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>연결 확인하고 계속</button>
+      </div>`;
+  } else if (flow.view === "result" && result.state === "cleanup-required") {
+    content = `<h3>이전 파일 정리가 남았어요</h3>
+      <div class="attendance-consolidation-actions">
+        <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
+        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>남은 이전 파일 정리</button>
+      </div>`;
+  } else if (flow.view === "result" && result.state === "complete") {
+    const moved = (Array.isArray(result.moved_files) && result.moved_files.length
+      ? result.moved_files
+      : (Array.isArray(flow.files) ? flow.files.map((file) => ({
+          name: file.name, moved_rows: file.total_rows,
+        })) : []));
+    content = `<h3>새 정본으로 정리를 마쳤어요</h3>
+      <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
+      <ul class="attendance-consolidation-moved">${moved.map(
+        (file) => `<li><b>${esc(file.name)}</b><span>${Number(file.moved_rows || 0)}줄 옮김</span></li>`,
+      ).join("")}</ul>
+      <p>AI 입력 연결 확인</p>
+      <p>휴지통으로 이동한 파일 ${Number(result.trashed_count || 0)}개</p>
+      <div class="attendance-consolidation-actions">${close}</div>`;
+  } else if (flow.view === "result" && [
+    "record-switch-in-flight", "record-switched", "recovery-required",
+  ].includes(result.state)) {
+    content = `<h3>저장된 진행 상태를 확인해 주세요</h3>
+      <p>${esc(result.detail || "정리 진행 상태를 확인한 뒤 이어서 진행합니다.")}</p>
+      <div class="attendance-consolidation-actions">${close}
+        ${result.spreadsheet_url ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>` : ""}
+        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>확인하고 계속</button>
+      </div>`;
+  } else if (flow.view === "refresh") {
+    content = `<h3>자료를 다시 확인해 주세요</h3><p>${esc(flow.detail || "확인한 뒤 자료가 바뀌었습니다.")}</p>
+      <div class="attendance-consolidation-actions">${close}
+        <button class="btn" data-action="consolidate-attendance-go">미리보기 다시 읽기</button>
+      </div>`;
+  } else {
+    content = `<h3>정리를 시작하지 못했어요</h3><p>${esc(flow.detail || "기존 자료와 현재 연결은 그대로입니다.")}</p>
+      <div class="attendance-consolidation-actions">${close}</div>`;
+  }
+  return `<div class="attendance-update-dialog-overlay">
+    <section class="attendance-update-dialog attendance-consolidation-dialog" role="dialog" aria-modal="true"${safeBackendState}>${content}</section>
+  </div>`;
+}
 function attendanceScriptUpdateHtml(a) {
   if (!a || !["ready", "script-check-required", "script-update-required"].includes(a.state)) return "";
   if (a.state === "ready") return "";
   const update = S.attendanceScriptUpdate;
+  if (update?.state === "ai-action-required") {
+    const detail = String(update.detail || "").trim()
+      || "출석부 안에서 AI 출결 입력 연결 확인을 한 번 눌러 주세요.";
+    return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
+      ${update.spreadsheet_url ? `<button class="btn-quiet" data-action="link-open" data-url="${esc(update.spreadsheet_url)}">출석부 열기</button>` : ""}
+      <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">연결 확인하고 계속</button></div>`;
+  }
   if (update?.state === "customized") {
     return `<div class="attendance-script-update warn"><span>직접 수정된 기능이라 자동으로 바꾸지 않아요.</span></div>`;
   }
@@ -1560,6 +1884,11 @@ function attendanceTabHtml() {
   } else if (a.state === "auth-error") {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
+  } else if (a.state === "reconnect-required") {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || "현재 출석부를 먼저 다시 연결해 주세요.")}</span>
+      <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
+  } else if (a.state === "recovery-required") {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || "정리 진행 기록을 안전하게 확인하지 못해 자동 작업을 멈췄습니다.")}</span></div>`;
   } else if (a.state === "profile-required"
       && (identityIssues().length || dayIssues().length)) {
     // 초안이 진짜 비어 있을 때만 안내한다.
@@ -1572,7 +1901,11 @@ function attendanceTabHtml() {
   const scriptCheckRequired = a.state === "script-check-required";
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
-  const consolidationRequired = a.state === "consolidation-required";
+  const consolidationRequired = a.consolidation_required === true;
+  const transitionAttentionRequired = [
+    "ai-action-required", "record-switch-in-flight", "record-switched",
+    "cleanup-required", "recovery-required",
+  ].includes(a.state);
   const pendingGuide = S.mode === "wizard"
     ? a.state === "installing"
       ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"
@@ -1600,9 +1933,10 @@ function attendanceTabHtml() {
       : ""}
     ${ready
       ? ""
-      : scriptAttentionRequired || consolidationRequired || S.mode === "wizard" ? ""
+      : scriptAttentionRequired || consolidationRequired || transitionAttentionRequired || S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
-    ${attendanceScriptUpdateDialogHtml()}`;
+    ${attendanceScriptUpdateDialogHtml()}
+    ${attendanceConsolidationDialogHtml()}`;
 }
 /* ---------- 연결 3탭: AI 에이전트 ---------- */
 function aiTabHtml() {
@@ -1860,34 +2194,197 @@ bindActions({
     }
   },
   "consolidate-attendance-go": async () => {
-    const a = S.attendance || {};
-    const name = a.canonical_workbook_name || "새 정식 출석부";
-    if (!window.confirm(
-      `AI 입력이 작동하던 기존 출결 자료를 ${name} 파일 하나로 전부 복사합니다.\n\n` +
-      "기존 Google Sheet 두 개는 지우거나 이름을 바꾸지 않고 그대로 둡니다. 계속할까요?"
-    )) return;
+    if (S.attendanceTransitioning) return;
+    const resumeToken = String(S.attendance?.transition_action_token || "").trim().toLowerCase();
+    const resumeState = String(S.attendance?.state || "");
+    if (/^[0-9a-f]{64}$/.test(resumeToken) && [
+      "ai-action-required", "record-switch-in-flight", "record-switched",
+      "cleanup-required", "recovery-required",
+    ].includes(resumeState)) {
+      const flow = beginAttendanceConsolidationFlow("result");
+      flow.fingerprint = resumeToken;
+      S.attendanceConsolidation = {
+        ...flow,
+        fingerprint: resumeToken,
+        result: {
+          state: resumeState,
+          spreadsheet_url: S.attendance?.spreadsheet_url || "",
+          detail: S.attendance?.detail || "",
+        },
+      };
+      render();
+      return;
+    }
+    const flow = beginAttendanceConsolidationFlow("loading-preview");
     S.attendanceTransitioning = true;
     render();
     try {
-      const data = await call("consolidate_attendance");
-      S.attendance = data;
-      S.attendanceScriptUpdate = null;
-      S.chatStatus = null;
-      S.chatSpaces = undefined;
-      S.chatSpaceName = undefined;
-      stopChatConnectPoll();
-      if (data.state === "ready") {
-        S.firstSetupDone = false;
-        if (S.mode === "wizard") startAttendancePreparePoll();
-        showToast("출결 시트를 새 정식 파일 하나로 정리했어요");
-        if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
+      if (!await attendanceConsolidationLiveAccountMatches(flow, ["loading-preview"])) return;
+      const preview = await call("attendance_consolidation_preview");
+      if (!await attendanceConsolidationLiveAccountMatches(flow, ["loading-preview"])) return;
+      if (preview.state === "permission-required") {
+        S.attendanceConsolidation = {
+          ...preview, view: "permission",
+          generation: flow.generation, account: flow.account,
+        };
+        render();
+        await pollAttendanceConsolidationLoginOnce(flow, true);
+        if (!attendanceConsolidationFlowActive(flow)) return;
+      } else if (preview.state === "ready") {
+        S.attendanceConsolidation = {
+          ...preview, view: "preview",
+          generation: flow.generation, account: flow.account,
+        };
       } else {
-        setBanner("warn", data.detail || "출결 시트를 하나로 정리하지 못했어요.");
+        S.attendanceConsolidation = {
+          ...preview, view: "failed",
+          generation: flow.generation, account: flow.account,
+        };
       }
     } finally {
+      if (!attendanceConsolidationFlowActive(flow)) return;
       S.attendanceTransitioning = false;
       render();
     }
+  },
+  "attendance-consolidation-confirm": async () => {
+    if (S.attendanceTransitioning || !S.attendanceConsolidation?.fingerprint) return;
+    const flow = S.attendanceConsolidation;
+    if (!attendanceConsolidationFlowActive(flow, ["preview"])) return;
+    const fingerprint = flow.fingerprint;
+    S.attendanceTransitioning = true;
+    S.attendanceConsolidation = {
+      ...flow, view: "progress",
+      generation: flow.generation, account: flow.account,
+    };
+    render();
+    try {
+      if (!await attendanceConsolidationLiveAccountMatches(flow, ["progress"])) return;
+      const pendingMutation = call("consolidate_attendance", fingerprint);
+      markAttendanceConsolidationMutationDispatched(flow);
+      const data = await pendingMutation;
+      if (!await reconcileAttendanceConsolidationMutationResult(flow, data)) return;
+      if ([
+        "complete", "cleanup-required", "ai-action-required",
+        "record-switch-in-flight", "record-switched", "recovery-required",
+      ].includes(data.state)) {
+        S.attendanceConsolidation = {
+          ...flow, view: "result", result: data,
+          generation: flow.generation, account: flow.account,
+        };
+        if (data.state === "complete") {
+          S.attendanceScriptUpdate = null;
+          S.chatStatus = null;
+          S.chatSpaces = undefined;
+          S.chatSpaceName = undefined;
+          stopChatConnectPoll();
+          S.firstSetupDone = false;
+          if (S.mode === "wizard") startAttendancePreparePoll();
+          render();
+          try {
+            const attendance = await call("attendance_status");
+            if (attendanceConsolidationFlowActive(flow, ["result"])
+                && S.attendanceConsolidation?.accountChangedAfterMutation !== true) {
+              S.attendance = attendance;
+            }
+          } catch (_) {
+            // 전환 결과는 이미 받았다. 뒤따른 상태 조회 실패가 그 결과를 지우지 않는다.
+          }
+        }
+      } else if (data.state === "refresh-required") {
+        S.attendanceConsolidation = {
+          view: "refresh", detail: data.detail || "",
+          generation: flow.generation, account: flow.account,
+        };
+      } else if (data.state === "permission-required") {
+        S.attendanceConsolidation = {
+          view: "permission", detail: data.detail || "",
+          generation: flow.generation, account: flow.account,
+        };
+        render();
+        await pollAttendanceConsolidationLoginOnce(flow, true);
+        if (!attendanceConsolidationFlowActive(flow)) return;
+      } else {
+        S.attendanceConsolidation = {
+          view: "failed", detail: data.detail || "",
+          generation: flow.generation, account: flow.account,
+        };
+      }
+    } finally {
+      if (!attendanceConsolidationFlowActive(flow)) return;
+      flow.mutationPending = false;
+      S.attendanceConsolidation = {
+        ...(S.attendanceConsolidation || {}), mutationPending: false,
+      };
+      S.attendanceTransitioning = false;
+      render();
+    }
+  },
+  "attendance-consolidation-cleanup": async () => {
+    if (S.attendanceTransitioning || !S.attendanceConsolidation?.fingerprint) return;
+    const flow = S.attendanceConsolidation;
+    if (!attendanceConsolidationFlowActive(flow, ["result"])) return;
+    const fingerprint = flow.fingerprint;
+    S.attendanceTransitioning = true;
+    render();
+    try {
+      if (!await attendanceConsolidationLiveAccountMatches(flow, ["result"])) return;
+      const pendingMutation = call("consolidate_attendance", fingerprint);
+      markAttendanceConsolidationMutationDispatched(flow);
+      const data = await pendingMutation;
+      if (!await reconcileAttendanceConsolidationMutationResult(flow, data)) return;
+      if ([
+        "complete", "cleanup-required", "ai-action-required",
+        "record-switch-in-flight", "record-switched", "recovery-required",
+      ].includes(data.state)) {
+        S.attendanceConsolidation = {
+          ...flow, view: "result", result: data,
+          generation: flow.generation, account: flow.account,
+        };
+        if (data.state === "complete") {
+          S.attendanceScriptUpdate = null;
+          S.chatStatus = null;
+          S.chatSpaces = undefined;
+          S.chatSpaceName = undefined;
+          stopChatConnectPoll();
+          S.firstSetupDone = false;
+          if (S.mode === "wizard") startAttendancePreparePoll();
+          render();
+          try {
+            const attendance = await call("attendance_status");
+            if (attendanceConsolidationFlowActive(flow, ["result"])
+                && S.attendanceConsolidation?.accountChangedAfterMutation !== true) {
+              S.attendance = attendance;
+            }
+          } catch (_) {
+            // 전환 결과는 이미 받았다. 뒤따른 상태 조회 실패가 그 결과를 지우지 않는다.
+          }
+        }
+      } else {
+        S.attendanceConsolidation = {
+          ...flow, view: data.state === "refresh-required" ? "refresh" : "failed",
+          detail: data.detail || "",
+          generation: flow.generation, account: flow.account,
+        };
+      }
+    } finally {
+      if (!attendanceConsolidationFlowActive(flow)) return;
+      flow.mutationPending = false;
+      S.attendanceConsolidation = {
+        ...(S.attendanceConsolidation || {}), mutationPending: false,
+      };
+      S.attendanceTransitioning = false;
+      render();
+    }
+  },
+  "attendance-consolidation-login-cancel": async () => {
+    invalidateAttendanceConsolidationFlow();
+    setBanner("warn", "권한 허용을 취소했습니다. 현재 연결과 출석부는 바뀌지 않았습니다");
+    await call("gws_login_cancel");
+  },
+  "attendance-consolidation-close": () => {
+    invalidateAttendanceConsolidationFlow();
+    render();
   },
   "chat-connect": async () => {
     await call("attendance_chat_connect");
@@ -2070,7 +2567,14 @@ function readinessRow(title, note, state, retryAction) {
 async function refreshSettingsStatus() {
   // 컴퓨터 → Google → 로그인 시 Calendar·Tasks 목록까지 한 번에 재점검한다.
   S.computer = await call("computer_status");
-  S.google = await call("google_status");
+  const previousGoogle = S.google;
+  const nextGoogle = await call("google_status");
+  const previousAccount = String(previousGoogle?.user || "").trim().toLowerCase();
+  const nextAccount = String(nextGoogle?.user || "").trim().toLowerCase();
+  S.google = nextGoogle;
+  if (previousGoogle && previousAccount !== nextAccount) {
+    clearGoogleDependentState();
+  }
   S.gwsUpdate = await call("gws_update_status");
   if (isGoeduGoogleStatus(S.google)) {
     try {
@@ -2809,12 +3313,15 @@ function capHtml(cap) {
   const emptyLine = !(cap.items || []).length && cap.ok
     ? `<div class="item"><span class="none">${esc(EMPTY_ITEM_LINES[cap.stage] || "만든 항목이 없어요.")}</span></div>` : "";
   const reason = cap.reason ? `<div class="cap-reason">${esc(cap.reason)}</div>` : "";
-  const retry = cap.retry ? `<div class="capture-retry">${esc(cap.retry)}</div>` : "";
+  const retry = !cap.retryable && cap.retry ? `<div class="capture-retry">${esc(cap.retry)}</div>` : "";
+  const retryButton = cap.retryable
+    ? `<div class="capture-retry-action"><button class="btn-tonal" data-action="cap-retry" data-source-hash="${esc(cap.source_hash || "")}" data-when="${esc(cap.when || "")}" data-busy-text="다시 처리하는 중…">실패한 항목 다시 시도</button></div>`
+    : "";
   return `<div class="cap${open}">
     <button class="cap-row" data-action="cap-toggle" data-key="${esc(key)}">
       ${dot}<span class="cap-when">${esc(fmtShort(cap.when))}</span><span class="cap-sum">${esc(cap.summary || "")}</span>${fresh}${trial}<span class="chev">▶</span>
     </button>
-    <div class="cap-items">${items}${emptyLine}${retry}</div>${reason}</div>`;
+    <div class="cap-items">${items}${emptyLine}${retry}${retryButton}</div>${reason}</div>`;
 }
 const CAP_PAGE_SIZE = 10;
 function capturePageNumbers(current, total) {
@@ -2899,6 +3406,16 @@ bindActions({
   "cap-page": (el) => {
     const page = Number(el.dataset.page || 1);
     if (page >= 1 && page <= S.capsTotalPages && page !== S.capsPage) loadCapturePage(page);
+  },
+  "cap-retry": async (el) => {
+    const result = await call(
+      "retry_capture",
+      String(el.dataset.sourceHash || ""),
+      String(el.dataset.when || ""),
+    );
+    if (result.success) showToast(result.message);
+    else setBanner("warn", result.message);
+    await loadCapturePage(1, { quiet: true, markFresh: true });
   },
 });
 
@@ -3303,9 +3820,12 @@ async function loadForEdit(key) {
 }
 
 /* ---------- 버전 및 제작 정보 ---------- */
+const LATEST_RELEASE_URL = "https://github.com/rheps/teacher-manager/releases/latest";
 function renderAbout() {
   const b = S.info.branding;
   const u = updateControls();
+  const directDisabled = S.updating ? " disabled" : "";
+  const manualInstallGuide = "자동 업데이트가 정상적으로 되지 않는 경우, 이 안내를 눌러 GitHub 릴리즈 페이지에서 최신 설치 파일을 직접 내려받은 뒤 실행해 주세요. 기존 프로그램을 삭제할 필요 없이 그대로 설치하면 업데이트됩니다.";
   root().innerHTML = homeHtml(true) + windowHtml("버전 및 제작 정보", `
     <h2 class="about-brand">${esc(b.name)}</h2>
     <p class="sub">${esc(b.tagline)}</p>
@@ -3314,6 +3834,7 @@ function renderAbout() {
       <div class="row"><span class="name">만든 사람</span><span class="st">${esc(b.credit.replace("만든 사람: ", ""))}</span></div>
       <div class="row"><span class="name">게시자</span><span class="st">${esc(b.publisher)}</span></div>
       <div class="row"><span class="name">프로그램 업데이트</span>${u.st}${u.btn}</div>
+      <div class="update-manual-note"><button type="button" class="update-manual-link" role="link" data-action="link-open" data-url="${LATEST_RELEASE_URL}"${directDisabled}>${esc(manualInstallGuide)}</button></div>
     </div>
     <div class="section-h">웹사이트</div>
     ${linkRow(b.website)}`, false) + toastHtml();

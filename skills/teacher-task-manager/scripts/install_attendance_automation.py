@@ -29,6 +29,7 @@ _PENDING_DEPLOYMENT_DESCRIPTION = "pending_deployment_description"
 _PENDING_DEPLOYMENT_VERSION = "pending_deployment_version_number"
 _DEPLOYMENT_DESCRIPTION_PREFIX = "teacher-manager-attendance-install-"
 _DRIVE_INTENT_PROPERTY = "teacherManagerInstallIntent"
+_CONSOLIDATION_FINGERPRINT_PROPERTY = "teacherManagerConsolidationFingerprint"
 _PENDING_TEMPLATE_INTENT = "pending_template_doc_intent"
 _PENDING_SHEET_INTENT = "pending_spreadsheet_intent"
 _PENDING_FOLDER_INTENT = "pending_folder_intent"
@@ -1348,6 +1349,73 @@ def _require_attendance_creation_reason(reason: str) -> str:
     return checked
 
 
+def _consolidation_candidate_name(workbook_name: str, fingerprint: str) -> str:
+    checked_name = str(workbook_name or "").strip()
+    checked_fingerprint = str(fingerprint or "").strip().lower()
+    if not checked_name:
+        raise ValueError("정리 후보 출석부의 정식 이름이 없습니다.")
+    if not re.fullmatch(r"[0-9a-f]{64}", checked_fingerprint):
+        raise ValueError("정리 미리보기 지문을 확인하지 못했습니다.")
+    return f"{checked_name} (정리 중 {checked_fingerprint[:12]})"
+
+
+def _verify_consolidation_candidate_identity(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    candidate_spreadsheet_id: str,
+    source_spreadsheet_id: str,
+    expected_name: str,
+    fingerprint: str,
+    gws_executable: str,
+) -> dict:
+    candidate_id = str(candidate_spreadsheet_id or "").strip()
+    source_id = str(source_spreadsheet_id or "").strip()
+    if not candidate_id or not source_id or candidate_id == source_id:
+        raise CreationRecoveryPendingError(
+            "정리 후보와 현재 출석부를 서로 다른 파일로 확인하지 못했어요."
+        )
+    checked = run_json(
+        runner,
+        [
+            gws_executable,
+            "drive",
+            "files",
+            "get",
+            "--params",
+            json.dumps(
+                {
+                    "fileId": candidate_id,
+                    "fields": (
+                        "id,name,mimeType,ownedByMe,trashed,"
+                        "appProperties,webViewLink"
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    properties = checked.get("appProperties") if isinstance(checked, dict) else None
+    if not (
+        isinstance(checked, dict)
+        and checked.get("id") == candidate_id
+        and checked.get("name") == expected_name
+        and checked.get("mimeType") == SPREADSHEET_MIME
+        and checked.get("ownedByMe") is True
+        and checked.get("trashed") is False
+        and isinstance(properties, dict)
+        and properties.get(_CONSOLIDATION_FINGERPRINT_PROPERTY) == fingerprint
+    ):
+        raise CreationRecoveryPendingError(
+            "정리 후보 파일의 이름, 소유자, 종류 또는 정리 표식을 확인하지 못했어요. "
+            "현재 출석부와 후보를 바꾸거나 지우지 않았습니다."
+        )
+    return checked
+
+
 def create_canonical_attendance_workbook(
     runner: CommandRunner,
     workdir: Path,
@@ -1357,17 +1425,23 @@ def create_canonical_attendance_workbook(
     intent: str,
     creation_reason: str,
     source_spreadsheet_id: str = "",
+    consolidation_fingerprint: str = "",
     existing_sheet: dict | None = None,
     dry_run: bool,
     gws_executable: str,
 ) -> dict:
     """승인된 세 경우에만 정식 출결 Google Sheet를 만드는 유일한 문."""
 
-    _require_attendance_creation_reason(creation_reason)
+    creation_reason = _require_attendance_creation_reason(creation_reason)
     dry = ["--dry-run"] if dry_run else []
     source_id = str(source_spreadsheet_id or "").strip()
     if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR and not source_id:
         raise ValueError("두 갈래 정리 원본 출결 시트 번호가 없습니다.")
+    candidate_name = (
+        _consolidation_candidate_name(workbook_name, consolidation_fingerprint)
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR
+        else workbook_name
+    )
     if existing_sheet is not None:
         sheet = dict(existing_sheet)
     else:
@@ -1380,10 +1454,19 @@ def create_canonical_attendance_workbook(
             "--json",
             json.dumps(
                 {
-                    "name": workbook_name,
+                    "name": candidate_name,
                     "mimeType": SPREADSHEET_MIME,
                     "appProperties": {
                         _DRIVE_INTENT_PROPERTY: intent,
+                        **(
+                            {
+                                _CONSOLIDATION_FINGERPRINT_PROPERTY: (
+                                    consolidation_fingerprint
+                                )
+                            }
+                            if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR
+                            else {}
+                        ),
                         **attendance_workbook_identity.attendance_workbook_app_properties(
                             profile
                         ),
@@ -1392,15 +1475,14 @@ def create_canonical_attendance_workbook(
                 ensure_ascii=False,
             ),
         ]
-        if creation_reason != ATTENDANCE_CREATION_SPLIT_REPAIR:
-            create_args.extend(
-                [
-                    "--upload",
-                    ".\\attendance-workbook.xlsx",
-                    "--upload-content-type",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                ]
-            )
+        create_args.extend(
+            [
+                "--upload",
+                ".\\attendance-workbook.xlsx",
+                "--upload-content-type",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ]
+        )
         create_args.extend(["--format", "json"])
         sheet = run_json(
             runner,
@@ -1417,8 +1499,7 @@ def create_canonical_attendance_workbook(
             },
             dry_run,
         )
-    if creation_reason != ATTENDANCE_CREATION_SPLIT_REPAIR or dry_run:
-        return sheet
+    return sheet
 
     destination_id = str(sheet.get("id", "") or "").strip()
     if not destination_id:
@@ -1920,6 +2001,144 @@ def _restore_candidate_student_dropdowns(
                 )
 
 
+_AUTHORITATIVE_TAB_RANGES = (
+    ("학생명단!A1:D", "학생명단!A:D", 4),
+    ("휴일!A1:F", "휴일!A:F", 6),
+)
+
+
+def _read_authoritative_tab_rows(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    spreadsheet_id: str,
+    range_name: str,
+    column_count: int,
+    gws_executable: str,
+) -> tuple[tuple[Any, ...], ...]:
+    reply = run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "values",
+            "get",
+            "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet_id,
+                    "range": range_name,
+                    "majorDimension": "ROWS",
+                    "valueRenderOption": "UNFORMATTED_VALUE",
+                    "dateTimeRenderOption": "SERIAL_NUMBER",
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    values = reply.get("values") if isinstance(reply, dict) else None
+    if not isinstance(values, list):
+        raise CreationRecoveryPendingError(
+            "현재 출석부의 학생명단과 휴일을 안전하게 읽지 못했어요."
+        )
+    normalized: list[tuple[Any, ...]] = []
+    for row in values:
+        if not isinstance(row, list) or len(row) > column_count or any(
+            isinstance(cell, (dict, list)) for cell in row
+        ):
+            raise CreationRecoveryPendingError(
+                "현재 출석부의 학생명단과 휴일 값 모양을 확인하지 못했어요."
+            )
+        normalized.append(
+            tuple("" if cell is None else cell for cell in row)
+            + ("",) * (column_count - len(row))
+        )
+    if not normalized or not any(cell != "" for cell in normalized[0]):
+        raise CreationRecoveryPendingError(
+            "현재 출석부의 학생명단과 휴일 제목 줄을 확인하지 못했어요."
+        )
+    return tuple(normalized)
+
+
+def _replace_authoritative_tab_rows(
+    runner: CommandRunner,
+    workdir: Path,
+    *,
+    spreadsheet_id: str,
+    range_name: str,
+    clear_range: str,
+    rows: tuple[tuple[Any, ...], ...],
+    gws_executable: str,
+) -> None:
+    run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "values",
+            "clear",
+            "--params",
+            json.dumps(
+                {"spreadsheetId": spreadsheet_id, "range": clear_range},
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    range_start, end_column = range_name.rsplit(":", 1)
+    exact_range = f"{range_start}:{end_column}{len(rows)}"
+    updated = run_json(
+        runner,
+        [
+            gws_executable,
+            "sheets",
+            "spreadsheets",
+            "values",
+            "update",
+            "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet_id,
+                    "range": exact_range,
+                    "valueInputOption": "RAW",
+                },
+                ensure_ascii=False,
+            ),
+            "--json",
+            json.dumps(
+                {"majorDimension": "ROWS", "values": [list(row) for row in rows]},
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        workdir,
+    )
+    if not isinstance(updated, dict) or updated.get("updatedRange") != exact_range:
+        raise CreationRecoveryPendingError(
+            "새 출석부 후보에 학생명단과 휴일을 쓴 범위를 확인하지 못했어요."
+        )
+    checked = _read_authoritative_tab_rows(
+        runner,
+        workdir,
+        spreadsheet_id=spreadsheet_id,
+        range_name=range_name,
+        column_count=len(rows[0]),
+        gws_executable=gws_executable,
+    )
+    if checked != rows:
+        raise CreationRecoveryPendingError(
+            "새 출석부 후보의 학생명단과 휴일을 다시 읽은 값이 원본과 다릅니다."
+        )
+
+
 def install_attendance_automation(
     profile_json: Path,
     runner: CommandRunner = default_runner,
@@ -1934,6 +2153,7 @@ def install_attendance_automation(
     gws_executable: str,
     creation_reason: str = ATTENDANCE_CREATION_FIRST_SETUP,
     source_spreadsheet_id: str = "",
+    consolidation_fingerprint: str = "",
     write_record_on_success: bool = True,
 ) -> AttendanceInstallResult:
     creation_reason = _require_attendance_creation_reason(creation_reason)
@@ -1947,6 +2167,13 @@ def install_attendance_automation(
     asset_root = bundle_paths.bundle_root() / "assets"
     profile = load_profile(profile_json)
     workbook_name = attendance_workbook_name(profile)
+    candidate_workbook_name = (
+        _consolidation_candidate_name(workbook_name, consolidation_fingerprint)
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR
+        else workbook_name
+    )
+    if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+        write_record_on_success = False
 
     # 지난 시도에서 이미 만든 Google 자료 ID — 있으면 생성 명령을 건너뛴다.
     created_ids: dict[str, str] = {
@@ -1963,6 +2190,7 @@ def install_attendance_automation(
         dry = ["--dry-run"] if dry_run else []
         source_setting_rows: list[list[str]] = []
         source_settings: dict[str, str] = {}
+        authoritative_tabs: dict[str, tuple[tuple[Any, ...], ...]] = {}
         if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
             source_setting_rows = _read_existing_setting_rows(
                 runner,
@@ -2003,6 +2231,15 @@ def install_attendance_automation(
             ).strip()
             if source_task_title:
                 attendance_task_list_title = source_task_title
+            for range_name, _clear_range, column_count in _AUTHORITATIVE_TAB_RANGES:
+                authoritative_tabs[range_name] = _read_authoritative_tab_rows(
+                    runner,
+                    workdir,
+                    spreadsheet_id=source_spreadsheet_id,
+                    range_name=range_name,
+                    column_count=column_count,
+                    gws_executable=gws_executable,
+                )
 
         # 설치 기록이 없는 컴퓨터만 정식 Drive 표식으로 되찾는다. 이름은 사용자가
         # 바꿀 수 있으므로 연결 근거로 쓰지 않는다. 예전 이름만 있으면 새 파일을
@@ -2136,7 +2373,7 @@ def install_attendance_automation(
                     runner,
                     workdir,
                     intent=intent,
-                    name=workbook_name,
+                    name=candidate_workbook_name,
                     mime_type=SPREADSHEET_MIME,
                     label="출결 시트",
                     gws_executable=gws_executable,
@@ -2153,6 +2390,7 @@ def install_attendance_automation(
                         intent=intent,
                         creation_reason=creation_reason,
                         source_spreadsheet_id=source_spreadsheet_id,
+                        consolidation_fingerprint=consolidation_fingerprint,
                         existing_sheet=sheet,
                         dry_run=dry_run,
                         gws_executable=gws_executable,
@@ -2169,6 +2407,7 @@ def install_attendance_automation(
                     intent=intent,
                     creation_reason=creation_reason,
                     source_spreadsheet_id=source_spreadsheet_id,
+                    consolidation_fingerprint=consolidation_fingerprint,
                     dry_run=dry_run,
                     gws_executable=gws_executable,
                 )
@@ -2187,6 +2426,29 @@ def install_attendance_automation(
             created_ids["spreadsheet_url"] = (
                 f"https://docs.google.com/spreadsheets/d/{created_ids['spreadsheet_id']}/edit"
             )
+        if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
+            verified_candidate = _verify_consolidation_candidate_identity(
+                runner,
+                workdir,
+                candidate_spreadsheet_id=created_ids["spreadsheet_id"],
+                source_spreadsheet_id=source_spreadsheet_id,
+                expected_name=candidate_workbook_name,
+                fingerprint=consolidation_fingerprint,
+                gws_executable=gws_executable,
+            )
+            verified_url = str(verified_candidate.get("webViewLink", "") or "").strip()
+            if verified_url:
+                created_ids["spreadsheet_url"] = verified_url
+            for range_name, clear_range, _column_count in _AUTHORITATIVE_TAB_RANGES:
+                _replace_authoritative_tab_rows(
+                    runner,
+                    workdir,
+                    spreadsheet_id=created_ids["spreadsheet_id"],
+                    range_name=range_name,
+                    clear_range=clear_range,
+                    rows=authoritative_tabs[range_name],
+                    gws_executable=gws_executable,
+                )
         if not created_ids.get("folder_id"):
             intent = str(created_ids.get(_PENDING_FOLDER_INTENT, "") or "")
             if intent:
@@ -2562,7 +2824,11 @@ def install_attendance_automation(
             ids,
             str(task_list["title"]),
             central_chat,
-            gemini_api_key=gemini_api_key,
+            gemini_api_key=(
+                source_settings.get("GEMINI_API_KEY", "") or gemini_api_key
+                if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR
+                else gemini_api_key
+            ),
         )
         if creation_reason == ATTENDANCE_CREATION_SPLIT_REPAIR:
             config_rows = merge_attendance_config_rows(
@@ -2570,16 +2836,10 @@ def install_attendance_automation(
                 config_rows,
                 overwrite_keys=frozenset(
                     {
-                        "SCHOOL_NAME",
-                        "SCHOOL_YEAR",
-                        "GRADE",
-                        "CLASS_NUMBER",
-                        "CLASS_LABEL",
-                        "TEACHER_NAME",
                         "SCRIPT_ID",
                         "DEPLOYMENT_ID",
-                        "CENTRAL_CHAT_SENDER_URL",
                         "CENTRAL_CHAT_SHEET_ID",
+                        "GEMINI_API_KEY",
                         "ATTENDANCE_AI_ALLOWED",
                     }
                 ),
@@ -2785,7 +3045,7 @@ def install_attendance_automation(
             deployment_id=created_ids["deployment_id"],
             folder_id=created_ids["folder_id"],
             task_list_id=created_ids["task_list_id"],
-            workbook_name=workbook_name,
+            workbook_name=candidate_workbook_name,
             script_bundle_sha256=script_bundle_sha256,
         )
         if not dry_run and write_record_on_success:

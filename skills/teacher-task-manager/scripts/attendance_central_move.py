@@ -45,6 +45,11 @@ class CentralMoveResult:
     new_sheet_id: str = ""
 
 
+@dataclass(frozen=True)
+class CentralRouteResult:
+    route: str
+
+
 def _hold(message: str, *, cause: Exception | None = None):
     error = AttendanceCentralMoveHold(
         "ATTENDANCE_CENTRAL_MOVE_HOLD: "
@@ -172,6 +177,32 @@ def _reply(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def _authenticated_status_active(
+    status: dict[str, Any], *, account: str, label: str
+) -> bool:
+    _need(
+        {"registered", "connected", "account"}.issubset(status)
+        and type(status.get("registered")) is bool
+        and type(status.get("connected")) is bool
+        and isinstance(status.get("account"), str),
+        f"{label} 응답의 필수 상태값이 빠졌거나 모양이 다릅니다.",
+    )
+    registered = status["registered"]
+    connected = status["connected"]
+    status_account = status["account"]
+    if registered is True and connected is True:
+        _need(
+            _email(status_account, f"{label} 계정") == account,
+            f"{label} 계정이 현재 Google 계정과 다릅니다.",
+        )
+        return True
+    _need(
+        registered is False and connected is False and status_account == "",
+        f"{label}가 명시적인 미등록 상태가 아닙니다.",
+    )
+    return False
+
+
 def _point_candidate_at_new_sheet_id(
     candidate_spreadsheet_id: str,
     *,
@@ -209,6 +240,71 @@ def _point_candidate_at_new_sheet_id(
         _settings_value(rechecked, SHEET_SECRET_KEY) == sheet_secret,
         "후보 설정 시트를 다시 읽은 발송 확인값이 달라졌습니다.",
     )
+
+
+def inspect_central_chat_route(
+    config_dir: Path,
+    *,
+    account: str,
+    source_spreadsheet_id: str,
+    candidate_spreadsheet_id: str,
+    read_config: Callable[[Path], dict] | None = None,
+    http_post: Callable[[str, str, dict], dict] | None = None,
+) -> CentralRouteResult:
+    """변경 요청 없이 중앙 발송 경로가 원본·후보·미등록 중 어디인지 확인한다."""
+
+    config_dir = Path(config_dir)
+    account = _email(account, "현재 Google 계정")
+    source_id = _spreadsheet_id(source_spreadsheet_id, "원본 Sheet ID")
+    candidate_id = _spreadsheet_id(candidate_spreadsheet_id, "후보 Sheet ID")
+    _need(source_id != candidate_id, "원본과 후보 Sheet ID가 같습니다.")
+    read_config = read_config or _default_read_config
+    http_post = http_post or _default_http_post
+    try:
+        config = read_config(config_dir)
+    except Exception as exc:
+        _hold("중앙 발송 설정을 읽지 못했습니다.", cause=exc)
+    _need(isinstance(config, dict), "중앙 발송 설정의 모양이 다릅니다.")
+    _need(
+        _spreadsheet_id(config.get("spreadsheet_id"), "설정을 읽은 Sheet ID")
+        == source_id,
+        "중앙 발송 설정을 읽은 Sheet가 이번 원본과 다릅니다.",
+    )
+    url = _text(config.get("url"), "중앙 발송소 주소")
+    _need(url.startswith("https://"), "중앙 발송소 주소가 https가 아닙니다.")
+    original_sheet_id = _text(config.get("sheet_id"), "원본 중앙 발송 시트 번호")
+    sheet_secret = _text(config.get("sheet_secret"), "중앙 발송 확인값")
+    suffix = _split_sheet_identity(original_sheet_id, source_id)
+    candidate_sheet_id = f"{candidate_id}:{suffix}"
+
+    def active(sheet_id: str, label: str) -> bool:
+        try:
+            status = _reply(
+                http_post(
+                    url,
+                    STATUS_PATH,
+                    {"sheetId": sheet_id, "sheetSecret": sheet_secret},
+                ),
+                label,
+            )
+        except AttendanceCentralMoveHold:
+            raise
+        except Exception as exc:
+            _hold(f"{label}를 읽지 못했습니다.", cause=exc)
+        return _authenticated_status_active(
+            status,
+            account=account,
+            label=label,
+        )
+
+    source_active = active(original_sheet_id, "원본 중앙 발송 상태")
+    candidate_active = active(candidate_sheet_id, "후보 중앙 발송 상태")
+    _need(not (source_active and candidate_active), "원본과 후보 중앙 발송 경로가 동시에 보입니다.")
+    if source_active:
+        return CentralRouteResult("source")
+    if candidate_active:
+        return CentralRouteResult("candidate")
+    return CentralRouteResult("not_registered")
 
 
 def move_central_chat_connection(
@@ -273,6 +369,11 @@ def move_central_chat_connection(
         raise
     except Exception as exc:
         _hold("중앙 발송 등록 상태를 확인하지 못했습니다.", cause=exc)
+    source_active = _authenticated_status_active(
+        status,
+        account=account,
+        label="중앙 발송 상태",
+    )
 
     # 후보는 옛 시트의 중앙 발송 번호를 그대로 들고 있으면 안 된다.
     # 등록이 없어도 후보가 자기 번호를 갖도록 이 한 칸은 항상 맞춘다.
@@ -284,12 +385,8 @@ def move_central_chat_connection(
         update_setting=update_setting,
     )
 
-    if status.get("registered") is not True or status.get("connected") is not True:
+    if not source_active:
         return _not_registered()
-    _need(
-        _email(status.get("account"), "중앙 발송에 등록된 계정") == account,
-        "중앙 발송에 등록된 계정이 현재 Google 계정과 다릅니다.",
-    )
 
     try:
         moved = _reply(
@@ -330,8 +427,99 @@ def move_central_chat_connection(
     )
 
 
+def rollback_central_chat_connection(
+    config_dir: Path,
+    *,
+    account: str,
+    source_spreadsheet_id: str,
+    candidate_spreadsheet_id: str,
+    read_config: Callable[[Path], dict] | None = None,
+    http_post: Callable[[str, str, dict], dict] | None = None,
+) -> bool:
+    """후보로 옮긴 중앙 발송 연결을 원본으로 되돌리고 상태를 다시 확인한다."""
+
+    config_dir = Path(config_dir)
+    account = _email(account, "현재 Google 계정")
+    source_id = _spreadsheet_id(source_spreadsheet_id, "원본 Sheet ID")
+    candidate_id = _spreadsheet_id(candidate_spreadsheet_id, "후보 Sheet ID")
+    _need(source_id != candidate_id, "원본과 후보 Sheet ID가 같습니다.")
+    read_config = read_config or _default_read_config
+    http_post = http_post or _default_http_post
+
+    try:
+        config = read_config(config_dir)
+    except Exception as exc:
+        _hold("되돌릴 중앙 발송 설정을 읽지 못했습니다.", cause=exc)
+    _need(isinstance(config, dict), "되돌릴 중앙 발송 설정의 모양이 다릅니다.")
+    _need(
+        _spreadsheet_id(config.get("spreadsheet_id"), "설정을 읽은 Sheet ID")
+        == source_id,
+        "되돌릴 중앙 발송 설정이 이번 원본과 다릅니다.",
+    )
+    url = _text(config.get("url"), "중앙 발송소 주소")
+    _need(url.startswith("https://"), "중앙 발송소 주소가 https가 아닙니다.")
+    original_sheet_id = _text(config.get("sheet_id"), "원본 중앙 발송 시트 번호")
+    sheet_secret = _text(config.get("sheet_secret"), "중앙 발송 확인값")
+    suffix = _split_sheet_identity(original_sheet_id, source_id)
+    candidate_sheet_id = f"{candidate_id}:{suffix}"
+
+    try:
+        moved = _reply(
+            http_post(
+                url,
+                MOVE_PATH,
+                {
+                    "sheetId": candidate_sheet_id,
+                    "sheetSecret": sheet_secret,
+                    "newSheetId": original_sheet_id,
+                },
+            ),
+            "중앙 발송 연결 되돌리기",
+        )
+    except AttendanceCentralMoveHold:
+        raise
+    except Exception as exc:
+        _hold("중앙 발송 연결을 되돌린 결과를 받지 못했습니다.", cause=exc)
+    _need(moved.get("ok") is True, "중앙 발송 연결 되돌리기가 성공으로 확인되지 않았습니다.")
+    _need(
+        _text(moved.get("outcome"), "중앙 발송 연결 되돌리기 결과") == "moved",
+        "중앙 발송 연결 되돌리기 결과가 확실하지 않습니다.",
+    )
+    _need(
+        _text(moved.get("newSheetId"), "되돌린 뒤 시트 번호")
+        == original_sheet_id,
+        "되돌린 뒤 중앙 발송 시트 번호가 원본과 다릅니다.",
+    )
+
+    try:
+        status = _reply(
+            http_post(
+                url,
+                STATUS_PATH,
+                {"sheetId": original_sheet_id, "sheetSecret": sheet_secret},
+            ),
+            "되돌린 중앙 발송 상태",
+        )
+    except AttendanceCentralMoveHold:
+        raise
+    except Exception as exc:
+        _hold("되돌린 중앙 발송 상태를 다시 읽지 못했습니다.", cause=exc)
+    _need(
+        status.get("registered") is True and status.get("connected") is True,
+        "되돌린 중앙 발송 연결이 등록되고 연결된 상태가 아닙니다.",
+    )
+    _need(
+        _email(status.get("account"), "되돌린 중앙 발송 계정") == account,
+        "되돌린 중앙 발송 계정이 현재 Google 계정과 다릅니다.",
+    )
+    return True
+
+
 __all__ = [
     "AttendanceCentralMoveHold",
     "CentralMoveResult",
+    "CentralRouteResult",
+    "inspect_central_chat_route",
     "move_central_chat_connection",
+    "rollback_central_chat_connection",
 ]

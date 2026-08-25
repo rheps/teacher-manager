@@ -49,6 +49,15 @@ def _read(path: Path) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def load(state_dir: Path, source_hash: str) -> dict | None:
+    """Return one saved message document without exposing its file layout."""
+
+    source_hash = _text(source_hash)
+    if not source_hash:
+        return None
+    return _read(message_path(Path(state_dir), source_hash))
+
+
 def begin(state_dir: Path, record, attachment_dir: str = "") -> None:
     """메시지를 읽어낸 직후 원문을 남긴다. 파일이 이미 있으면 덮지 않는다."""
     source_hash = _text(getattr(record, "source_hash", ""))

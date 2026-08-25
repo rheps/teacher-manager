@@ -25,6 +25,7 @@ from brity_bridge import (
     component_lock,
     gws_env,
     paths,
+    pipeline,
     process_win,
 )
 from brity_bridge.settings import load_settings
@@ -46,6 +47,15 @@ _V1_STEP_TO_V2 = {1: 1, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 9}
 _ATTENDANCE_AUTH_BLOCKED_STATES = {
     "gws-required", "login-required", "account-required", "auth-error"
 }
+_ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
+    "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해 주세요. "
+    "기존 출석부와 감지기는 그대로입니다."
+)
+_ATTENDANCE_AI_PROOF_MESSAGE = (
+    "출석부 안의 연결 확인 표시가 없거나 맞지 않아요. 출석부를 열고 "
+    "출결 업무 자동화 메뉴에서 AI 출결 입력 연결 확인을 한 번 누른 뒤 "
+    "연결 확인하고 계속해 주세요."
+)
 _DEFAULT_SCREEN_FAILURE = (
     "작업을 마치지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요."
 )
@@ -70,8 +80,10 @@ _SCREEN_FAILURES = {
     "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요. 폴더 위치를 다시 확인해 주세요.",
     "attendance_status": "출결 상태를 확인하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
     "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
+    "attendance_google_identity": "현재 Google 로그인 계정을 확인하지 못했어요. 현재 연결과 출석부는 그대로입니다. 설정에서 Google 로그인을 다시 점검해 주세요.",
     "ensure_attendance": "출결 자료를 준비하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "consolidate_attendance": "출결 자료를 하나로 정리하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
+    "attendance_consolidation_preview": "정리할 출결 자료를 확인하지 못했어요. 현재 연결은 그대로입니다. Google 로그인을 확인한 뒤 다시 시도해 주세요.",
+    "consolidate_attendance": "출결 자료 정리 결과를 끝까지 확인하지 못했어요. 저장된 진행 상태를 확인해 이어서 진행해 주세요.",
     "start_new_attendance": "새 학년도 출석부를 시작하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
     "attendance_prepare_start": "출결 준비를 시작하지 못했어요. 이 컴퓨터 설정과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
     "attendance_prepare_status": "출결 준비 상태를 확인하지 못했어요. 설정에서 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
@@ -94,11 +106,33 @@ _SCREEN_FAILURES = {
     "ensure_tasklist_named": "할 일 목록을 만들지 못했어요. 이름과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
     "open_logs": "기록 폴더를 열지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요.",
     "open_url": "안전한 https 주소만 열 수 있어요. 주소를 다시 확인해 주세요.",
+    "retry_capture": "실패한 항목을 다시 처리하지 못했어요. 잠시 뒤 다시 시도해 주세요.",
 }
 
 
 class ScreenSafeError(RuntimeError):
     """A fixed Korean sentence intentionally prepared for the screen."""
+
+
+class _AttendanceRemoteWorkLease:
+    """백그라운드 로그인 종료까지 공용 출결 잠금의 소유권을 보관한다."""
+
+    def __init__(self, context):
+        self._context = context
+        self._release_lock = threading.Lock()
+
+    @classmethod
+    def acquire(cls, config_dir, **lock_options):
+        context = engine.attendance_remote_work_lock(config_dir, **lock_options)
+        context.__enter__()
+        return cls(context)
+
+    def release(self):
+        with self._release_lock:
+            context = self._context
+            self._context = None
+        if context is not None:
+            context.__exit__(None, None, None)
 
 
 def _ok(data):
@@ -178,6 +212,7 @@ class BridgeDeps:
     gws_component_root: object = None
     attendance_script_updater: object = None
     attendance_script_runner: object = None
+    attendance_ai_inspector: object = None
     attendance_remote_work_timeout_seconds: object = None
 
 
@@ -191,7 +226,9 @@ class Api:
         self._gws_update_last_status = None
         self._gws_update_install_lock = threading.Lock()
         self._attendance_script_update_lock = threading.Lock()
+        self._gws_login_start_lock = threading.Lock()
         self._attendance_prepare_lock = threading.Lock()
+        self._capture_retry_lock = threading.Lock()
         self._attendance_prepare_thread = None
         self._attendance_prepare_result = None
         # 완료 확인 폴링용 gws 경로 캐시 — 3초 폴마다 resolve_gws(동봉본 SHA-256 검증
@@ -549,6 +586,16 @@ class Api:
         return engine.load_attendance_status_cache(self._config_dir)
 
     @guarded
+    def attendance_google_identity(self):
+        """출결 정리 화면에 실제 GWS 로그인 계정 하나만 안전하게 돌려준다."""
+        run, gws = self._resolve_gws_or_fail()
+        auth = engine.gws_auth_status(run, gws)
+        account = ""
+        if auth.get("logged_in"):
+            account = str(auth.get("user", "") or "").strip().lower()
+        return {"account": account}
+
+    @guarded
     def ensure_attendance(self):
         self._require_safe_gws_account_storage()
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
@@ -573,15 +620,25 @@ class Api:
         return status
 
     @guarded
-    def consolidate_attendance(self):
+    def attendance_consolidation_preview(self):
         self._require_safe_gws_account_storage()
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
             run_command=self._attendance_remote_run()
         )
-        status = asdict(engine.consolidate_attendance(self._config_dir, deps=deps))
-        if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
-            engine.save_attendance_status_cache(self._config_dir, status)
-        return status
+        return asdict(
+            engine.attendance_consolidation_preview(self._config_dir, deps=deps)
+        )
+
+    @guarded
+    def consolidate_attendance(self, preview_fingerprint):
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+        result = engine.consolidate_attendance(
+            self._config_dir, str(preview_fingerprint or ""), deps=deps
+        )
+        return asdict(result)
 
     @guarded
     def attendance_prepare_start(self, profile, grid, bridge_updates):
@@ -693,6 +750,7 @@ class Api:
         apply: bool,
         record_snapshot=None,
         resolved=None,
+        account: str = "",
     ):
         """기존 출결 Sheet의 Apps Script만 확인하거나 명시적으로 갱신한다."""
 
@@ -716,6 +774,15 @@ class Api:
         if record_snapshot is None:
             record_snapshot = read_attendance_install_snapshot(record_path)
         record = record_snapshot.record
+        mutation_guard = self._attendance_update_mutation_guard(
+            run, gws, account
+        ) if apply else None
+        if apply and not mutation_guard():
+            return {
+                "state": "permission-required",
+                "verified": False,
+                "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
+            }
         updater = self._deps.attendance_script_updater
         if updater is None:
             from attendance_script_update import inspect_or_update_attendance_script
@@ -751,14 +818,25 @@ class Api:
                         pass
                     raise
         assets_dir = bundle_paths.bundle_root() / "assets"
+        update_options = {
+            "assets_dir": assets_dir,
+            "apply": apply,
+            "runner": script_runner,
+            "gws_executable": gws,
+        }
+        if apply:
+            update_options["mutation_guard"] = mutation_guard
         result = updater(
             record,
-            assets_dir=assets_dir,
-            apply=apply,
-            runner=script_runner,
-            gws_executable=gws,
+            **update_options,
         )
         payload = dict(result) if isinstance(result, dict) else asdict(result)
+        if apply and payload.get("state") == "permission-required":
+            return {
+                "state": "permission-required",
+                "verified": False,
+                "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
+            }
         if (
             apply
             and payload.get("verified") is True
@@ -767,24 +845,86 @@ class Api:
             # 결과 글자만 믿지 않는다. 현재 프로그램에 실제로 든 코드 지문, 원격
             # 확인 결과, 처음 읽은 세 연결 ID가 모두 같을 때만 준비 증명을 남긴다.
             expected_sha256 = engine.current_attendance_script_bundle_sha256()
-            same_ids = all(
-                payload.get(key) == record.get(key)
-                for key in ("spreadsheet_id", "script_id", "deployment_id")
-            )
-            if (
-                not same_ids
-                or payload.get("target_bundle_sha256") != expected_sha256
-                or payload.get("current_bundle_sha256") != expected_sha256
+            from attendance_script_update import verified_same_attendance_connection
+
+            if not verified_same_attendance_connection(
+                payload, record, expected_sha256
             ):
                 raise ScreenSafeError(
                     "확인한 출결 기능이 지금 프로그램에 든 파일과 달라서 준비 완료로 바꾸지 않았어요."
                 )
+            if not mutation_guard():
+                return {
+                    "state": "permission-required",
+                    "verified": False,
+                    "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
+                }
+            ai_inspector = self._deps.attendance_ai_inspector
+            if ai_inspector is None:
+                from attendance_ai_setup import inspect_attendance_ai_setup
+
+                ai_inspector = inspect_attendance_ai_setup
+            ai_args = {
+                "runner": script_runner,
+                "workdir": self._config_dir,
+                "gws_executable": gws,
+                "spreadsheet_id": record["spreadsheet_id"],
+            }
+            try:
+                ai_status = ai_inspector(**ai_args)
+            except Exception:  # noqa: BLE001 - 외부 원문을 화면에 내보내지 않는다.
+                ai_status = None
+            if not self._attendance_ai_setup_is_current(ai_status):
+                payload["state"] = "ai-action-required"
+                payload["verified"] = False
+                payload["detail"] = _ATTENDANCE_AI_PROOF_MESSAGE
+                payload["spreadsheet_url"] = str(
+                    record.get("spreadsheet_url", "") or ""
+                )
+                return payload
+            if not mutation_guard():
+                return {
+                    "state": "permission-required",
+                    "verified": False,
+                    "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
+                }
             # 업데이트를 시작할 때 읽은 기록이 지금도 정확히 같을 때만 증명을 쓰고
             # 옛판 표식을 함께 지운다. 다른 창의 새 기록은 건드리지 않는다.
             mark_attendance_script_current(
                 record_path, record_snapshot, expected_sha256
             )
         return payload
+
+    def _attendance_update_mutation_guard(self, run, gws, expected_account):
+        expected = str(expected_account or "").strip().casefold()
+
+        def guard():
+            if not expected:
+                return False
+            try:
+                current = engine.require_goedu_gws_session(run, gws)
+            except Exception:  # noqa: BLE001 - 인증 원문은 호출자에게 내보내지 않는다.
+                return False
+            return (
+                current.casefold() == expected
+                and engine.has_current_gws_scope_grant(
+                    self._config_dir, expected_account
+                )
+            )
+
+        return guard
+
+    @staticmethod
+    def _attendance_ai_setup_is_current(status) -> bool:
+        return (
+            getattr(status, "ok", None) is True
+            and getattr(status, "state", None) == "verified"
+            and getattr(status, "spreadsheet_matches", None) is True
+            and getattr(status, "target_matches", None) is True
+            and type(getattr(status, "trigger_count", None)) is int
+            and status.trigger_count == 1
+            and getattr(status, "setup_done", None) is True
+        )
 
     def _require_current_attendance_script(self, record=None) -> None:
         """예전 공식 출결 기능을 되찾은 직후에는 Chat 쓰기를 먼저 막는다."""
@@ -919,8 +1059,25 @@ class Api:
         try:
             # 다른 대시보드 창과 새 학년도 출결 준비도 같은 기록과 Google Script를
             # 만질 수 있다. 공용 잠금 안에서 계정부터 다시 확인하고 한 번씩 실행한다.
-            with engine.attendance_setup_lock(self._config_dir):
-                return self._attendance_script_update(apply=True)
+            timeout = self._deps.attendance_remote_work_timeout_seconds
+            lock_options = {}
+            if timeout is not None:
+                lock_options["timeout_seconds"] = float(timeout)
+            with engine.attendance_remote_work_lock(
+                self._config_dir, **lock_options
+            ):
+                if not paths.attendance_install_record_path(
+                    self._config_dir
+                ).exists():
+                    return self._attendance_script_update(apply=True)
+                run, gws, account = (
+                    self._resolve_attendance_goedu_gws_context_or_fail()
+                )
+                return self._attendance_script_update(
+                    apply=True,
+                    resolved=(run, gws),
+                    account=account,
+                )
         finally:
             self._attendance_script_update_lock.release()
 
@@ -1118,17 +1275,49 @@ class Api:
 
     @guarded
     def recent_captures(self, limit=20):
-        return capture_store.read_captures(paths.bridge_state_dir(self._config_dir), int(limit))
+        rows = capture_store.read_captures(paths.bridge_state_dir(self._config_dir), int(limit))
+        return [self._capture_retry_state(row) for row in rows]
+
+    def _capture_retry_state(self, row):
+        shown = dict(row)
+        shown["retryable"] = pipeline.saved_capture_retry_available(
+            self._config_dir,
+            str(shown.get("source_hash") or ""),
+            str(shown.get("when") or ""),
+        )
+        return shown
 
     @guarded
     def capture_history_page(self, page=1, page_size=10):
-        return capture_store.read_capture_page(
+        result = capture_store.read_capture_page(
             paths.bridge_state_dir(self._config_dir), int(page), int(page_size)
         )
+        result["items"] = [self._capture_retry_state(row) for row in result["items"]]
+        return result
 
     @guarded
     def capture_progress(self):
         return capture_store.read_progress(paths.bridge_state_dir(self._config_dir))
+
+    @guarded
+    def retry_capture(self, source_hash, capture_when=""):
+        source_hash = str(source_hash or "")
+        capture_when = str(capture_when or "")
+        if not self._capture_retry_lock.acquire(blocking=False):
+            raise ScreenSafeError("다른 실패 기록을 다시 처리하고 있어요. 끝난 뒤 눌러 주세요.")
+        try:
+            result = pipeline.retry_saved_capture(
+                self._config_dir,
+                source_hash,
+                capture_when=capture_when,
+            )
+        finally:
+            self._capture_retry_lock.release()
+        return {
+            "success": bool(result.ok),
+            "stage": str(result.stage),
+            "message": str(result.message),
+        }
 
     # ----- 행동 -----
 
@@ -1206,32 +1395,49 @@ class Api:
     @guarded
     def gws_login_start(self):
         run, gws = self._resolve_gws_or_fail()
-        # 로그인 시작 전에 gws가 남긴 반쪽 잔재를 먼저 치우고 다시 판정한다.
-        self._discard_broken_gws_config_client(self._gws_config_dir())
-        base, config_dir, _bundled, selection = self._oauth_context()
-        if not selection.ready:
-            if selection.error_code == "OAUTH_CLIENT_CONFLICT":
-                raise ScreenSafeError(
-                    "기존 Google 로그인 설정과 Teacher Manager의 로그인 설정이 서로 달라요. "
-                    "로그인 설정을 확인해 주세요."
+        with self._gws_login_start_lock:
+            snapshot = self._login.snapshot()
+            if snapshot.get("running") is True:
+                return snapshot
+            lock_options = self._attendance_remote_lock_options()
+            lease = _AttendanceRemoteWorkLease.acquire(
+                self._config_dir, **lock_options
+            )
+            try:
+                # 잠금을 얻은 뒤 다시 읽어 기다리는 동안 바뀐 로그인 준비도 반영한다.
+                self._discard_broken_gws_config_client(self._gws_config_dir())
+                base, config_dir, _bundled, selection = self._oauth_context()
+                if not selection.ready:
+                    if selection.error_code == "OAUTH_CLIENT_CONFLICT":
+                        raise ScreenSafeError(
+                            "기존 Google 로그인 설정과 Teacher Manager의 로그인 설정이 서로 달라요. "
+                            "로그인 설정을 확인해 주세요."
+                        )
+                    if selection.error_code == "OAUTH_CLIENT_MISSING":
+                        raise ScreenSafeError(
+                            "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
+                        )
+                    raise ScreenSafeError(
+                        "Google 로그인 준비 파일을 안전하게 읽지 못했어요."
+                    )
+                child_env = gws_env.login_environ(
+                    base,
+                    selection,
+                    gws_config_dir=config_dir,
                 )
-            if selection.error_code == "OAUTH_CLIENT_MISSING":
-                raise ScreenSafeError(
-                    "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
+                started = self._login.start(
+                    engine.login_command(gws),
+                    popen=self._deps.popen_factory,
+                    env=child_env,
+                    auth_url_opener=self._open_external_url,
+                    on_complete=lease.release,
                 )
-            raise ScreenSafeError("Google 로그인 준비 파일을 안전하게 읽지 못했어요.")
-        child_env = gws_env.login_environ(
-            base,
-            selection,
-            gws_config_dir=config_dir,
-        )
-        self._login.start(
-            engine.login_command(gws),
-            popen=self._deps.popen_factory,
-            env=child_env,
-            auth_url_opener=self._open_external_url,
-        )
-        return self._login.snapshot()
+                if not started:
+                    lease.release()
+                return self._login.snapshot()
+            except Exception:
+                lease.release()
+                raise
 
     def _discard_broken_gws_config_client(self, config_dir) -> None:
         """gws가 로그인 실패로 남긴 반쪽짜리 client_secret.json만 치운다.
@@ -1266,7 +1472,13 @@ class Api:
 
     @guarded
     def gws_login_status(self):
-        return engine.annotate_login_snapshot(self._login.snapshot())
+        snapshot = self._login.snapshot()
+        if snapshot.get("ok") is True:
+            run, gws = self._resolve_gws_or_fail()
+            auth = engine.gws_auth_status(run, gws)
+            if auth.get("logged_in") and auth.get("account_allowed"):
+                engine.record_gws_scope_grant(self._config_dir, auth.get("user", ""))
+        return engine.annotate_login_snapshot(snapshot)
 
     @guarded
     def gws_login_cancel(self):
@@ -1292,7 +1504,7 @@ class Api:
         engine.require_goedu_gws_session(run, gws)
         return run, gws
 
-    def _resolve_attendance_goedu_gws_or_fail(self):
+    def _resolve_attendance_goedu_gws_context_or_fail(self):
         """출결 자료는 처음 준비한 학교 계정으로만 읽거나 바꾼다."""
 
         self._require_safe_gws_account_storage()
@@ -1305,12 +1517,25 @@ class Api:
         owner = str(saved.get("account", "") or "").strip()
         if owner and owner.casefold() != current.casefold():
             raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+        return run, gws, current
+
+    def _resolve_attendance_goedu_gws_or_fail(self):
+        run, gws, _account = self._resolve_attendance_goedu_gws_context_or_fail()
         return run, gws
+
+    def _attendance_remote_lock_options(self):
+        timeout = self._deps.attendance_remote_work_timeout_seconds
+        if timeout is None:
+            return {}
+        return {"timeout_seconds": float(timeout)}
 
     @guarded
     def gws_logout(self):
-        run, gws = self._resolve_gws_or_fail()
-        return self._success(*engine.gws_logout(run, gws))
+        with engine.attendance_remote_work_lock(
+            self._config_dir, **self._attendance_remote_lock_options()
+        ):
+            run, gws = self._resolve_gws_or_fail()
+            return self._success(*engine.gws_logout(run, gws))
 
     @guarded
     def ensure_calendar_named(self, name):

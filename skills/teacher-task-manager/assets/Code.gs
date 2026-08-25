@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.11.0
+ * 버전: 5.12.0
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.11.0';
+const APP_VERSION = '5.12.0';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -73,7 +73,10 @@ const ATTENDANCE_AI_GEMINI_API_KEY_SETTING = 'GEMINI_API_KEY';
 const ATTENDANCE_AI_ALLOWED_SETTING = 'ATTENDANCE_AI_ALLOWED';
 const ATTENDANCE_AI_ALLOWED_VALUE = '예';
 const ATTENDANCE_AI_EDIT_TRIGGER_HANDLER = 'onAttendanceAiEdit';
-const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 켜기';
+const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 연결 확인';
+const ATTENDANCE_AI_VERIFICATION_SETTING = 'ATTENDANCE_AI_SETUP_VERIFICATION';
+const ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION = 1;
+const ATTENDANCE_AI_SETUP_VERSION = '1';
 
 const DEFAULT_CONFIG = Object.freeze({
   SCHOOL_NAME: '',
@@ -131,8 +134,11 @@ function onOpen() {
     .addItem('연결 상태 확인', 'checkCentralChatStatus')
     .addToUi();
 
-  // 아래 두 메뉴는 계열이 다르지만 둘 다 실행 전용이다 — 사전 세팅 항목을 넣지 않는다.
+  // 아래 두 메뉴는 계열이 다르지만 모두 교사가 Sheet 안에서 직접 실행하는 일이다.
+  // 새 출석부의 AI 입력 연결 확인도 이 메뉴에서 한 번만 실행한다.
   const attendanceMenu = ui.createMenu('출결 업무 자동화')
+    .addItem(ATTENDANCE_AI_MENU_ITEM, 'enableAttendanceAiInput')
+    .addSeparator()
     .addItem('선택 행 출결신고서 Google Docs에 만들기', 'createDocFromTemplate')
     .addItem('선택 행 미제출 서류 Google Tasks에 추가하기', 'addSelectedRowToTasks')
     .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow');
@@ -1431,7 +1437,18 @@ function handleAttendanceAiEdit(e, testPorts) {
 /** 설정 시트를 새로 만들지 않고 값 하나만 읽는다. 읽지 못하면 빈 값으로 본다. */
 function readConfigValueReadOnly_(key) {
   try {
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG_SHEET_NAME);
+    return readConfigValueReadOnlyFor_(SpreadsheetApp.getActiveSpreadsheet(), key);
+  } catch (err) {
+    return '';
+  }
+}
+
+/** 명시적으로 받은 출석부의 설정 탭만 읽는다. 없으면 만들지 않는다. */
+function readConfigValueReadOnlyFor_(spreadsheet, key) {
+  try {
+    const sheet = spreadsheet && typeof spreadsheet.getSheetByName === 'function'
+      ? spreadsheet.getSheetByName(CONFIG_SHEET_NAME)
+      : null;
     if (!sheet) return '';
     const value = readConfigMapFromSheet_(sheet)[key];
     return String(value === undefined || value === null ? '' : value).trim();
@@ -1445,10 +1462,22 @@ function readConfigValueReadOnly_(key) {
  * 확인하지 못하면 켤 수 없다고 본다.
  */
 function attendanceAiWorkbookState_() {
+  try {
+    return attendanceAiWorkbookStateFor_(SpreadsheetApp.getActiveSpreadsheet());
+  } catch (err) {
+    return {
+      ok: false,
+      spreadsheetId: '',
+      message: '지금 열려 있는 파일 정보를 읽지 못했습니다. 시트를 다시 열고 눌러 주세요.'
+    };
+  }
+}
+
+/** 명시적으로 받은 출석부가 AI 입력을 켤 수 있는 정식 출석부인지 확인한다. */
+function attendanceAiWorkbookStateFor_(spreadsheet) {
   let spreadsheetId = '';
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    spreadsheetId = String(ss.getId() || '').trim();
+    spreadsheetId = String(spreadsheet && spreadsheet.getId() || '').trim();
   } catch (err) {
     return {
       ok: false,
@@ -1480,7 +1509,7 @@ function attendanceAiWorkbookState_() {
   }
   // Teacher Manager가 정식으로 만든 시트는 설정값으로만 알아본다.
   // 파일 이름은 사용자가 바꿀 수 있으므로 AI 허용 근거로 쓰지 않는다.
-  if (readConfigValueReadOnly_(ATTENDANCE_AI_ALLOWED_SETTING) === ATTENDANCE_AI_ALLOWED_VALUE) {
+  if (readConfigValueReadOnlyFor_(spreadsheet, ATTENDANCE_AI_ALLOWED_SETTING) === ATTENDANCE_AI_ALLOWED_VALUE) {
     return { ok: true, spreadsheetId: spreadsheetId, message: '' };
   }
   return {
@@ -1554,8 +1583,8 @@ function attendanceAiEditTriggersFor_(triggers, spreadsheetId) {
 }
 
 /** 같은 감지기를 두 번 만들지 않는다. 이미 여러 개면 하나만 남긴다. */
-function ensureAttendanceAiEditTrigger_(spreadsheetId) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function ensureAttendanceAiEditTrigger_(spreadsheetId, spreadsheet) {
+  const ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
   const activeId = String(ss.getId() || '').trim();
   const wanted = String(spreadsheetId || '').trim();
   if (!wanted || !activeId || wanted !== activeId) {
@@ -1581,9 +1610,155 @@ function ensureAttendanceAiEditTrigger_(spreadsheetId) {
   return { created: true, removed: 0, count: 1 };
 }
 
+/** 실행 계정이 화면에서 넘긴 학교 계정과 정확히 같은지만 돌려준다. */
+function attendanceAiExpectedAccountMatches_(expectedAccount) {
+  const expected = String(expectedAccount || '').trim().toLowerCase();
+  if (!/^[^@\s]+@goedu\.kr$/.test(expected)) return false;
+  let actual = '';
+  try { actual = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase(); } catch (err) {}
+  if (!actual) {
+    try { actual = String(Session.getEffectiveUser().getEmail() || '').trim().toLowerCase(); } catch (err) {}
+  }
+  return actual === expected;
+}
+
+/** 실행 경계의 예상 밖 오류는 외부 정보 없이 같은 실패 상태로 돌려준다. */
+function attendanceAiSetupSafeFailure_() {
+  return {
+    ok: false,
+    account_matches: false,
+    spreadsheet_matches: false,
+    key_present: false,
+    target_matches: false,
+    trigger_count: 0,
+    setup_done: false
+  };
+}
+
+/** 밖으로는 계정·키 원문 없이 여섯 가지 확인 결과만 돌려준다. */
+function attendanceAiSetupStatusFor_(spreadsheet, expectedAccount, boundSpreadsheet) {
+  const spreadsheetId = String(spreadsheet && spreadsheet.getId() || '').trim();
+  const boundId = String(boundSpreadsheet && boundSpreadsheet.getId() || '').trim();
+  const accountMatches = attendanceAiExpectedAccountMatches_(expectedAccount);
+  const spreadsheetMatches = !!spreadsheetId && spreadsheetId === boundId;
+  const keyPresent = isAttendanceAiApiKeyShape_(attendanceAiGeminiApiKey_(spreadsheet));
+  let targetMatches = false;
+  try {
+    targetMatches = !!spreadsheetId && String(PropertiesService.getScriptProperties()
+      .getProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY) || '').trim() === spreadsheetId;
+  } catch (err) {}
+  const triggerCount = spreadsheetId
+    ? attendanceAiEditTriggersFor_(ScriptApp.getProjectTriggers(), spreadsheetId).length
+    : 0;
+  let setupDone = false;
+  try {
+    const rawMarker = readConfigValueReadOnlyFor_(
+      spreadsheet, ATTENDANCE_AI_VERIFICATION_SETTING
+    );
+    const marker = rawMarker ? JSON.parse(rawMarker) : null;
+    setupDone = Boolean(marker)
+      && marker.schema_version === ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION
+      && marker.setup_version === ATTENDANCE_AI_SETUP_VERSION
+      && String(marker.spreadsheet_id || '').trim() === spreadsheetId
+      && marker.handler_name === ATTENDANCE_AI_EDIT_TRIGGER_HANDLER
+      && marker.trigger_count === 1
+      && marker.success === true;
+  } catch (err) {
+    setupDone = false;
+  }
+  const ok = accountMatches && spreadsheetMatches && keyPresent && targetMatches
+    && triggerCount === 1 && setupDone;
+  return {
+    ok: ok,
+    account_matches: accountMatches,
+    spreadsheet_matches: spreadsheetMatches,
+    key_present: keyPresent,
+    target_matches: targetMatches,
+    trigger_count: triggerCount,
+    setup_done: setupDone
+  };
+}
+
+/** 감지기 개수를 다시 읽어 증명한 뒤, 비밀값 없는 확인 표시를 마지막에 적는다. */
+function writeAttendanceAiVerificationMarkerFor_(spreadsheet, spreadsheetId) {
+  const sheet = spreadsheet && typeof spreadsheet.getSheetByName === 'function'
+    ? spreadsheet.getSheetByName(CONFIG_SHEET_NAME)
+    : null;
+  if (!sheet) throw new Error('설정 탭을 찾지 못했습니다.');
+  const lastRow = Math.max(2, Number(sheet.getLastRow() || 0));
+  const rows = sheet.getRange(2, 1, Math.max(1, lastRow - 1), 2).getValues();
+  const indexes = [];
+  rows.forEach(function (row, index) {
+    if (String(row[0] || '').trim() === ATTENDANCE_AI_VERIFICATION_SETTING) {
+      indexes.push(index);
+    }
+  });
+  // 손상된 중복 표시는 먼저 비운다. 정확한 새 표시는 아래 마지막 쓰기 한 번이다.
+  for (let index = 1; index < indexes.length; index++) {
+    sheet.getRange(indexes[index] + 2, 1).setValue('');
+    sheet.getRange(indexes[index] + 2, 2).setValue('');
+  }
+  const marker = JSON.stringify({
+    schema_version: ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION,
+    setup_version: ATTENDANCE_AI_SETUP_VERSION,
+    spreadsheet_id: String(spreadsheetId || '').trim(),
+    handler_name: ATTENDANCE_AI_EDIT_TRIGGER_HANDLER,
+    trigger_count: 1,
+    success: true
+  });
+  if (indexes.length) {
+    sheet.getRange(indexes[0] + 2, 2).setValue(marker);
+  } else if (typeof sheet.appendRow === 'function') {
+    sheet.appendRow([ATTENDANCE_AI_VERIFICATION_SETTING, marker]);
+  } else {
+    sheet.getRange(lastRow + 1, 1).setValue(ATTENDANCE_AI_VERIFICATION_SETTING);
+    sheet.getRange(lastRow + 1, 2).setValue(marker);
+  }
+}
+
+/** 대상 이외의 같은 편집 감지기는 남기지 않는다. */
+function removeUnexpectedAttendanceAiEditTriggers_(spreadsheetId) {
+  const wanted = String(spreadsheetId || '').trim();
+  (ScriptApp.getProjectTriggers() || []).forEach(trigger => {
+    const sameHandler = trigger.getHandlerFunction() === ATTENDANCE_AI_EDIT_TRIGGER_HANDLER;
+    const editTrigger = trigger.getEventType() === ScriptApp.EventType.ON_EDIT;
+    const sourceId = String(trigger.getTriggerSourceId() || '').trim();
+    if (sameHandler && editTrigger && sourceId !== wanted) ScriptApp.deleteTrigger(trigger);
+  });
+}
+
+/** 열린 Sheet 메뉴가 쓰는 실제 연결 절차다. */
+function setupAttendanceAiInputFor_(spreadsheet, expectedAccount, boundSpreadsheet) {
+  try {
+    const before = attendanceAiSetupStatusFor_(spreadsheet, expectedAccount, boundSpreadsheet);
+    if (!before.account_matches || !before.spreadsheet_matches || !before.key_present) return before;
+    const state = attendanceAiWorkbookStateFor_(spreadsheet);
+    if (!state || state.ok !== true) return before;
+    removeUnexpectedAttendanceAiEditTriggers_(state.spreadsheetId);
+    ensureAttendanceAiEditTrigger_(state.spreadsheetId, spreadsheet);
+    PropertiesService.getScriptProperties()
+      .setProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY, state.spreadsheetId);
+    const checked = attendanceAiSetupStatusFor_(spreadsheet, expectedAccount, boundSpreadsheet);
+    if (!checked.account_matches || !checked.spreadsheet_matches || !checked.key_present
+      || !checked.target_matches || checked.trigger_count !== 1) return checked;
+    writeAttendanceAiVerificationMarkerFor_(spreadsheet, state.spreadsheetId);
+    return {
+      ok: true,
+      account_matches: true,
+      spreadsheet_matches: true,
+      key_present: true,
+      target_matches: true,
+      trigger_count: 1,
+      setup_done: true
+    };
+  } catch (err) {
+    return attendanceAiSetupSafeFailure_();
+  }
+}
+
 /** 메뉴: 이 사본에서만 1행 AI 입력을 켠다. */
 function enableAttendanceAiInput(options) {
-  requireGoeduTeacherAccount_();
+  const expectedAccount = requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
   // 통합 설정이 부를 때는 단계마다 창을 띄우지 않고 결과만 돌려준다 — 화면은 마지막에 한 번만 뜬다.
   const quiet = !!(options && options.quiet === true);
@@ -1592,54 +1767,24 @@ function enableAttendanceAiInput(options) {
     return { ok: ok, created: created === true, message: message };
   }
 
-  const state = attendanceAiWorkbookState_();
-  if (!state || state.ok !== true) {
-    return finish_(false, String(state && state.message || '이 파일에서는 켤 수 없습니다.'));
-  }
-
-  // 키는 컴퓨터의 티처 매니저에서 이미 받아 설정 탭에 들어와 있다. 여기서 다시 묻지 않는다.
-  const apiKey = attendanceAiGeminiApiKey_(SpreadsheetApp.getActiveSpreadsheet());
-  if (!isAttendanceAiApiKeyShape_(apiKey)) {
-    return finish_(
-      false,
-      '이 시트에 쓸 Gemini API key를 찾지 못했습니다.\n\n' +
-      '컴퓨터의 티처 매니저를 열고 [연결] 화면에서 Gemini API key를 넣어 저장한 다음\n' +
-      '이 메뉴를 다시 눌러 주세요.\n\n' +
-      'AI 입력은 아직 켜지지 않았습니다.'
-    );
-  }
-
-  try {
-    PropertiesService.getScriptProperties()
-      .setProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY, state.spreadsheetId);
-  } catch (err) {
-    return finish_(
-      false,
-      '이 사본을 AI 입력 대상으로 기록하지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
-      'AI 입력은 켜지지 않았습니다.'
-    );
-  }
-
-  let trigger;
-  try {
-    trigger = ensureAttendanceAiEditTrigger_(state.spreadsheetId);
-  } catch (err) {
-    return finish_(
-      false,
-      '1행 편집을 받는 감지기를 만들지 못했습니다.\n\n' + errorMessage_(err) + '\n\n' +
-      '권한 승인 화면이 나오면 허용한 뒤 같은 메뉴를 다시 눌러 주세요.\n' +
-      'AI 입력은 아직 켜지지 않았습니다.'
-    );
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const before = attendanceAiWorkbookStateFor_(spreadsheet);
+  const triggerAlreadyThere = attendanceAiEditTriggersFor_(
+    ScriptApp.getProjectTriggers(), String(spreadsheet.getId() || '').trim()
+  ).length === 1;
+  const setup = setupAttendanceAiInputFor_(spreadsheet, expectedAccount, spreadsheet);
+  if (!setup.ok) {
+    return finish_(false, String(before && before.message || 'AI 입력을 켜지 못했습니다.'));
   }
 
   return finish_(
     true,
     'AI 출결 입력을 켰습니다.\n\n' +
-    (trigger.created ? '1행 편집을 받는 감지기를 새로 하나 만들었습니다.\n' : '이미 있던 감지기 하나를 그대로 씁니다.\n') +
+    (!triggerAlreadyThere ? '1행 편집을 받는 감지기를 새로 하나 만들었습니다.\n' : '이미 있던 감지기 하나를 그대로 씁니다.\n') +
     '\n월 시트 1행에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르면\n' +
     '맨 아래에 연한 초록색 출결행이 생깁니다.\n\n' +
     '이름을 못 찾거나 날짜·구분을 해석하지 못하면 아무 줄도 만들지 않습니다.',
-    trigger.created
+    !triggerAlreadyThere
   );
 }
 

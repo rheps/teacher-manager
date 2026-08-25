@@ -135,6 +135,16 @@ class _Hold(Exception):
     """자료가 모호하거나 빠져 있어 안전하게 계속할 수 없음."""
 
 
+class _PermissionRequired(_Hold):
+    """원격 쓰기 직전 현재 계정 또는 승인 지문이 달라져 중단함."""
+
+
+_PERMISSION_REQUIRED_DETAIL = (
+    "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해 주세요. "
+    "기존 자료는 그대로입니다."
+)
+
+
 def _public_failure_detail(error: Exception) -> str:
     if isinstance(error, _Hold):
         detail = str(error).strip()
@@ -146,6 +156,15 @@ def _public_failure_detail(error: Exception) -> str:
 def _need(condition: Any, detail: str = "") -> None:
     if not condition:
         raise _Hold(detail)
+
+
+def _guard_remote_mutation(mutation_guard) -> None:
+    try:
+        allowed = callable(mutation_guard) and mutation_guard() is True
+    except Exception as error:  # noqa: BLE001 - 계정·토큰·외부 오류는 버린다.
+        raise _PermissionRequired(_PERMISSION_REQUIRED_DETAIL) from error
+    if not allowed:
+        raise _PermissionRequired(_PERMISSION_REQUIRED_DETAIL)
 
 
 def _clean_id(value: Any) -> str:
@@ -594,6 +613,7 @@ def inspect_or_update_attendance_script(
     runner,
     gws_executable,
     temp_parent=None,
+    mutation_guard=None,
 ) -> AttendanceScriptUpdateResult:
     """저장된 설치 기록의 세 ID만 엄격히 읽어 확인 또는 갱신으로 보낸다."""
 
@@ -629,6 +649,32 @@ def inspect_or_update_attendance_script(
         values["deployment_id"],
         **common,
         temp_parent=temp_parent,
+        mutation_guard=mutation_guard,
+    )
+
+
+def verified_same_attendance_connection(
+    result: Mapping[str, Any],
+    record: Mapping[str, Any],
+    expected_bundle_sha256: str,
+) -> bool:
+    """원격 확인 결과가 저장된 세 연결과 현재 제품 파일을 그대로 가리키는지 본다."""
+
+    if not isinstance(result, Mapping) or not isinstance(record, Mapping):
+        return False
+    expected_sha256 = _clean_id(expected_bundle_sha256)
+    return (
+        result.get("verified") is True
+        and result.get("state") in {"current", "updated"}
+        and bool(expected_sha256)
+        and all(
+            isinstance(record.get(key), str)
+            and record.get(key) != ""
+            and result.get(key) == record.get(key)
+            for key in ("spreadsheet_id", "script_id", "deployment_id")
+        )
+        and result.get("target_bundle_sha256") == expected_sha256
+        and result.get("current_bundle_sha256") == expected_sha256
     )
 
 
@@ -640,7 +686,14 @@ def _require_bundle(reply: Any, script: str, wanted_sha: str) -> None:
     )
 
 
-def _create_version(runner, gws: str, script: str, description: str) -> int:
+def _create_version(
+    runner,
+    gws: str,
+    script: str,
+    description: str,
+    mutation_guard,
+) -> int:
+    _guard_remote_mutation(mutation_guard)
     reply = _call(
         runner,
         gws,
@@ -658,6 +711,7 @@ def _push_exact_files(
     code_bytes: bytes,
     manifest_bytes: bytes,
     temp_parent: Path | None,
+    mutation_guard,
 ):
     parent = None if temp_parent is None else str(Path(temp_parent))
     with tempfile.TemporaryDirectory(
@@ -666,6 +720,7 @@ def _push_exact_files(
         folder = Path(name)
         (folder / "Code.gs").write_bytes(code_bytes)
         (folder / "appsscript.json").write_bytes(manifest_bytes)
+        _guard_remote_mutation(mutation_guard)
         return _run_one_json(
             runner,
             [
@@ -702,6 +757,21 @@ def _updated_result(
         deployment_version_number=updated_version,
         updated_version_number=updated_version,
         detail="",
+    )
+
+
+def _stopped_result(
+    inspected: AttendanceScriptUpdateResult,
+    error: Exception,
+    **changes,
+) -> AttendanceScriptUpdateResult:
+    state = "permission-required" if isinstance(error, _PermissionRequired) else "hold"
+    return replace(
+        inspected,
+        state=state,
+        verified=False,
+        detail=_public_failure_detail(error),
+        **changes,
     )
 
 
@@ -749,6 +819,7 @@ def _finish_existing_verified_version(
     runner,
     gws: str,
     sleeper,
+    mutation_guard,
 ) -> AttendanceScriptUpdateResult:
     """준비된 판을 같은 배포에 한 번만 연결하고, 모호하면 읽기만 한다."""
 
@@ -774,6 +845,7 @@ def _finish_existing_verified_version(
             live_version == previous_version,
             "확인하는 사이 기존 배포가 다른 버전으로 바뀌었어요.",
         )
+        _guard_remote_mutation(mutation_guard)
         update_reply = _call(
             runner,
             gws,
@@ -784,6 +856,8 @@ def _finish_existing_verified_version(
         _check_updated_deployment(
             update_reply, script, deployment, updated_version, update_description
         )
+    except _PermissionRequired as exc:
+        return _stopped_result(inspected, exc)
     except Exception as exc:
         error = exc
 
@@ -824,6 +898,7 @@ def _create_missing_target_version(
     inspected: AttendanceScriptUpdateResult,
     runner,
     gws: str,
+    mutation_guard,
 ) -> AttendanceScriptUpdateResult:
     """이미 올라간 정식 HEAD를 다시 확인하고 빠진 불변 판 하나만 만든다."""
 
@@ -834,7 +909,7 @@ def _create_missing_target_version(
         # 상태 확인 뒤 다른 편집이 끼어들었으면 어떤 판도 만들지 않는다.
         _require_bundle(_content(runner, gws, script), script, target_sha)
         updated_version = _create_version(
-            runner, gws, script, update_description
+            runner, gws, script, update_description, mutation_guard
         )
         _require_bundle(
             _content(runner, gws, script, updated_version), script, target_sha
@@ -842,12 +917,7 @@ def _create_missing_target_version(
     except Exception as exc:
         # versions.create 답이 사라진 경우 같은 쓰기를 반복하지 않는다. 다음 버튼
         # 실행의 읽기 단계가 실제로 생긴 판을 찾아 이어간다.
-        return replace(
-            inspected,
-            state="hold",
-            verified=False,
-            detail=_public_failure_detail(exc),
-        )
+        return _stopped_result(inspected, exc)
     return replace(inspected, updated_version_number=updated_version)
 
 
@@ -861,6 +931,7 @@ def apply_attendance_script_update(
     gws_executable: str | None = None,
     temp_parent=None,
     sleeper=None,
+    mutation_guard=None,
 ) -> AttendanceScriptUpdateResult:
     """검증된 옛 공개본만 백업한 뒤 같은 배포 ID를 새 버전으로 바꾼다."""
 
@@ -882,6 +953,7 @@ def apply_attendance_script_update(
                 inspected,
                 runner,
                 _clean_id(gws_executable),
+                mutation_guard,
             )
             if inspected.state == "hold" or not inspected.verified:
                 return inspected
@@ -890,6 +962,7 @@ def apply_attendance_script_update(
             runner,
             _clean_id(gws_executable),
             actual_sleeper,
+            mutation_guard,
         )
     if inspected.state != "update_available" or not inspected.verified:
         return inspected
@@ -908,7 +981,7 @@ def apply_attendance_script_update(
         _need(fresh_target_sha == target_sha, "업데이트 파일이 확인 도중 바뀌었어요.")
 
         backup_version = _create_version(
-            runner, gws, script, before_description
+            runner, gws, script, before_description, mutation_guard
         )
         _require_bundle(
             _content(runner, gws, script, backup_version), script, old_sha
@@ -917,12 +990,7 @@ def apply_attendance_script_update(
         # 실제 업로드 바로 앞에서 현재 편집본을 한 번 더 읽어 옛 정식본 그대로인지 본다.
         _require_bundle(_content(runner, gws, script), script, old_sha)
     except Exception as exc:
-        return replace(
-            inspected,
-            state="hold",
-            verified=False,
-            detail=_public_failure_detail(exc),
-        )
+        return _stopped_result(inspected, exc)
 
     try:
         pushed = _push_exact_files(
@@ -932,23 +1000,22 @@ def apply_attendance_script_update(
             code_bytes,
             manifest_bytes,
             None if temp_parent is None else Path(temp_parent),
+            mutation_guard,
         )
         _require_bundle(pushed, script, target_sha)
     except Exception as exc:
         # 쓰기가 성공했는데 답만 사라졌을 수 있다. 읽기는 한 번 하되 쓰기는 반복하지 않는다.
         _safe_head_read(runner, gws, script)
-        return replace(
+        return _stopped_result(
             inspected,
-            state="hold",
-            verified=False,
+            exc,
             backup_version_number=backup_version,
-            detail=_public_failure_detail(exc),
         )
 
     try:
         _require_bundle(_content(runner, gws, script), script, target_sha)
         updated_version = _create_version(
-            runner, gws, script, update_description
+            runner, gws, script, update_description, mutation_guard
         )
         _need(
             updated_version > backup_version,
@@ -958,12 +1025,10 @@ def apply_attendance_script_update(
             _content(runner, gws, script, updated_version), script, target_sha
         )
     except Exception as exc:
-        return replace(
+        return _stopped_result(
             inspected,
-            state="hold",
-            verified=False,
+            exc,
             backup_version_number=backup_version,
-            detail=_public_failure_detail(exc),
         )
 
     return _finish_existing_verified_version(
@@ -977,6 +1042,7 @@ def apply_attendance_script_update(
         runner,
         gws,
         actual_sleeper,
+        mutation_guard,
     )
 
 
@@ -989,4 +1055,5 @@ __all__ = [
     "inspect_attendance_script_update",
     "inspect_or_update_attendance_script",
     "target_bundle_sha256",
+    "verified_same_attendance_connection",
 ]

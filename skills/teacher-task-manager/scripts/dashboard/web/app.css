@@ -372,6 +372,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .capture-context { margin:7px 0; color:#4B5563; font-size:13px; line-height:1.5; }
 .capture-context b { color:#333D4B; }
 .capture-retry { margin:10px 0 2px; padding:9px 11px; border-radius:9px; background:var(--tm-blue-soft); color:var(--tm-blue); font-size:12.8px; line-height:1.45; }
+.capture-retry-action { margin:12px 0 2px; }
 .cap-reason { display:none; padding:0 0 14px 36px; font-size:13.5px; color:var(--tm-red); }
 .cap.open .cap-reason { display:block; }
 .cap-pages { display:flex; align-items:center; justify-content:center; gap:6px; margin:12px 0 2px; }
@@ -457,6 +458,17 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog h3 { margin:0; font-size:18px; }
 .attendance-update-dialog p { margin:10px 0 20px; color:var(--tm-sub); line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog-actions { display:flex; justify-content:flex-end; gap:8px; }
+.attendance-consolidation-dialog { width:min(620px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; }
+.attendance-consolidation-files,.attendance-consolidation-moved,.attendance-consolidation-stages { display:grid; gap:9px; margin:14px 0; padding:0; list-style:none; }
+.attendance-consolidation-files li,.attendance-consolidation-moved li,.attendance-consolidation-stages li { display:flex; flex-wrap:wrap; align-items:center; gap:7px 12px; padding:11px 12px; border:1px solid var(--tm-line); border-radius:11px; }
+.attendance-consolidation-files li b { flex:1 1 100%; }
+.attendance-consolidation-files li small { flex:1 1 100%; color:var(--tm-sub); }
+.attendance-consolidation-files li span,.attendance-consolidation-files li strong { font-size:12px; }
+.attendance-consolidation-moved li b { flex:1; }
+.attendance-consolidation-stages li span { color:var(--tm-blue); }
+.attendance-consolidation-total { font-weight:700; text-align:right; }
+.attendance-consolidation-warning { padding:11px 12px; border-radius:11px; color:#8A5A10; background:var(--tm-amber-soft); }
+.attendance-consolidation-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-top:18px; }
 
 /* 1단계 "화면에서 찾기" — 구글 워크스페이스 위치 캡처 안내 */
 .guide-overlay { position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:20px; background:rgba(15,23,42,.5); }
@@ -505,6 +517,13 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .win-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding:20px 24px 28px; }
 .win-body .page { max-width:100%; }
 .about-brand { font-size:21px; font-weight:800; margin:2px 0 4px; }
+.update-manual-note { border-top:1px solid var(--tm-line); padding:12px 0 14px; }
+.update-manual-link { display:block; width:100%; border:0; background:none; padding:0;
+  color:var(--tm-faint); font-family:inherit; font-size:13px; line-height:1.65;
+  text-align:left; cursor:pointer; }
+.update-manual-link:hover, .update-manual-link:focus-visible { color:#4E5968; text-decoration:underline; text-underline-offset:3px; }
+.update-manual-link:focus-visible { outline:2px solid #B6D5FB; outline-offset:4px; border-radius:3px; }
+.update-manual-link:disabled { opacity:.55; cursor:default; text-decoration:none; }
 body.win-open { overflow:hidden; }
 
 @media (max-width:900px) {

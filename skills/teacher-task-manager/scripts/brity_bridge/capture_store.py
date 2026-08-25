@@ -88,12 +88,93 @@ def _display_capture(row: dict) -> dict:
     return shown
 
 
+def merge_retry_items(previous_items, retry_items) -> list[dict]:
+    """Keep earlier successes and replace matching failed rows with retry outcomes."""
+
+    merged = [dict(item) for item in (previous_items or []) if isinstance(item, dict)]
+    for retry_item in retry_items or []:
+        if not isinstance(retry_item, dict):
+            continue
+        current = dict(retry_item)
+        key = tuple(str(current.get(field) or "") for field in ("kind", "target", "title"))
+        replace_at = next(
+            (
+                index
+                for index, old in enumerate(merged)
+                if old.get("result") == "failed"
+                and tuple(str(old.get(field) or "") for field in ("kind", "target", "title"))
+                == key
+            ),
+            None,
+        )
+        if replace_at is None:
+            merged.append(current)
+        else:
+            merged[replace_at] = current
+    return merged
+
+
+def _merged_retry_capture(previous: dict, retry: dict) -> dict:
+    shown = dict(retry)
+    previous_items = [item for item in (previous.get("items") or []) if isinstance(item, dict)]
+    retry_items = [item for item in (retry.get("items") or []) if isinstance(item, dict)]
+    shown["items"] = (
+        [dict(item) for item in retry_items]
+        if len(retry_items) >= len(previous_items)
+        else merge_retry_items(previous_items, retry_items)
+    )
+    shown.setdefault("original_when", previous.get("original_when") or previous.get("when") or "")
+    for field in (
+        "message_sender",
+        "message_sent_at",
+        "message_preview",
+        "attachment_count",
+        "attachment_names",
+        "attachment_analyzed_names",
+        "attachment_skipped_names",
+        "attachment_link_status",
+        "attachment_link_detail",
+        "attachment_files",
+    ):
+        if field not in shown and field in previous:
+            shown[field] = previous[field]
+    summary = str(shown.get("summary") or "")
+    if shown.get("ok") is True and "실패했던 항목을 다시 처리" not in summary:
+        shown["summary"] = f"실패했던 항목을 다시 처리했습니다 ({summary})."
+    return _display_capture(shown)
+
+
+def _current_capture_rows(state_dir: Path) -> list[dict]:
+    """Return one current screen row per retry chain while keeping the raw audit append-only."""
+
+    visible = []
+    for row in _capture_rows(state_dir):
+        source_hash = str(row.get("source_hash") or "")
+        retry_of_when = str(row.get("retry_of_when") or "")
+        if source_hash and retry_of_when:
+            replace_at = next(
+                (
+                    index
+                    for index in range(len(visible) - 1, -1, -1)
+                    if str(visible[index].get("source_hash") or "") == source_hash
+                    and str(visible[index].get("when") or "") == retry_of_when
+                ),
+                None,
+            )
+            if replace_at is not None:
+                previous = visible.pop(replace_at)
+                visible.append(_merged_retry_capture(previous, row))
+                continue
+        visible.append(_display_capture(row))
+    return visible
+
+
 def read_captures(state_dir: Path, limit: int = 20) -> list[dict]:
     wanted = max(0, int(limit))
     if wanted == 0:
         return []
     rows = deque(maxlen=wanted)
-    rows.extend(_display_capture(row) for row in _capture_rows(state_dir))
+    rows.extend(_current_capture_rows(state_dir))
     return list(reversed(rows))
 
 
@@ -113,18 +194,31 @@ def latest_successful_done(state_dir: Path, source_hash: str) -> dict | None:
     return latest
 
 
+def find_capture(state_dir: Path, source_hash: str, when: str = "") -> dict | None:
+    """Return the newest capture matching one message and optional attempt time."""
+
+    if not source_hash:
+        return None
+    latest = None
+    for row in _capture_rows(state_dir):
+        if row.get("source_hash") != source_hash:
+            continue
+        if when and row.get("when") != when:
+            continue
+        latest = _display_capture(row)
+    return latest
+
+
 def read_capture_page(state_dir: Path, page: int = 1, page_size: int = 10) -> dict:
     size = max(1, int(page_size))
-    total = sum(1 for _ in _capture_rows(state_dir))
+    rows = _current_capture_rows(state_dir)
+    total = len(rows)
     total_pages = (total + size - 1) // size
     current = min(max(1, int(page)), total_pages or 1)
 
     newest_end = total - ((current - 1) * size)
     newest_start = max(0, newest_end - size)
-    selected = [
-        _display_capture(row) for index, row in enumerate(_capture_rows(state_dir))
-        if newest_start <= index < newest_end
-    ]
+    selected = rows[newest_start:newest_end]
     selected.reverse()
     return {
         "items": selected,

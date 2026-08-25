@@ -37,7 +37,9 @@ from brity_bridge.message_parse import (
 from brity_bridge.proposal_check import (
     BODY_MAX,
     CheckError,
+    CheckedAction,
     add_work_task_copies,
+    build_action_key,
     check_proposal,
 )
 
@@ -331,6 +333,7 @@ def _finish(
     attachment_link_status: str = "",
     attachment_link_detail: str = "",
     run: dict | None = None,
+    retry_of_when: str = "",
 ) -> FlowResult:
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -375,6 +378,8 @@ def _finish(
         entry["retry"] = retry
     if original_when:
         entry["original_when"] = original_when
+    if retry_of_when:
+        entry["retry_of_when"] = retry_of_when
     try:
         capture_store.append_capture(paths.bridge_state_dir(config_dir), entry)
     except (OSError, ValueError):
@@ -394,6 +399,222 @@ def _finish(
     if progress is not None:
         progress("done" if result.ok else "fail", result.message)
     return result
+
+
+def _saved_actions(document: dict, notice_sheet_id: str) -> list[CheckedAction]:
+    runs = document.get("runs") if isinstance(document, dict) else None
+    if not isinstance(runs, list):
+        return []
+    saved_rows = []
+    for run in reversed(runs):
+        rows = run.get("checked_actions") if isinstance(run, dict) else None
+        if isinstance(rows, list) and rows:
+            saved_rows = rows
+            break
+    actions = []
+    for row in saved_rows:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "")
+        target = str(row.get("target") or "")
+        action_key = str(row.get("action_key") or "")
+        payload = row.get("payload")
+        container_id = str(row.get("container_id") or "")
+        if kind == "notice":
+            container_id = notice_sheet_id
+        if (
+            kind not in {"calendar", "task", "notice"}
+            or not target
+            or not action_key
+            or not isinstance(payload, dict)
+        ):
+            continue
+        actions.append(
+            CheckedAction(
+                kind=kind,
+                target=target,
+                google_id=container_id,
+                payload=dict(payload),
+                action_key=action_key,
+            )
+        )
+    return actions
+
+
+def _legacy_class_notice_actions(
+    capture: dict | None, notice_sheet_id: str
+) -> list[CheckedAction]:
+    if not isinstance(capture, dict) or capture.get("ok") is not False:
+        return []
+    failed = [
+        item
+        for item in (capture.get("items") or [])
+        if isinstance(item, dict) and item.get("result") == "failed"
+    ]
+    if not failed or any(
+        item.get("kind") != "notice" or item.get("target") != "학생 안내표 · 단체톡"
+        for item in failed
+    ):
+        return []
+    date_text = str(capture.get("when") or "")[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+        return []
+    actions = []
+    for item in failed:
+        content = str(item.get("title") or "").strip()
+        if not content or len(content) > BODY_MAX:
+            return []
+        actions.append(
+            CheckedAction(
+                kind="notice",
+                target="class",
+                google_id=notice_sheet_id,
+                payload={"content": content},
+                action_key=build_action_key("notice", "class", date_text, "|" + content),
+            )
+        )
+    return actions
+
+
+def retry_saved_capture(
+    config_dir: Path,
+    source_hash: str,
+    *,
+    capture_when: str = "",
+    gws_runner=None,
+    gws_executable: str | None = None,
+    attendance_script_inspector=None,
+) -> FlowResult:
+    """Retry only unfinished actions from a saved message run."""
+
+    config_dir = Path(config_dir)
+    if not re.fullmatch(r"[0-9a-f]{64}", str(source_hash or "")):
+        return FlowResult(False, "retry", "다시 시도할 메시지 정보를 확인하지 못했어요.")
+    state_dir = paths.bridge_state_dir(config_dir)
+    capture = capture_store.find_capture(state_dir, source_hash, capture_when)
+    if not capture or capture.get("ok") is not False or not capture.get("retry"):
+        return FlowResult(False, "retry", "이 기록은 안전하게 다시 시도할 수 없어요.")
+    document = message_archive.load(state_dir, source_hash)
+    message = document.get("message") if isinstance(document, dict) else None
+
+    profile = _load_profile(config_dir)
+    if profile is None:
+        return FlowResult(False, "profile", "내 정보가 없습니다. Teacher Manager 처음 시작 설정을 먼저 끝내 주세요.")
+    notice_sheet_id, notice_unavailable_message = _load_notice_sheet(config_dir)
+    actions = (
+        _saved_actions(document, notice_sheet_id)
+        if isinstance(message, dict)
+        else _legacy_class_notice_actions(capture, notice_sheet_id)
+    )
+    if not actions:
+        return FlowResult(False, "retry", "다시 시도할 항목 정보를 확인하지 못했어요.")
+
+    history = HistoryStore(paths.history_path(config_dir))
+    history.load()
+    completed_keys = history.completed_keys(source_hash)
+    pending = [action for action in actions if action.action_key not in completed_keys]
+    if not pending:
+        return FlowResult(True, "duplicate", "이미 모든 항목이 처리되어 새로 만들지 않았어요.")
+
+    report = execute_actions(
+        pending,
+        history,
+        runner=gws_runner,
+        source_hash=source_hash,
+        gws_executable=gws_executable,
+        notice_unavailable_message=notice_unavailable_message,
+        expected_account=_load_attendance_owner(config_dir),
+        notice_preflight=(
+            (
+                lambda runner, executable: _remote_notice_script_preflight(
+                    config_dir,
+                    runner,
+                    executable,
+                    attendance_script_inspector,
+                )
+            )
+            if notice_sheet_id
+            else None
+        ),
+    )
+    summary = _summarize_report(report)
+    items = capture_store.merge_retry_items(capture.get("items"), _items_from_report(report, profile))
+    run = _new_run()
+    run["checked_actions"] = _checked_action_rows(actions)
+    run["created"] = _created_rows(report)
+    if report.all_done:
+        try:
+            history.mark_completed(source_hash)
+            history.save()
+        except Exception:
+            pass
+        result = FlowResult(
+            True,
+            "done",
+            f"실패했던 항목을 다시 처리했습니다 ({summary})." + _notice_created_note(report),
+            report=report,
+        )
+    else:
+        result = FlowResult(
+            False,
+            "execute",
+            f"다시 시도했지만 아직 처리하지 못한 항목이 있습니다 ({summary})."
+            + _notice_blocked_note(report)
+            + _account_blocked_note(report),
+            report=report,
+        )
+    if isinstance(message, dict):
+        identity = {
+            "sender": str(message.get("sender") or ""),
+            "sent_at": str(message.get("sent_at") or ""),
+            "preview": str(message.get("plain_text") or "")[:60],
+        }
+        attachment_names = tuple(message.get("local_attachment_names") or ())
+    else:
+        identity = {
+            "sender": str((capture or {}).get("message_sender") or ""),
+            "sent_at": str((capture or {}).get("message_sent_at") or ""),
+            "preview": str((capture or {}).get("message_preview") or ""),
+        }
+        attachment_names = tuple((capture or {}).get("attachment_names") or ())
+    return _finish(
+        config_dir,
+        result,
+        source_hash,
+        detail=summary,
+        summary=result.message,
+        items=items,
+        identity=identity,
+        retry=RETRY_MESSAGE if not result.ok else "",
+        attachment_count=len(attachment_names),
+        attachment_names=attachment_names,
+        attachment_analyzed_names=attachment_names,
+        attachment_link_status="not-confirmed" if attachment_names else "",
+        run=run,
+        retry_of_when=capture_when,
+    )
+
+
+def saved_capture_retry_available(
+    config_dir: Path, source_hash: str, capture_when: str = ""
+) -> bool:
+    """Return whether one failed capture has enough trusted local data to retry."""
+
+    if not re.fullmatch(r"[0-9a-f]{64}", str(source_hash or "")):
+        return False
+    config_dir = Path(config_dir)
+    state_dir = paths.bridge_state_dir(config_dir)
+    capture = capture_store.find_capture(state_dir, source_hash, capture_when)
+    if not capture or capture.get("ok") is not False or not capture.get("retry"):
+        return False
+    document = message_archive.load(state_dir, source_hash)
+    actions = _saved_actions(document, "") if document else _legacy_class_notice_actions(capture, "")
+    if not actions:
+        return False
+    history = HistoryStore(paths.history_path(config_dir))
+    history.load()
+    completed = history.completed_keys(source_hash)
+    return any(action.action_key not in completed for action in actions)
 
 
 def _load_profile(config_dir: Path) -> dict | None:

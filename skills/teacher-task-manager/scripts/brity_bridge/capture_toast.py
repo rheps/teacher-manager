@@ -12,7 +12,10 @@ import sys
 import threading
 from ctypes import wintypes
 
-PRESSED_TEXT = "단축키를 눌렀어요 — 메신저 화면을 읽을게요"
+PRESSED_TEXT = (
+    "단축키를 눌렀어요 — 메신저 화면을 읽을게요\n"
+    "아직 다른 메시지로 넘어가시면 안돼요"
+)
 TITLE_TEXT = "Teacher Manager"
 
 _STAGE_TEXTS = {
@@ -177,7 +180,7 @@ class CaptureToast:
     """항상 위 우하단 상태창. show → update* → close(지연) 순서로 쓴다."""
 
     BASE_WIDTH = 344
-    BASE_HEIGHT = 88
+    BASE_HEIGHT = 112
     BASE_MARGIN = 16
 
     def __init__(self):
