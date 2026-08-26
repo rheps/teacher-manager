@@ -48,7 +48,8 @@ _ATTENDANCE_AUTH_BLOCKED_STATES = {
     "gws-required", "login-required", "account-required", "auth-error"
 }
 _ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
-    "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해 주세요. "
+    "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. "
+    "설정에서 현재 Google 계정을 로그아웃한 뒤 같은 @goedu.kr 계정으로 다시 로그인해 주세요. "
     "기존 출석부와 감지기는 그대로입니다."
 )
 _ATTENDANCE_AI_PROOF_MESSAGE = (
@@ -80,10 +81,10 @@ _SCREEN_FAILURES = {
     "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요. 폴더 위치를 다시 확인해 주세요.",
     "attendance_status": "출결 상태를 확인하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
     "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
-    "attendance_google_identity": "현재 Google 로그인 계정을 확인하지 못했어요. 현재 연결과 출석부는 그대로입니다. 설정에서 Google 로그인을 다시 점검해 주세요.",
+    "attendance_connection_candidates": "기존 정식 출석부 목록을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
+    "select_attendance_connection": "고른 출석부 연결을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
+    "select_attendance_connection_by_code": "붙여 넣은 확인번호로 출석부 연결을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
     "ensure_attendance": "출결 자료를 준비하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_consolidation_preview": "정리할 출결 자료를 확인하지 못했어요. 현재 연결은 그대로입니다. Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "consolidate_attendance": "출결 자료 정리 결과를 끝까지 확인하지 못했어요. 저장된 진행 상태를 확인해 이어서 진행해 주세요.",
     "start_new_attendance": "새 학년도 출석부를 시작하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
     "attendance_prepare_start": "출결 준비를 시작하지 못했어요. 이 컴퓨터 설정과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
     "attendance_prepare_status": "출결 준비 상태를 확인하지 못했어요. 설정에서 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
@@ -569,12 +570,12 @@ class Api:
     @guarded
     def attendance_status(self):
         self._require_safe_gws_account_storage()
-        status_value = engine.read_attendance_status(self._config_dir, self._run())
+        status_value = engine.read_attendance_status(
+            self._config_dir,
+            self._run(),
+        )
         if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
             return asdict(status_value)
-        # 허용 계정임을 확인한 뒤에만 옛 기록에 학년도 도장을 채운다.
-        if engine.backfill_attendance_record_stamp(self._config_dir):
-            status_value = engine.read_attendance_status(self._config_dir, self._run())
         status = asdict(status_value)
         # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다.
         engine.save_attendance_status_cache(self._config_dir, status)
@@ -586,14 +587,51 @@ class Api:
         return engine.load_attendance_status_cache(self._config_dir)
 
     @guarded
-    def attendance_google_identity(self):
-        """출결 정리 화면에 실제 GWS 로그인 계정 하나만 안전하게 돌려준다."""
-        run, gws = self._resolve_gws_or_fail()
-        auth = engine.gws_auth_status(run, gws)
-        account = ""
-        if auth.get("logged_in"):
-            account = str(auth.get("user", "") or "").strip().lower()
-        return {"account": account}
+    def attendance_connection_candidates(self):
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+        return asdict(
+            engine.attendance_connection_candidates(self._config_dir, deps=deps)
+        )
+
+    @guarded
+    def select_attendance_connection(self, spreadsheet_id):
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+        result = engine.select_attendance_connection(
+            self._config_dir, str(spreadsheet_id or ""), deps=deps
+        )
+        if result.state == "selected":
+            try:
+                (self._config_dir / engine.ATTENDANCE_STATUS_CACHE_NAME).unlink()
+            except OSError:
+                # 정본 선택은 이미 원자 교체로 끝났다. 옛 화면 저장본을 치우지
+                # 못했다는 이유로 선택 성공을 실패처럼 돌려주지 않는다. 저장본은
+                # 다음 읽기에서 현재 정본 URL과 대조되어 맞지 않으면 버려진다.
+                pass
+        return asdict(result)
+
+    @guarded
+    def select_attendance_connection_by_code(self, connection_code):
+        """붙여 넣은 확인번호를 정식 후보 하나와 대조해 현재 연결을 바꾼다."""
+
+        self._require_safe_gws_account_storage()
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+        result = engine.select_attendance_connection_by_code(
+            self._config_dir, str(connection_code or ""), deps=deps
+        )
+        if result.state == "selected":
+            try:
+                (self._config_dir / engine.ATTENDANCE_STATUS_CACHE_NAME).unlink()
+            except OSError:
+                pass
+        return asdict(result)
 
     @guarded
     def ensure_attendance(self):
@@ -618,27 +656,6 @@ class Api:
         if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
             engine.save_attendance_status_cache(self._config_dir, status)
         return status
-
-    @guarded
-    def attendance_consolidation_preview(self):
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        return asdict(
-            engine.attendance_consolidation_preview(self._config_dir, deps=deps)
-        )
-
-    @guarded
-    def consolidate_attendance(self, preview_fingerprint):
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        result = engine.consolidate_attendance(
-            self._config_dir, str(preview_fingerprint or ""), deps=deps
-        )
-        return asdict(result)
 
     @guarded
     def attendance_prepare_start(self, profile, grid, bridge_updates):
@@ -764,16 +781,24 @@ class Api:
         from attendance_install_record import (
             mark_attendance_script_current,
             read_attendance_install_snapshot,
+            validate_verified_canonical_record,
         )
 
+        if record_snapshot is None:
+            record_snapshot = read_attendance_install_snapshot(record_path)
+        try:
+            record = validate_verified_canonical_record(record_snapshot.record)
+        except Exception:
+            return {
+                "state": "connection-repair-required",
+                "verified": False,
+                "detail": engine.ATTENDANCE_CONNECTION_REPAIR_MESSAGE,
+            }
         run, gws = (
             resolved
             if resolved is not None
             else self._resolve_attendance_goedu_gws_or_fail()
         )
-        if record_snapshot is None:
-            record_snapshot = read_attendance_install_snapshot(record_path)
-        record = record_snapshot.record
         mutation_guard = self._attendance_update_mutation_guard(
             run, gws, account
         ) if apply else None
@@ -1622,10 +1647,6 @@ class Api:
         return bool(resume())
 
     @guarded
-    def reset_attendance(self):
-        return engine.reset_attendance_record(self._config_dir)
-
-    @guarded
     def open_logs(self):
         logs = paths.settings_path(self._config_dir).parent / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -1636,3 +1657,21 @@ class Api:
     @guarded
     def open_url(self, url):
         return self._open_external_url(url)
+
+    @guarded
+    def open_current_attendance(self):
+        """화면에 남은 주소 대신 누른 순간의 검증된 정본 출석부만 연다."""
+
+        from attendance_install_record import (
+            AttendanceInstallRecordError,
+            read_verified_canonical_record,
+        )
+
+        record_path = paths.attendance_install_record_path(self._config_dir)
+        try:
+            record = read_verified_canonical_record(record_path)
+        except (OSError, AttendanceInstallRecordError) as error:
+            raise ScreenSafeError(
+                "현재 출석부 연결을 먼저 바로잡아 주세요."
+            ) from error
+        return self._open_external_url(record["spreadsheet_url"])

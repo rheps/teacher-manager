@@ -66,7 +66,9 @@
 #       자동 업데이트 실패 때 공식 GitHub Release 직접 설치 안내를 문장 전체 링크로 제공
 # v3.0: Brity 재시도 성공 기록을 최종 결과로 합치고 Calendar 첨부파일을 짧은 한 주소로 안전하게 연결 ·
 #       VirtualBox 기반 깨끗한 Windows 촬영 안내 추가
-APP_VERSION = "3.0"
+# v3.1: 한 번 고른 정식 출석부 번호만 사용하고 옛 통합·휴지통 길을 제거 ·
+#       업데이트 때 새 판에 없는 옛 내부 부품과 작업용 화면 시안을 정리
+APP_VERSION = "3.1"
 
 BRANDING = {
     "name": "Teacher Manager",

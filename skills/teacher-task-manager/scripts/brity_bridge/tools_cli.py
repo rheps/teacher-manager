@@ -452,48 +452,11 @@ def run_attendance_install(
     return 0
 
 
-def run_connect_attendance(
-    argv: Sequence[str], *, connector: Callable | None = None,
-    expected_config_dir: Path | None = None,
-    account_resolver: Callable[[], str] = current_gws_account,
-    lock_factory: Callable | None = None,
-) -> int:
-    parser = _command_parser("connect-attendance", "이미 쓰는 출결 시트를 읽어 로컬 기록에 연결합니다.")
-    parser.add_argument("--config-dir", required=True)
-    parser.add_argument("--spreadsheet-id", required=True)
-    parser.add_argument("--apply", action="store_true")
-    args = _parse(parser, argv)
-    if args is None:
-        return 2
-    if not args.apply:
-        return _approval_required("로컬 출결 연결 기록을 바꾸려면 내용을 확인한 뒤 --apply를 붙여 주세요.")
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if connector is None:
-        from connect_existing_attendance_sheet import connect_existing_attendance_sheet
-
-        connector = connect_existing_attendance_sheet
-    if lock_factory is None:
-        from dashboard.engine import attendance_setup_lock
-
-        lock_factory = attendance_setup_lock
-    # 적용 버튼을 누른 직후 같은 잠금 안에서 소유자·설정·자료를 전부 다시 읽은 뒤
-    # 마지막 단계에서만 로컬 연결 기록을 바꾼다.
-    with lock_factory(config):
-        account = _checked_goedu_account(account_resolver)
-        if not account:
-            return 2
-        result = connector(config, args.spreadsheet_id, account=account)
-    return _print_result_with_exit(result, {"connected"})
-
-
-
-
 def _default_handlers() -> dict[str, Callable[[Sequence[str]], int]]:
     return {
         "setup-init": run_setup_init,
         "parse-settings": run_parse_settings,
         "attendance-install": run_attendance_install,
-        "connect-attendance": run_connect_attendance,
     }
 
 

@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 
 ATTENDANCE_RECORD_BROKEN = "ATTENDANCE_RECORD_BROKEN"
@@ -32,11 +33,14 @@ CONNECTION_FIELDS = {
 }
 SCRIPT_UPDATE_REQUIRED_FIELD = "script_update_required"
 SCRIPT_ATTESTATION_FIELD = "script_attestation"
+SETUP_ACCOUNT_FIELD = "setup_account"
 SCRIPT_ATTESTATION_SCHEMA = 1
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RECORD_WRITE_TIMEOUT_SECONDS = 10.0
 _RECORD_THREAD_LOCKS: dict[str, threading.Lock] = {}
 _RECORD_THREAD_LOCKS_GUARD = threading.Lock()
+_CANONICAL_WORKBOOK_ROLE = "canonical-v1"
+_CANONICAL_WORKBOOK_SUFFIX = "(Teacher manager 출결 자동화)"
 
 
 class AttendanceInstallRecordError(ValueError):
@@ -192,6 +196,14 @@ def validate_attendance_install_record(record: dict) -> dict:
         and type(record[SCRIPT_UPDATE_REQUIRED_FIELD]) is not bool
     ):
         raise _error("script_update_required 값은 true 또는 false여야 해요.")
+    if SETUP_ACCOUNT_FIELD in record:
+        setup_account = record[SETUP_ACCOUNT_FIELD]
+        if (
+            not isinstance(setup_account, str)
+            or re.fullmatch(r"[^@\s]+@goedu\.kr", setup_account.strip(), re.IGNORECASE)
+            is None
+        ):
+            raise _error("setup_account는 확인된 @goedu.kr 계정이어야 해요.")
     if SCRIPT_ATTESTATION_FIELD in record:
         attestation = record[SCRIPT_ATTESTATION_FIELD]
         if (
@@ -295,6 +307,56 @@ def load_attendance_install_record(path: Path) -> dict:
     """중복 이름과 잘린 JSON을 거절하고 설치 기록을 읽는다."""
 
     return copy.deepcopy(read_attendance_install_snapshot(path).record)
+
+
+def _spreadsheet_id_from_url(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or parsed.hostname != "docs.google.com":
+        return ""
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 3 or parts[:2] != ["spreadsheets", "d"]:
+        return ""
+    return parts[2].strip()
+
+
+def validate_verified_canonical_record(record: dict) -> dict:
+    """평상시 열기·업데이트에 쓸 정본 표시와 Sheet 주소를 함께 확인한다."""
+
+    record = validate_attendance_install_record(record)
+    if record.get("workbook_role") != _CANONICAL_WORKBOOK_ROLE:
+        raise _error("현재 연결 기록에 정식 출석부 확인 표시가 없어요.")
+    spreadsheet_id = str(record.get("spreadsheet_id", "") or "").strip()
+    if not spreadsheet_id:
+        raise _error("정식 출석부 연결번호가 비어 있어요.")
+    linked_id = _spreadsheet_id_from_url(record.get("spreadsheet_url"))
+    if linked_id != spreadsheet_id:
+        raise _error("정식 출석부 연결번호와 열기 주소가 서로 달라요.")
+    for key in ("school_year", "workbook_name"):
+        if not isinstance(record.get(key), str) or not str(record[key]).strip():
+            raise _error(f"정식 출석부의 {key} 확인값이 비어 있어요.")
+    school_year = str(record["school_year"]).strip()
+    grade = str(record.get("homeroom_grade", "") or "").strip()
+    klass = str(record.get("homeroom_class", "") or "").strip()
+    stem = (
+        f"{school_year}학년도 {grade}학년 {klass}반 출석부"
+        if grade and klass
+        else f"{school_year}학년도 출석부"
+    )
+    expected_name = stem + _CANONICAL_WORKBOOK_SUFFIX
+    if str(record["workbook_name"]).strip() != expected_name:
+        raise _error("현재 연결 기록의 출석부 이름이 정식 이름과 달라요.")
+    return record
+
+
+def read_verified_canonical_record(path: Path) -> dict:
+    """파일을 엄격히 읽고 검증된 정본 기록만 돌려준다."""
+
+    return validate_verified_canonical_record(load_attendance_install_record(path))
 
 
 def ensure_create_only_install_backup(

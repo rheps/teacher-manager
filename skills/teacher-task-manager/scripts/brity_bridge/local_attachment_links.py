@@ -13,6 +13,9 @@ SHORT_LINK_ID_LENGTH = 16
 _SOURCE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SHORT_LINK_RE = re.compile(r"^https?://127\.0\.0\.1:49271/a/[0-9a-f]{16}$")
 _LEGACY_LINK_PREFIX = f"http://{LOCAL_ATTACHMENT_HOST}:{LOCAL_ATTACHMENT_PORT}/open?name="
+_ADMINISTRATIVE_PREFIX_RE = re.compile(
+    r"^\([^()\r\n]+-\d+\s+\((?:첨부|본문)\)\s+[^()\r\n]+\)\s+(?P<title>\S.*)$"
+)
 WINDOWS_PACKAGE_SUFFIXES = {
     ".appinstaller", ".appx", ".appxbundle", ".appxupload",
     ".msix", ".msixbundle", ".msixupload",
@@ -39,6 +42,16 @@ class AttachmentNotFound(Exception):
 
 class BlockedAttachmentType(Exception):
     pass
+
+
+def attachment_display_name(name: object) -> str:
+    """원본 파일은 그대로 두고 캘린더에 보여 줄 행정 접두어만 뺀다."""
+    original = str(name or "").strip()
+    match = _ADMINISTRATIVE_PREFIX_RE.fullmatch(original)
+    if match is None:
+        return original
+    title = match.group("title").strip()
+    return title or original
 
 
 def build_local_attachment_url(source_hash: str) -> str:
@@ -121,8 +134,9 @@ def add_local_attachment_links(
     except ValueError as error:
         raise CheckError(["첨부파일 연결 주소를 만들 수 없음"]) from error
     unique_names = tuple(dict.fromkeys(str(name) for name in names))
+    display_names = tuple(attachment_display_name(name) for name in unique_names)
     attachment_lines = [LOCAL_ATTACHMENT_HEADER]
-    attachment_lines.extend(f"- {name}" for name in unique_names)
+    attachment_lines.extend(f"- {name}" for name in display_names)
     attachment_lines.append(link)
     attachment_block = "\n".join(attachment_lines)
     result: list[CheckedAction] = []
@@ -132,7 +146,7 @@ def add_local_attachment_links(
             continue
         payload = dict(action.payload)
         old_description = _without_existing_attachment_lines(
-            payload.get("description", ""), unique_names
+            payload.get("description", ""), unique_names + display_names
         )
         payload["description"] = (
             f"{old_description}\n\n{attachment_block}"

@@ -49,14 +49,15 @@ const S = {
   connectTab: "messenger",   // messenger | attendance
   attendance: null,          // attendance_status/ensure_attendance 응답
   firstSetupDone: false,     // 시트 [처음 설정 한 번에 끝내기] 완료 확인 (마법사 출결 탭)
+  firstSetupConnectionCode: "", // 완료 표시가 어느 출석부 확인번호에 묶였는지
   attendanceStaleNotice: false, // 준비가 끝난 뒤 3~5단계를 다녀오면 출결 탭에 한 줄 안내
   attendanceSaving: false,   // 탭을 오가며 다시 그려도 출결 준비 중복 클릭을 막는다
   attendanceScriptUpdate: null, // 사용자가 눌러 확인한 기존 출결 Apps Script 상태
-  attendanceScriptDialog: null, // null | "update" | "finish"
+  attendanceScriptDialog: null, // null | "update"
   attendanceScriptUpdating: false,
+  attendanceConnection: null, // null | 후보 조회·선택 대화상자 상태
+  attendanceConnectionBusy: false,
   attendanceTransitioning: false, // 정리·새 학년도 전환 중에는 화면을 다시 그려도 재실행 금지
-  attendanceConsolidation: null, // null | 미리보기·권한·진행·결과 화면
-  attendanceConsolidationLoginStarted: false,
   workspaceGuideOpen: false,   // 1단계 "화면에서 찾기"로 뜨는 구글 워크스페이스 위치 캡처
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
@@ -67,7 +68,7 @@ let attendanceScriptRequestToken = 0;
 
 const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
-  "이 컴퓨터 설정", "Google 연결", "학생 계정 준비", "저장 및 마무리",
+  "이 컴퓨터 설정", "Google 연결", "학생 계정 준비", "모두 저장",
 ];
 const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
 function isGoeduGoogleStatus(status) {
@@ -292,6 +293,13 @@ bindActions({
     }
   },
   "link-copy": (el) => { copyText(el.dataset.url); },
+  "attendance-open": async () => {
+    try {
+      await call("open_current_attendance");
+    } catch (_error) {
+      showToast("현재 출석부 연결을 먼저 바로잡아 주세요");
+    }
+  },
   "show-workspace-guide": () => { S.workspaceGuideOpen = true; render(); },
   "close-workspace-guide": () => { S.workspaceGuideOpen = false; render(); },
 });
@@ -325,13 +333,11 @@ function googleStatusKey(status) {
 }
 function clearGoogleDependentState() {
   clearAttendanceScriptDialogState();
-  if (!preserveAttendanceConsolidationMutationForAccountChange()) {
-    invalidateAttendanceConsolidationFlow();
-  }
   stopAttendancePreparePoll();
   S.attendance = null;
   S.attendanceScriptUpdate = null;
   S.firstSetupDone = false;   // 계정이 바뀌면 다른 시트의 완료 표시일 수 있다
+  S.firstSetupConnectionCode = "";
   S.attendanceStaleNotice = false;
   S.chatStatus = null;
   S.checks = [];
@@ -407,15 +413,42 @@ function attendanceWizardGateOpen() {
   return Boolean(
     S.attendance
     && S.attendance.state === "ready"
-    && !S.attendance.consolidation_required
     && S.firstSetupDone
+    && S.firstSetupConnectionCode
+    && S.firstSetupConnectionCode === String(S.attendance.connection_code || "").trim().toUpperCase()
   );
+}
+function firstSetupCodeFromValue(value) {
+  const match = String(value || "").trim().match(/^(TM-[0-9A-F]{6}-[0-9A-F]{6})(?:\s|$)/i);
+  return match ? match[1].toUpperCase() : "";
+}
+async function refreshAttendanceWizardGate() {
+  // 준비 중이라고 이미 확인한 화면에서 단계 건너뛰기를 누르면, 일반 상태 조회가
+  // 먼저 완성된 옛 연결 기록을 돌려주더라도 준비 스레드가 끝난 것으로 보지 않는다.
+  if (S.attendance?.state === "installing") return false;
+  // 다른 창이 현재 출석부를 바꿨을 수 있으므로 7단계를 넘기 직전에 실제 상태와
+  // 그 Sheet에 묶인 완료 표시를 다시 읽는다. 옛 창의 true 값은 먼저 버린다.
+  S.firstSetupDone = false;
+  S.firstSetupConnectionCode = "";
+  try {
+    S.attendance = await call("attendance_status");
+    if (!S.attendance || S.attendance.state !== "ready") return false;
+    const first = await call("attendance_first_setup_status");
+    const completionCode = firstSetupCodeFromValue(first && first.value);
+    const currentCode = String(S.attendance.connection_code || "").trim().toUpperCase();
+    S.firstSetupConnectionCode = completionCode;
+    S.firstSetupDone = Boolean(
+      first && first.done === true && completionCode && completionCode === currentCode
+    );
+  } catch (_error) {
+    S.firstSetupDone = false;
+    S.firstSetupConnectionCode = "";
+  }
+  return attendanceWizardGateOpen();
 }
 function attendanceWizardGateMessage() {
   const state = S.attendance ? S.attendance.state : "";
-  if (S.attendance && S.attendance.consolidation_required) {
-    return "출결 시트 하나로 정리를 먼저 끝내 주세요.";
-  }
+  if (state === "connection-repair-required") return "출결 탭에서 사용할 기존 출석부를 먼저 골라 주세요.";
   if (state === "installing") return "출결 준비가 끝나야 다음으로 갈 수 있어요";
   if (state === "ready") return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
   if (state === "failed") return "출결 준비가 실패했어요. 출결 탭에서 [다시 시도]를 눌러 주세요.";
@@ -423,7 +456,7 @@ function attendanceWizardGateMessage() {
 }
 async function goStepAsync(n) {
   const target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
-  if (S.mode === "wizard" && S.step <= 7 && target > 7 && !attendanceWizardGateOpen()) {
+  if (S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
     setBanner("warn", attendanceWizardGateMessage());
     return;
   }
@@ -458,7 +491,7 @@ async function goNextAsync() {
     return;
   }
   if (S.step === 7 && S.connectTab === "attendance") {
-    if (S.mode === "wizard" && !attendanceWizardGateOpen()) {
+    if (S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
       // 게이트 판정과 문구는 goStepAsync의 7단계 경계와 같은 함수 하나를 쓴다 (검토 C1).
       setBanner("warn", attendanceWizardGateMessage());
       return;
@@ -1206,7 +1239,9 @@ function startAttendancePreparePoll() {
     const onTab = S.mode === "wizard" && S.connectTab === "attendance" &&
       WIZARD_CARD_BY_STEP[S.step] === "connect";
     if (!onTab) { attendancePreparePollOn = false; return; }
-    const before = JSON.stringify([S.attendance, S.firstSetupDone]);
+    const before = JSON.stringify([
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
+    ]);
     let keepPolling = false;
     try {
       let a = S.attendance;
@@ -1219,11 +1254,16 @@ function startAttendancePreparePoll() {
         }
         keepPolling = Boolean(data && data.running);
       }
-      if (a && a.state === "ready" && !S.firstSetupDone) {
+      if (a && a.state === "ready" && !attendanceWizardGateOpen()) {
         const first = await call("attendance_first_setup_status");
         if (gen !== attendancePrepareGen) return;
-        if (first && first.done === true) {
-          S.firstSetupDone = true;
+        const completionCode = firstSetupCodeFromValue(first && first.value);
+        const currentCode = String(a.connection_code || "").trim().toUpperCase();
+        S.firstSetupConnectionCode = completionCode;
+        S.firstSetupDone = Boolean(
+          first && first.done === true && completionCode && completionCode === currentCode
+        );
+        if (S.firstSetupDone) {
           S.chatStatus = null;  // 처음 설정이 발송까지 켠다 — Chat 줄을 연결됨으로 다시 읽는다
           S.banner = null;      // "처음 설정이 끝나야…" 게이트 배너는 조건이 풀리면 걷는다 (검토 C2)
         } else {
@@ -1233,7 +1273,9 @@ function startAttendancePreparePoll() {
     } catch (error) { keepPolling = true; /* 다음 틱에 다시 */ }
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
-    if (JSON.stringify([S.attendance, S.firstSetupDone]) !== before) render();
+    if (JSON.stringify([
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
+    ]) !== before) render();
     if (!keepPolling) { attendancePreparePollOn = false; return; }
     attendancePrepareTimer = setTimeout(tick, 3000);
   };
@@ -1336,27 +1378,25 @@ function serviceOpenButtonHtml(entry, a) {
   // 기존 코드 확인이 끝나지 않아 Chat 쓰기를 잠가도, 선생님이 이미 가진
   // Sheet와 안내장 서식은 읽어 볼 수 있어야 한다.
   const resourcesAvailable = [
-    "ready", "script-check-required", "script-update-required", "consolidation-required",
-    "ai-action-required", "record-switch-in-flight", "record-switched",
-    "cleanup-required", "recovery-required",
+    "ready", "script-check-required", "script-update-required",
+    "connection-repair-required", "ai-action-required",
   ].includes(a.state);
   if (!resourcesAvailable) return "";
   if (entry.service === "sheet") {
-    const open = a.spreadsheet_url
-      ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 열기</button>`
+    const open = ["ready", "script-check-required", "script-update-required", "ai-action-required"].includes(a.state)
+      ? `<button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} 열기</button>`
       : "";
-    // 새 학년도 단추는 편집 화면에만 둔다. 다만 새 컴퓨터의 7단계에서 예전 Drive
-    // 출결표를 찾은 경우에는 그 자리에서 막히지 않도록 정리 단추를 바로 보여 준다.
+    // 평상시에는 선택한 정본 번호만 쓴다. 여러 파일을 합치려고 새 Sheet를 만드는
+    // 옛 정리 단추는 두지 않고, 새 생성은 사용자가 누른 새 학년도 시작만 허용한다.
     const transitionDisabled = S.attendanceTransitioning ? "disabled" : "";
-    const consolidate = a.consolidation_required
-      ? `<button class="btn-tonal" data-action="consolidate-attendance-go"
-      data-busy-text="정리하는 중… (1~2분 걸릴 수 있어요)" ${transitionDisabled}>출결 시트 하나로 정리</button>`
-      : "";
-    const make = S.mode === "edit" && resourcesAvailable && !a.consolidation_required
+    const make = S.mode === "edit" && resourcesAvailable
       ? `<button class="btn-tonal" data-action="new-attendance-go"
       data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch && !S.attendanceTransitioning ? "" : "disabled"}>새 학년도 출석부 시작</button>`
       : "";
-    return consolidate + make + open;
+    const reconnect = S.mode === "edit"
+      ? `<button class="btn-tonal" data-action="attendance-connection-choose" ${S.attendanceConnectionBusy || transitionDisabled ? "disabled" : ""}>연결 확인/바꾸기</button>`
+      : "";
+    return make + reconnect + open;
   }
   if (entry.service === "docs" && a.template_doc_url) {
     return `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.template_doc_url)}">${icon("external-link", "small")} 서식 열기</button>`;
@@ -1375,8 +1415,7 @@ function serviceSubrowsHtml(entry, a) {
    배경·테두리·둥근 모서리는 칠하지 않는다 — 알약 모양은 2026-07-30에 질책받았다. */
 function attendanceTransitionNeedsAttention(state) {
   return [
-    "ai-action-required", "record-switch-in-flight", "record-switched",
-    "cleanup-required", "recovery-required",
+    "connection-repair-required", "ai-action-required",
   ].includes(state);
 }
 function serviceStatusHtml(entry, a) {
@@ -1416,7 +1455,6 @@ function serviceStatusHtml(entry, a) {
     return `<span class="svc-status muted">준비 전</span>`;
   }
   if (entry.service === "sheet") {
-    if (a.state === "consolidation-required") return `<span class="svc-status warn">정리 필요</span>`;
     if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
@@ -1438,13 +1476,15 @@ function attendanceServiceRow(entry, a) {
     chatActs = connect + guide;
   }
   const note = (a.state === "failed" && a.failed_service === entry.service)
-      || (a.state === "consolidation-required" && entry.service === "sheet")
     ? `<span class="field-error">${esc(a.detail || "")}</span>` : "";
+  const connectionCode = entry.service === "sheet" && a.connection_code
+    ? `<small class="attendance-connection-code">연결 확인번호 ${esc(a.connection_code)}</small>`
+    : "";
   return `<div class="svc-group">
     <div class="attendance-service">
       <img class="service-logo" src="${entry.logo}" alt="${esc(entry.name)} 로고">
       <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(
-        entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${note}</span>
+        entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${connectionCode}${note}</span>
       <span class="svc-acts">${serviceOpenButtonHtml(entry, a)}${chatActs}</span>
       ${serviceStatusHtml(entry, a)}</div>
     ${serviceSubrowsHtml(entry, a)}</div>`;
@@ -1483,315 +1523,6 @@ function loadAttendanceStatus() {
     })
     .finally(() => { S.attendanceLoading = false; render(); });
 }
-const ATTENDANCE_CONSOLIDATION_STAGES = [
-  "자료 읽기", "새 정본 만들기", "기록 옮기기", "AI 입력 연결",
-  "연결 교체", "기존 파일 휴지통 이동",
-];
-const ATTENDANCE_CONSOLIDATION_ACCOUNT_CHANGED_MESSAGE =
-  "Google 로그인 계정이 바뀌었어요. 현재 연결과 출석부는 그대로입니다. 처음 사용한 계정으로 로그인한 뒤 다시 시작해 주세요.";
-const ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE =
-  "작업이 이미 시작되었거나 완료되었습니다. 원래 Google 계정으로 돌아가 상태를 다시 확인하세요.";
-let attendanceConsolidationLoginTimer = null;
-let attendanceConsolidationGeneration = 0;
-function stopAttendanceConsolidationLoginPoll() {
-  if (attendanceConsolidationLoginTimer) {
-    clearTimeout(attendanceConsolidationLoginTimer);
-    attendanceConsolidationLoginTimer = null;
-  }
-}
-function attendanceConsolidationAccount() {
-  const account = S.google?.user || S.attendance?.current_user || S.attendance?.account || "";
-  return String(account).trim().toLowerCase();
-}
-function attendanceConsolidationFlowActive(flow, expectedViews) {
-  const current = S.attendanceConsolidation;
-  const expected = Array.isArray(expectedViews) ? expectedViews : null;
-  return Boolean(
-    flow && current
-    && flow.generation === attendanceConsolidationGeneration
-    && current.generation === flow.generation
-    && current.account === flow.account
-    && (!expected || expected.includes(current.view))
-  );
-}
-function invalidateAttendanceConsolidationFlow() {
-  attendanceConsolidationGeneration += 1;
-  stopAttendanceConsolidationLoginPoll();
-  S.attendanceConsolidationLoginStarted = false;
-  S.attendanceConsolidation = null;
-  S.attendanceTransitioning = false;
-}
-function attendanceConsolidationMutationBackendState(data) {
-  const state = String(data?.state || data?.backend_state || "");
-  return [
-    "complete", "cleanup-required", "ai-action-required", "refresh-required",
-    "permission-required", "record-switch-in-flight", "record-switched",
-    "recovery-required",
-  ].includes(state) ? state : "unknown";
-}
-function preserveAttendanceConsolidationMutationForAccountChange(data) {
-  const current = S.attendanceConsolidation;
-  if (!current?.mutationDispatched) return false;
-  const source = data || current.result || {};
-  const backendState = attendanceConsolidationMutationBackendState(source);
-  stopAttendanceConsolidationLoginPoll();
-  S.attendanceConsolidationLoginStarted = false;
-  S.attendanceConsolidation = {
-    view: "result",
-    result: {
-      state: "account-changed-after-mutation",
-      backend_state: backendState,
-      detail: ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE,
-    },
-    generation: current.generation,
-    account: current.account,
-    mutationDispatched: true,
-    mutationPending: backendState === "unknown" && current.mutationPending === true,
-    accountChangedAfterMutation: true,
-  };
-  return true;
-}
-function markAttendanceConsolidationMutationDispatched(flow) {
-  if (!attendanceConsolidationFlowActive(flow)) return false;
-  flow.mutationDispatched = true;
-  flow.mutationPending = true;
-  S.attendanceConsolidation = {
-    ...(S.attendanceConsolidation || {}),
-    generation: flow.generation,
-    account: flow.account,
-    mutationDispatched: true,
-    mutationPending: true,
-  };
-  return true;
-}
-function attendanceConsolidationMutationResponseExpected(flow) {
-  const current = S.attendanceConsolidation;
-  return Boolean(
-    flow?.mutationDispatched && current?.mutationDispatched
-    && flow.generation === attendanceConsolidationGeneration
-    && current.generation === flow.generation
-    && current.account === flow.account
-  );
-}
-async function reconcileAttendanceConsolidationMutationResult(flow, data) {
-  if (!attendanceConsolidationMutationResponseExpected(flow)) return false;
-  let accountChanged = S.attendanceConsolidation?.accountChangedAfterMutation === true;
-  if (!accountChanged) {
-    try {
-      const identity = await call("attendance_google_identity");
-      const actualAccount = String(identity?.account || "").trim().toLowerCase();
-      accountChanged = !actualAccount || Boolean(flow.account && actualAccount !== flow.account);
-    } catch (_) {
-      // 백엔드 결과는 이미 받았다. 추가 계정 확인 실패만으로 그 결과를 버리지 않는다.
-    }
-  }
-  if (!attendanceConsolidationMutationResponseExpected(flow)) return false;
-  accountChanged = accountChanged
-    || S.attendanceConsolidation?.accountChangedAfterMutation === true;
-  if (!accountChanged) return true;
-  preserveAttendanceConsolidationMutationForAccountChange(data);
-  S.attendanceTransitioning = false;
-  render();
-  return false;
-}
-function beginAttendanceConsolidationFlow(view) {
-  invalidateAttendanceConsolidationFlow();
-  const flow = {
-    view,
-    generation: attendanceConsolidationGeneration,
-    account: attendanceConsolidationAccount(),
-  };
-  S.attendanceConsolidation = flow;
-  return flow;
-}
-function stopAttendanceConsolidationForAccountChange(flow, expectedViews) {
-  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
-  invalidateAttendanceConsolidationFlow();
-  setBanner("warn", ATTENDANCE_CONSOLIDATION_ACCOUNT_CHANGED_MESSAGE);
-  return false;
-}
-async function attendanceConsolidationLiveAccountMatches(flow, expectedViews) {
-  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
-  let identity;
-  try {
-    identity = await call("attendance_google_identity");
-  } catch (_) {
-    if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
-    return stopAttendanceConsolidationForAccountChange(flow, expectedViews);
-  }
-  if (!attendanceConsolidationFlowActive(flow, expectedViews)) return false;
-  const actualAccount = String(identity?.account || "").trim().toLowerCase();
-  if (!actualAccount || (flow.account && actualAccount !== flow.account)) {
-    return stopAttendanceConsolidationForAccountChange(flow, expectedViews);
-  }
-  if (!flow.account) {
-    flow.account = actualAccount;
-    S.attendanceConsolidation = {
-      ...(S.attendanceConsolidation || {}),
-      generation: flow.generation,
-      account: actualAccount,
-    };
-  }
-  return attendanceConsolidationFlowActive(flow, expectedViews);
-}
-function scheduleAttendanceConsolidationLoginPoll(flow) {
-  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-  stopAttendanceConsolidationLoginPoll();
-  attendanceConsolidationLoginTimer = setTimeout(() => {
-    attendanceConsolidationLoginTimer = null;
-    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-    pollAttendanceConsolidationLoginOnce(flow, false).catch((error) => {
-      if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-      S.attendanceConsolidation = {
-        view: "failed", detail: error.message || "Google 권한 허용을 확인하지 못했어요.",
-        generation: flow.generation, account: flow.account,
-      };
-      S.attendanceConsolidationLoginStarted = false;
-      render();
-    });
-  }, 500);
-}
-async function pollAttendanceConsolidationLoginOnce(flow, startLogin) {
-  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-  let snap;
-  if (startLogin && !S.attendanceConsolidationLoginStarted) {
-    S.attendanceConsolidationLoginStarted = true;
-    snap = await call("gws_login_start");
-    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-  } else {
-    snap = await call("gws_login_status");
-    if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-  }
-  if (snap.ok === true) {
-    stopAttendanceConsolidationLoginPoll();
-    S.attendanceConsolidationLoginStarted = false;
-    if (!await attendanceConsolidationLiveAccountMatches(flow, ["permission"])) return;
-    const preview = await call("attendance_consolidation_preview");
-    if (!await attendanceConsolidationLiveAccountMatches(flow, ["permission"])) return;
-    S.attendanceConsolidation = {
-      ...preview,
-      view: preview.state === "ready" ? "preview" : "failed",
-      generation: flow.generation,
-      account: flow.account,
-    };
-    render();
-    return;
-  }
-  if (snap.ok === false) {
-    stopAttendanceConsolidationLoginPoll();
-    S.attendanceConsolidationLoginStarted = false;
-    S.attendanceConsolidation = {
-      view: "failed",
-      detail: snap.detail || "Google 권한 허용이 끝나지 않았어요. 다시 시도해 주세요.",
-      generation: flow.generation,
-      account: flow.account,
-    };
-    render();
-    return;
-  }
-  S.attendanceConsolidation = {
-    ...(S.attendanceConsolidation || {}), view: "permission", login: snap,
-    generation: flow.generation, account: flow.account,
-  };
-  render();
-  if (!attendanceConsolidationFlowActive(flow, ["permission"])) return;
-  scheduleAttendanceConsolidationLoginPoll(flow);
-}
-function attendanceConsolidationDialogHtml() {
-  const flow = S.attendanceConsolidation;
-  if (!flow) return "";
-  const result = flow.result || {};
-  const safeBackendState = result.state === "account-changed-after-mutation"
-    ? ` data-backend-state="${esc(result.backend_state || "unknown")}"`
-    : "";
-  const close = `<button class="btn-quiet" data-action="attendance-consolidation-close">닫기</button>`;
-  let content = "";
-  if (flow.view === "loading-preview") {
-    content = `<h3>정리할 자료 확인</h3><p>같은 이름의 출석부와 줄 수를 읽고 있어요.</p>
-      <div class="attendance-consolidation-actions">${close}</div>`;
-  } else if (flow.view === "permission") {
-    const url = flow.login?.url || "";
-    content = `<h3>Google 권한 허용</h3>
-      <p>기존 자료는 바꾸지 않고, 정리에 필요한 Google 권한을 한 번 확인합니다.</p>
-      ${url ? linkRow(url) : ""}
-      <div class="attendance-consolidation-actions">
-        <button class="btn-quiet" data-action="attendance-consolidation-login-cancel">취소</button>
-      </div>`;
-  } else if (flow.view === "preview") {
-    const files = Array.isArray(flow.files) ? flow.files : [];
-    const rows = files.map((file) => `<li>
-      <b>${esc(file.name)}</b><small>${esc(file.created_time)}</small>
-      <span>출결 ${Number(file.attendance_rows || 0)}줄</span>
-      <span>개인톡 ${Number(file.personal_chat_rows || 0)}줄</span>
-      <span>단체톡 ${Number(file.group_chat_rows || 0)}줄</span>
-      <span>발송 ${Number(file.send_rows || 0)}줄</span>
-      <strong>합계 ${Number(file.total_rows || 0)}줄</strong>
-    </li>`).join("");
-    content = `<h3>정리할 자료 확인</h3>
-      <ul class="attendance-consolidation-files">${rows}</ul>
-      <p class="attendance-consolidation-total">출석부 ${files.length}개 · 전체 ${Number(flow.total_rows || 0)}줄</p>
-      <p class="attendance-consolidation-warning">완료 뒤 이전 같은 이름 출석부는 Google Drive 휴지통으로 이동하며 복원할 수 있습니다</p>
-      <div class="attendance-consolidation-actions">${close}
-        <button class="btn" data-action="attendance-consolidation-confirm">새 정본으로 정리하기</button>
-      </div>`;
-  } else if (flow.view === "progress") {
-    content = `<h3>출석부를 하나로 정리하고 있어요</h3>
-      <ol class="attendance-consolidation-stages">${ATTENDANCE_CONSOLIDATION_STAGES.map(
-        (stage) => `<li><span>•</span><b>${stage}</b></li>`,
-      ).join("")}</ol>`;
-  } else if (flow.view === "result" && result.state === "account-changed-after-mutation") {
-    content = `<h3>Google 계정이 바뀌었어요</h3>
-      <p>${esc(ATTENDANCE_CONSOLIDATION_MUTATION_ACCOUNT_CHANGED_MESSAGE)}</p>
-      <div class="attendance-consolidation-actions">${close}</div>`;
-  } else if (flow.view === "result" && result.state === "ai-action-required") {
-    content = `<h3>AI 입력 연결 확인이 필요해요</h3>
-      <p>새 정본을 열고 출결 업무 자동화 메뉴에서 <b>AI 출결 입력 연결 확인</b>을 한 번 눌러 주세요.</p>
-      <div class="attendance-consolidation-actions">
-        <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
-        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>연결 확인하고 계속</button>
-      </div>`;
-  } else if (flow.view === "result" && result.state === "cleanup-required") {
-    content = `<h3>이전 파일 정리가 남았어요</h3>
-      <div class="attendance-consolidation-actions">
-        <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
-        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>남은 이전 파일 정리</button>
-      </div>`;
-  } else if (flow.view === "result" && result.state === "complete") {
-    const moved = (Array.isArray(result.moved_files) && result.moved_files.length
-      ? result.moved_files
-      : (Array.isArray(flow.files) ? flow.files.map((file) => ({
-          name: file.name, moved_rows: file.total_rows,
-        })) : []));
-    content = `<h3>새 정본으로 정리를 마쳤어요</h3>
-      <button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>
-      <ul class="attendance-consolidation-moved">${moved.map(
-        (file) => `<li><b>${esc(file.name)}</b><span>${Number(file.moved_rows || 0)}줄 옮김</span></li>`,
-      ).join("")}</ul>
-      <p>AI 입력 연결 확인</p>
-      <p>휴지통으로 이동한 파일 ${Number(result.trashed_count || 0)}개</p>
-      <div class="attendance-consolidation-actions">${close}</div>`;
-  } else if (flow.view === "result" && [
-    "record-switch-in-flight", "record-switched", "recovery-required",
-  ].includes(result.state)) {
-    content = `<h3>저장된 진행 상태를 확인해 주세요</h3>
-      <p>${esc(result.detail || "정리 진행 상태를 확인한 뒤 이어서 진행합니다.")}</p>
-      <div class="attendance-consolidation-actions">${close}
-        ${result.spreadsheet_url ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(result.spreadsheet_url)}">새 정본 열기</button>` : ""}
-        <button class="btn" data-action="attendance-consolidation-cleanup" ${S.attendanceTransitioning ? "disabled" : ""}>확인하고 계속</button>
-      </div>`;
-  } else if (flow.view === "refresh") {
-    content = `<h3>자료를 다시 확인해 주세요</h3><p>${esc(flow.detail || "확인한 뒤 자료가 바뀌었습니다.")}</p>
-      <div class="attendance-consolidation-actions">${close}
-        <button class="btn" data-action="consolidate-attendance-go">미리보기 다시 읽기</button>
-      </div>`;
-  } else {
-    content = `<h3>정리를 시작하지 못했어요</h3><p>${esc(flow.detail || "기존 자료와 현재 연결은 그대로입니다.")}</p>
-      <div class="attendance-consolidation-actions">${close}</div>`;
-  }
-  return `<div class="attendance-update-dialog-overlay">
-    <section class="attendance-update-dialog attendance-consolidation-dialog" role="dialog" aria-modal="true"${safeBackendState}>${content}</section>
-  </div>`;
-}
 function attendanceScriptUpdateHtml(a) {
   if (!a || !["ready", "script-check-required", "script-update-required"].includes(a.state)) return "";
   if (a.state === "ready") return "";
@@ -1800,8 +1531,14 @@ function attendanceScriptUpdateHtml(a) {
     const detail = String(update.detail || "").trim()
       || "출석부 안에서 AI 출결 입력 연결 확인을 한 번 눌러 주세요.";
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
-      ${update.spreadsheet_url ? `<button class="btn-quiet" data-action="link-open" data-url="${esc(update.spreadsheet_url)}">출석부 열기</button>` : ""}
+      ${update.spreadsheet_url ? `<button class="btn-quiet" data-action="attendance-open">출석부 열기</button>` : ""}
       <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">연결 확인하고 계속</button></div>`;
+  }
+  if (update?.state === "permission-required") {
+    const detail = String(update.detail || "").trim()
+      || "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. 설정에서 현재 Google 계정을 로그아웃한 뒤 같은 @goedu.kr 계정으로 다시 로그인해 주세요. 기존 출석부와 감지기는 그대로입니다.";
+    return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 설정 열기</button></div>`;
   }
   if (update?.state === "customized") {
     return `<div class="attendance-script-update warn"><span>직접 수정된 기능이라 자동으로 바꾸지 않아요.</span></div>`;
@@ -1812,12 +1549,8 @@ function attendanceScriptUpdateHtml(a) {
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       <button class="btn-quiet" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   }
-  if (update?.state === "current" || update?.state === "finishing_required") {
-    return `<div class="attendance-script-update warn"><span>출결 기능 업데이트를 마무리해야 해요.</span>
-      <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">마무리</button></div>`;
-  }
   return `<div class="attendance-script-update warn"><span>출결 기능을 최신판으로 바꿔야 해요.</span>
-    <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">문제 해결</button></div>`;
+    <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 업데이트</button></div>`;
 }
 function attendanceScriptAccountKey() {
   const attendanceAccount = S.attendance?.account || S.attendance?.current_user || "";
@@ -1840,12 +1573,9 @@ function focusAttendanceScriptResolve() {
 function attendanceScriptUpdateDialogHtml() {
   const kind = S.attendanceScriptDialog;
   if (!kind) return "";
-  const finishing = kind === "finish";
-  const title = finishing ? "업데이트 마무리" : "출결 기능 업데이트";
-  const message = finishing
-    ? "새 기능은 준비됐고 마지막 연결만 남았습니다. 학생 자료는 그대로입니다."
-    : "학생 명단과 출결 기록은 그대로 두고 기능만 최신으로 바꿉니다.";
-  const action = finishing ? "마무리" : "업데이트";
+  const title = "출결 기능 업데이트";
+  const message = "학생 명단과 출결 기록은 그대로 두고 기능만 최신으로 바꿉니다.";
+  const action = "업데이트";
   // 실행 중에는 두 단추 모두 잠근다 — 취소로 빠져나가면 다이얼로그 없이 성공 안내만
   // 뜬금없이 뜨게 된다(실행은 계속 진행 중이라 취소로 멈출 수 없다).
   const busy = S.attendanceScriptUpdating;
@@ -1860,18 +1590,65 @@ function attendanceScriptUpdateDialogHtml() {
       </div>
     </section></div>`;
 }
+function attendanceConnectionModifiedText(value) {
+  const shown = String(value || "").trim();
+  if (!shown) return "최근 사용 시각 확인 안 됨";
+  const date = new Date(shown);
+  if (Number.isNaN(date.getTime())) return "최근 사용 시각 확인 안 됨";
+  return `최근 사용 ${date.toLocaleString("ko-KR", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
+}
+function attendanceConnectionDialogHtml() {
+  const flow = S.attendanceConnection;
+  if (!flow) return "";
+  const close = `<button class="btn-quiet" data-action="attendance-connection-close" ${S.attendanceConnectionBusy ? "disabled" : ""}>취소</button>`;
+  let content = "";
+  if (flow.state === "loading") {
+    content = `<h3>기존 출석부 확인 중</h3><p>정식 표식이 있는 출석부만 찾고 있어요. 새 파일은 만들지 않습니다.</p>`;
+  } else if (["ready", "choose"].includes(flow.state) && Array.isArray(flow.candidates) && flow.candidates.length) {
+    const rows = flow.candidates.map((candidate) => `
+      <div class="attendance-candidate-row">
+        <div><b>${esc(candidate.name || flow.expected_name || "정식 출석부")}</b>
+          <small>연결 확인번호 ${esc(candidate.connection_code || "확인 안 됨")} · ${esc(attendanceConnectionModifiedText(candidate.modified_time))} · 출결 기록 ${Number(candidate.attendance_rows || 0)}줄</small></div>
+        <button class="btn-tonal" data-action="attendance-connection-select" data-sheet-id="${esc(candidate.spreadsheet_id || "")}" ${S.attendanceConnectionBusy ? "disabled" : ""}>이 출석부 사용</button>
+      </div>`).join("");
+    const manualError = flow.input_error
+      ? `<p class="field-error attendance-connection-code-error">${esc(flow.input_error)}</p>`
+      : "";
+    content = `<h3>사용할 출석부 고르기</h3>
+      <p>먼저 사용할 시트의 [처음 한 번 설정하기 → 연결 상태 확인]을 눌러, 아래 연결 확인번호와 같은지 눈으로 비교해 주세요. 선택하지 않은 파일은 삭제하거나 바꾸지 않습니다.</p>
+      <div class="attendance-candidate-list">${rows}</div>
+      <div class="attendance-connection-manual">
+        <label for="attendance-connection-code-input"><b>확인번호로 직접 연결</b></label>
+        <div class="attendance-connection-code-entry">
+          <input id="attendance-connection-code-input" type="text" inputmode="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="TM-XXXXXX-XXXXXX" aria-label="연결 확인번호 붙여넣기">
+          <button class="btn-tonal" data-action="attendance-connection-code-select" ${S.attendanceConnectionBusy ? "disabled" : ""}>확인번호로 직접 연결</button>
+        </div>
+        <small>복사할 때는 시트의 설정 탭에서 ATTENDANCE_CONNECTION_CODE 값을 사용해도 됩니다.</small>
+        ${manualError}
+      </div>
+      <div class="attendance-update-dialog-actions">${close}</div>`;
+  } else {
+    content = `<h3>기존 출석부를 확인하지 못했어요</h3><p>${esc(flow.detail || "현재 연결과 Google 파일은 그대로입니다. 새 파일은 만들지 않았습니다.")}</p>
+      <div class="attendance-update-dialog-actions">${close}</div>`;
+  }
+  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-connection-dialog" role="dialog" aria-modal="true" aria-label="사용할 출석부 고르기">${content}</section></div>`;
+}
 /* 마법사 7단계 "마지막 한 번" 카드 — 준비가 끝난 뒤, 시트에서 처음 설정을 끝내라는 안내.
    기존 서비스 칸(.svc-group)과 같은 톤이고 상태는 글자 색만(.svc-status). */
 function firstSetupCardHtml(a) {
-  const status = S.firstSetupDone
+  const status = attendanceWizardGateOpen()
     ? `<span class="svc-status ok">완료 확인됨</span>`
     : `<span class="svc-status muted">기다리는 중…</span>`;
   const open = a.spreadsheet_url
-    ? `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.spreadsheet_url)}">${icon("external-link", "small")} 시트 열기</button>`
+    ? `<button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} 시트 열기</button>`
+    : "";
+  const connectionCode = a.connection_code
+    ? `<p class="attendance-connection-code"><b>연결 확인번호 ${esc(a.connection_code)}</b><br>시트의 연결 상태 확인 창에도 같은 번호가 보여야 합니다.</p>`
     : "";
   return `<div class="first-setup-card">
     <div class="first-setup-head"><b>마지막 한 번 — 시트에서 처음 설정을 끝내 주세요</b>${status}</div>
     <p>방금 만든 출결 시트를 열고, 위 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 눌러 주세요. 처음 실행하면 Google 계정 선택과 권한 허용 창이 먼저 뜨고, 준비에 몇 분 정도 걸릴 수 있어요. 끝나면 시트에 결과를 정리한 안내 창이 뜨는데, [확인]을 누르고 잠시 기다리면 이 칸이 완료로 바뀝니다.</p>
+    ${connectionCode}
     <div class="first-setup-acts">${open}</div>
   </div>`;
 }
@@ -1893,11 +1670,9 @@ function attendanceTabHtml() {
   } else if (a.state === "auth-error") {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
-  } else if (a.state === "reconnect-required") {
-    statusArea = `<div class="banner warn"><span>${esc(a.detail || "현재 출석부를 먼저 다시 연결해 주세요.")}</span>
-      <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
-  } else if (a.state === "recovery-required") {
-    statusArea = `<div class="banner warn"><span>${esc(a.detail || "정리 진행 기록을 안전하게 확인하지 못해 자동 작업을 멈췄습니다.")}</span></div>`;
+  } else if (a.state === "connection-repair-required") {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || "현재 연결이 옛 출석부를 가리키고 있어요.")}</span>
+      <button class="btn-tonal" data-action="attendance-connection-choose" ${S.attendanceConnectionBusy ? "disabled" : ""}>사용할 출석부 고르기</button></div>`;
   } else if (a.state === "profile-required"
       && (identityIssues().length || dayIssues().length)) {
     // 초안이 진짜 비어 있을 때만 안내한다.
@@ -1910,7 +1685,6 @@ function attendanceTabHtml() {
   const scriptCheckRequired = a.state === "script-check-required";
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
-  const consolidationRequired = a.consolidation_required === true;
   const transitionAttentionRequired = attendanceTransitionNeedsAttention(a.state);
   const pendingGuide = S.mode === "wizard"
     ? a.state === "installing"
@@ -1939,10 +1713,10 @@ function attendanceTabHtml() {
       : ""}
     ${ready
       ? ""
-      : scriptAttentionRequired || consolidationRequired || transitionAttentionRequired || S.mode === "wizard" ? ""
+      : scriptAttentionRequired || transitionAttentionRequired || S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
     ${attendanceScriptUpdateDialogHtml()}
-    ${attendanceConsolidationDialogHtml()}`;
+    ${attendanceConnectionDialogHtml()}`;
 }
 /* ---------- 연결 3탭: AI 에이전트 ---------- */
 function aiTabHtml() {
@@ -2129,11 +1903,8 @@ bindActions({
         || requestAccount !== attendanceScriptAccountKey()) return;
     S.attendanceScriptUpdate = update;
     S.attendanceScriptDialog = null;
-    if (S.attendanceScriptUpdate.state === "update_available") {
+    if (["update_available", "current", "finishing_required"].includes(S.attendanceScriptUpdate.state)) {
       S.attendanceScriptDialog = "update";
-    } else if (S.attendanceScriptUpdate.state === "current"
-        || S.attendanceScriptUpdate.state === "finishing_required") {
-      S.attendanceScriptDialog = "finish";
     }
     render();
   },
@@ -2169,6 +1940,96 @@ bindActions({
       focusAttendanceScriptResolve();
     }
   },
+  "attendance-connection-choose": async () => {
+    if (S.attendanceConnectionBusy) return;
+    S.attendanceConnectionBusy = true;
+    S.attendanceConnection = { state: "loading" };
+    render();
+    try {
+      S.attendanceConnection = await call("attendance_connection_candidates");
+    } catch (_error) {
+      S.attendanceConnection = {
+        state: "failed",
+        detail: "기존 출석부 목록을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
+      };
+    } finally {
+      S.attendanceConnectionBusy = false;
+      render();
+    }
+  },
+  "attendance-connection-close": () => {
+    if (S.attendanceConnectionBusy) return;
+    S.attendanceConnection = null;
+    render();
+  },
+  "attendance-connection-select": async (el) => {
+    if (S.attendanceConnectionBusy) return;
+    const spreadsheetId = String(el.dataset.sheetId || "").trim();
+    if (!spreadsheetId) return;
+    S.attendanceConnectionBusy = true;
+    render();
+    try {
+      const result = await call("select_attendance_connection", spreadsheetId);
+      if (result?.state === "selected") {
+        // 다른 Sheet를 골랐으므로 이전 Sheet의 처음 설정 완료값을 절대 이어 쓰지 않는다.
+        S.firstSetupDone = false;
+        S.firstSetupConnectionCode = "";
+        S.attendanceConnection = null;
+        S.attendanceScriptUpdate = null;
+        S.attendance = await call("attendance_status");
+        S.chatStatus = null;
+        if (S.mode === "wizard") startAttendancePreparePoll();
+        refreshChecks().catch(() => {});
+        showToast("이 출석부를 현재 출석부로 연결했어요");
+      } else {
+        S.attendanceConnection = result || {
+          state: "failed",
+          detail: "고른 출석부 연결을 확인하지 못했어요.",
+        };
+      }
+    } finally {
+      S.attendanceConnectionBusy = false;
+      render();
+    }
+  },
+  "attendance-connection-code-select": async () => {
+    if (S.attendanceConnectionBusy) return;
+    const input = document.getElementById("attendance-connection-code-input");
+    const connectionCode = String(input?.value || "").trim();
+    const flow = S.attendanceConnection;
+    if (!/^TM-[0-9A-F]{6}-[0-9A-F]{6}$/i.test(connectionCode)) {
+      S.attendanceConnection = {
+        ...(flow || {}),
+        input_error: "시트에 나온 TM-XXXXXX-XXXXXX 확인번호를 그대로 붙여 넣어 주세요.",
+      };
+      render();
+      return;
+    }
+    S.attendanceConnectionBusy = true;
+    try {
+      const result = await call("select_attendance_connection_by_code", connectionCode);
+      if (result?.state === "selected") {
+        // 확인번호로 바꿔도 새 Sheet 자체의 완료 표시를 다시 읽어야 한다.
+        S.firstSetupDone = false;
+        S.firstSetupConnectionCode = "";
+        S.attendanceConnection = null;
+        S.attendanceScriptUpdate = null;
+        S.attendance = await call("attendance_status");
+        S.chatStatus = null;
+        if (S.mode === "wizard") startAttendancePreparePoll();
+        refreshChecks().catch(() => {});
+        showToast("확인번호와 같은 출석부를 현재 출석부로 연결했어요");
+      } else {
+        S.attendanceConnection = {
+          ...(flow || {}),
+          input_error: result?.detail || "확인번호와 같은 출석부를 찾지 못했어요.",
+        };
+      }
+    } finally {
+      S.attendanceConnectionBusy = false;
+      render();
+    }
+  },
   "new-attendance-go": async () => {
     const a = S.attendance || {};
     const name = a.canonical_workbook_name || "새 학년도 정식 출석부";
@@ -2188,9 +2049,10 @@ bindActions({
       stopChatConnectPoll();
       if (data.state === "ready") {
         S.firstSetupDone = false;
+        S.firstSetupConnectionCode = "";
         if (S.mode === "wizard") startAttendancePreparePoll();
         showToast("새 학년도 출석부를 시작했어요");
-        if (data.spreadsheet_url) call("open_url", data.spreadsheet_url).catch(() => {});
+        call("open_current_attendance").catch(() => {});
       } else {
         setBanner("warn", data.detail || "새 학년도 출석부를 시작하지 못했어요.");
       }
@@ -2198,199 +2060,6 @@ bindActions({
       S.attendanceTransitioning = false;
       render();
     }
-  },
-  "consolidate-attendance-go": async () => {
-    if (S.attendanceTransitioning) return;
-    const resumeToken = String(S.attendance?.transition_action_token || "").trim().toLowerCase();
-    const resumeState = String(S.attendance?.state || "");
-    if (/^[0-9a-f]{64}$/.test(resumeToken) && [
-      "ai-action-required", "record-switch-in-flight", "record-switched",
-      "cleanup-required", "recovery-required",
-    ].includes(resumeState)) {
-      const flow = beginAttendanceConsolidationFlow("result");
-      flow.fingerprint = resumeToken;
-      S.attendanceConsolidation = {
-        ...flow,
-        fingerprint: resumeToken,
-        result: {
-          state: resumeState,
-          spreadsheet_url: S.attendance?.spreadsheet_url || "",
-          detail: S.attendance?.detail || "",
-        },
-      };
-      render();
-      return;
-    }
-    const flow = beginAttendanceConsolidationFlow("loading-preview");
-    S.attendanceTransitioning = true;
-    render();
-    try {
-      if (!await attendanceConsolidationLiveAccountMatches(flow, ["loading-preview"])) return;
-      const preview = await call("attendance_consolidation_preview");
-      if (!await attendanceConsolidationLiveAccountMatches(flow, ["loading-preview"])) return;
-      if (preview.state === "permission-required") {
-        S.attendanceConsolidation = {
-          ...preview, view: "permission",
-          generation: flow.generation, account: flow.account,
-        };
-        render();
-        await pollAttendanceConsolidationLoginOnce(flow, true);
-        if (!attendanceConsolidationFlowActive(flow)) return;
-      } else if (preview.state === "ready") {
-        S.attendanceConsolidation = {
-          ...preview, view: "preview",
-          generation: flow.generation, account: flow.account,
-        };
-      } else {
-        S.attendanceConsolidation = {
-          ...preview, view: "failed",
-          generation: flow.generation, account: flow.account,
-        };
-      }
-    } finally {
-      if (!attendanceConsolidationFlowActive(flow)) return;
-      S.attendanceTransitioning = false;
-      render();
-    }
-  },
-  "attendance-consolidation-confirm": async () => {
-    if (S.attendanceTransitioning || !S.attendanceConsolidation?.fingerprint) return;
-    const flow = S.attendanceConsolidation;
-    if (!attendanceConsolidationFlowActive(flow, ["preview"])) return;
-    const fingerprint = flow.fingerprint;
-    S.attendanceTransitioning = true;
-    S.attendanceConsolidation = {
-      ...flow, view: "progress",
-      generation: flow.generation, account: flow.account,
-    };
-    render();
-    try {
-      if (!await attendanceConsolidationLiveAccountMatches(flow, ["progress"])) return;
-      const pendingMutation = call("consolidate_attendance", fingerprint);
-      markAttendanceConsolidationMutationDispatched(flow);
-      const data = await pendingMutation;
-      if (!await reconcileAttendanceConsolidationMutationResult(flow, data)) return;
-      if ([
-        "complete", "cleanup-required", "ai-action-required",
-        "record-switch-in-flight", "record-switched", "recovery-required",
-      ].includes(data.state)) {
-        S.attendanceConsolidation = {
-          ...flow, view: "result", result: data,
-          generation: flow.generation, account: flow.account,
-        };
-        if (data.state === "complete") {
-          S.attendanceScriptUpdate = null;
-          S.chatStatus = null;
-          S.chatSpaces = undefined;
-          S.chatSpaceName = undefined;
-          stopChatConnectPoll();
-          S.firstSetupDone = false;
-          if (S.mode === "wizard") startAttendancePreparePoll();
-          render();
-          try {
-            const attendance = await call("attendance_status");
-            if (attendanceConsolidationFlowActive(flow, ["result"])
-                && S.attendanceConsolidation?.accountChangedAfterMutation !== true) {
-              S.attendance = attendance;
-            }
-          } catch (_) {
-            // 전환 결과는 이미 받았다. 뒤따른 상태 조회 실패가 그 결과를 지우지 않는다.
-          }
-        }
-      } else if (data.state === "refresh-required") {
-        S.attendanceConsolidation = {
-          view: "refresh", detail: data.detail || "",
-          generation: flow.generation, account: flow.account,
-        };
-      } else if (data.state === "permission-required") {
-        S.attendanceConsolidation = {
-          view: "permission", detail: data.detail || "",
-          generation: flow.generation, account: flow.account,
-        };
-        render();
-        await pollAttendanceConsolidationLoginOnce(flow, true);
-        if (!attendanceConsolidationFlowActive(flow)) return;
-      } else {
-        S.attendanceConsolidation = {
-          view: "failed", detail: data.detail || "",
-          generation: flow.generation, account: flow.account,
-        };
-      }
-    } finally {
-      if (!attendanceConsolidationFlowActive(flow)) return;
-      flow.mutationPending = false;
-      S.attendanceConsolidation = {
-        ...(S.attendanceConsolidation || {}), mutationPending: false,
-      };
-      S.attendanceTransitioning = false;
-      render();
-    }
-  },
-  "attendance-consolidation-cleanup": async () => {
-    if (S.attendanceTransitioning || !S.attendanceConsolidation?.fingerprint) return;
-    const flow = S.attendanceConsolidation;
-    if (!attendanceConsolidationFlowActive(flow, ["result"])) return;
-    const fingerprint = flow.fingerprint;
-    S.attendanceTransitioning = true;
-    render();
-    try {
-      if (!await attendanceConsolidationLiveAccountMatches(flow, ["result"])) return;
-      const pendingMutation = call("consolidate_attendance", fingerprint);
-      markAttendanceConsolidationMutationDispatched(flow);
-      const data = await pendingMutation;
-      if (!await reconcileAttendanceConsolidationMutationResult(flow, data)) return;
-      if ([
-        "complete", "cleanup-required", "ai-action-required",
-        "record-switch-in-flight", "record-switched", "recovery-required",
-      ].includes(data.state)) {
-        S.attendanceConsolidation = {
-          ...flow, view: "result", result: data,
-          generation: flow.generation, account: flow.account,
-        };
-        if (data.state === "complete") {
-          S.attendanceScriptUpdate = null;
-          S.chatStatus = null;
-          S.chatSpaces = undefined;
-          S.chatSpaceName = undefined;
-          stopChatConnectPoll();
-          S.firstSetupDone = false;
-          if (S.mode === "wizard") startAttendancePreparePoll();
-          render();
-          try {
-            const attendance = await call("attendance_status");
-            if (attendanceConsolidationFlowActive(flow, ["result"])
-                && S.attendanceConsolidation?.accountChangedAfterMutation !== true) {
-              S.attendance = attendance;
-            }
-          } catch (_) {
-            // 전환 결과는 이미 받았다. 뒤따른 상태 조회 실패가 그 결과를 지우지 않는다.
-          }
-        }
-      } else {
-        S.attendanceConsolidation = {
-          ...flow, view: data.state === "refresh-required" ? "refresh" : "failed",
-          detail: data.detail || "",
-          generation: flow.generation, account: flow.account,
-        };
-      }
-    } finally {
-      if (!attendanceConsolidationFlowActive(flow)) return;
-      flow.mutationPending = false;
-      S.attendanceConsolidation = {
-        ...(S.attendanceConsolidation || {}), mutationPending: false,
-      };
-      S.attendanceTransitioning = false;
-      render();
-    }
-  },
-  "attendance-consolidation-login-cancel": async () => {
-    invalidateAttendanceConsolidationFlow();
-    setBanner("warn", "권한 허용을 취소했습니다. 현재 연결과 출석부는 바뀌지 않았습니다");
-    await call("gws_login_cancel");
-  },
-  "attendance-consolidation-close": () => {
-    invalidateAttendanceConsolidationFlow();
-    render();
   },
   "chat-connect": async () => {
     await call("attendance_chat_connect");
@@ -2967,15 +2636,15 @@ function stepStudentAccounts() {
 }
 stepBodies[8] = stepStudentAccounts;
 
-/* ---------- 9단계: 마무리 ---------- */
+/* ---------- 9단계: 모두 저장 ---------- */
 function summaryRow(label, value) {
   return `<div class="row"><span class="name">${esc(label)}</span><span class="st">${esc(value || "—")}</span></div>`;
 }
 stepBodies[9] = function stepFinish() {
   const p = S.draft.profile;
   return `
-    <h1>모두 저장하고 적용할게요</h1>
-    <p class="sub">저장 → 설정 확인 → 출결 자동화 설치 → 도우미 시작까지 한 번에 하고, 끝나면 홈으로 가요</p>
+    <h1>설정을 저장할게요</h1>
+    <p class="sub">내 정보·시간표·메신저 설정을 저장하고 도우미를 시작한 뒤 홈으로 가요</p>
     <div class="panel">
       ${summaryRow("이름 · 학교", `${p["선생님이름"] || ""} · ${p["학교명"] || ""}`)}
       ${summaryRow("담임", p["담임여부"] === "예" ? `${p["담임학년"]}학년 ${p["담임반"]}반` : "아니오")}
@@ -2988,7 +2657,7 @@ stepBodies[9] = function stepFinish() {
     </div>
     <div class="foot">
       <button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>
-      <button class="btn" data-action="apply-all" data-busy-text="적용하는 중… (1~2분 걸릴 수 있어요)">모두 저장하고 적용</button>
+      <button class="btn" data-action="apply-all" data-busy-text="저장하는 중… (1~2분 걸릴 수 있어요)">모두 저장</button>
     </div>`;
 };
 bindActions({
@@ -3003,7 +2672,7 @@ bindActions({
       setBanner("warn", S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"]);
       return;
     }
-    // 마무리 화면엔 격자 입력이 없다 — draft에 저장된 최신 값을 그대로 쓴다.
+    // 모두 저장 화면엔 격자 입력이 없다 — draft에 저장된 최신 값을 그대로 쓴다.
     await ensureGridLoaded();
     const results = await call("apply_all", S.draft.profile, S.draft.grid, S.draft.bridge);
     const failed = results.filter((r) => r.status === "failed");
@@ -3017,7 +2686,7 @@ bindActions({
     S.attendanceScriptUpdate = null;
     clearAttendanceScriptDialogState();
     S.chatStatus = null;
-    S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
+    S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
       : "messenger";
     S.mode = "home";
@@ -3817,7 +3486,7 @@ async function loadForEdit(key) {
     S.attendanceScriptUpdate = null;
     clearAttendanceScriptDialogState();
     S.chatStatus = null;
-    S.connectTab = S.attendance && ["script-check-required", "script-update-required"].includes(S.attendance.state)
+    S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
       : "messenger";
   }

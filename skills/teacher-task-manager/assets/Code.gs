@@ -75,6 +75,7 @@ const ATTENDANCE_AI_ALLOWED_VALUE = '예';
 const ATTENDANCE_AI_EDIT_TRIGGER_HANDLER = 'onAttendanceAiEdit';
 const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 연결 확인';
 const ATTENDANCE_AI_VERIFICATION_SETTING = 'ATTENDANCE_AI_SETUP_VERIFICATION';
+const ATTENDANCE_CONNECTION_CODE_SETTING = 'ATTENDANCE_CONNECTION_CODE';
 const ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION = 1;
 const ATTENDANCE_AI_SETUP_VERSION = '1';
 
@@ -171,6 +172,23 @@ function onOpen() {
  * 처음 한 번 설정하기 — 사전 세팅 네 가지를 한 번에
  *************************************************/
 
+/** 실제 Google Sheet 번호를 노출하지 않고 양쪽 화면에서 대조할 48비트 확인번호를 만든다. */
+function attendanceConnectionCodeForSpreadsheetId_(spreadsheetId) {
+  const checked = String(spreadsheetId || '').trim();
+  if (!checked) return '';
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    checked,
+    Utilities.Charset.UTF_8
+  );
+  if (!bytes || bytes.length < 6) return '';
+  const hex = bytes.slice(0, 6).map(function (value) {
+    const unsigned = (Number(value) + 256) % 256;
+    return ('0' + unsigned.toString(16)).slice(-2);
+  }).join('').toUpperCase();
+  return 'TM-' + hex.slice(0, 6) + '-' + hex.slice(6);
+}
+
 /**
  * 사전 세팅 네 가지를 순서대로 돌리고 결과를 마지막에 한 화면으로 보여 준다.
  *
@@ -184,7 +202,7 @@ function onOpen() {
  * 나머지는 계속 진행한 뒤 실패한 것만 결과 화면에 적는다.
  */
 function runFirstTimeSetup() {
-  requireGoeduTeacherAccount_();
+  const setupAccount = String(requireGoeduTeacherAccount_() || '').trim();
   const ui = SpreadsheetApp.getUi();
   const steps = [
     { title: '기본 시트/설정 점검', run: firstTimeSetupWorkbookStep_ },
@@ -212,13 +230,33 @@ function runFirstTimeSetup() {
     if (result.ok !== true) leftovers.push(step.title + '\n' + String(result.message || ''));
   });
 
-  // 네 단계가 모두 끝났을 때만 완료 표시를 적는다 — 설치 프로그램이 이 값을 읽어
+  // 네 단계가 모두 끝났을 때 실제 Sheet 번호에서 만든 확인번호를 먼저 적는다.
+  // 전체 번호는 화면에 드러내지 않고, 프로그램과 시트가 같은 파일인지 사람이 대조한다.
+  let connectionCode = '';
+  if (leftovers.length === 0) {
+    try {
+      const spreadsheetId = String(SpreadsheetApp.getActiveSpreadsheet().getId() || '').trim();
+      connectionCode = attendanceConnectionCodeForSpreadsheetId_(spreadsheetId);
+      if (!connectionCode) throw new Error('지금 열린 출석부의 연결 확인번호를 읽지 못했습니다.');
+      setConfigValue_(ATTENDANCE_CONNECTION_CODE_SETTING, connectionCode);
+    } catch (err) {
+      const connectionError = errorMessage_(err);
+      lines.push('[못 함] 연결 확인번호 기록 — ' + connectionError);
+      leftovers.push('연결 확인번호 기록\n' + connectionError);
+    }
+  }
+
+  // 확인번호까지 준비됐을 때만 완료 표시를 적는다 — 설치 프로그램이 이 값을 읽어
   // 마법사의 [다음]을 켠다. 일부 실패면 적지 않는다(거짓 완료 방지).
   if (leftovers.length === 0) {
     try {
-      let doneAccount = '';
-      try { doneAccount = String(Session.getActiveUser().getEmail() || ''); } catch (e) {}
-      setConfigValue_('FIRST_TIME_SETUP_DONE', (doneAccount + ' ' + new Date().toISOString()).trim());
+      // 완료 표시는 현재 Sheet에서 만든 확인번호에 묶는다. Sheet를 복사해 옛 완료
+      // 값이 따라와도, 새 Sheet의 확인번호나 처음 통과한 학교 계정과 다르면
+      // Teacher Manager가 완료로 믿지 않는다.
+      setConfigValue_(
+        'FIRST_TIME_SETUP_DONE',
+        (connectionCode + ' ' + setupAccount + ' ' + new Date().toISOString()).trim()
+      );
     } catch (err) {
       // 네 단계가 끝났어도 표시가 없으면 프로그램의 [다음]이 계속 잠긴다.
       // 다시 눌렀을 때 이미 끝난 네 단계는 건너뛰고 이 표시만 다시 적게 안내한다.
@@ -232,7 +270,9 @@ function runFirstTimeSetup() {
     ? '아직 남은 것\n\n' + leftovers.join('\n\n') + '\n\n' +
       '위 안내대로 마친 뒤 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 다시 누르면 됩니다.\n' +
       '이미 끝난 것은 건너뛰니 여러 번 눌러도 안전합니다.'
-    : '네 가지가 모두 준비됐습니다. 이 메뉴는 다시 누르지 않아도 됩니다.';
+    : '네 가지가 모두 준비됐습니다. 이 메뉴는 다시 누르지 않아도 됩니다.\n\n' +
+      '연결 확인번호: ' + connectionCode + '\n' +
+      'Teacher Manager에 보이는 번호와 같은지 확인해 주세요.';
 
   ui.alert('처음 한 번 설정하기', lines.join('\n') + '\n\n' + closing, ui.ButtonSet.OK);
 }
@@ -251,7 +291,7 @@ function firstTimeSetupWorkbookStep_() {
 
 /** 2단계 — 1행 AI 입력 켜기(편집 감지기 만들기). */
 function firstTimeSetupAiStep_() {
-  // 켤 수 있는 사본인지 먼저 본다. 아닌 시트에서는 이 단계만 건너뛰고 나머지는 그대로 한다.
+  // 켤 수 있는 사본인지 먼저 본다. 아닌 시트에서도 나머지 단계는 계속하되 전체 완료로 적지는 않는다.
   let state = null;
   try {
     state = attendanceAiWorkbookState_();
@@ -260,8 +300,7 @@ function firstTimeSetupAiStep_() {
   }
   if (!state || state.ok !== true) {
     return {
-      ok: true,
-      skipped: true,
+      ok: false,
       message: state && state.message ? state.message : 'AI 입력을 켤 수 있는 사본이 아닙니다.'
     };
   }
@@ -435,6 +474,7 @@ function ensureConfigSheet_(ss) {
     ['PERSONAL_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_PERSONAL_SHEET_NAME, '개인에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 개인톡 내용'],
     ['CLASS_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_CLASS_SHEET_NAME, '학급 전체에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 단체톡 내용'],
     ['ATTENDANCE_AI_ALLOWED', ATTENDANCE_AI_ALLOWED_VALUE, 'Teacher Manager 정식 출석부에서 AI 입력을 켤 수 있게 하는 값입니다.', '예'],
+    ['ATTENDANCE_CONNECTION_CODE', '', '이 출석부의 실제 Google Sheet 번호에서 만든 연결 확인번호입니다. 처음 설정 결과와 Teacher Manager 화면의 번호를 대조합니다.', '자동 입력'],
     ['SCRIPT_ID', DEFAULT_CONFIG.SCRIPT_ID, '이 시트에 연결된 Apps Script 프로젝트 ID입니다. 설치/점검 때 자동 기록되어, 설치 기록 파일이 없는 컴퓨터나 사본 시트에서도 스크립트를 찾을 수 있습니다.', '자동 입력']
   ];
 
@@ -1685,35 +1725,54 @@ function writeAttendanceAiVerificationMarkerFor_(spreadsheet, spreadsheetId) {
     ? spreadsheet.getSheetByName(CONFIG_SHEET_NAME)
     : null;
   if (!sheet) throw new Error('설정 탭을 찾지 못했습니다.');
+  const actualSpreadsheetId = String(
+    spreadsheet && typeof spreadsheet.getId === 'function' ? spreadsheet.getId() : ''
+  ).trim();
+  const checkedSpreadsheetId = String(spreadsheetId || '').trim();
+  if (!checkedSpreadsheetId || actualSpreadsheetId !== checkedSpreadsheetId) {
+    throw new Error('AI 입력 연결을 확인할 출석부 번호가 서로 다릅니다.');
+  }
+  const connectionCode = attendanceConnectionCodeForSpreadsheetId_(checkedSpreadsheetId);
+  if (!connectionCode) throw new Error('출석부 연결 확인번호를 만들지 못했습니다.');
   const lastRow = Math.max(2, Number(sheet.getLastRow() || 0));
   const rows = sheet.getRange(2, 1, Math.max(1, lastRow - 1), 2).getValues();
-  const indexes = [];
+  const markerIndexes = [];
+  const connectionIndexes = [];
   rows.forEach(function (row, index) {
     if (String(row[0] || '').trim() === ATTENDANCE_AI_VERIFICATION_SETTING) {
-      indexes.push(index);
+      markerIndexes.push(index);
+    }
+    if (String(row[0] || '').trim() === ATTENDANCE_CONNECTION_CODE_SETTING) {
+      connectionIndexes.push(index);
     }
   });
-  // 손상된 중복 표시는 먼저 비운다. 정확한 새 표시는 아래 마지막 쓰기 한 번이다.
-  for (let index = 1; index < indexes.length; index++) {
-    sheet.getRange(indexes[index] + 2, 1).setValue('');
-    sheet.getRange(indexes[index] + 2, 2).setValue('');
+  function writeUniqueSetting_(key, value, indexes) {
+    // 손상된 중복 표시는 먼저 비운다. 정확한 값은 아래 마지막 쓰기 한 번이다.
+    for (let index = 1; index < indexes.length; index++) {
+      sheet.getRange(indexes[index] + 2, 1).setValue('');
+      sheet.getRange(indexes[index] + 2, 2).setValue('');
+    }
+    if (indexes.length) {
+      sheet.getRange(indexes[0] + 2, 2).setValue(value);
+    } else if (typeof sheet.appendRow === 'function') {
+      sheet.appendRow([key, value]);
+    } else {
+      const appendAt = Math.max(2, Number(sheet.getLastRow() || 0) + 1);
+      sheet.getRange(appendAt, 1).setValue(key);
+      sheet.getRange(appendAt, 2).setValue(value);
+    }
   }
   const marker = JSON.stringify({
     schema_version: ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION,
     setup_version: ATTENDANCE_AI_SETUP_VERSION,
-    spreadsheet_id: String(spreadsheetId || '').trim(),
+    spreadsheet_id: checkedSpreadsheetId,
     handler_name: ATTENDANCE_AI_EDIT_TRIGGER_HANDLER,
     trigger_count: 1,
     success: true
   });
-  if (indexes.length) {
-    sheet.getRange(indexes[0] + 2, 2).setValue(marker);
-  } else if (typeof sheet.appendRow === 'function') {
-    sheet.appendRow([ATTENDANCE_AI_VERIFICATION_SETTING, marker]);
-  } else {
-    sheet.getRange(lastRow + 1, 1).setValue(ATTENDANCE_AI_VERIFICATION_SETTING);
-    sheet.getRange(lastRow + 1, 2).setValue(marker);
-  }
+  writeUniqueSetting_(ATTENDANCE_CONNECTION_CODE_SETTING, connectionCode, connectionIndexes);
+  // 자동화 확인 JSON은 기존 형식을 그대로 지켜 Windows 프로그램의 읽기 계약을 깨지 않는다.
+  writeUniqueSetting_(ATTENDANCE_AI_VERIFICATION_SETTING, marker, markerIndexes);
 }
 
 /** 대상 이외의 같은 편집 감지기는 남기지 않는다. */
@@ -3746,21 +3805,45 @@ function startCentralChatConnection(options) {
 function checkCentralChatStatus() {
   requireGoeduTeacherAccount_();
   const ui = SpreadsheetApp.getUi();
+  let connectionCode = '';
+  let connectionSettingNote = '';
   try {
+    // Chat 연결 여부와 상관없이 지금 열린 출석부의 확인번호부터 보여 준다.
+    connectionCode = attendanceConnectionCodeForSpreadsheetId_(
+      SpreadsheetApp.getActiveSpreadsheet().getId()
+    );
+    if (!connectionCode) throw new Error('지금 열린 출석부의 연결 확인번호를 읽지 못했습니다.');
+    try {
+      // 복사된 Sheet에 원본 확인번호가 남아 있어도, 상태 확인을 누른 현재 Sheet의
+      // 실제 ID로 설정 탭 복사용 값을 바로 고친다.
+      setConfigValue_(ATTENDANCE_CONNECTION_CODE_SETTING, connectionCode);
+    } catch (settingError) {
+      connectionSettingNote = '\n\n설정 탭의 복사용 번호는 갱신하지 못했습니다. 이 창의 번호를 사용해 주세요.';
+    }
     const status = callCentralChatSender_('/v1/status', {});
     if (!status.connected) {
-      ui.alert(status.reason || 'Google Chat 최초 발송 연결이 아직 안 됐습니다.\n\n[Google Chat 최초 발송 연결하기]를 먼저 눌러 주세요.');
+      ui.alert(
+        '연결 확인번호: ' + connectionCode + '\n\n' +
+        (status.reason || 'Google Chat 최초 발송 연결이 아직 안 됐습니다.\n\n[Google Chat 최초 발송 연결하기]를 먼저 눌러 주세요.') +
+        connectionSettingNote
+      );
       return;
     }
     ui.alert(
       'Google Chat 발송 연결됨\n\n' +
+      '연결 확인번호: ' + connectionCode + '\n' +
       '연결 계정: ' + (status.account || '') + '\n' +
       '발송 방식: 선생님 이름으로 발송\n' +
       '개인톡: ' + (status.personalEnabled ? '가능' : '확인 필요') + '\n' +
-      '단체톡: ' + (status.classEnabled ? '가능' : '학급 단톡방 고르기 필요')
+      '단체톡: ' + (status.classEnabled ? '가능' : '학급 단톡방 고르기 필요') +
+      connectionSettingNote
     );
   } catch (err) {
-    ui.alert('Google Chat 연결 상태를 확인하지 못했습니다.\n\n' + centralChatErrorMessage_(err));
+    ui.alert(
+      (connectionCode ? '연결 확인번호: ' + connectionCode + '\n\n' : '') +
+      'Google Chat 연결 상태를 확인하지 못했습니다.\n\n' + centralChatErrorMessage_(err) +
+      connectionSettingNote
+    );
   }
 }
 
