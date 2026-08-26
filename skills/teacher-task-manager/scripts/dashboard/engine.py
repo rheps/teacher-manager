@@ -75,6 +75,7 @@ DEFAULT_ATTACHMENT_FOLDER = r"C:\BrityWorks\BrityMessenger\download"
 class HomeCheckDeps:
     doctor_deps: DoctorDeps = field(default_factory=DoctorDeps)
     document_probe: object = None
+    attendance_ui_probe: object = None
 
 
 def _timetable_check(config_dir: Path) -> CheckResult:
@@ -152,16 +153,22 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
         card="settings", target="brity_download_dir",
     ))
 
-    attendance = read_attendance_status(config_dir, doctor_deps.run_command)
-    # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
-    # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
-    attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
-    results.append(CheckResult(
-        "connect.attendance", "출결 시트", attendance_ok,
-        attendance.detail or "출결 업무 준비가 끝났어요",
-        "" if attendance_ok is not False else (attendance.detail or "연결의 출결 탭에서 출결 준비 시작하기를 눌러 주세요."),
-        card="connect", tab="attendance", target="attendance-setup",
-    ))
+    attendance_ui_visible = (
+        bool(deps.attendance_ui_probe())
+        if callable(deps.attendance_ui_probe)
+        else attendance_ui_enabled()
+    )
+    if attendance_ui_visible:
+        attendance = read_attendance_status(config_dir, doctor_deps.run_command)
+        # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
+        # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
+        attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
+        results.append(CheckResult(
+            "connect.attendance", "출결 시트", attendance_ok,
+            attendance.detail or "출결 업무 준비가 끝났어요",
+            "" if attendance_ok is not False else (attendance.detail or "연결의 출결 탭에서 출결 준비 시작하기를 눌러 주세요."),
+            card="connect", tab="attendance", target="attendance-setup",
+        ))
     return results
 
 
@@ -2535,6 +2542,15 @@ def ai_skill_install_enabled() -> bool:
     except (OSError, ValueError, TypeError):
         return False
     return isinstance(data, dict) and data.get("aiSkillInstallEnabled") is True
+
+
+def attendance_ui_enabled() -> bool:
+    """설치본에 출결 시험 화면이 명시적으로 들어간 경우에만 화면을 연다."""
+    try:
+        data = _json.loads((bundle_paths.bundle_root() / "release.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and data.get("attendanceUiEnabled") is True
 
 
 def ai_tools_status(home=None) -> list:

@@ -74,6 +74,9 @@ const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 
 function isGoeduGoogleStatus(status) {
   return Boolean(status && status.logged_in && status.account_allowed === true);
 }
+function attendanceUiEnabled() {
+  return S.info?.features?.attendance_ui_enabled === true;
+}
 
 /* ---------- bridge ---------- */
 function call(name, ...args) {
@@ -384,7 +387,7 @@ function wizardFootHtml() {
       : S.step === 8 ? "Chat은 나중에 설정"
         : "다음";
   const nextLocked = (S.step === 2 && !isGoeduGoogleStatus(S.google))
-    || (S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
+    || (attendanceUiEnabled() && S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
   const disabled = nextLocked ? " disabled" : "";
   // 8단계의 핵심은 학생 가입·Chat 초대다 — 건너뛰기(다음)가 제일 눈에 띄면 안 된다.
   const nextClass = S.step === 8 ? "btn-quiet" : "btn";
@@ -456,7 +459,7 @@ function attendanceWizardGateMessage() {
 }
 async function goStepAsync(n) {
   const target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
-  if (S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
+  if (attendanceUiEnabled() && S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
     setBanner("warn", attendanceWizardGateMessage());
     return;
   }
@@ -465,7 +468,7 @@ async function goStepAsync(n) {
   S.banner = null;
   S.step = target;
   S.maxStep = Math.max(S.maxStep || 1, S.step);
-  if (S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
+  if (attendanceUiEnabled() && S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
     // 단계 목록으로 출결 탭에 곧장 돌아와도 진행 표시와 완료 자동 확인이 다시 돈다.
     startAttendancePreparePoll();
   }
@@ -477,21 +480,22 @@ async function goNextAsync() {
   const problem = validate ? await validate() : "";
   if (problem) { setBanner("warn", problem); return; }
   if (S.step === 7 && S.connectTab === "messenger") {
-    // 연결은 메신저 → 출결 → AI 에이전트 세 탭을 차례로 지난 뒤에 마무리로 간다.
-    // [다음] 순간 입력을 실제 저장하고 출결 준비를 뒤에서 시작한다 — 출결 탭이 진행을 보여준다.
-    const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
-    if (!startReply.started) { setBanner("warn", startReply.reason); return; }
-    S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
+    // 공개용은 출결 안내만 보여 주고, 별도 시험 설치본만 기존 준비 흐름을 실행한다.
+    if (attendanceUiEnabled()) {
+      const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
+      if (!startReply.started) { setBanner("warn", startReply.reason); return; }
+      S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
+    }
     S.connectTab = "attendance";
     S.chatStatus = null;
     S.attendance = null;  // 탭 클릭 경로와 동일하게 새로 확인 — 오래된 상태 재사용 방지
-    startAttendancePreparePoll();
+    if (attendanceUiEnabled()) startAttendancePreparePoll();
     await saveDraft();
     render();
     return;
   }
   if (S.step === 7 && S.connectTab === "attendance") {
-    if (S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
+    if (attendanceUiEnabled() && S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
       // 게이트 판정과 문구는 goStepAsync의 7단계 경계와 같은 함수 하나를 쓴다 (검토 C1).
       setBanner("warn", attendanceWizardGateMessage());
       return;
@@ -516,7 +520,7 @@ bindActions({
       S.connectTab = "attendance";
       S.chatStatus = null;
       S.attendance = null;
-      startAttendancePreparePoll();
+      if (attendanceUiEnabled()) startAttendancePreparePoll();
       render();
       return;
     }
@@ -1147,9 +1151,10 @@ function connectTabsHtml() {
     const active = S.connectTab === entry.tab ? " active" : "";
     const count = tabProblemCount(entry.tab);
     const countHtml = `<span class="tab-count" data-tab-count="${entry.tab}"${count ? "" : ' style="display:none"'}>${count || ""}</span>`;
+    const detail = entry.tab === "attendance" && !attendanceUiEnabled() ? "곧 제공" : entry.detail;
     return `<button class="connect-tab${active}" data-action="connect-tab" data-tab="${entry.tab}">
       <b class="tab-title">${esc(entry.title)}${countHtml}</b>
-      <small class="tab-detail">${esc(entry.detail)}</small></button>`;
+      <small class="tab-detail">${esc(detail)}</small></button>`;
   }).join("");
   return `<div class="connect-tabs">${buttons}</div>`;
 }
@@ -1652,6 +1657,12 @@ function firstSetupCardHtml(a) {
     <div class="first-setup-acts">${open}</div>
   </div>`;
 }
+function attendanceComingSoonHtml() {
+  return `<div class="attendance-head"><div>
+    <h2>출결</h2>
+    <p>출결 기능은 준비 중이며 곧 제공됩니다.</p>
+  </div></div>`;
+}
 function attendanceTabHtml() {
   // 마법사에서 준비 폴링이 도는 동안에는 같은 상태를 두 경로로 읽지 않는다 —
   // 느린 attendance_status 응답이 폴링이 방금 놓은 새 상태를 옛 값으로 덮는 것을 막는다.
@@ -1772,7 +1783,7 @@ bindActions({
     if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
     S.banner = null;  // 이전 탭의 안내 배너(게이트 포함)가 새 탭까지 따라가지 않는다 (검토 C2)
     S.connectTab = tab;
-    if (tab === "attendance") {
+    if (tab === "attendance" && attendanceUiEnabled()) {
       if (S.mode === "wizard") {
         // 마법사에서는 준비 폴링이 상태를 읽는다 — 같은 정보를 두 경로로 묻지 않는다.
         startAttendancePreparePoll();
@@ -2172,7 +2183,7 @@ function stepConnect() {
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
     loadLinkLists();
   }
-  const body = S.connectTab === "attendance" ? attendanceTabHtml()
+  const body = S.connectTab === "attendance" ? (attendanceUiEnabled() ? attendanceTabHtml() : attendanceComingSoonHtml())
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
     <h1>Google 연결</h1>
@@ -2678,9 +2689,13 @@ bindActions({
     const failed = results.filter((r) => r.status === "failed");
     // 성공이든 실패든 곧장 홈으로 — 실패 항목은 홈 점검과 출결 탭이 이유를 보여준다.
     await call("finish_setup");
-    try {
-      S.attendance = await call("attendance_status");
-    } catch (_error) {
+    if (attendanceUiEnabled()) {
+      try {
+        S.attendance = await call("attendance_status");
+      } catch (_error) {
+        S.attendance = null;
+      }
+    } else {
       S.attendance = null;
     }
     S.attendanceScriptUpdate = null;
@@ -2781,7 +2796,9 @@ function editingCard() {
 }
 function effectiveChecks() {
   const editing = editingCard();
-  const saved = uniqueChecks(S.checks);
+  const saved = uniqueChecks(S.checks).filter(
+    (row) => attendanceUiEnabled() || row.tab !== "attendance"
+  );
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
@@ -3154,6 +3171,9 @@ function cardBadges(card) {
   return badge("y", st.label) + badge("n", `${st.summary.good}/${st.summary.total} 정상`);
 }
 function cardDetail(card) {
+  if (card.key === "connect" && !attendanceUiEnabled()) {
+    return "Calendar · Tasks · Gemini API key";
+  }
   return card.detail;
 }
 /* 점검 실패 → 배너 → 재렌더 → 재조회의 자기지속 루프를 끊는다:
@@ -3179,7 +3199,10 @@ function shouldAutoRefreshChecks() {
 }
 function homeHtml(behind) {
   const info = S.info;
-  const problems = checkSummary(uniqueChecks(S.checks)).bad;
+  const visibleChecks = uniqueChecks(S.checks).filter(
+    (row) => attendanceUiEnabled() || row.tab !== "attendance"
+  );
+  const problems = checkSummary(visibleChecks).bad;
   const pill = !S.checks.length ? badge("n", "점검 중…")
     : problems ? badge("y", `확인할 항목 ${problems}개`) : badge("g", "모두 정상");
   const name = (S.profileCache && S.profileCache["선생님이름"]) ? `${S.profileCache["선생님이름"]} 선생님, ` : "";
@@ -3477,7 +3500,7 @@ async function loadForEdit(key) {
       status: null,
     };
   }
-  if (key === "connect") {
+  if (key === "connect" && attendanceUiEnabled()) {
     try {
       S.attendance = await call("attendance_status");
     } catch (_error) {
@@ -3489,6 +3512,12 @@ async function loadForEdit(key) {
     S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
       : "messenger";
+  } else if (key === "connect") {
+    S.attendance = null;
+    S.attendanceScriptUpdate = null;
+    clearAttendanceScriptDialogState();
+    S.chatStatus = null;
+    S.connectTab = "messenger";
   }
   // 설정 화면은 열 때마다 실제 상태를 다시 확인한다 — 홈 점검과 화면이 어긋나지 않게.
   if (key === "settings") refreshSettingsStatus().catch(() => {});

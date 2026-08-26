@@ -27,7 +27,9 @@ from typing import Callable, Literal, Sequence
 
 PROBE_DIR_PREFIX = "TeacherManager-WebView2-Probe-"
 PROBE_MARKER_NAME = "owned-probe.json"
-PROBE_OVERALL_TIMEOUT_SECONDS = 35.0
+PROBE_ATTEMPT_TIMEOUT_SECONDS = 90.0
+PROBE_OVERALL_TIMEOUT_SECONDS = 240.0
+PROBE_RETRY_COUNT = 2
 _NONCE_RE = re.compile(r"^[0-9a-f]{32,64}$")
 _VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 _LOCAL_HTML = "<!doctype html><meta charset='utf-8'><title>Teacher Manager WebView2 check</title>"
@@ -186,27 +188,44 @@ def _cleanup_owned_probe_dir(candidate: Path, temp_root: Path, nonce: str) -> bo
         path = Path(os.path.abspath(os.fspath(candidate)))
         if path.parent != root or not path.name.startswith(PROBE_DIR_PREFIX):
             return False
-        if not os.path.lexists(path):
-            # private_mode인 pywebview가 종료하면서 먼저 안전하게 지웠다.
-            return True
-        if path.is_symlink() or _is_junction(path) or _is_reparse_point(path):
-            return False
-        marker = path / PROBE_MARKER_NAME
-        if (
-            marker.is_symlink()
-            or _is_junction(marker)
-            or _is_reparse_point(marker)
-            or not marker.is_file()
-        ):
-            return False
-        raw = marker.read_bytes()
-        if len(raw) > 256:
-            return False
-        data = json.loads(raw.decode("utf-8"))
-        if data != {"nonce": nonce}:
-            return False
-        shutil.rmtree(path)
-        return not os.path.lexists(path)
+        # WebView2는 창과 모든 자식 작업이 끝난 뒤에도 Windows의 검사 프로그램이
+        # 새 파일을 잠깐 확인할 수 있다. 최대 30초 동안 이 검사 전용 폴더만 다시
+        # 확인하며 기다린다.
+        for attempt in range(300):
+            if not os.path.lexists(path):
+                # private_mode인 pywebview가 종료하면서 먼저 안전하게 지웠다.
+                return True
+            # WebView2가 파일 손잡이를 잠깐 늦게 놓을 수 있다. 다시 지우기 전에도
+            # 매번 연결 폴더와 소유 표시를 재확인해 다른 위치를 따라가지 않는다.
+            if path.is_symlink() or _is_junction(path) or _is_reparse_point(path):
+                return False
+            marker = path / PROBE_MARKER_NAME
+            if (
+                marker.is_symlink()
+                or _is_junction(marker)
+                or _is_reparse_point(marker)
+                or not marker.is_file()
+            ):
+                return False
+            raw = marker.read_bytes()
+            if len(raw) > 256:
+                return False
+            data = json.loads(raw.decode("utf-8"))
+            if data != {"nonce": nonce}:
+                return False
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                if attempt == 299:
+                    return False
+                time.sleep(0.1)
+                continue
+            if not os.path.lexists(path):
+                return True
+            if attempt == 299:
+                return False
+            time.sleep(0.1)
+        return False
     except Exception:
         return False
 
@@ -446,8 +465,8 @@ def run_webview2_probe(
     *,
     webview_module,
     minimum_version: str,
-    attempt_timeout_seconds: float = 15.0,
-    retry_count: int = 1,
+    attempt_timeout_seconds: float = PROBE_ATTEMPT_TIMEOUT_SECONDS,
+    retry_count: int = PROBE_RETRY_COUNT,
     temp_root: Path | None = None,
     nonce_factory: Callable[[], str] = make_probe_nonce,
     probe_dir: Path | None = None,
@@ -476,7 +495,7 @@ def run_webview2_probe(
                 False, "", selected_version, "shutdown", "TEMP_ROOT_UNAVAILABLE", 1
             )
         last = WebView2ProbeResult(False, "", selected_version, "loaded", "INITIALIZATION_FAILED", 1)
-        retries = max(0, min(int(retry_count), 1))
+        retries = max(0, min(int(retry_count), 2))
         if probe_dir is not None or parent_manages_shutdown:
             retries = 0
         for index in range(retries + 1):
@@ -490,7 +509,10 @@ def run_webview2_probe(
                 webview_module=webview_module,
                 selected_version=selected_version,
                 attempt=attempt,
-                attempt_timeout_seconds=min(max(float(attempt_timeout_seconds), 0.01), 15.0),
+                attempt_timeout_seconds=min(
+                    max(float(attempt_timeout_seconds), 0.01),
+                    PROBE_ATTEMPT_TIMEOUT_SECONDS,
+                ),
                 temp_root=root,
                 nonce=nonce,
                 probe_dir=probe_dir,
@@ -723,8 +745,8 @@ def _stop_ungated_worker(worker, deadline: float) -> bool:
 def run_supervised_webview2_probe(
     *,
     minimum_version: str,
-    attempt_timeout_seconds: float = 15.0,
-    retry_count: int = 1,
+    attempt_timeout_seconds: float = PROBE_ATTEMPT_TIMEOUT_SECONDS,
+    retry_count: int = PROBE_RETRY_COUNT,
     temp_root: Path | None = None,
     nonce_factory: Callable[[], str] = make_probe_nonce,
     process_factory=subprocess.Popen,
@@ -735,8 +757,11 @@ def run_supervised_webview2_probe(
     try:
         root = (temp_root or Path(tempfile.gettempdir())).resolve(strict=True)
         minimum = _version_tuple(minimum_version)
-        retries = max(0, min(int(retry_count), 1))
-        timeout = min(max(float(attempt_timeout_seconds), 0.01), 15.0)
+        retries = max(0, min(int(retry_count), 2))
+        timeout = min(
+            max(float(attempt_timeout_seconds), 0.01),
+            PROBE_ATTEMPT_TIMEOUT_SECONDS,
+        )
     except Exception:
         return WebView2ProbeResult(
             False, "", "", "shutdown", "PROBE_INTERNAL_ERROR", 1

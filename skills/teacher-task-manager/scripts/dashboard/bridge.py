@@ -359,6 +359,7 @@ class Api:
             "draft": state["draft"],
             "features": {
                 "ai_skill_install_enabled": engine.ai_skill_install_enabled(),
+                "attendance_ui_enabled": engine.attendance_ui_enabled(),
             },
         }
 
