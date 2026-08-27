@@ -427,7 +427,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-service .nameblock { flex:1; min-width:0; }
 /* 출결 탭 상태 셀 — 글자 색만, 모든 줄 같은 폭, 맨 오른쪽 (2026-07-31 설계) */
 /* 폭은 가장 긴 낱말(준비 필요)에 맞춘다 — 넓으면 단추와 상태 사이가 벌어진다(2026-07-31) */
-.svc-status { flex:none; width:64px; text-align:right; font-size:12.5px; font-weight:700; }
+.svc-status { flex:none; min-width:88px; white-space:nowrap; text-align:right; font-size:12.5px; font-weight:700; }
 .svc-status.ok { color:var(--tm-green); }
 .svc-status.warn { color:var(--tm-amber); }
 .svc-status.bad { color:var(--tm-red); }
@@ -446,6 +446,28 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .first-setup-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .first-setup-head b { font-size:14px; color:var(--tm-ink); }
 .first-setup-card .svc-status { width:auto; }
+.attendance-primary-issue,
+.connection-comparison,
+.connection-notice { min-width:0; overflow-wrap:anywhere; }
+.attendance-primary-issue { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; margin:12px 0; padding:14px 16px; border:1px solid var(--tm-line); }
+.connection-reason { margin:0; }
+.connection-comparison { display:grid; grid-template-columns:minmax(0,1fr); gap:8px; margin:0; }
+.connection-comparison div { min-width:0; }
+.connection-comparison dt { color:var(--tm-muted); font-size:12px; }
+.connection-comparison dd { margin:2px 0 0; font-weight:700; }
+.connection-notice { margin:0 17px 10px 61px; color:var(--tm-muted); font-size:12px; }
+.connection-setting-status { display:grid; gap:8px; min-width:0; padding:8px 0; }
+.connection-setting-head { display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:0; }
+.connection-setting-head > span:first-child { min-width:0; overflow-wrap:anywhere; font-size:12px; color:var(--tm-muted); }
+.connection-item-issue { display:grid; gap:8px; padding:10px 12px; border-radius:12px; background:var(--tm-surface); }
+.connection-item-issue .connection-reason { margin:0; }
+.connection-item-issue .btn-tonal { justify-self:start; }
+.attendance-primary-issue .btn-tonal:focus-visible { outline:3px solid var(--tm-blue); outline-offset:2px; }
+@media (max-width:375px) {
+  .attendance-service { align-items:flex-start; }
+  .attendance-service .svc-acts { width:100%; order:3; }
+  .connection-notice { margin-left:17px; }
+}
 .first-setup-card p { margin:8px 0 12px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
 .first-setup-acts { display:flex; justify-content:flex-end; gap:8px; }
 .attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }

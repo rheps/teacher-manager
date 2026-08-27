@@ -212,11 +212,12 @@ def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
     return CheckResult("connect.gemini-key", "Gemini API key", False, detail, fix, **common)
 
 
-def run_doctor_checks(
+def _run_doctor_checks(
     config_dir: Path,
     deps: DoctorDeps | None = None,
     *,
     gws_executable: str | None = None,
+    include_connection_checks: bool,
 ) -> list[CheckResult]:
     deps = deps or DoctorDeps()
     gws_damage = False
@@ -233,10 +234,11 @@ def run_doctor_checks(
 
     results: list[CheckResult] = []
     results.extend(_identity_checks(profile))
-    results.extend(_connect_checks(profile))
 
     bridge_settings = load_settings(paths.settings_path(config_dir))
-    results.append(_gemini_check(deps, bridge_settings))
+    if include_connection_checks:
+        results.extend(_connect_checks(profile))
+        results.append(_gemini_check(deps, bridge_settings))
 
     code, output = _gws_status(deps, gws_executable) if gws_executable else (127, "")
     cli_found = bool(gws_executable) and code != 127
@@ -304,6 +306,34 @@ def run_doctor_checks(
         card="settings", target="autostart",
     ))
     return results
+
+
+def run_doctor_checks(
+    config_dir: Path,
+    deps: DoctorDeps | None = None,
+    *,
+    gws_executable: str | None = None,
+) -> list[CheckResult]:
+    return _run_doctor_checks(
+        config_dir,
+        deps,
+        gws_executable=gws_executable,
+        include_connection_checks=True,
+    )
+
+
+def run_home_doctor_checks(
+    config_dir: Path,
+    deps: DoctorDeps | None = None,
+    *,
+    gws_executable: str | None = None,
+) -> list[CheckResult]:
+    return _run_doctor_checks(
+        config_dir,
+        deps,
+        gws_executable=gws_executable,
+        include_connection_checks=False,
+    )
 
 
 def format_report(results: list[CheckResult]) -> str:

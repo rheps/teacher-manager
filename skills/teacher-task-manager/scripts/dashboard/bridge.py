@@ -71,7 +71,6 @@ _SCREEN_FAILURES = {
     "read_profile": "이 컴퓨터에 저장된 내 정보를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
     "read_grid": "이 컴퓨터에 저장된 시간표를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
     "get_messenger_settings": "이 컴퓨터에 저장된 메신저 설정을 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
-    "save_profile_grid": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
     "save_messenger": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
     "apply_all": "이 컴퓨터 설정을 저장하고 적용하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
     "choose_attachment_folder": (
@@ -179,10 +178,12 @@ class BridgeDeps:
 
     run_command: object = None
     gemini_transport: object = None
+    gemini_key_pusher: object = None
     hotkey_register: object = None
     hotkey_unregister: object = None
     hotkey_modifier_probe: object = None
     home_check_deps: object = None
+    connection_probe_deps: object = None
     apply_deps: object = None
     attendance_deps: object = None
     helper_restart: object = None
@@ -359,7 +360,6 @@ class Api:
             "draft": state["draft"],
             "features": {
                 "ai_skill_install_enabled": engine.ai_skill_install_enabled(),
-                "attendance_ui_enabled": engine.attendance_ui_enabled(),
             },
         }
 
@@ -569,6 +569,22 @@ class Api:
         return [asdict(r) for r in results]
 
     @guarded
+    def connection_statuses(self, item_ids=None):
+        from dashboard.connection_probe import read_connection_statuses
+
+        requested = tuple(
+            text
+            for value in (item_ids or ())
+            if (text := str(value).strip())
+        )
+        report = read_connection_statuses(
+            self._config_dir,
+            item_ids=requested or None,
+            deps=self._deps.connection_probe_deps,
+        )
+        return report.as_payload()
+
+    @guarded
     def attendance_status(self):
         self._require_safe_gws_account_storage()
         status_value = engine.read_attendance_status(
@@ -660,7 +676,7 @@ class Api:
 
     @guarded
     def attendance_prepare_start(self, profile, grid, bridge_updates):
-        """메신저 탭 [다음] — 입력 저장 후 출결 준비를 뒤에서 시작한다. 여러 번 불려도 안전."""
+        """메신저 탭 [다음] — 화면 초안을 저장하지 않고 출결 준비만 뒤에서 시작한다."""
         self._require_safe_gws_account_storage()
         # pywebview는 js_api 호출마다 새 스레드를 만든다 — [다음] 더블클릭이면
         # is_alive 확인과 start() 사이(저장은 수백 ms~수 초)에 둘 다 지나가
@@ -670,13 +686,19 @@ class Api:
             thread = self._attendance_prepare_thread
             if thread is not None and thread.is_alive():
                 return {"started": True, "reason": "이미 준비하는 중이에요"}
-            save_deps = self._deps.apply_deps or engine.ApplyDeps(
-                run_command=self._attendance_remote_run()
+            att_deps = (
+                self._deps.attendance_deps
+                or self._deps.apply_deps
+                or engine.AttendanceDeps(
+                    run_command=self._attendance_remote_run(),
+                    gws_resolver=engine.tool_runtime.resolve_gws_executable,
+                )
             )
+            gws = str(att_deps.gws_resolver())
             try:
-                ok, reason = engine.save_wizard_inputs(
-                    self._config_dir, dict(profile), list(grid), dict(bridge_updates),
-                    deps=save_deps,
+                engine.require_goedu_gws_session(att_deps.run_command, gws)
+                draft_profile, reason = engine.prepare_attendance_draft(
+                    self._config_dir, dict(profile), list(grid)
                 )
             except RuntimeError:
                 # 로그인 문제(require_goedu_gws_session)는 guarded의 오류 응답이 아니라
@@ -688,18 +710,21 @@ class Api:
                         "@goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요."
                     ),
                 }
-            if not ok:
+            if not draft_profile:
                 return {"started": False, "reason": reason}
-            att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
-                run_command=self._attendance_remote_run()
-            )
+            gemini_key = str(dict(bridge_updates).get("gemini_api_key", "") or "")
 
             def _prepare():
                 # 예외로 조용히 죽으면 화면은 running=False + 사유 0글자만 본다.
                 # 성공이든 실패든 결과를 남겨 attendance_prepare_status가 보여준다.
                 try:
                     status = asdict(
-                        engine.ensure_attendance(self._config_dir, deps=att_deps)
+                        engine.ensure_attendance(
+                            self._config_dir,
+                            deps=att_deps,
+                            profile_data=draft_profile,
+                            gemini_api_key=gemini_key,
+                        )
                     )
                     # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
                     if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
@@ -1595,11 +1620,28 @@ class Api:
         ]
 
     @guarded
-    def save_profile_grid(self, profile, grid, require_links=True):
-        engine.write_profile_values(self._config_dir, dict(profile))
-        engine.write_timetable_grid(self._config_dir, list(grid))
-        parsed, detail = engine.run_parser(self._config_dir, require_links=bool(require_links))
-        return {"parsed": parsed, "detail": detail}
+    def save_identity(self, updates):
+        return engine.save_identity(self._config_dir, dict(updates))
+
+    @guarded
+    def save_timetable(self, grid):
+        return engine.save_timetable(self._config_dir, list(grid))
+
+    @guarded
+    def save_calendars(self, updates):
+        return engine.save_calendars(self._config_dir, dict(updates))
+
+    @guarded
+    def save_tasks(self, updates):
+        return engine.save_tasks(self._config_dir, dict(updates))
+
+    @guarded
+    def save_gemini(self, updates):
+        return engine.save_gemini(
+            self._config_dir,
+            dict(updates),
+            push_key=self._deps.gemini_key_pusher,
+        )
 
     @guarded
     def get_messenger_settings(self):

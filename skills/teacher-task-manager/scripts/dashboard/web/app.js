@@ -63,7 +63,17 @@ const S = {
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
+  connectionReport: { checked_at: "", items: [], primary_group_issue: null },
+  connectionRows: Object.create(null),
+  connectionRequestGeneration: Object.create(null),
+  connectionRequestSequence: 0,
+  connectionReportAccount: "",
+  connectionHomeLoaded: false,
+  connectionEditLoaded: false,
+  connectionWizardLoaded: false,
+  attendanceConnectionRefreshKey: "",
 };
+const connectionRequests = new Map();
 let attendanceScriptRequestToken = 0;
 
 const WIZARD_STEPS = [
@@ -73,9 +83,6 @@ const WIZARD_STEPS = [
 const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
 function isGoeduGoogleStatus(status) {
   return Boolean(status && status.logged_in && status.account_allowed === true);
-}
-function attendanceUiEnabled() {
-  return S.info?.features?.attendance_ui_enabled === true;
 }
 
 /* ---------- bridge ---------- */
@@ -347,6 +354,7 @@ function clearGoogleDependentState() {
   S.lists = { calendars: [], tasklists: [] };
   S.listsLoaded = false;
   S.listsError = false;
+  invalidateConnectionReport();
 }
 function startLoginWatch() {
   if (loginWatchTimer) return;
@@ -387,7 +395,7 @@ function wizardFootHtml() {
       : S.step === 8 ? "Chat은 나중에 설정"
         : "다음";
   const nextLocked = (S.step === 2 && !isGoeduGoogleStatus(S.google))
-    || (attendanceUiEnabled() && S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
+    || (S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
   const disabled = nextLocked ? " disabled" : "";
   // 8단계의 핵심은 학생 가입·Chat 초대다 — 건너뛰기(다음)가 제일 눈에 띄면 안 된다.
   const nextClass = S.step === 8 ? "btn-quiet" : "btn";
@@ -401,6 +409,14 @@ function renderWizard() {
   root().innerHTML =
     `<div class="shell">${railHtml()}` +
     `<div class="body"><div class="body-inner"><div class="page">${bannerHtml()}${body}</div></div>${foot}</div></div>` + toastHtml();
+  if (S.step === 7) {
+    if (!S.connectionWizardLoaded) {
+      S.connectionWizardLoaded = true;
+      loadConnectionReport().catch(() => {});
+    }
+  } else {
+    S.connectionWizardLoaded = false;
+  }
 }
 
 function currentState() {
@@ -447,7 +463,9 @@ async function refreshAttendanceWizardGate() {
     S.firstSetupDone = false;
     S.firstSetupConnectionCode = "";
   }
-  return attendanceWizardGateOpen();
+  const open = attendanceWizardGateOpen();
+  if (open) await refreshWizardAttendanceConnectionOnce();
+  return open;
 }
 function attendanceWizardGateMessage() {
   const state = S.attendance ? S.attendance.state : "";
@@ -459,7 +477,7 @@ function attendanceWizardGateMessage() {
 }
 async function goStepAsync(n) {
   const target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
-  if (attendanceUiEnabled() && S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
+  if (S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
     setBanner("warn", attendanceWizardGateMessage());
     return;
   }
@@ -468,7 +486,7 @@ async function goStepAsync(n) {
   S.banner = null;
   S.step = target;
   S.maxStep = Math.max(S.maxStep || 1, S.step);
-  if (attendanceUiEnabled() && S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
+  if (S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
     // 단계 목록으로 출결 탭에 곧장 돌아와도 진행 표시와 완료 자동 확인이 다시 돈다.
     startAttendancePreparePoll();
   }
@@ -480,22 +498,19 @@ async function goNextAsync() {
   const problem = validate ? await validate() : "";
   if (problem) { setBanner("warn", problem); return; }
   if (S.step === 7 && S.connectTab === "messenger") {
-    // 공개용은 출결 안내만 보여 주고, 별도 시험 설치본만 기존 준비 흐름을 실행한다.
-    if (attendanceUiEnabled()) {
-      const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
-      if (!startReply.started) { setBanner("warn", startReply.reason); return; }
-      S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
-    }
+    const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
+    if (!startReply.started) { setBanner("warn", startReply.reason); return; }
+    S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
     S.connectTab = "attendance";
     S.chatStatus = null;
     S.attendance = null;  // 탭 클릭 경로와 동일하게 새로 확인 — 오래된 상태 재사용 방지
-    if (attendanceUiEnabled()) startAttendancePreparePoll();
+    startAttendancePreparePoll();
     await saveDraft();
     render();
     return;
   }
   if (S.step === 7 && S.connectTab === "attendance") {
-    if (attendanceUiEnabled() && S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
+    if (S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
       // 게이트 판정과 문구는 goStepAsync의 7단계 경계와 같은 함수 하나를 쓴다 (검토 C1).
       setBanner("warn", attendanceWizardGateMessage());
       return;
@@ -520,7 +535,7 @@ bindActions({
       S.connectTab = "attendance";
       S.chatStatus = null;
       S.attendance = null;
-      if (attendanceUiEnabled()) startAttendancePreparePoll();
+      startAttendancePreparePoll();
       render();
       return;
     }
@@ -958,6 +973,7 @@ async function finishHotkeyRecording() {
       if (S.mode === "edit" && S.edit === "settings") {
         // 설정 화면은 자동 저장 — 녹음이 끝나면(아래 finally에서 등록 재개 후) 바로 저장한다.
         S.hk.status = { kind: "ok", text: `${prettyHotkey(text)} · 저장하는 중…` };
+        editDirtyFields.add("hotkey");
         autoSaveWhenDone = true;
       } else {
         S.hk.status = { kind: "ok", text: `${prettyHotkey(text)} · 저장할 수 있어요` };
@@ -1027,11 +1043,13 @@ function apiKeyLinkRow() {
 function geminiSectionHtml(d) {
   const keyLine = S.keyStatus ? badge(S.keyStatus.kind, S.keyStatus.text) : "";
   const model = d.gemini_model || "gemini-3.5-flash";
+  const connection = connectionRow("gemini") || connectionFallbackRow("gemini", true);
   const modelRow = rawRow("Gemini model", `<div class="field"><select name="gemini_model">
     <option value="gemini-3.5-flash" ${model === "gemini-3.5-flash" ? "selected" : ""}>Gemini 3.5 Flash · 추천</option>
     <option value="gemini-3.1-flash-lite" ${model === "gemini-3.1-flash-lite" ? "selected" : ""}>Gemini 3.1 Flash-Lite · 빠른 처리</option>
   </select></div>`);
-  return `<div class="section-h">Gemini API key</div>
+  return `<div class="section-h section-head"><span>Gemini API key</span>${connectionStatusHtml(connection)}</div>
+    ${connectionItemIssueHtml(connection)}
     <p class="sub" style="margin-bottom:10px">입력 내용이 제품 개선에 쓰일 수 있어요. 학생 개인정보가 담긴 메시지는 등록하지 마세요. key는 이 컴퓨터에만 저장돼요.</p>
     ${apiKeyLinkRow()}
     <div style="margin-top:12px"></div>
@@ -1125,9 +1143,17 @@ function linkGroupHtml(kind) {
   const skipNote = !cal && p["담임여부"] !== "예"
     ? `<p class="sub">담임이 아니라서 조종례 전달용 목록은 건너뛰어요.</p>` : "";
   const taskRule = cal ? "" : `<span class="section-note">Google Tasks 목록 어디에 등록해도 날짜·시간은 지정하지 않아요</span>`;
+  const connectionIds = cal ? ["calendar.work", "calendar.school"] : ["tasks.work", "tasks.homeroom"].slice(0, fields.length);
+  const statusRows = connectionIds.map((id, index) => {
+    const row = connectionRow(id) || connectionFallbackRow(id, true);
+    return `<div class="connection-setting-status">
+      <div class="connection-setting-head"><span>${esc(fields[index][2])}</span>${connectionStatusHtml(row)}</div>
+      ${connectionItemIssueHtml(row)}
+    </div>`;
+  }).join("");
   return `<div class="section-h section-head"><span>${cal ? "Calendar" : "Tasks"}</span>${taskRule}</div>
     <div style="margin-bottom:10px">${segments}</div>
-    ${body}${skipNote}`;
+    ${statusRows}${body}${skipNote}`;
 }
 function listsErrorNoticeHtml() {
   if (!S.listsError) return "";
@@ -1144,17 +1170,23 @@ const CONNECT_TABS = [
   { tab: "ai", title: "AI 에이전트", detail: "MCP · Skill" },
 ];
 function tabProblemCount(tab) {
-  return checkSummary(checksForTab(tab)).bad;
+  if (tab === "attendance") {
+    return ATTENDANCE_DISPLAY_ROWS.map(projectConnectionRow).filter((row) => row.countedFailure).length;
+  }
+  const ids = tab === "ai" ? ["ai-agent"] : [
+    "google.account", "calendar.work", "calendar.school", "tasks.work",
+    ...(isHomeroomConnectionProfile() ? ["tasks.homeroom"] : []), "gemini",
+  ];
+  return ids.map(connectionRow).filter((row) => row && row.connected !== true && row.reason_code !== "CHECKING").length;
 }
 function connectTabsHtml() {
   const buttons = CONNECT_TABS.map((entry) => {
     const active = S.connectTab === entry.tab ? " active" : "";
     const count = tabProblemCount(entry.tab);
     const countHtml = `<span class="tab-count" data-tab-count="${entry.tab}"${count ? "" : ' style="display:none"'}>${count || ""}</span>`;
-    const detail = entry.tab === "attendance" && !attendanceUiEnabled() ? "곧 제공" : entry.detail;
     return `<button class="connect-tab${active}" data-action="connect-tab" data-tab="${entry.tab}">
       <b class="tab-title">${esc(entry.title)}${countHtml}</b>
-      <small class="tab-detail">${esc(detail)}</small></button>`;
+      <small class="tab-detail">${esc(entry.detail)}</small></button>`;
   }).join("");
   return `<div class="connect-tabs">${buttons}</div>`;
 }
@@ -1184,12 +1216,262 @@ function messengerTabHtml() {
     <div class="connect-section">${linkGroupHtml("task")}</div>
     <div class="connect-section">${geminiSectionHtml(S.draft.bridge)}</div>`;
 }
-const ATTENDANCE_SERVICES = [
-  { role: "출결 DB 관리", name: "Google Sheet", logo: "assets/google-sheets.svg", service: "sheet" },
-  { role: "결석 신고서 자동완성", name: "Google Docs", logo: "assets/google-docs.svg", service: "docs" },
-  { role: "조종례시 출결서류 미제출 안내", name: "Google Tasks", logo: "assets/google-tasks.svg", service: "tasks" },
-  { role: "미제출 출결서류 지참 요청 문자 전송", name: "Google Chat", logo: "assets/google-chat.svg", service: "chat" },
+const ATTENDANCE_DISPLAY_ROWS = [
+  { id: "attendance.display.sheet", role: "출결 DB 관리", name: "Google Sheet", logo: "assets/google-sheets.svg", service: "sheet", sourceIds: ["attendance.sheet", "attendance.script", "attendance.ai-trigger"] },
+  { id: "attendance.display.docs", role: "결석 신고서 자동완성", name: "Google Docs", logo: "assets/google-docs.svg", service: "docs", sourceIds: ["attendance.docs"] },
+  { id: "attendance.display.tasks", role: "조종례시 출결서류 미제출 안내", name: "Google Tasks", logo: "assets/google-tasks.svg", service: "tasks", sourceIds: ["attendance.tasks"] },
+  { id: "attendance.display.personal-chat", role: "미제출 출결서류 지참 요청 문자 전송", name: "Google Chat", logo: "assets/google-chat.svg", service: "chat", sourceIds: ["attendance.chat", "attendance.personal-queue"] },
+  { id: "attendance.display.class-space", role: "학급 단톡방", name: "Google Chat", logo: "assets/google-chat.svg", service: "class-space", sourceIds: ["attendance.chat", "attendance.class-space", "attendance.class-queue"] },
 ];
+const ATTENDANCE_SOURCE_IDS = [...new Set(ATTENDANCE_DISPLAY_ROWS.flatMap((row) => row.sourceIds))];
+const CONNECTION_ALWAYS_EXPECTED_IDS = [
+  "google.account", "calendar.work", "calendar.school", "tasks.work", "gemini",
+  ...ATTENDANCE_SOURCE_IDS,
+  "brity.helper", "brity.attachment-folder", "ai-agent",
+];
+const CONNECTION_CONDITIONAL_IDS = ["tasks.homeroom"];
+const CONNECTION_CHAT_IDS = ["attendance.chat", "attendance.personal-queue", "attendance.class-space", "attendance.class-queue"];
+const CONNECTION_CLASS_SPACE_IDS = ["attendance.class-space", "attendance.class-queue"];
+const ALLOWED_CONNECTION_ACTIONS = new Set([
+  "goto-settings-google",
+  "goto-work-calendar",
+  "goto-school-calendar",
+  "goto-work-tasks",
+  "goto-homeroom-tasks",
+  "goto-gemini",
+  "goto-identity-year",
+  "goto-identity-homeroom",
+  "attendance-connection-choose",
+  "attendance-open-first-setup",
+  "attendance-script-check",
+  "chat-connect",
+  "class-space-reload",
+  "retry-connection-check",
+]);
+function connectionAccountKey() {
+  return String(S.google?.user || "").trim().toLocaleLowerCase();
+}
+function isHomeroomConnectionProfile() {
+  return String(S.draft.profile?.["담임여부"] || S.profileCache?.["담임여부"] || "") === "예";
+}
+function expectedConnectionIds() {
+  return [...CONNECTION_ALWAYS_EXPECTED_IDS, ...(isHomeroomConnectionProfile() ? CONNECTION_CONDITIONAL_IDS : [])];
+}
+function connectionScreenKey() {
+  if (S.mode === "edit" && S.edit === "connect") return `${S.mode}|${S.step}|${S.edit}`;
+  if (S.mode === "wizard" && S.step === 7) return `${S.mode}|${S.step}|connect`;
+  return screenKey();
+}
+function connectionRow(id) { return S.connectionRows[id] || null; }
+function connectionFallbackRow(id, checking) {
+  return {
+    id, group: id.startsWith("attendance.") ? "attendance" : "connection", label: id,
+    connected: false, level: "unknown", category: "external_unreachable",
+    reason_code: checking ? "CHECKING" : "EXTERNAL_UNREACHABLE",
+    reason_ko: checking
+      ? "현재 연결 상태를 확인하는 중입니다. 확인이 끝나기 전에는 연결된 것으로 표시하지 않습니다."
+      : "Google에서 현재 연결 상태를 확인하지 못했습니다. 연결된 것으로 표시하지 않습니다.",
+    expected: { label: "정식 연결", value: "확인 가능" },
+    actual: { label: "현재 확인", value: checking ? "확인 중" : "읽기 실패" },
+    action: { id: "retry-connection-check", label: "다시 확인" },
+    source: { kind: "local-read", checked_at: "", account: connectionAccountKey(), ttl_seconds: 0 },
+    notice_code: "",
+  };
+}
+function invalidateConnectionReport() {
+  S.connectionRequestSequence += 1;
+  S.connectionRequestGeneration = Object.create(null);
+  S.connectionRows = Object.create(null);
+  S.connectionReport = { checked_at: "", items: [], primary_group_issue: null };
+  S.connectionReportAccount = "";
+  S.connectionHomeLoaded = false;
+  S.connectionEditLoaded = false;
+  S.connectionWizardLoaded = false;
+  S.attendanceConnectionRefreshKey = "";
+  connectionRequests.clear();
+}
+function mergeConnectionRows(report, requestedIds, generation, fullRequest) {
+  const rows = Array.isArray(report?.items) ? report.items : [];
+  const received = new Map(rows.filter((row) => row && row.id).map((row) => [row.id, row]));
+  const targets = fullRequest ? expectedConnectionIds() : requestedIds;
+  if (fullRequest) {
+    for (const id of Object.keys(S.connectionRows)) {
+      if (!targets.includes(id)) delete S.connectionRows[id];
+    }
+  }
+  rows.forEach((row) => {
+    if (row && row.id && targets.includes(row.id) && S.connectionRequestGeneration[row.id] === generation) {
+      S.connectionRows[row.id] = row;
+    }
+  });
+  targets.forEach((id) => {
+    if (!received.has(id) && S.connectionRequestGeneration[id] === generation) {
+      S.connectionRows[id] = connectionFallbackRow(id, false);
+    }
+  });
+  S.connectionReport.checked_at = String(report?.checked_at || "");
+  S.connectionReport.items = Object.values(S.connectionRows);
+  const coversAttendance = ATTENDANCE_SOURCE_IDS.every((id) => targets.includes(id));
+  const attendanceGenerationCurrent = ATTENDANCE_SOURCE_IDS.every(
+    (id) => S.connectionRequestGeneration[id] === generation,
+  );
+  if ((fullRequest || coversAttendance) && attendanceGenerationCurrent) {
+    const attendanceMissing = targets.some((id) => id.startsWith("attendance.") && !received.has(id));
+    S.connectionReport.primary_group_issue = report?.primary_group_issue
+      || (attendanceMissing ? connectionFallbackRow("attendance.primary", false) : null);
+  }
+}
+function projectConnectionRow(definition) {
+  const sources = definition.sourceIds.map((id) => connectionRow(id));
+  const connected = sources.every((row) => row && row.connected === true);
+  const knownFailures = sources.filter((row) => row && row.connected !== true && row.reason_code !== "CHECKING");
+  const checking = !connected && knownFailures.length === 0;
+  const notices = sources.filter((row) => row && row.connected === true && row.level === "degraded" && row.reason_ko);
+  return { ...definition, connected, checking, countedFailure: !connected && !checking, notices };
+}
+function connectionStatusHtml(row) {
+  const connected = row && row.connected === true;
+  return `<span class="svc-status ${connected ? "ok" : "bad"}">${connected ? "✓ 연결됨" : "! 연결 안 됨"}</span>`;
+}
+function safePrimaryIssue(issue) {
+  const expected = issue?.expected || {};
+  const actual = issue?.actual || {};
+  const complete = issue && issue.connected === false && issue.reason_ko
+    && expected.label && expected.value && actual.label && actual.value
+    && expected.value !== actual.value;
+  if (!complete) return connectionFallbackRow("attendance.primary", false);
+  const action = issue.action || {};
+  return {
+    ...issue,
+    action: ALLOWED_CONNECTION_ACTIONS.has(action.id) && action.label
+      ? action : { id: "retry-connection-check", label: "다시 확인" },
+  };
+}
+function connectionIssueHtml(row) {
+  const safe = safePrimaryIssue(row);
+  return `<div class="connection-item-issue" role="status" aria-live="polite">
+    <p class="connection-reason">${esc(safe.reason_ko)}</p>
+    <dl class="connection-comparison">
+      <div><dt>${esc(safe.expected.label)}</dt><dd>${esc(safe.expected.value)}</dd></div>
+      <div><dt>${esc(safe.actual.label)}</dt><dd>${esc(safe.actual.value)}</dd></div>
+    </dl>
+    <button class="btn-tonal" data-action="run-connection-action" data-connection-action="${esc(safe.action.id)}">${esc(safe.action.label || "다시 확인")}</button>
+  </div>`;
+}
+function connectionItemIssueHtml(row) {
+  if (!row || row.connected === true) return "";
+  if (row.reason_code === "CHECKING") {
+    return `<div class="connection-item-issue" role="status" aria-live="polite"><p class="connection-reason">${esc(connectionFallbackRow(row.id || "connection", true).reason_ko)}</p></div>`;
+  }
+  return connectionIssueHtml(row);
+}
+function attendancePrimaryIssueHtml() {
+  const projected = ATTENDANCE_DISPLAY_ROWS.map(projectConnectionRow);
+  const issue = S.connectionReport.primary_group_issue;
+  if (!issue && !projected.some((row) => row.checking)) return "";
+  if (!issue) {
+    return `<div class="attendance-primary-issue" role="status" aria-live="polite"><p class="connection-reason">현재 연결 상태를 확인하는 중입니다. 확인이 끝나기 전에는 연결된 것으로 표시하지 않습니다.</p></div>`;
+  }
+  const safe = safePrimaryIssue(issue);
+  return `<div class="attendance-primary-issue" role="status" aria-live="polite">
+    <p class="connection-reason">${esc(safe.reason_ko)}</p>
+    <dl class="connection-comparison">
+      <div><dt>${esc(safe.expected.label)}</dt><dd>${esc(safe.expected.value)}</dd></div>
+      <div><dt>${esc(safe.actual.label)}</dt><dd>${esc(safe.actual.value)}</dd></div>
+    </dl>
+    <button class="btn-tonal" data-action="run-connection-action" data-connection-action="${esc(safe.action.id)}">${esc(safe.action.label || "다시 확인")}</button>
+  </div>`;
+}
+async function loadConnectionReport(itemIds = null, options = {}) {
+  if (!S.google) {
+    try { S.google = await call("google_status"); } catch (_error) { /* 보고서가 정확한 실패를 돌려준다 */ }
+  }
+  const normalized = itemIds == null ? null : [...new Set(itemIds.map((id) => String(id).trim()).filter(Boolean))].sort();
+  const requestKey = normalized ? normalized.join("|") : "all";
+  if (connectionRequests.has(requestKey)) {
+    const existing = connectionRequests.get(requestKey);
+    existing.screens.add(connectionScreenKey());
+    if (!options.quiet) existing.renderRequested = true;
+    return existing.promise;
+  }
+  const generation = ++S.connectionRequestSequence;
+  const account = connectionAccountKey();
+  const screens = new Set([connectionScreenKey()]);
+  const requestState = { promise: null, screens, renderRequested: !options.quiet };
+  const targets = normalized || expectedConnectionIds();
+  if (!normalized) {
+    for (const id of CONNECTION_CONDITIONAL_IDS) {
+      if (!targets.includes(id)) delete S.connectionRows[id];
+    }
+  }
+  targets.forEach((id) => {
+    S.connectionRequestGeneration[id] = generation;
+    S.connectionRows[id] = connectionFallbackRow(id, true);
+  });
+  const coversAttendance = ATTENDANCE_SOURCE_IDS.every((id) => targets.includes(id));
+  if (!normalized || coversAttendance) {
+    S.connectionReport.primary_group_issue = null;
+  }
+  if (!options.quiet) render();
+  const request = (async () => {
+    try {
+      const report = normalized
+        ? await call("connection_statuses", normalized)
+        : await call("connection_statuses");
+      const current = account === connectionAccountKey() && screens.has(connectionScreenKey());
+      if (!current) return;
+      mergeConnectionRows(report, normalized || [], generation, !normalized);
+      S.connectionReportAccount = account;
+      if (requestState.renderRequested) render();
+    } catch (_error) {
+      const current = account === connectionAccountKey() && screens.has(connectionScreenKey());
+      if (!current) return;
+      targets.forEach((id) => {
+        if (S.connectionRequestGeneration[id] === generation) {
+          S.connectionRows[id] = connectionFallbackRow(id, false);
+        }
+      });
+      S.connectionReport.items = Object.values(S.connectionRows);
+      const attendanceGenerationCurrent = ATTENDANCE_SOURCE_IDS.every(
+        (id) => S.connectionRequestGeneration[id] === generation,
+      );
+      if ((!normalized || coversAttendance) && attendanceGenerationCurrent) {
+        S.connectionReport.primary_group_issue = connectionFallbackRow("attendance.primary", false);
+      }
+      if (requestState.renderRequested) render();
+    } finally {
+      if (connectionRequests.get(requestKey)?.promise === request) connectionRequests.delete(requestKey);
+    }
+  })();
+  requestState.promise = request;
+  connectionRequests.set(requestKey, requestState);
+  return request;
+}
+async function runConnectionAction(actionId) {
+  if (!ALLOWED_CONNECTION_ACTIONS.has(actionId)) actionId = "retry-connection-check";
+  const openTarget = async (card, tab, field) => {
+    await openCard(card);
+    if (tab) S.connectTab = tab;
+    S.focusTarget = field;
+    render();
+  };
+  switch (actionId) {
+    case "goto-settings-google": return openTarget("settings", "", "google-login");
+    case "goto-work-calendar": return openTarget("connect", "messenger", "업무캘린더ID");
+    case "goto-school-calendar": return openTarget("connect", "messenger", "학사일정캘린더ID");
+    case "goto-work-tasks": return openTarget("connect", "messenger", "업무Tasks목록ID");
+    case "goto-homeroom-tasks": return openTarget("connect", "messenger", "담임안내Tasks목록ID");
+    case "goto-gemini": return openTarget("connect", "messenger", "gemini_api_key");
+    case "goto-identity-year": return openTarget("identity", "", "학년도");
+    case "goto-identity-homeroom": return openTarget("identity", "", "담임학년");
+    case "attendance-open-first-setup": return actions["attendance-open"]?.({ dataset: {} });
+    case "attendance-script-check": return actions["attendance-script-update-resolve"]?.({ dataset: {} });
+    case "attendance-connection-choose": return actions["attendance-connection-choose"]?.({ dataset: {} });
+    case "chat-connect": return actions["chat-connect"]?.({ dataset: {} });
+    case "class-space-reload": return actions["class-space-reload"]?.({ dataset: {} });
+    default: return loadConnectionReport(S.connectTab === "attendance" ? ATTENDANCE_SOURCE_IDS : null);
+  }
+}
 const ATTENDANCE_CHAT_GUIDE_URL = "";  // 유튜브 안내 영상 — 링크가 생기면 여기만 채운다
 function loadChatStatus(force) {
   if (!force && S.chatStatus != null) return;  // 결과가 없을 때(null)만 새로 묻는다
@@ -1216,7 +1498,12 @@ function startChatConnectPoll() {
     try {
       const data = await call("attendance_chat_status");
       S.chatStatus = data;
-      if (data.connected) { showToast("Google Chat 연결이 끝났어요"); return; }
+      if (data.connected) {
+        await loadConnectionReport(CONNECTION_CHAT_IDS, { quiet: true });
+        showToast("Google Chat 연결이 끝났어요");
+        render();
+        return;
+      }
     } catch (error) { /* 다음 틱에 다시 */ }
     render();
     chatPollTimer = setTimeout(tick, 3000);
@@ -1229,6 +1516,15 @@ function startChatConnectPoll() {
 let attendancePrepareTimer = null;
 let attendancePrepareGen = 0;       // 늦게 도착한 옛 폴 결과가 새 화면을 덮지 않게 한다
 let attendancePreparePollOn = false;
+async function refreshWizardAttendanceConnectionOnce() {
+  if (S.mode !== "wizard" || S.step !== 7 || !attendanceWizardGateOpen()) return false;
+  const code = String(S.attendance?.connection_code || "").trim().toUpperCase();
+  const refreshKey = `${connectionAccountKey()}|${code}`;
+  if (!code || S.attendanceConnectionRefreshKey === refreshKey) return false;
+  S.attendanceConnectionRefreshKey = refreshKey;
+  await loadConnectionReport(ATTENDANCE_SOURCE_IDS, { quiet: true });
+  return true;
+}
 function stopAttendancePreparePoll() {
   attendancePrepareGen += 1;
   attendancePreparePollOn = false;
@@ -1248,6 +1544,7 @@ function startAttendancePreparePoll() {
       S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
     ]);
     let keepPolling = false;
+    let connectionRefreshed = false;
     try {
       let a = S.attendance;
       if (!a || a.state !== "ready") {
@@ -1275,12 +1572,15 @@ function startAttendancePreparePoll() {
           keepPolling = true;
         }
       }
+      if (attendanceWizardGateOpen()) {
+        connectionRefreshed = await refreshWizardAttendanceConnectionOnce();
+      }
     } catch (error) { keepPolling = true; /* 다음 틱에 다시 */ }
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
     if (JSON.stringify([
       S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
-    ]) !== before) render();
+    ]) !== before || connectionRefreshed) render();
     if (!keepPolling) { attendancePreparePollOn = false; return; }
     attendancePrepareTimer = setTimeout(tick, 3000);
   };
@@ -1302,7 +1602,10 @@ function classSpaceSubrowHtml(a) {
     S.chatSpaces = null;
     S.chatSpacesError = false;
     call("attendance_chat_spaces")
-      .then((rows) => { S.chatSpaces = rows; })
+      .then(async (rows) => {
+        S.chatSpaces = rows;
+        await loadConnectionReport(CONNECTION_CLASS_SPACE_IDS, { quiet: true });
+      })
       .catch(() => { S.chatSpaces = []; S.chatSpacesError = true; })
       .finally(render);
   }
@@ -1411,7 +1714,7 @@ function serviceOpenButtonHtml(entry, a) {
 /* 서비스 칸 안 딸림 줄 — 학급 단톡방(Chat)만 남는다. Sheet의 "새 출석부 만들기"는
    서비스 줄 단추로 옮겼다(설계 2026-07-31 — serviceOpenButtonHtml 참고). */
 function serviceSubrowsHtml(entry, a) {
-  if (entry.service === "chat") {
+  if (entry.service === "class-space") {
     return classSpaceSubrowHtml(a);
   }
   return "";
@@ -1424,51 +1727,7 @@ function attendanceTransitionNeedsAttention(state) {
   ].includes(state);
 }
 function serviceStatusHtml(entry, a) {
-  const scriptCheck = a.state === "script-check-required";
-  const scriptUpdate = a.state === "script-update-required";
-  const scriptAttention = scriptCheck || scriptUpdate;
-  if (scriptAttention) return `<span class="svc-status" aria-hidden="true"></span>`;
-  if (attendanceTransitionNeedsAttention(a.state)) {
-    return `<span class="svc-status warn">확인 필요</span>`;
-  }
-  // 뒤에서 준비가 도는 동안에도 이미 만들어진 자료는 그 줄부터 바로 켠다.
-  // engine이 progress에 실제 Google 자료 번호를 하나씩 남기므로 화면에서 추측하지 않는다.
-  if (a.state === "installing") {
-    const progress = a.progress && typeof a.progress === "object" ? a.progress : {};
-    if (entry.service === "sheet" && progress.spreadsheet_id) {
-      return `<span class="svc-status ok">준비됨</span>`;
-    }
-    if (entry.service === "docs" && progress.template_doc_id) {
-      return `<span class="svc-status ok">연결됨</span>`;
-    }
-    if (entry.service === "tasks" && progress.task_list_id) {
-      return `<span class="svc-status ok">연결됨</span>`;
-    }
-    return `<span class="svc-status muted">준비 중…</span>`;
-  }
-  if (entry.service === "chat") {
-    const cs = S.chatStatus;
-    if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
-      return `<span class="svc-status ok">연결됨</span>`;
-    }
-    if (a.state === "ready" && (!cs || cs === "loading")) {
-      return `<span class="svc-status muted">확인 중…</span>`;
-    }
-    if (a.state === "ready") {
-      return `<span class="svc-status warn">연결 필요</span>`;
-    }
-    return `<span class="svc-status muted">준비 전</span>`;
-  }
-  if (entry.service === "sheet") {
-    if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
-    if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
-    if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
-    return `<span class="svc-status muted">준비 전</span>`;
-  }
-  // docs · tasks
-  if (a.state === "ready") return `<span class="svc-status ok">연결됨</span>`;
-  if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
-  return `<span class="svc-status muted">준비 전</span>`;
+  return connectionStatusHtml(projectConnectionRow(entry));
 }
 function attendanceServiceRow(entry, a) {
   let chatActs = "";
@@ -1480,19 +1739,20 @@ function attendanceServiceRow(entry, a) {
     const guide = `<button class="btn-tonal youtube" data-action="chat-guide">${icon("youtube", "small")} 연결방법</button>`;
     chatActs = connect + guide;
   }
-  const note = (a.state === "failed" && a.failed_service === entry.service)
-    ? `<span class="field-error">${esc(a.detail || "")}</span>` : "";
+  const projected = projectConnectionRow(entry);
+  const notices = projected.notices.map((row) =>
+    `<div class="connection-notice">${esc(row.reason_ko)}</div>`).join("");
   const connectionCode = entry.service === "sheet" && a.connection_code
     ? `<small class="attendance-connection-code">연결 확인번호 ${esc(a.connection_code)}</small>`
     : "";
-  return `<div class="svc-group">
+  return `<div class="svc-group" data-connection-row="${esc(entry.id)}">
     <div class="attendance-service">
       <img class="service-logo" src="${entry.logo}" alt="${esc(entry.name)} 로고">
       <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(
-        entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${connectionCode}${note}</span>
+        entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${connectionCode}</span>
       <span class="svc-acts">${serviceOpenButtonHtml(entry, a)}${chatActs}</span>
-      ${serviceStatusHtml(entry, a)}</div>
-    ${serviceSubrowsHtml(entry, a)}</div>`;
+      ${connectionStatusHtml(projected)}</div>
+    ${notices}${serviceSubrowsHtml(entry, a)}</div>`;
 }
 function refreshAttendanceStatus() {
   // 화면에 이미 있는 내용은 그대로 두고 다시 읽는다. 결과가 오면 그때 갈아 끼운다.
@@ -1657,12 +1917,6 @@ function firstSetupCardHtml(a) {
     <div class="first-setup-acts">${open}</div>
   </div>`;
 }
-function attendanceComingSoonHtml() {
-  return `<div class="attendance-head"><div>
-    <h2>출결</h2>
-    <p>출결 기능은 준비 중이며 곧 제공됩니다.</p>
-  </div></div>`;
-}
 function attendanceTabHtml() {
   // 마법사에서 준비 폴링이 도는 동안에는 같은 상태를 두 경로로 읽지 않는다 —
   // 느린 attendance_status 응답이 폴링이 방금 놓은 새 상태를 옛 값으로 덮는 것을 막는다.
@@ -1705,7 +1959,7 @@ function attendanceTabHtml() {
         : "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요."
     : "아래 버튼을 누르면 로그인한 계정에 자동으로 준비해요.";
   const chip = account ? `<span class="account-chip">${esc(account)}</span>` : "";
-  const rows = ATTENDANCE_SERVICES.map((entry) => attendanceServiceRow(entry, a)).join("");
+  const rows = ATTENDANCE_DISPLAY_ROWS.map((entry) => attendanceServiceRow(entry, a)).join("");
   const staleNotice = S.mode === "wizard" && S.attendanceStaleNotice
     ? `<p class="hint" style="margin:0 0 12px">이미 만든 출결 시트에는 새 값이 자동으로 들어가지 않아요.</p>`
     : "";
@@ -1718,6 +1972,7 @@ function attendanceTabHtml() {
     <div class="promise">
       ${rows}
     </div>
+    ${attendancePrimaryIssueHtml()}
     ${S.mode === "wizard" && a.state === "ready" ? firstSetupCardHtml(a) : ""}
     ${S.mode === "wizard" && a.state === "failed"
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
@@ -1735,7 +1990,7 @@ function aiTabHtml() {
     return `<div class="attendance-head"><div>
       <h2>AI 에이전트 연결 <span class="tab-optional">(선택)</span></h2>
       <p>AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요. 준비가 끝나면 업데이트로 알려드릴게요.</p>
-    </div></div>`;
+    </div>${connectionStatusHtml(connectionRow("ai-agent") || connectionFallbackRow("ai-agent", true))}</div>`;
   }
   if (S.aiTools === null) {
     S.aiTools = "loading";
@@ -1768,7 +2023,7 @@ function aiTabHtml() {
   return `<div class="attendance-head"><div>
       <h2>AI 에이전트와 Google을 연결할까요? <span class="tab-optional">(선택)</span></h2>
       <p>연결하면 AI에게 말로 학교 업무(일정·결석·신고서·문자)를 시킬 수 있어요. 안 써도 프로그램 사용에는 지장 없어요.</p>
-    </div></div>
+    </div>${connectionStatusHtml(connectionRow("ai-agent") || connectionFallbackRow("ai-agent", true))}</div>
     <div class="ai-rows">${rows}</div>
     ${anyFound
       ? `<div class="attendance-action"><button class="btn" data-action="ai-connect" data-busy-text="연결하는 중… (1~2분 걸릴 수 있어요)" ${S.aiConnecting ? "disabled" : ""}>${S.aiConnecting ? "연결하는 중…" : "선택한 AI와 연결"}</button></div>`
@@ -1776,6 +2031,7 @@ function aiTabHtml() {
     ${nodeLine}${result}`;
 }
 bindActions({
+  "run-connection-action": (el) => runConnectionAction(String(el.dataset.connectionAction || "")),
   "connect-tab": (el) => {
     const tab = el.dataset.tab;
     if (S.connectTab === tab) return;
@@ -1783,7 +2039,7 @@ bindActions({
     if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
     S.banner = null;  // 이전 탭의 안내 배너(게이트 포함)가 새 탭까지 따라가지 않는다 (검토 C2)
     S.connectTab = tab;
-    if (tab === "attendance" && attendanceUiEnabled()) {
+    if (tab === "attendance") {
       if (S.mode === "wizard") {
         // 마법사에서는 준비 폴링이 상태를 읽는다 — 같은 정보를 두 경로로 묻지 않는다.
         startAttendancePreparePoll();
@@ -1935,6 +2191,7 @@ bindActions({
         S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
         S.chatStatus = null;
+        await loadConnectionReport(["attendance.script", "attendance.ai-trigger"], { quiet: true });
         // 홈 점검 결과도 같이 다시 읽는다 — 안 읽으면 연결 카드의 `확인 필요`와
         // 출결 탭의 빨간 숫자가 프로그램을 다시 켤 때까지 그대로 남는다.
         refreshChecks().catch(() => {});
@@ -1989,6 +2246,7 @@ bindActions({
         S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
         S.chatStatus = null;
+        await loadConnectionReport(ATTENDANCE_SOURCE_IDS, { quiet: true });
         if (S.mode === "wizard") startAttendancePreparePoll();
         refreshChecks().catch(() => {});
         showToast("이 출석부를 현재 출석부로 연결했어요");
@@ -2027,6 +2285,7 @@ bindActions({
         S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
         S.chatStatus = null;
+        await loadConnectionReport(ATTENDANCE_SOURCE_IDS, { quiet: true });
         if (S.mode === "wizard") startAttendancePreparePoll();
         refreshChecks().catch(() => {});
         showToast("확인번호와 같은 출석부를 현재 출석부로 연결했어요");
@@ -2062,6 +2321,7 @@ bindActions({
         S.firstSetupDone = false;
         S.firstSetupConnectionCode = "";
         if (S.mode === "wizard") startAttendancePreparePoll();
+        await loadConnectionReport(ATTENDANCE_SOURCE_IDS, { quiet: true });
         showToast("새 학년도 출석부를 시작했어요");
         call("open_current_attendance").catch(() => {});
       } else {
@@ -2087,6 +2347,7 @@ bindActions({
       S.chatSpaceName = data.display_name;
       S.chatSpaces = undefined;   // 방금 만든 방이 목록에 잡히게 다시 읽는다
       S.chatStatus = null;
+      await loadConnectionReport(CONNECTION_CLASS_SPACE_IDS, { quiet: true });
       showToast("학급 단톡방을 만들고 골라 뒀어요");
     } else if (data.state === "blocked") {
       S.spaceCreate = "blocked";
@@ -2160,7 +2421,12 @@ document.addEventListener("change", (event) => {
     if (!spaceName) return;
     const label = select.options[select.selectedIndex].textContent;
     call("attendance_chat_set_space", spaceName, label)
-      .then(() => { S.chatSpaceName = label; showToast("학급 단톡방을 골랐어요"); })
+      .then(async () => {
+        S.chatSpaceName = label;
+        await loadConnectionReport(CONNECTION_CLASS_SPACE_IDS, { quiet: true });
+        showToast("학급 단톡방을 골랐어요");
+        render();
+      })
       .catch((error) => setBanner("error", error.message));
   }
 });
@@ -2183,7 +2449,7 @@ function stepConnect() {
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
     loadLinkLists();
   }
-  const body = S.connectTab === "attendance" ? (attendanceUiEnabled() ? attendanceTabHtml() : attendanceComingSoonHtml())
+  const body = S.connectTab === "attendance" ? attendanceTabHtml()
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
     <h1>Google 연결</h1>
@@ -2226,15 +2492,19 @@ async function provisionConnectTargets() {
   if (modes.cal === "new") {
     const work = await call("ensure_calendar_named", p["업무캘린더이름"]);
     p["업무캘린더ID"] = work.id;
+    markEditDirtyField("업무캘린더ID");
     const school = await call("ensure_calendar_named", p["학사일정캘린더이름"]);
     p["학사일정캘린더ID"] = school.id;
+    markEditDirtyField("학사일정캘린더ID");
   }
   if (modes.task === "new") {
     const workTasks = await call("ensure_tasklist_named", p["업무Tasks목록이름"]);
     p["업무Tasks목록ID"] = workTasks.id;
+    markEditDirtyField("업무Tasks목록ID");
     if (homeroom) {
       const homeTasks = await call("ensure_tasklist_named", p["담임안내Tasks목록이름"]);
       p["담임안내Tasks목록ID"] = homeTasks.id;
+      markEditDirtyField("담임안내Tasks목록ID");
     }
   }
 }
@@ -2593,6 +2863,7 @@ bindActions({
     );
     if (result.cancelled) return;
     S.draft.bridge.brity_download_dir = result.path;
+    editDirtyFields.add("brity_download_dir");
     S.attachmentFolderStatus = await call("check_attachment_folder", result.path);
     render();
     await autoSaveSettings();
@@ -2689,13 +2960,9 @@ bindActions({
     const failed = results.filter((r) => r.status === "failed");
     // 성공이든 실패든 곧장 홈으로 — 실패 항목은 홈 점검과 출결 탭이 이유를 보여준다.
     await call("finish_setup");
-    if (attendanceUiEnabled()) {
-      try {
-        S.attendance = await call("attendance_status");
-      } catch (_error) {
-        S.attendance = null;
-      }
-    } else {
+    try {
+      S.attendance = await call("attendance_status");
+    } catch (_error) {
       S.attendance = null;
     }
     S.attendanceScriptUpdate = null;
@@ -2796,9 +3063,7 @@ function editingCard() {
 }
 function effectiveChecks() {
   const editing = editingCard();
-  const saved = uniqueChecks(S.checks).filter(
-    (row) => attendanceUiEnabled() || row.tab !== "attendance"
-  );
+  const saved = uniqueChecks(S.checks);
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
@@ -2839,7 +3104,7 @@ function currentScreenIssues() {
 }
 function updateTabBadges() {
   document.querySelectorAll("[data-tab-count]").forEach((el) => {
-    const count = checkSummary(checksForTab(el.dataset.tabCount)).bad;
+    const count = tabProblemCount(el.dataset.tabCount);
     el.textContent = count ? String(count) : "";
     el.style.display = count ? "" : "none";
   });
@@ -3159,7 +3424,29 @@ const CARDS = [
   { key: "settings", icon: "sliders", title: "설정", detail: "컴퓨터 준비 · Google 로그인 · 단축키 · 자동 실행" },
   { key: "connect", icon: "link", title: "연결", detail: "Calendar · Tasks · Gemini API key · 출결 시트" },
 ];
+function connectionOverview() {
+  const attendanceRows = ATTENDANCE_DISPLAY_ROWS.map(projectConnectionRow);
+  const singleRows = [
+    "google.account", "calendar.work", "calendar.school", "tasks.work",
+    ...(isHomeroomConnectionProfile() ? ["tasks.homeroom"] : []), "gemini", "ai-agent",
+  ]
+    .map(connectionRow).filter(Boolean).map((row) => ({
+      connected: row.connected === true,
+      checking: row.connected !== true && row.reason_code === "CHECKING",
+      countedFailure: row.connected !== true && row.reason_code !== "CHECKING",
+    }));
+  const visible = attendanceRows.concat(singleRows);
+  const failed = visible.filter((row) => row.countedFailure).length;
+  const checking = visible.some((row) => row.checking);
+  if (failed) return { connected: false, checking, failed, label: `연결 안 됨 · ${failed}개` };
+  if (checking) return { connected: false, checking: true, failed: 0, label: "연결 안 됨" };
+  return { connected: true, checking: false, failed: 0, label: "연결됨" };
+}
 function cardStatus(card) {
+  if (card.key === "connect") {
+    const overview = connectionOverview();
+    return { kind: overview.connected ? "g" : "y", label: overview.label, bad: !overview.connected, overview };
+  }
   if (!S.checks.length) return { kind: "n", label: "점검 중…", bad: false };
   const summary = checkSummary(checksForCard(card.key));
   if (summary.bad) return { kind: "y", label: "확인 필요", bad: true, summary };
@@ -3167,13 +3454,11 @@ function cardStatus(card) {
 }
 function cardBadges(card) {
   const st = cardStatus(card);
+  if (card.key === "connect") return badge(st.kind, st.label);
   if (!st.bad) return badge(st.kind, st.label);
   return badge("y", st.label) + badge("n", `${st.summary.good}/${st.summary.total} 정상`);
 }
 function cardDetail(card) {
-  if (card.key === "connect" && !attendanceUiEnabled()) {
-    return "Calendar · Tasks · Gemini API key";
-  }
   return card.detail;
 }
 /* 점검 실패 → 배너 → 재렌더 → 재조회의 자기지속 루프를 끊는다:
@@ -3199,12 +3484,8 @@ function shouldAutoRefreshChecks() {
 }
 function homeHtml(behind) {
   const info = S.info;
-  const visibleChecks = uniqueChecks(S.checks).filter(
-    (row) => attendanceUiEnabled() || row.tab !== "attendance"
-  );
-  const problems = checkSummary(visibleChecks).bad;
-  const pill = !S.checks.length ? badge("n", "점검 중…")
-    : problems ? badge("y", `확인할 항목 ${problems}개`) : badge("g", "모두 정상");
+  const overview = connectionOverview();
+  const pill = badge(overview.connected ? "g" : "y", overview.label);
   const name = (S.profileCache && S.profileCache["선생님이름"]) ? `${S.profileCache["선생님이름"]} 선생님, ` : "";
   const tiles = CARDS.map((card) => {
     const st = cardStatus(card);
@@ -3241,6 +3522,10 @@ function homeHtml(behind) {
 }
 function renderHome() {
   root().innerHTML = homeHtml(false) + toastHtml();
+  if (!S.connectionHomeLoaded) {
+    S.connectionHomeLoaded = true;
+    loadConnectionReport().catch(() => {});
+  }
   if (shouldAutoRefreshChecks()) refreshChecks();
   if (!S.profileCache) call("read_profile").then((p) => { S.profileCache = p; render(); }).catch(() => {});
   if (S.caps === null) {
@@ -3273,6 +3558,7 @@ async function closeWindow() {
   S.chatStatus = null;
   S.chatSpaces = undefined;
   S.chatSpaceName = undefined;
+  S.connectionEditLoaded = false;
   S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
   return true;
 }
@@ -3298,14 +3584,18 @@ async function autoSaveSettings(afterHotkey) {
   try {
     do {
       settingsAutoSavePending = false;
+      const dirtyFields = new Set(editDirtyFields);
+      editDirtyFields.clear();
       syncMessengerDraft();
       const folderProblem = await validateAttachmentFolder();
       if (folderProblem) { setBanner("warn", folderProblem); return; }
-      const updates = {
-        hotkey: S.draft.bridge.hotkey || DEFAULT_HOTKEY,
-        autostart: S.draft.bridge.autostart !== false,
-        brity_download_dir: S.draft.bridge.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER,
-      };
+      const updates = {};
+      if (dirtyFields.has("hotkey")) updates.hotkey = S.draft.bridge.hotkey || DEFAULT_HOTKEY;
+      if (dirtyFields.has("autostart")) updates.autostart = S.draft.bridge.autostart !== false;
+      if (dirtyFields.has("brity_download_dir")) {
+        updates.brity_download_dir = S.draft.bridge.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER;
+      }
+      if (!Object.keys(updates).length) continue;
       const result = await call("save_messenger", updates);
       if (!result.saved) {
         S.hk.status = { kind: "bad", text: result.reason };
@@ -3315,7 +3605,6 @@ async function autoSaveSettings(afterHotkey) {
       }
       S.hk.current = result.hotkey;
       if (afterHotkey) S.hk.status = { kind: "ok", text: `${prettyHotkey(result.hotkey)} · 저장했어요` };
-      editDirty = false;  // 방금 저장했다 — 나갈 때 같은 것을 또 저장해 도우미를 두 번 재시작하지 않게
       S.checks = [];
       showToast("저장했어요 — 도우미가 새 설정으로 실행 중이에요");
       render();
@@ -3324,15 +3613,6 @@ async function autoSaveSettings(afterHotkey) {
     settingsAutoSaveBusy = false;
   }
 }
-document.addEventListener("change", (event) => {
-  if (!(S.mode === "edit" && S.edit === "settings")) return;
-  const name = event.target && event.target.name;
-  if (name === "autostart" || name === "brity_download_dir") {
-    // 저장 예외(레지스트리 거부 등)가 무통지로 사라지면 화면과 실제 값이 어긋난다.
-    autoSaveSettings().catch((error) => setBanner("error", error.message));
-  }
-});
-
 /* 내 정보·시간표·연결 자동 저장 — 저장 버튼 없이, 값을 바꾸면 잠깐 뒤 저장한다.
    마법사(S.mode === "wizard")는 마지막에 한꺼번에 적용하므로 여기서 건드리지 않는다. */
 const AUTO_SAVE_SCREENS = ["identity", "timetable", "connect"];
@@ -3340,9 +3620,42 @@ const AUTO_SAVE_DELAY_MS = 700;  // 타자를 치는 중간중간 저장하지 �
 let editAutoSaveTimer = null;
 let editAutoSaveBusy = false;
 let editAutoSavePending = false;
+let editAutoSavePromise = null;
+// 글자·선택 입력은 같은 조작에서 input 뒤 change가 한 번 더 온다. input으로 이미
+// 저장한 값을 창을 닫을 때 change가 다시 저장하지 않도록 같은 입력칸의 두 이벤트를 묶는다.
+const editInputTargets = new WeakSet();
 /* 사람이 실제로 손댄 적이 있는지. 화면을 열어 보기만 하고 나오는 것은 저장할 일이 아니다 —
    그때도 저장하면 홈 점검 결과를 버리게 되어, 되돌아갈 때마다 홈이 처음부터 다시 점검한다. */
-let editDirty = false;
+let editDirtyFields = new Set();
+const SCOPED_IDENTITY_FIELDS = new Set([
+  "선생님이름", "학년도", "학교명", "학교급", "담임여부", "담임학년", "담임반",
+  "출근시간", "퇴근시간", "조회시작", "1교시시작", "점심종료시간",
+  "월요일마지막교시", "화요일마지막교시", "수요일마지막교시", "목요일마지막교시", "금요일마지막교시",
+]);
+const SCOPED_CALENDAR_FIELDS = new Set(CAL_LINK_FIELDS.flatMap(([id, name]) => [id, name]));
+const SCOPED_TASK_FIELDS = new Set(TASK_LINK_FIELDS.flatMap(([id, name]) => [id, name]));
+const SCOPED_GEMINI_FIELDS = new Set(["gemini_api_key", "gemini_model"]);
+const ATTENDANCE_IDENTITY_FIELDS = new Set(["학년도", "담임여부", "담임학년", "담임반"]);
+const CONNECT_FIELD_PAIRS = Object.fromEntries(
+  [...CAL_LINK_FIELDS, ...TASK_LINK_FIELDS].flatMap(([id, name]) => [[id, name], [name, id]])
+);
+function markEditDirtyField(name) {
+  if (!name) return;
+  editDirtyFields.add(name);
+  if (CONNECT_FIELD_PAIRS[name]) editDirtyFields.add(CONNECT_FIELD_PAIRS[name]);
+}
+function editedFieldName(box) {
+  if (!box) return "";
+  if (box.dataset && box.dataset.grid !== undefined) return "__timetable__";
+  if (box.dataset && box.dataset.dayHour) return box.dataset.dayHour;
+  if (box.dataset && box.dataset.dayMinute) return box.dataset.dayMinute;
+  return box.name || "";
+}
+function dirtyValues(source, allowed, dirtyFields) {
+  return Object.fromEntries([...dirtyFields]
+    .filter((name) => allowed.has(name))
+    .map((name) => [name, source[name]]));
+}
 function autoSaveScreen() {
   return S.mode === "edit" && AUTO_SAVE_SCREENS.includes(S.edit) ? S.edit : null;
 }
@@ -3350,38 +3663,78 @@ async function autoSaveEdit(options) {
   const leaving = !!(options && options.leaving);
   const key = autoSaveScreen();
   if (!key) return true;
-  if (!editDirty) return true;  // 고친 게 없다
-  if (editAutoSaveBusy) { editAutoSavePending = true; return true; }
+  if (editAutoSavePromise) {
+    if (editDirtyFields.size) editAutoSavePending = true;
+    return await editAutoSavePromise;
+  }
+  if (!editDirtyFields.size) return true;  // 고친 게 없다
   // 여기서 미리 내린다 — 저장하는 동안 들어온 수정은 다시 올라가서 한 번 더 저장된다.
   // 저장이 끝난 뒤에 내리면 그 사이의 수정을 놓친다.
-  editDirty = false;
   editAutoSaveBusy = true;
   showSaveState("저장 중…");
-  try {
+  const savePromise = (async () => {
     do {
       editAutoSavePending = false;
-      syncEditFields(key);
-      await ensureGridLoaded();
-      // 연결 화면은 링크가 다 차 있는지까지 보고(require_links), Gemini 값도 함께 저장한다.
-      await call("save_profile_grid", S.draft.profile, S.draft.grid, key === "connect");
-      if (key === "connect") {
-        const messenger = await call("save_messenger", {
-          gemini_api_key: S.draft.bridge.gemini_api_key || "",
-          gemini_model: S.draft.bridge.gemini_model || "gemini-3.5-flash",
-        });
-        if (!messenger.saved) { setBanner("warn", messenger.reason); return false; }
-        // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지
-        // 않는다. 타자를 칠 때마다 경고를 띄우면 쓰던 것이 끊기므로 나갈 때만 알린다.
-        const push = messenger.sheet_push;
-        if (leaving && push && push.state === "failed") setBanner("warn", "저장했어요. 다만 " + push.detail);
+      const dirtyFields = new Set(editDirtyFields);
+      editDirtyFields.clear();
+      try {
+        syncEditFields(key);
+        const identity = dirtyValues(S.draft.profile, SCOPED_IDENTITY_FIELDS, dirtyFields);
+        const calendars = dirtyValues(S.draft.profile, SCOPED_CALENDAR_FIELDS, dirtyFields);
+        const tasks = dirtyValues(S.draft.profile, SCOPED_TASK_FIELDS, dirtyFields);
+        const gemini = dirtyValues(S.draft.bridge, SCOPED_GEMINI_FIELDS, dirtyFields);
+        if (Object.keys(identity).length) {
+          await call("save_identity", identity);
+          if ([...dirtyFields].some((name) => ATTENDANCE_IDENTITY_FIELDS.has(name))) {
+            const becameHomeroom = dirtyFields.has("담임여부") && isHomeroomConnectionProfile();
+            if (!isHomeroomConnectionProfile()) {
+              delete S.connectionRows["tasks.homeroom"];
+              S.connectionReport.items = Object.values(S.connectionRows);
+            }
+            await loadConnectionReport([
+              ...ATTENDANCE_SOURCE_IDS,
+              ...(becameHomeroom ? ["tasks.homeroom"] : []),
+            ], { quiet: true });
+          }
+        }
+        if (dirtyFields.has("__timetable__")) {
+          await ensureGridLoaded();
+          await call("save_timetable", S.draft.grid);
+        }
+        if (Object.keys(calendars).length) {
+          await call("save_calendars", calendars);
+          await loadConnectionReport(["calendar.work", "calendar.school"], { quiet: true });
+        }
+        if (Object.keys(tasks).length) {
+          await call("save_tasks", tasks);
+          await loadConnectionReport(["tasks.work", ...(isHomeroomConnectionProfile() ? ["tasks.homeroom"] : [])], { quiet: true });
+        }
+        if (Object.keys(gemini).length) {
+          const saved = await call("save_gemini", gemini);
+          await loadConnectionReport(["gemini", "attendance.sheet"], { quiet: true });
+          // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지
+          // 않는다. 타자를 칠 때마다 경고를 띄우면 쓰던 것이 끊기므로 나갈 때만 알린다.
+          const push = saved.sheet_push;
+          if (leaving && push && push.state === "failed") setBanner("warn", "저장했어요. 다만 " + push.detail);
+        }
+        // 홈 점검과 프로필 사본은 다음에 홈으로 갈 때 새로 읽는다.
+        S.checks = [];
+        S.profileCache = null;
+      } catch (error) {
+        // 실패한 묶음은 다음 저장에서 다시 시도한다. 저장 도중 들어온 새 변경은 이미
+        // editDirtyFields에 있으므로 합치기만 하고 지우지 않는다.
+        dirtyFields.forEach((name) => editDirtyFields.add(name));
+        throw error;
       }
-      // 홈 점검과 프로필 사본은 다음에 홈으로 갈 때 새로 읽는다.
-      S.checks = [];
-      S.profileCache = null;
-    } while (editAutoSavePending);
+    } while (editAutoSavePending || editDirtyFields.size);
     showSaveState("저장됨", 2500);
     return true;
+  })();
+  editAutoSavePromise = savePromise;
+  try {
+    return await savePromise;
   } finally {
+    if (editAutoSavePromise === savePromise) editAutoSavePromise = null;
     editAutoSaveBusy = false;
   }
 }
@@ -3402,17 +3755,22 @@ async function flushEditSave() {
     // 설정도 같은 규칙 — 열어 보기만 하고 나오면 저장(도우미 재시작)도, 홈 점검
     // 다시 돌기도 없어야 한다(사용자 확인 2026-07-31). 값을 바꾸면 그 자리에서
     // 이미 저장되므로, 여기서는 저장이 미처 못 따라온 경우만 마저 저장한다.
-    if (editDirty) await autoSaveSettings();
+    if (editDirtyFields.size) await autoSaveSettings();
     return true;
   }
   if (!autoSaveScreen()) return true;
-  if (!editDirty) return true;  // 열어 보기만 하고 나온다 — 저장할 것도, 만들 것도 없다
+  const inFlightSave = editAutoSavePromise;
+  if (inFlightSave) await inFlightSave;
+  // 열어 보기만 한 창은 아무것도 만들지 않는다. 반면 저장 중 닫았다면 그 저장이
+  // 끝난 뒤에도 아래의 연결 대상 만들기와 반환 ID 저장까지 계속해야 한다.
+  if (!editDirtyFields.size && !inFlightSave) return true;
   if (S.edit === "connect") {
     // '새로 만들기'를 고른 캘린더·Tasks 목록은 여기서 실제로 만들어 ID를 채운다.
     // 타자를 칠 때마다 만들면 안 되므로 나갈 때 한 번만 한다. 실패해도 입력한 값은
     // 그대로 저장하고 홈으로 보낸다 — 남은 문제는 홈 점검이 알려 준다.
     try { await provisionConnectTargets(); } catch (error) { /* 홈 점검이 알려 준다 */ }
   }
+  if (!editDirtyFields.size) return true;
   return await autoSaveEdit({ leaving: true });
 }
 for (const eventName of ["input", "change"]) {
@@ -3427,9 +3785,20 @@ for (const eventName of ["input", "change"]) {
       S.attendanceStaleNotice = true;
     }
     if (S.mode !== "edit") return;
-    if (S.edit === "settings") { editDirty = true; return; }  // 저장은 설정 자체 감지가 한다
+    const changedField = editedFieldName(box);
+    const duplicateChange = eventName === "change" && box && editInputTargets.has(box);
+    if (eventName === "input" && box) editInputTargets.add(box);
+    if (eventName === "change" && box) editInputTargets.delete(box);
+    if (!duplicateChange) markEditDirtyField(changedField);
+    if (S.edit === "settings") {
+      if (eventName === "change" && (changedField === "autostart" || changedField === "brity_download_dir")) {
+        // 저장 예외(레지스트리 거부 등)가 무통지로 사라지면 화면과 실제 값이 어긋난다.
+        autoSaveSettings().catch((error) => setBanner("error", error.message));
+      }
+      return;
+    }
     if (!autoSaveScreen()) return;
-    editDirty = true;
+    if (duplicateChange) return;
     scheduleEditAutoSave();
   });
 }
@@ -3500,7 +3869,7 @@ async function loadForEdit(key) {
       status: null,
     };
   }
-  if (key === "connect" && attendanceUiEnabled()) {
+  if (key === "connect") {
     try {
       S.attendance = await call("attendance_status");
     } catch (_error) {
@@ -3512,12 +3881,6 @@ async function loadForEdit(key) {
     S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
       : "messenger";
-  } else if (key === "connect") {
-    S.attendance = null;
-    S.attendanceScriptUpdate = null;
-    clearAttendanceScriptDialogState();
-    S.chatStatus = null;
-    S.connectTab = "messenger";
   }
   // 설정 화면은 열 때마다 실제 상태를 다시 확인한다 — 홈 점검과 화면이 어긋나지 않게.
   if (key === "settings") refreshSettingsStatus().catch(() => {});
@@ -3558,7 +3921,11 @@ async function openCard(key) {
   uniqueChecks(S.checks)
     .filter((c) => c.card === key && c.ok === false)
     .forEach((c) => { S.fieldIssues[c.target] = issue(c.key, c.target, c.fix || c.detail || c.label, c.tab); });
-  S.mode = "edit"; S.edit = key; editDirty = false; render();
+  S.mode = "edit"; S.edit = key; editDirtyFields.clear(); render();
+  if (key === "connect" && !S.connectionEditLoaded) {
+    S.connectionEditLoaded = true;
+    loadConnectionReport().catch(() => {});
+  }
 }
 bindActions({
   "field-eye": (el) => {

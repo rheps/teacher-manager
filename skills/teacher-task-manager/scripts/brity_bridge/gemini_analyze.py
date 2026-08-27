@@ -454,10 +454,21 @@ def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str
     url = API_URL_TEMPLATE.format(model=model)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     try:
-        status, _reply = transport(url, headers, body, TIMEOUT_SECONDS)
+        status, reply = transport(url, headers, body, TIMEOUT_SECONDS)
     except OSError as error:
         return "network", str(error)
     if status == 200:
+        try:
+            payload = json.loads(reply)
+            candidate = json.loads(_reply_text(payload))
+            if (
+                not isinstance(candidate, dict)
+                or set(candidate) != {"ok"}
+                or type(candidate["ok"]) is not bool
+            ):
+                raise ValueError("Gemini 응답 JSON 모양이 올바르지 않음")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            return "network", "Gemini 응답 모양을 확인하지 못했어요."
         return "ok", ""
     if status in (401, 403):
         return "invalid", f"http {status}"
