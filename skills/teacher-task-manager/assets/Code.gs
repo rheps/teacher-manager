@@ -373,6 +373,25 @@ function apiSetupAttendanceWorkbook() {
   return 'ok';
 }
 
+// Teacher Manager가 기존 출결 기능을 갱신한 직후 부르는 좁은 정리 작업.
+// 새 시트는 만들지 않고, 이미 있는 학생명단의 옛 4칸 배치만 3칸으로 옮긴다.
+function apiMigrateRosterLayoutAfterUpdate() {
+  requireGoeduTeacherAccount_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = getConfig_();
+  const rosterName = cfg.ROSTER_SHEET_NAME || '학생명단';
+  if (!ss.getSheetByName(rosterName)) {
+    throw new Error('학생명단 시트를 찾을 수 없습니다.');
+  }
+  if (!ss.getSheetByName(STUDENT_DROPDOWN_SHEET_NAME)) {
+    throw new Error('드롭다운 시트를 찾을 수 없습니다.');
+  }
+  ensureRosterSheet_(ss);
+  syncStudentDropdownValues_(ss, cfg);
+  applyStudentDropdowns_(ss, cfg);
+  return 'ok';
+}
+
 function setupAttendanceWorkbookCore_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   ensureConfigSheet_(ss);
@@ -1180,6 +1199,7 @@ function handleAttendanceAiEdit(e, testPorts) {
       .getValues()[0],
     resetInputRow: targetSheet => resetAttendanceAiInputRow_(targetSheet),
     reStripe: targetSheet => reStripeSheet_(targetSheet),
+    sortRows: targetSheet => sortMonthlyAttendanceRows_(targetSheet, 'date'),
     readRosterRows: (spreadsheet, context) => {
       const rosterSheet = spreadsheet.getSheetByName(context.rosterSheetName);
       if (!rosterSheet || rosterSheet.getLastRow() < 2) return [];
@@ -1412,11 +1432,13 @@ function handleAttendanceAiEdit(e, testPorts) {
     ) {
       return { status: 'check_required' };
     }
-    // 새 줄도 제 날짜 덩어리의 줄무늬 색을 갖게 한다. 칠하지 못해도 이미 넣은 줄은 그대로 둔다.
+    // 맨 아래에 붙은 새 줄을 기존 출결과 함께 날짜순으로 다시 모은다.
+    // 정렬 함수가 끝난 정확한 자리에서 줄무늬도 다시 칠한다. 시트 모양이 예상과 달라
+    // 안전 정렬을 멈춘 경우에는 현재 순서를 바꾸지 않고 줄무늬만 다시 칠한다.
     try {
-      ports.reStripe(sheet);
+      if (!ports.sortRows(sheet)) ports.reStripe(sheet);
     } catch (err) {
-      // 색은 다음에 A열을 고칠 때 다시 입혀진다.
+      // 자료 기록은 이미 끝났다. 정렬·색칠 실패 때문에 같은 출결을 다시 넣지는 않는다.
     }
     return {
       status: 'applied',
@@ -2510,6 +2532,9 @@ function sortMonthlyAttendanceRows_(sheet, mode) {
   const range = sheet.getRange(3, 1, lastRow - 2, lastColumn);
   if (!validateMonthlyAttendanceSortRange_(sheet, range)) return false;
   range.sort(sortSpec);
+  // Google 정렬은 기존 배경색도 각 행에 붙여 옮긴다. 새 날짜 순서에서 다시 칠하지
+  // 않으면 같은 날짜 묶음 안에 예전 회색·흰색이 섞여 남는다.
+  reStripeSheet_(sheet);
   return true;
 }
 

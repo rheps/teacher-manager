@@ -57,6 +57,10 @@ _ATTENDANCE_AI_PROOF_MESSAGE = (
     "[처음 한 번 설정하기]에서 [처음 설정 한 번에 끝내기]를 누른 뒤 "
     "연결 확인하고 계속해 주세요."
 )
+_ATTENDANCE_ROSTER_MIGRATION_MESSAGE = (
+    "새 출결 기능은 올라갔지만 학생명단의 이메일을 C열로 옮기지 못했어요. "
+    "기존 학생 자료는 그대로이며, 같은 계정으로 갱신을 다시 눌러 주세요."
+)
 _DEFAULT_SCREEN_FAILURE = (
     "작업을 마치지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요."
 )
@@ -162,6 +166,44 @@ def _fail(error, operation: str = ""):
     return reply
 
 
+def _migrate_attendance_roster_layout(
+    *, runner, workdir, gws_executable, deployment_id
+) -> bool:
+    """배포된 Apps Script에서 기존 학생명단 정리 함수만 실행한다."""
+
+    gws = str(gws_executable or "").strip()
+    deployment = str(deployment_id or "").strip()
+    if not (callable(runner) and gws and deployment):
+        return False
+    from attendance_script_update import _run_one_json
+
+    reply = _run_one_json(
+        runner,
+        [
+            gws,
+            "script",
+            "scripts",
+            "run",
+            "--params",
+            json.dumps({"scriptId": deployment}, ensure_ascii=False),
+            "--json",
+            json.dumps(
+                {"function": "apiMigrateRosterLayoutAfterUpdate"},
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        Path(workdir),
+    )
+    if not isinstance(reply, dict) or reply.get("done") is not True:
+        return False
+    if reply.get("error"):
+        return False
+    response = reply.get("response")
+    return isinstance(response, dict) and response.get("result") == "ok"
+
+
 def guarded(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -214,6 +256,7 @@ class BridgeDeps:
     gemini_key_pusher: object = None
     attendance_script_updater: object = None
     attendance_script_runner: object = None
+    attendance_roster_migrator: object = None
     attendance_ai_inspector: object = None
     attendance_remote_work_timeout_seconds: object = None
 
@@ -890,6 +933,23 @@ class Api:
                     "verified": False,
                     "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
                 }
+            roster_migrator = self._deps.attendance_roster_migrator
+            if roster_migrator is None:
+                roster_migrator = _migrate_attendance_roster_layout
+            try:
+                roster_migrated = roster_migrator(
+                    runner=script_runner,
+                    workdir=self._config_dir,
+                    gws_executable=gws,
+                    deployment_id=record["deployment_id"],
+                )
+            except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
+                roster_migrated = False
+            if roster_migrated is not True:
+                payload["state"] = "hold"
+                payload["verified"] = False
+                payload["detail"] = _ATTENDANCE_ROSTER_MIGRATION_MESSAGE
+                return payload
             ai_inspector = self._deps.attendance_ai_inspector
             if ai_inspector is None:
                 from attendance_ai_setup import inspect_attendance_ai_setup
