@@ -1536,7 +1536,7 @@ function attendanceScriptUpdateHtml(a) {
   const update = S.attendanceScriptUpdate;
   if (update?.state === "ai-action-required") {
     const detail = String(update.detail || "").trim()
-      || "출석부 안에서 AI 출결 입력 연결 확인을 한 번 눌러 주세요.";
+      || "출석부의 [처음 한 번 설정하기]에서 [처음 설정 한 번에 끝내기]를 눌러 주세요.";
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       ${update.spreadsheet_url ? `<button class="btn-quiet" data-action="attendance-open">출석부 열기</button>` : ""}
       <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">연결 확인하고 계속</button></div>`;
@@ -2462,13 +2462,7 @@ function googleAccountDecisionHtml() {
       <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>@goedu.kr 계정으로만 진행할 수 있습니다.</p>
     </div>${lockedGoogleServicesHtml()}`;
   }
-  return `${account}<div class="decision-banner success">
-      <h3>@goedu.kr 계정으로 Google Workspace에 로그인을 성공했습니다.</h3>
-    </div><div class="success-next">
-      <div><b>일정 (Google Calendar)·할 일 (Google Tasks)</b><span>업무와 전달사항을 넣을 곳을 고릅니다.</span></div>
-      <div><b>학생 안내표·결석 신고서</b><span>출결 자료와 결석 신고서를 준비합니다.</span></div>
-      <div><b>학급 단톡방 (Google Chat)</b><span>쓸 선생님만 학급 공간을 연결합니다.</span></div>
-    </div>`;
+  return account;
 }
 function googleAccountSectionHtml(includeRefresh) {
   return `<div class="section-h section-head"><span>Google Workspace 준비</span>${includeRefresh ? settingsRefreshButtonHtml() : ""}</div>
@@ -2955,7 +2949,7 @@ const RESULT_GROUPS = [
   { kind: "notice", title: "학생 안내 · Google Sheet" },
 ];
 function resultLabel(it) {
-  if (it.kind === "notice" && it.result === "created") return ["확인필요", "review"];
+  if (it.kind === "notice" && it.result === "created") return ["대기", "ok"];
   return ITEM_RES[it.result] || ["", "dup"];
 }
 function groupedItemsHtml(cap) {
@@ -2971,7 +2965,7 @@ function groupedItemsHtml(cap) {
         `<span class="res ${cls}">${esc(label)}</span></div>${detail}`;
     }).join("");
     const guide = group.kind === "notice"
-      ? `<div class="sheet-guide">아직 학생에게 보내지 않았어요. Google Sheet에서 대상과 내용을 확인한 뒤 발송 대기로 바꿔 주세요.</div>`
+      ? `<div class="sheet-guide">쪽지 대장에 발송 대기로 넣었어요. 아직 학생에게 보내지는 않았습니다.</div>`
       : "";
     return `<section class="result-group"><div class="result-group-head">${esc(group.title)} ${items.length}건</div>${rows}${guide}</section>`;
   }).join("");

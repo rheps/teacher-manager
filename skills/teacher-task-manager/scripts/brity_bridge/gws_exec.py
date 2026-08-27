@@ -237,7 +237,7 @@ def _insert_task(runner, gws_command, action) -> str:
     body = dict(action.payload)
     body.pop("due", None)
     notes = body.get("notes", "").rstrip()
-    body["notes"] = f"{notes}\n\n{TASK_NOTE_MARK}{action.action_key}" if notes else f"{TASK_NOTE_MARK}{action.action_key}"
+    body["notes"] = notes
     args = gws_command + [
         "tasks", "tasks", "insert",
         "--params", json.dumps({"tasklist": action.google_id}, ensure_ascii=False),
@@ -308,7 +308,7 @@ def _append_notice(runner, gws_command, action) -> str:
     if action.target == "personal":
         row = [
             today, "", str(action.payload.get("name", "")).strip(), "기타",
-            content, "자동분석", "확인필요", "", "", "",
+            content, "자동분석", "대기", "", "", "",
         ]
         _values_append(runner, gws_command, action.google_id, PERSONAL_QUEUE_SHEET, [row])
         return "created"
@@ -322,7 +322,7 @@ def _append_notice(runner, gws_command, action) -> str:
         row_status = str(sheet_row[4] if len(sheet_row) > 4 else "").strip()
         if row_date == today and row_text == content and row_status != "보냄":
             return "duplicate"
-    row = [today, "기타", content, "자동분석", "확인필요", "", ""]
+    row = [today, "기타", content, "자동분석", "대기", "", ""]
     _values_append(runner, gws_command, action.google_id, CLASS_QUEUE_SHEET, [row])
     return "created"
 

@@ -870,8 +870,8 @@ def _notice_created_note(report: ExecutionReport) -> str:
     if not created:
         return ""
     return (
-        "\n학생 안내는 학생 안내표에 확인필요 상태로 옮겼어요. "
-        "아직 학생에게 보내지 않았어요 — 안내표에서 확인 후 발송 대기로 바꿔 주세요."
+        "\n학생 안내는 학생 안내표에 대기 상태로 옮겼어요. "
+        "아직 학생에게 보내지 않았어요 — 발송 버튼을 누르면 보낼 수 있어요."
     )
 
 

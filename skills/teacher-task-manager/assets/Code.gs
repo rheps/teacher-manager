@@ -8,7 +8,7 @@
  * - 월별 입력표는 A:L이 실제 표다. M~P는 값도 제목도 없고 색도 칠하지 않는다.
  * - 신고서 양식은 이미 만들어 둔 Google Docs 템플릿을 그대로 복사해서 사용
  * - 새 템플릿 문서 생성 기능은 넣지 않음
- * - 학생명단은 A열 번호, B열 이름을 적으면 C열 '번호+이름'이 자동 생성되고, 월별 시트 B열 드롭다운으로 연결
+ * - 학생명단은 A열 번호, B열 이름, C열 학생 이메일만 두고, 번호+이름은 드롭다운 시트의 숨은 목록에서 자동 생성
  */
 
 const APP_NAME = '출결 신고서 자동화';
@@ -73,11 +73,17 @@ const ATTENDANCE_AI_GEMINI_API_KEY_SETTING = 'GEMINI_API_KEY';
 const ATTENDANCE_AI_ALLOWED_SETTING = 'ATTENDANCE_AI_ALLOWED';
 const ATTENDANCE_AI_ALLOWED_VALUE = '예';
 const ATTENDANCE_AI_EDIT_TRIGGER_HANDLER = 'onAttendanceAiEdit';
-const ATTENDANCE_AI_MENU_ITEM = 'AI 출결 입력 연결 확인';
+const ATTENDANCE_AI_SETUP_TITLE = 'AI 출결 입력 연결';
 const ATTENDANCE_AI_VERIFICATION_SETTING = 'ATTENDANCE_AI_SETUP_VERIFICATION';
 const ATTENDANCE_CONNECTION_CODE_SETTING = 'ATTENDANCE_CONNECTION_CODE';
 const ATTENDANCE_AI_VERIFICATION_SCHEMA_VERSION = 1;
 const ATTENDANCE_AI_SETUP_VERSION = '1';
+const STUDENT_DROPDOWN_SHEET_NAME = '드롭다운';
+const STUDENT_DROPDOWN_HEADER = '학생_번호이름';
+const STUDENT_DROPDOWN_COLUMN = 10; // J — 드롭다운 시트에서 숨겨 두는 내부 목록
+const STUDENT_DROPDOWN_FIRST_ROW = 2;
+const STUDENT_DROPDOWN_LAST_ROW = 200;
+const STUDENT_DROPDOWN_RANGE = 'J2:J200';
 
 const DEFAULT_CONFIG = Object.freeze({
   SCHOOL_NAME: '',
@@ -93,7 +99,7 @@ const DEFAULT_CONFIG = Object.freeze({
   TASK_LIST_TITLE: '출결 미제출 확인',
   HOLIDAY_SHEET_NAME: FALLBACK_HOLIDAY_SHEET_NAME,
   ROSTER_SHEET_NAME: '학생명단',
-  STUDENT_DROPDOWN_RANGE: 'C2:C200',
+  STUDENT_DROPDOWN_RANGE: STUDENT_DROPDOWN_RANGE,
   TIMEZONE: 'Asia/Seoul',
   MONTH_SHEET_NAMES: DEFAULT_MONTH_SHEETS.join(','),
   HOMEROOM_TASK_LIST_ID: '',
@@ -107,7 +113,7 @@ const DEFAULT_CONFIG = Object.freeze({
 });
 
 const INPUT_HEADERS = ['날짜','번호+이름','구분','종류','사유','교시','신고서','첨부'];
-const ROSTER_HEADERS = ['번호','이름','번호+이름','학생 Google 이메일'];
+const ROSTER_HEADERS = ['번호','이름','학생 Google 이메일'];
 const MESSENGER_PERSONAL_SHEET_NAME = '메신저 개인톡 내용';
 const MESSENGER_CLASS_SHEET_NAME = '메신저 단체톡 내용';
 const LEGACY_PERSONAL_MESSAGE_QUEUE_SHEET_NAMES = ['개인톡 내용', '개인 쪽지 대장'];
@@ -116,7 +122,7 @@ const PERSONAL_MESSAGE_QUEUE_HEADERS = ['보낼 날짜','번호','이름','쪽�
 const CLASS_MESSAGE_QUEUE_HEADERS = ['보낼 날짜','안내 종류','안내 내용','들어온 곳','상태','보낸 시각','결과'];
 const MONTHLY_CHAT_RESULT_HEADERS = ['Google Chat 발송상태','Google Chat 시도시각','Google Chat 결과','Google Chat 내용기준'];
 const MESSAGE_QUEUE_SOURCES = ['출결표','자동분석','직접입력'];
-const MESSAGE_QUEUE_STATUSES = ['확인필요','대기','발송중','제외','보냄','실패'];
+const MESSAGE_QUEUE_STATUSES = ['대기','발송중','제외','보냄','실패'];
 const PERSONAL_MESSAGE_TYPES = ['출결서류','준비물','개별안내','상담/확인','기타'];
 const CLASS_MESSAGE_TYPES = ['준비물','제출물','일정','생활지도','기타'];
 const CHAT_MESSAGE_LIMIT_BYTES = 30000;
@@ -135,25 +141,12 @@ function onOpen() {
     .addItem('연결 상태 확인', 'checkCentralChatStatus')
     .addToUi();
 
-  // 아래 두 메뉴는 계열이 다르지만 모두 교사가 Sheet 안에서 직접 실행하는 일이다.
-  // 새 출석부의 AI 입력 연결 확인도 이 메뉴에서 한 번만 실행한다.
-  const attendanceMenu = ui.createMenu('출결 업무 자동화')
-    .addItem(ATTENDANCE_AI_MENU_ITEM, 'enableAttendanceAiInput')
-    .addSeparator()
+  // 최초 연결과 자동 복구는 위의 한 번 설정에서 맡고, 여기에는 평소 실행할 일만 둔다.
+  ui.createMenu('출결 업무 자동화')
     .addItem('선택 행 출결신고서 Google Docs에 만들기', 'createDocFromTemplate')
     .addItem('선택 행 미제출 서류 Google Tasks에 추가하기', 'addSelectedRowToTasks')
-    .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow');
-
-  attendanceMenu
+    .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow')
     .addSeparator()
-    .addSubMenu(ui.createMenu('문제가 생겼을 때')
-      .addItem('입력 색/드롭다운 다시 적용', 'refreshInputFormattingAndDropdowns')
-      .addItem('기존 템플릿 ID/접근 점검', 'checkExistingTemplateDoc')
-      .addItem('출력 폴더 만들기/연결', 'connectDestinationFolder')
-      .addItem('Tasks 목록 만들기/연결', 'connectTasksList')
-      .addSeparator()
-      .addItem('날짜 줄무늬: 현재 월 시트', 'reStripeActiveSheet')
-      .addItem('날짜 줄무늬: 모든 월 시트', 'reStripeAllSheets'))
     .addItem('ⓘ 만든 사람 / 버전', 'showAbout')
     .addToUi();
 
@@ -368,7 +361,7 @@ function setupAttendanceWorkbook() {
   SpreadsheetApp.getUi().alert(
     '기본 시트/설정 점검 완료.\n\n' +
     '- 월별 입력 시트는 맨 앞에 정렬했습니다.\n' +
-    '- 학생명단 C열(번호+이름) → 월별 시트 B열 드롭다운을 연결했습니다.\n' +
+    '- 학생명단 A열 번호와 B열 이름을 합쳐 월별 시트 B열 드롭다운을 연결했습니다.\n' +
     '- 신고서 템플릿 문서 ID는 설치 도우미가 설정 시트에 자동으로 입력합니다.'
   );
 }
@@ -421,23 +414,6 @@ function setupAttendanceWorkbookCore_() {
   applyStudentDropdowns_(ss, cfg);
 }
 
-function refreshInputFormattingAndDropdowns() {
-  requireGoeduTeacherAccount_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  ensureConfigSheet_(ss);
-  ensureRosterSheet_(ss);
-  ensureDropdownSheet_(ss);
-  ensurePersonalMessageQueueSheet_(ss);
-  ensureClassMessageQueueSheet_(ss);
-  const cfg = getConfig_();
-  getInputSheets_(ss, cfg).forEach(sh => {
-    applyInputSheetFormatting_(sh);
-    ensureMonthlyChatResultColumns_(sh);
-  });
-  applyStudentDropdowns_(ss, cfg);
-  SpreadsheetApp.getUi().alert('월별 입력 시트의 색/드롭다운을 다시 적용했습니다.');
-}
-
 function ensureConfigSheet_(ss) {
   let sh = ss.getSheetByName(CONFIG_SHEET_NAME);
   if (!sh) sh = ss.insertSheet(CONFIG_SHEET_NAME);
@@ -455,13 +431,13 @@ function ensureConfigSheet_(ss) {
     ['CLASS_LABEL', DEFAULT_CONFIG.CLASS_LABEL, '{반번호} 또는 파일명/Tasks 제목에 쓰는 학반 표시입니다.', '예: 2-2'],
     ['TEACHER_NAME', DEFAULT_CONFIG.TEACHER_NAME, '템플릿에 {담임} placeholder가 있을 때만 사용합니다.', '예: 홍길동'],
     ['TEMPLATE_DOC_ID', '', '설치 도우미가 자동으로 입력합니다. 비어 있으면 출결 자동화 시트를 만든 설치 도우미를 다시 실행하세요.', '필수 / Google Docs 문서 ID'],
-    ['DEST_FOLDER_ID', '', '생성된 신고서가 저장될 Google Drive 폴더 ID입니다. 메뉴로 자동 연결 가능합니다.', '비워두고 메뉴 실행 권장'],
+    ['DEST_FOLDER_ID', '', '설치 도우미가 자동으로 입력한 신고서 저장 폴더 번호입니다. 비어 있으면 Teacher Manager의 출결 연결을 다시 점검하세요.', '자동 입력 / 필수'],
     ['DEST_FOLDER_NAME', DEFAULT_CONFIG.DEST_FOLDER_NAME, '출력 폴더 자동 생성 시 사용할 폴더명입니다.', '출결 증빙'],
-    ['TASK_LIST_ID', '', 'Google Tasks 목록 ID입니다. Tasks API 고급 서비스를 켠 뒤 메뉴 실행으로 자동 입력 가능합니다.', 'Tasks 사용 시 필수'],
+    ['TASK_LIST_ID', '', 'Teacher Manager에서 고른 Google Tasks 목록 번호입니다. 비어 있으면 Teacher Manager의 연결 화면을 다시 점검하세요.', '자동 입력 / Tasks 사용 시 필수'],
     ['TASK_LIST_TITLE', DEFAULT_CONFIG.TASK_LIST_TITLE, 'Tasks 목록 자동 생성 시 사용할 이름입니다.', '출결 미제출 확인'],
     ['HOLIDAY_SHEET_NAME', DEFAULT_CONFIG.HOLIDAY_SHEET_NAME, '수업일 계산에서 제외할 휴일 시트 이름입니다.', '휴일'],
-    ['ROSTER_SHEET_NAME', DEFAULT_CONFIG.ROSTER_SHEET_NAME, '학생 드롭다운 원본 시트입니다. A열 번호, B열 이름을 채우면 C열 번호+이름이 자동으로 만들어집니다.', '학생명단'],
-    ['STUDENT_DROPDOWN_RANGE', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE, '학생명단에서 월별 시트 B열 드롭다운으로 사용할 범위입니다.', 'C2:C200'],
+    ['ROSTER_SHEET_NAME', DEFAULT_CONFIG.ROSTER_SHEET_NAME, '학생명단 시트입니다. A열 번호, B열 이름, C열 학생 Google 이메일을 씁니다.', '학생명단'],
+    ['STUDENT_DROPDOWN_RANGE', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE, '월별 시트 B열이 읽는 드롭다운 시트의 숨은 학생 목록입니다.', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE],
     ['TIMEZONE', DEFAULT_CONFIG.TIMEZONE, '날짜 표시 시간대입니다.', 'Asia/Seoul'],
     ['MONTH_SHEET_NAMES', DEFAULT_CONFIG.MONTH_SHEET_NAMES, '자동화 대상 월별 입력 시트 이름입니다.', DEFAULT_CONFIG.MONTH_SHEET_NAMES],
     ['HOMEROOM_TASK_LIST_ID', DEFAULT_CONFIG.HOMEROOM_TASK_LIST_ID, '조종례시 담임학급 안내사항 Google Tasks 목록 ID입니다. 설치 도우미가 담임 설정에서 가져옵니다.', '담임일 때 자동 입력'],
@@ -854,7 +830,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext, holiday
     return {
       number: String(row[0] === null || row[0] === undefined ? '' : row[0]).trim(),
       name: String(row[1] === null || row[1] === undefined ? '' : row[1]).trim(),
-      combined: String(row[2] === null || row[2] === undefined ? '' : row[2]).trim()
+      combined: combineStudentNumberAndName_(row[0], row[1])
     };
   }).filter(row => row && row.number && row.name && row.combined);
   const sentence = sheetContext.sentence;
@@ -1022,7 +998,10 @@ function buildAttendanceAiBatchUpdate_(records, writeContext) {
       { stringValue: record.reason },
       { stringValue: record.period }
     ].map(userEnteredValue => ({ userEnteredValue: userEnteredValue }));
-    // G~L은 비워 두고, M열에만 AI가 넣은 줄이라고 적는다.
+    // 신고서(G)는 비워 두고 첨부(H)는 미제출로 시작한다. I~L은 비워 둔다.
+    values.push({});
+    values.push({ userEnteredValue: { stringValue: '미제출' } });
+    // M열에만 AI가 넣은 줄이라고 적는다.
     // 배경색은 건드리지 않는다 — 그 자리는 날짜 줄무늬가 쓴다.
     const betweenCount = MONTHLY_ATTENDANCE_AI_MARK_COL - values.length - 1;
     const between = [];
@@ -1204,7 +1183,7 @@ function handleAttendanceAiEdit(e, testPorts) {
     readRosterRows: (spreadsheet, context) => {
       const rosterSheet = spreadsheet.getSheetByName(context.rosterSheetName);
       if (!rosterSheet || rosterSheet.getLastRow() < 2) return [];
-      return rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 4).getValues();
+      return rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, ROSTER_HEADERS.length).getValues();
     },
     readHolidayDateKeys: (spreadsheet, calendarYear) => {
       const holidaySheet = spreadsheet.getSheetByName(getHolidaySheetName_());
@@ -1822,7 +1801,7 @@ function enableAttendanceAiInput(options) {
   // 통합 설정이 부를 때는 단계마다 창을 띄우지 않고 결과만 돌려준다 — 화면은 마지막에 한 번만 뜬다.
   const quiet = !!(options && options.quiet === true);
   function finish_(ok, message, created) {
-    if (!quiet) ui.alert(ATTENDANCE_AI_MENU_ITEM, message, ui.ButtonSet.OK);
+    if (!quiet) ui.alert(ATTENDANCE_AI_SETUP_TITLE, message, ui.ButtonSet.OK);
     return { ok: ok, created: created === true, message: message };
   }
 
@@ -1867,40 +1846,53 @@ function ensureRosterSheet_(ss) {
     sh.insertColumnsAfter(sh.getMaxColumns(), ROSTER_HEADERS.length - sh.getMaxColumns());
   }
 
+  const lastRow = Math.max(sh.getLastRow(), 1);
   const headerA = String(sh.getRange(1, 1).getValue() || '').trim();
+  const headerB = String(sh.getRange(1, 2).getValue() || '').trim();
+  const headerC = String(sh.getRange(1, 3).getValue() || '').trim();
+
+  const clearFormerFourthColumn = () => {
+    if (sh.getMaxColumns() < 4) return;
+    const former = sh.getRange(1, 4, lastRow, 1);
+    former.clearContent();
+    if (typeof former.clearFormat === 'function') former.clearFormat();
+  };
 
   if (headerA === '번호+이름') {
-    // 옛 배치(번호+이름이 A열)를 새 배치(번호/이름/번호+이름/이메일)로 옮긴다.
-    const lastRow = Math.max(sh.getLastRow(), 2);
+    // 가장 오래된 배치(A=번호+이름, B=번호, C=이름, D=이메일)를
+    // A=번호, B=이름, C=이메일 세 칸으로 옮긴다. 전체 시트는 비우지 않는다.
     const width = Math.min(4, sh.getMaxColumns());
-    const vals = lastRow > 1 ? sh.getRange(2, 1, lastRow - 1, width).getValues() : [];
-    const migrated = vals.map(row => {
+    const values = lastRow > 1
+      ? sh.getRange(2, 1, lastRow - 1, width).getValues()
+      : [];
+    const migrated = values.map(row => {
       const combined = String(row[0] || '').trim();
-      const no = String(row[1] || '').trim();
-      const nm = String(row[2] || '').trim();
-      const email = String((row[3] !== undefined ? row[3] : '') || '').trim();
+      const number = String(row[1] || '').trim();
+      const studentName = String(row[2] || '').trim();
+      const email = String(row[3] || '').trim();
       const parsed = parseStudentLabel_(combined);
-      return [no || parsed.number, nm || parsed.name, combined || (no && nm ? no + nm : ''), email];
-    }).filter(row => row[2]);
-    // 옛 열(개인 DM 사용, Space ID, 비고, 마지막 DM 발송일)은 더 이상 쓰지 않는다.
-    const hadDmColumns = sh.getMaxColumns() > ROSTER_HEADERS.length &&
-      String(sh.getRange(1, 5).getValue() || '').trim() === '개인 DM 사용';
-    sh.clear();
-    if (hadDmColumns) {
-      sh.deleteColumns(ROSTER_HEADERS.length + 1, Math.min(4, sh.getMaxColumns() - ROSTER_HEADERS.length));
-    }
+      return [number || parsed.number, studentName || parsed.name, email];
+    });
     sh.getRange(1, 1, 1, ROSTER_HEADERS.length).setValues([ROSTER_HEADERS]);
-    if (migrated.length) sh.getRange(2, 1, migrated.length, ROSTER_HEADERS.length).setValues(migrated);
+    if (migrated.length) {
+      sh.getRange(2, 1, migrated.length, ROSTER_HEADERS.length).setValues(migrated);
+    }
+    clearFormerFourthColumn();
+  } else if (headerA === '번호' && headerB === '이름' && headerC === '번호+이름') {
+    // 바로 전 배치(A=번호, B=이름, C=번호+이름, D=이메일)는
+    // D의 이메일을 먼저 읽어 C로 옮긴 뒤 옛 D열을 비운다.
+    const emails = lastRow > 1
+      ? sh.getRange(2, 4, lastRow - 1, 1).getValues()
+      : [];
+    if (emails.length) sh.getRange(2, 3, emails.length, 1).setValues(emails);
+    sh.getRange(1, 1, 1, ROSTER_HEADERS.length).setValues([ROSTER_HEADERS]);
+    clearFormerFourthColumn();
   } else {
     sh.getRange(1, 1, 1, ROSTER_HEADERS.length).setValues([ROSTER_HEADERS]);
-    fillRosterCombinedColumns_(sh);
   }
 
-  // 드롭다운 원본이 옛 설정(A열)으로 남아 있으면 C열로 바꿔준다.
-  const dropdownRange = String(cfg.STUDENT_DROPDOWN_RANGE || '').trim();
-  const oldRangeMatch = dropdownRange.match(/^A(\d+):A(\d+)$/i);
-  if (oldRangeMatch) {
-    setConfigValue_('STUDENT_DROPDOWN_RANGE', 'C' + oldRangeMatch[1] + ':C' + oldRangeMatch[2]);
+  if (String(cfg.STUDENT_DROPDOWN_RANGE || '').trim() !== STUDENT_DROPDOWN_RANGE) {
+    setConfigValue_('STUDENT_DROPDOWN_RANGE', STUDENT_DROPDOWN_RANGE);
   }
 
   sh.getRange(1, 1, 1, ROSTER_HEADERS.length)
@@ -1910,26 +1902,8 @@ function ensureRosterSheet_(ss) {
     .setHorizontalAlignment('center');
   sh.setFrozenRows(1);
   sh.setColumnWidths(1, 2, 90);
-  sh.setColumnWidths(3, 1, 140);
-  sh.setColumnWidths(4, 1, 240);
+  sh.setColumnWidths(3, 1, 240);
   sh.getDataRange().setWrap(true).setVerticalAlignment('middle');
-}
-
-// A열 번호, B열 이름을 적으면 C열(번호+이름)을 자동으로 만들고,
-// 반대로 C열만 적으면 번호/이름을 자동으로 나눈다. 양방향 모두 지원한다.
-function fillRosterCombinedColumns_(sh) {
-  const lastRow = sh.getLastRow();
-  if (lastRow < 2) return;
-  const values = sh.getRange(2, 1, lastRow - 1, 3).getValues();
-  const updates = values.map(row => {
-    const no = String(row[0] || '').trim();
-    const nm = String(row[1] || '').trim();
-    const combined = String(row[2] || '').trim();
-    if (!combined && no && nm) return [no, nm, no + nm];
-    const parsed = parseStudentLabel_(combined);
-    return [no || parsed.number, nm || parsed.name, combined];
-  });
-  sh.getRange(2, 1, updates.length, 3).setValues(updates);
 }
 
 function parseStudentLabel_(value) {
@@ -1937,6 +1911,49 @@ function parseStudentLabel_(value) {
   const match = text.match(/^(\d+)\s*(.+)$/);
   if (!match) return { number: '', name: text };
   return { number: match[1], name: String(match[2] || '').trim() };
+}
+
+function combineStudentNumberAndName_(number, name) {
+  const cleanNumber = String(number === null || number === undefined ? '' : number).trim();
+  const cleanName = String(name === null || name === undefined ? '' : name).trim();
+  return cleanNumber && cleanName ? cleanNumber + cleanName : '';
+}
+
+function buildStudentDropdownValues_(rows) {
+  return (rows || []).map(row => (
+    Array.isArray(row) ? combineStudentNumberAndName_(row[0], row[1]) : ''
+  )).filter(Boolean);
+}
+
+function syncStudentDropdownValues_(ss, cfg) {
+  const rosterName = (cfg && cfg.ROSTER_SHEET_NAME) || '학생명단';
+  const roster = ss.getSheetByName(rosterName);
+  const dropdown = ss.getSheetByName(STUDENT_DROPDOWN_SHEET_NAME);
+  if (!roster || !dropdown) return;
+
+  if (dropdown.getMaxColumns() < STUDENT_DROPDOWN_COLUMN) {
+    dropdown.insertColumnsAfter(
+      dropdown.getMaxColumns(),
+      STUDENT_DROPDOWN_COLUMN - dropdown.getMaxColumns()
+    );
+  }
+
+  const rows = roster.getLastRow() > 1
+    ? roster.getRange(2, 1, roster.getLastRow() - 1, 2).getValues()
+    : [];
+  const labels = buildStudentDropdownValues_(rows);
+  const output = Array.from(
+    { length: STUDENT_DROPDOWN_LAST_ROW - STUDENT_DROPDOWN_FIRST_ROW + 1 },
+    (_, index) => [labels[index] || '']
+  );
+  dropdown.getRange(1, STUDENT_DROPDOWN_COLUMN).setValue(STUDENT_DROPDOWN_HEADER);
+  dropdown.getRange(
+    STUDENT_DROPDOWN_FIRST_ROW,
+    STUDENT_DROPDOWN_COLUMN,
+    output.length,
+    1
+  ).setValues(output);
+  dropdown.hideColumns(STUDENT_DROPDOWN_COLUMN, 1);
 }
 
 function loadStudentRosterForDm_() {
@@ -1952,7 +1969,7 @@ function loadStudentRosterForDm_() {
 }
 
 // 학생명단 행 배열로 "키 → 학생" 맵을 만든다. GAS API를 쓰지 않는 순수 함수라
-// 테스트가 Node로 직접 실행한다. rows: [번호, 이름, 번호+이름, 학생 Google 이메일]
+// 테스트가 Node로 직접 실행한다. rows: [번호, 이름, 학생 Google 이메일]
 function buildRosterKeyMap_(rows) {
   const map = {};
   const ambiguous = new Set();
@@ -1968,9 +1985,9 @@ function buildRosterKeyMap_(rows) {
   (rows || []).forEach((row, index) => {
     const number = String(row[0] || '').trim();
     const name = String(row[1] || '').trim();
-    const combined = String(row[2] || '').trim();
+    const combined = combineStudentNumberAndName_(number, name);
     // 학생 Google 이메일 — 있으면 개인 DM 대상이다.
-    const email = String(row[3] || '').trim();
+    const email = String(row[2] || '').trim();
     const student = {
       rowNumber: index + 2,
       combined: combined || (number + name),
@@ -1990,12 +2007,10 @@ function buildRosterKeyMap_(rows) {
 }
 
 function applyStudentDropdowns_(ss, cfg) {
-  const rosterName = cfg.ROSTER_SHEET_NAME || '학생명단';
-  const roster = ss.getSheetByName(rosterName);
-  if (!roster) return;
-  const rangeA1 = cfg.STUDENT_DROPDOWN_RANGE || 'C2:C200';
+  const dropdown = ss.getSheetByName(STUDENT_DROPDOWN_SHEET_NAME);
+  if (!dropdown) return;
   const rule = SpreadsheetApp.newDataValidation()
-    .requireValueInRange(roster.getRange(rangeA1), true)
+    .requireValueInRange(dropdown.getRange(STUDENT_DROPDOWN_RANGE), true)
     .setAllowInvalid(true)
     .build();
 
@@ -2102,8 +2117,8 @@ function getDefaultHolidayRows_() {
 }
 
 function ensureDropdownSheet_(ss) {
-  let sh = ss.getSheetByName('드롭다운');
-  if (!sh) sh = ss.insertSheet('드롭다운');
+  let sh = ss.getSheetByName(STUDENT_DROPDOWN_SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(STUDENT_DROPDOWN_SHEET_NAME);
   const columns = [
     ['구분','질병','미인정','기타','출석인정'],
     ['종류','결석함','지각함','조퇴함','결과함'],
@@ -2125,6 +2140,7 @@ function ensureDropdownSheet_(ss) {
   sh.getRange(1,1,1,columns.length).setBackground('#1F4E79').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
   sh.setFrozenRows(1);
   sh.setColumnWidths(1,columns.length,120);
+  syncStudentDropdownValues_(ss, getConfig_());
 }
 
 function ensurePersonalMessageQueueSheet_(ss) {
@@ -2191,6 +2207,21 @@ function ensureMessageQueueSheet_(ss, preferredName, legacyNames, headers) {
     .setVerticalAlignment('middle');
   sh.setFrozenRows(1);
   sh.getRange(1, 1, sh.getMaxRows(), headers.length).setWrap(true).setVerticalAlignment('middle');
+  // 옛 판의 '확인필요'는 더 이상 선택값이 아니다. 발송은 여전히 선생님이 버튼을
+  // 눌러 확인해야 시작되므로, 기존 줄은 안전하게 '대기'로 한 번 바꾼다.
+  const statusColumn = headers.indexOf('상태') + 1;
+  const lastRow = sh.getLastRow();
+  if (statusColumn > 0 && lastRow >= 2) {
+    const statusRange = sh.getRange(2, statusColumn, lastRow - 1, 1);
+    const statuses = statusRange.getValues();
+    let changed = false;
+    statuses.forEach(row => {
+      if (String(row[0] || '').trim() !== '확인필요') return;
+      row[0] = '대기';
+      changed = true;
+    });
+    if (changed) statusRange.setValues(statuses);
+  }
   return sh;
 }
 
@@ -2266,8 +2297,8 @@ function ensureUsageSheet_(ss) {
     [2,'Apps Script 붙여넣기','확장 프로그램 → Apps Script에 Code.gs 전체를 붙여넣고 저장합니다.','','',''],
     [3,'설정 입력','설정 시트 B열의 학교명, 학반, 담임, TEMPLATE_DOC_ID를 입력합니다.','','',''],
     [4,'기존 템플릿 사용','이미 있는 Google Docs 템플릿 ID를 사용합니다. 새 문서 템플릿은 만들지 않습니다.','','',''],
-    [5,'학생명단 입력','학생명단에 번호와 이름을 나눠 입력하면 번호+이름은 자동으로 채워집니다. 개인 DM을 쓸 학생만 Google 이메일을 적습니다.','','',''],
-    [6,'드롭다운 적용','메뉴의 입력 색/드롭다운 다시 적용을 누르면 B열 학생 드롭다운이 갱신됩니다.','','',''],
+    [5,'학생명단 입력','학생명단 A열에 번호, B열에 이름을 적습니다. 개인 DM을 쓸 학생만 C열에 Google 이메일을 적습니다. 월별 시트에서는 번호+이름이 자동으로 합쳐집니다.','','',''],
+    [6,'드롭다운 적용','처음 설정과 학생명단 변경 때 B열 학생 드롭다운이 자동으로 갱신됩니다.','','',''],
     [7,'신고서 생성','월별 시트에서 행을 선택하고 선택 행으로 신고서 만들기를 실행합니다.','','',''],
     [8,'Tasks 사용','Tasks 기능은 Google Tasks API 고급 서비스를 별도로 켜야 합니다.','','','']
   ];
@@ -2502,16 +2533,16 @@ function getTemplateDocId_() {
 function getDestinationFolder_() {
   const cfg = getConfig_();
   const folderId = String(cfg.DEST_FOLDER_ID || '').trim();
-  if (folderId) return DriveApp.getFolderById(folderId);
-  const folderName = String(cfg.DEST_FOLDER_NAME || DEFAULT_CONFIG.DEST_FOLDER_NAME).trim() || '출결 증빙';
-  const folders = DriveApp.getFoldersByName(folderName);
-  return folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+  if (!folderId) {
+    throw new Error('설정 시트의 DEST_FOLDER_ID가 비어 있습니다. Teacher Manager에서 출결 연결을 다시 점검하세요. 새 폴더는 만들지 않습니다.');
+  }
+  return DriveApp.getFolderById(folderId);
 }
 
 function getTaskListId_() {
   const cfg = getConfig_();
   const id = String(cfg.TASK_LIST_ID || FALLBACK_TASK_LIST_ID || '').trim();
-  if (!id) throw new Error('설정 시트의 TASK_LIST_ID가 비어 있습니다. 먼저 Tasks 목록 만들기/연결을 실행하세요.');
+  if (!id) throw new Error('설정 시트의 TASK_LIST_ID가 비어 있습니다. Teacher Manager의 연결 화면에서 조종례 Tasks 목록을 다시 확인하세요. 새 목록은 만들지 않습니다.');
   return id;
 }
 
@@ -2529,53 +2560,6 @@ function replaceOptionalConfigPlaceholders_(body) {
   replaceAll_(body, '{학년}', String(cfg.GRADE || ''));
   replaceAll_(body, '{반}', String(cfg.CLASS_NUMBER || ''));
   replaceAll_(body, '{담임}', String(cfg.TEACHER_NAME || ''));
-}
-
-function checkExistingTemplateDoc() {
-  try {
-    requireGoeduTeacherAccount_();
-    const id = getTemplateDocId_();
-    const file = DriveApp.getFileById(id);
-    const doc = DocumentApp.openById(id);
-    SpreadsheetApp.getUi().alert('기존 템플릿 접근 확인 완료\n\n문서명: ' + file.getName() + '\n본문 길이: ' + doc.getBody().getText().length + '자');
-  } catch (err) {
-    SpreadsheetApp.getUi().alert('기존 템플릿 접근 실패\n\n' + (err && err.message ? err.message : err) + '\n\n확인: 설정!TEMPLATE_DOC_ID가 Google Docs 문서 ID인지, 현재 계정에 접근 권한이 있는지 확인하세요.');
-  }
-}
-
-function connectDestinationFolder() {
-  try {
-    requireGoeduTeacherAccount_();
-    const folder = getDestinationFolder_();
-    setConfigValue_('DEST_FOLDER_ID', folder.getId());
-    SpreadsheetApp.getUi().alert('출력 폴더 연결 완료\n\n폴더명: ' + folder.getName() + '\nID: ' + folder.getId());
-  } catch (err) {
-    SpreadsheetApp.getUi().alert('출력 폴더 연결 오류\n\n' + (err && err.message ? err.message : err));
-  }
-}
-
-function connectTasksList() {
-  requireGoeduTeacherAccount_();
-  if (typeof Tasks === 'undefined') {
-    SpreadsheetApp.getUi().alert(
-      'Google Tasks API 고급 서비스가 켜져 있지 않습니다.\n\n' +
-      'Apps Script 편집기 왼쪽 [서비스 +] → Google Tasks API 추가 후 다시 실행하세요.\n' +
-      '이 설정은 Tasks 기능을 쓰는 사용자/스크립트마다 한 번 필요합니다.'
-    );
-    return;
-  }
-
-  try {
-    const cfg = getConfig_();
-    const title = String(cfg.TASK_LIST_TITLE || DEFAULT_CONFIG.TASK_LIST_TITLE).trim() || '출결 미제출 확인';
-    const lists = Tasks.Tasklists.list().items || [];
-    let found = lists.find(list => list.title === title);
-    if (!found) found = Tasks.Tasklists.insert({ title });
-    setConfigValue_('TASK_LIST_ID', found.id);
-    SpreadsheetApp.getUi().alert('Tasks 목록 연결 완료\n\n목록명: ' + found.title + '\nID: ' + found.id);
-  } catch (err) {
-    SpreadsheetApp.getUi().alert('Google Tasks 연결 중 오류가 났습니다.\n\n' + (err && err.message ? err.message : err));
-  }
 }
 
 function isChatAppConfigurationError_(err) {
@@ -3118,7 +3102,8 @@ function appendClassMessageQueueLines_(lines, sendDateKey, source, status, kind)
   const sh = ensureClassMessageQueueSheet_(ss);
   const targetDate = String(sendDateKey || todayKey_()).trim();
   const cleanSource = String(source || '자동분석').trim();
-  const cleanStatus = String(status || '확인필요').trim();
+  const requestedStatus = String(status || '').trim();
+  const cleanStatus = !requestedStatus || requestedStatus === '확인필요' ? '대기' : requestedStatus;
   const cleanKind = String(kind || '기타').trim();
   const existing = new Set();
   const rows = getQueueRows_(sh, CLASS_MESSAGE_QUEUE_HEADERS.length);
@@ -3149,6 +3134,7 @@ function appendPersonalMessageQueueItemsForAutomation(items) {
     const content = normalizeMessageLine_(item && item.content);
     const name = String(item && item.name || '').trim();
     if (!content || !name) return;
+    const requestedStatus = String(item.status || '').trim();
     rows.push([
       String(item.sendDate || todayKey_()).trim(),
       String(item.number || '').trim(),
@@ -3156,7 +3142,7 @@ function appendPersonalMessageQueueItemsForAutomation(items) {
       String(item.type || '기타').trim(),
       content,
       String(item.source || '자동분석').trim(),
-      String(item.status || '확인필요').trim(),
+      !requestedStatus || requestedStatus === '확인필요' ? '대기' : requestedStatus,
       String(item.link || '').trim(),
       '',
       ''
@@ -3176,7 +3162,7 @@ function appendClassMessageQueueItemsForAutomation(items) {
     const content = item && item.content;
     if (content) lines.push(content);
   });
-  return appendClassMessageQueueLines_(lines, todayKey_(), '자동분석', '확인필요', '기타');
+  return appendClassMessageQueueLines_(lines, todayKey_(), '자동분석', '대기', '기타');
 }
 
 function appendAnalyzedMessageQueueItemsForAutomation(payload) {
@@ -3186,15 +3172,6 @@ function appendAnalyzedMessageQueueItemsForAutomation(payload) {
     personal: appendPersonalMessageQueueItemsForAutomation(data.personal || []),
     class: appendClassMessageQueueItemsForAutomation(data.class || data.group || [])
   };
-}
-
-function countQueueRowsByDateAndStatus_(rows, dateIndex, statusIndex, targetDate, status) {
-  let count = 0;
-  (rows || []).forEach(row => {
-    const dateKey = formatQueueDateKey_(row[dateIndex], '');
-    if (dateKey === targetDate && String(row[statusIndex] || '').trim() === status) count++;
-  });
-  return count;
 }
 
 function findQueueStudent_(group, rosterMap) {
@@ -3592,13 +3569,9 @@ function sendTodayClassMessagesOnly() {
     const today = todayKey_();
     const classRows = getQueueRows_(classSheet, CLASS_MESSAGE_QUEUE_HEADERS.length);
     const classGroup = groupClassMessageQueueRows_(classRows, today);
-    const waitingReview = countQueueRowsByDateAndStatus_(classRows, 0, 4, today, '확인필요');
 
     if (!classGroup.lines.length) {
-      const msg = waitingReview
-        ? `보낼 대기 단체 쪽지가 없습니다.\n\n확인필요 상태 ${waitingReview}줄이 있습니다. 검토 후 상태를 대기로 바꾸면 보낼 수 있습니다.`
-        : '보낼 대기 단체 쪽지가 없습니다.';
-      ui.alert(msg);
+      ui.alert('보낼 대기 단체 쪽지가 없습니다.');
       return;
     }
 
@@ -3607,7 +3580,6 @@ function sendTodayClassMessagesOnly() {
       '',
       '단체 쪽지: ' + classGroup.lines.length + '줄'
     ];
-    if (waitingReview) confirmLines.push('', '확인필요 상태 ' + waitingReview + '줄은 보내지 않습니다.');
     const confirm = ui.alert('메신저 쪽지 내용 Google Chat으로 단체톡 보내기', confirmLines.join('\n'), ui.ButtonSet.OK_CANCEL);
     if (confirm !== ui.Button.OK) return;
 
@@ -3632,13 +3604,9 @@ function sendTodayPersonalMessagesOnly() {
     const today = todayKey_();
     const personalRows = getQueueRows_(personalSheet, PERSONAL_MESSAGE_QUEUE_HEADERS.length);
     const personalGroups = groupPersonalMessageQueueRows_(personalRows, today);
-    const waitingReview = countQueueRowsByDateAndStatus_(personalRows, 0, 6, today, '확인필요');
 
     if (!personalGroups.length) {
-      const msg = waitingReview
-        ? `보낼 대기 개인 쪽지가 없습니다.\n\n확인필요 상태 ${waitingReview}줄이 있습니다. 검토 후 상태를 대기로 바꾸면 보낼 수 있습니다.`
-        : '보낼 대기 개인 쪽지가 없습니다.';
-      ui.alert(msg);
+      ui.alert('보낼 대기 개인 쪽지가 없습니다.');
       return;
     }
 
@@ -3648,7 +3616,6 @@ function sendTodayPersonalMessagesOnly() {
       '',
       '개인 쪽지: ' + personalGroups.length + '명 / ' + totalLines + '줄'
     ];
-    if (waitingReview) confirmLines.push('', '확인필요 상태 ' + waitingReview + '줄은 보내지 않습니다.');
     const confirm = ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡 보내기', confirmLines.join('\n'), ui.ButtonSet.OK_CANCEL);
     if (confirm !== ui.Button.OK) return;
 
@@ -3686,15 +3653,9 @@ function sendTodayDismissalMessages() {
     const classRows = getQueueRows_(classSheet, CLASS_MESSAGE_QUEUE_HEADERS.length);
     const personalGroups = groupPersonalMessageQueueRows_(personalRows, today);
     const classGroup = groupClassMessageQueueRows_(classRows, today);
-    const waitingReview =
-      countQueueRowsByDateAndStatus_(personalRows, 0, 6, today, '확인필요') +
-      countQueueRowsByDateAndStatus_(classRows, 0, 4, today, '확인필요');
 
     if (!personalGroups.length && !classGroup.lines.length) {
-      const msg = waitingReview
-        ? `보낼 대기 쪽지가 없습니다.\n\n확인필요 상태 ${waitingReview}줄이 있습니다. 검토 후 상태를 대기로 바꾸면 종례 때 보낼 수 있습니다.`
-        : '보낼 대기 쪽지가 없습니다.';
-      ui.alert(msg);
+      ui.alert('보낼 대기 쪽지가 없습니다.');
       return;
     }
 
@@ -3704,7 +3665,6 @@ function sendTodayDismissalMessages() {
       '단체 쪽지: ' + classGroup.lines.length + '줄',
       '개인 쪽지: ' + personalGroups.length + '명 / ' + personalGroups.reduce((sum, group) => sum + group.lines.length, 0) + '줄'
     ];
-    if (waitingReview) confirmLines.push('', '확인필요 상태 ' + waitingReview + '줄은 보내지 않습니다.');
     const confirm = ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡+단체톡 보내기', confirmLines.join('\n'), ui.ButtonSet.OK_CANCEL);
     if (confirm !== ui.Button.OK) return;
 
@@ -4898,10 +4858,12 @@ function onEdit(e) {
     const startCol = range.getColumn();
     const endCol = range.getLastColumn();
 
-    // 학생명단에서 번호(A)/이름(B)/번호+이름(C)을 고치면 C열을 바로 자동 채움
+    // 학생명단의 번호(A)/이름(B)을 고치면 드롭다운 시트의 숨은 목록만 갱신한다.
     const cfg = getConfig_();
     if (sheet.getName() === (cfg.ROSTER_SHEET_NAME || '학생명단')) {
-      if (startCol <= 3 && endCol >= 1) fillRosterCombinedColumns_(sheet);
+      if (startCol <= 2 && endCol >= 1) {
+        syncStudentDropdownValues_(e.source || SpreadsheetApp.getActiveSpreadsheet(), cfg);
+      }
       return;
     }
 
@@ -4926,20 +4888,6 @@ function onEdit(e) {
     console.log('onEdit error:', err);
   }
 }
-/** 메뉴: 현재 탭만 줄무늬 재적용 */
-function reStripeActiveSheet() {
-  requireGoeduTeacherAccount_();
-  const sheet = SpreadsheetApp.getActiveSheet();
-  reStripeSheet_(sheet);
-}
-
-/** 메뉴: 모든 탭에 줄무늬 재적용 */
-function reStripeAllSheets() {
-  requireGoeduTeacherAccount_();
-  const ss = SpreadsheetApp.getActive();
-  ss.getSheets().forEach(sh => reStripeSheet_(sh));
-}
-
 /** 핵심: A열의 '같은 날짜 블록'마다 교대로 색을 칠함 (A:L) */
 function reStripeSheet_(sheet) {
   if (shouldSkipSheet_(sheet)) return;

@@ -54,7 +54,7 @@ _ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
 )
 _ATTENDANCE_AI_PROOF_MESSAGE = (
     "출석부 안의 연결 확인 표시가 없거나 맞지 않아요. 출석부를 열고 "
-    "출결 업무 자동화 메뉴에서 AI 출결 입력 연결 확인을 한 번 누른 뒤 "
+    "[처음 한 번 설정하기]에서 [처음 설정 한 번에 끝내기]를 누른 뒤 "
     "연결 확인하고 계속해 주세요."
 )
 _DEFAULT_SCREEN_FAILURE = (

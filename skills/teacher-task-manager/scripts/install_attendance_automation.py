@@ -240,7 +240,7 @@ def build_config_rows(
         ["TASK_LIST_TITLE", task_list_title, "Tasks 목록 이름입니다.", task_list_title],
         ["HOLIDAY_SHEET_NAME", "휴일", "휴일 시트 이름입니다.", "휴일"],
         ["ROSTER_SHEET_NAME", "학생명단", "학생 드롭다운 원본 시트입니다.", "학생명단"],
-        ["STUDENT_DROPDOWN_RANGE", "C2:C200", "학생명단에서 사용할 범위입니다.", "C2:C200"],
+        ["STUDENT_DROPDOWN_RANGE", "J2:J200", "드롭다운 시트의 숨은 학생 목록입니다.", "J2:J200"],
         ["TIMEZONE", "Asia/Seoul", "날짜 표시 시간대입니다.", "Asia/Seoul"],
         [
             "MONTH_SHEET_NAMES",
