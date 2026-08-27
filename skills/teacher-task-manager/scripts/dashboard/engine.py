@@ -8,7 +8,6 @@ import json as _json
 import os
 import platform
 import re
-import shutil
 import socket
 import ssl
 import subprocess
@@ -60,7 +59,7 @@ from brity_bridge import (
     process_win,
     tool_runtime,
 )
-from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, run_home_doctor_checks
+from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, run_doctor_checks
 from brity_bridge.gemini_analyze import check_gemini_key
 from brity_bridge.hotkey import MODIFIER_ORDER, parse_hotkey
 from brity_bridge.settings import ALLOWED_GEMINI_MODELS, load_settings, save_settings
@@ -76,6 +75,7 @@ DEFAULT_ATTACHMENT_FOLDER = r"C:\BrityWorks\BrityMessenger\download"
 class HomeCheckDeps:
     doctor_deps: DoctorDeps = field(default_factory=DoctorDeps)
     document_probe: object = None
+    attendance_ui_probe: object = None
 
 
 def _timetable_check(config_dir: Path) -> CheckResult:
@@ -108,6 +108,23 @@ _READINESS_ROWS = [
     ("screen", "화면 표시 기능"),
 ]
 
+# 출결 준비 상태를 홈 점검 한 건으로 바꾸는 규칙 — 로그인·개인 설정 문제는
+# 설정/내 정보 카드가 이미 소유하므로 출결에서 다시 문제로 세지 않는다.
+_ATTENDANCE_STATE_TO_OK = {
+    "ready": True,
+    "script-check-required": False,
+    "script-update-required": False,
+    "connection-repair-required": False,
+    "not-ready": False,
+    "failed": False,
+    "gws-required": None,
+    "login-required": None,
+    "account-required": None,
+    "auth-error": None,
+    "profile-required": None,
+}
+
+
 def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[CheckResult]:
     if deps is None:
         deps = HomeCheckDeps()
@@ -116,7 +133,7 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
     config_dir = Path(config_dir)
     doctor_deps = deps.doctor_deps or DoctorDeps()
 
-    results = run_home_doctor_checks(config_dir, doctor_deps)
+    results = list(run_doctor_checks(config_dir, doctor_deps))
     results.append(_timetable_check(config_dir))
 
     readiness = computer_readiness(doctor_deps.run_command, deps.document_probe)
@@ -136,6 +153,22 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
         card="settings", target="brity_download_dir",
     ))
 
+    attendance_ui_visible = (
+        bool(deps.attendance_ui_probe())
+        if callable(deps.attendance_ui_probe)
+        else attendance_ui_enabled()
+    )
+    if attendance_ui_visible:
+        attendance = read_attendance_status(config_dir, doctor_deps.run_command)
+        # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
+        # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
+        attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
+        results.append(CheckResult(
+            "connect.attendance", "출결 시트", attendance_ok,
+            attendance.detail or "출결 업무 준비가 끝났어요",
+            "" if attendance_ok is not False else (attendance.detail or "연결의 출결 탭에서 출결 준비 시작하기를 눌러 주세요."),
+            card="connect", tab="attendance", target="attendance-setup",
+        ))
     return results
 
 
@@ -421,11 +454,14 @@ def save_messenger_settings(
     autostart_checker=None,
     autostart_enable=None,
     autostart_disable=None,
+    push_key=None,
 ) -> dict:
-    """설정 화면의 단축키·자동실행·첨부폴더만 저장하고 실패하면 되돌린다."""
+    """메신저 화면의 네 가지 선택을 한 번에 저장하고 실패하면 모두 되돌린다."""
     if not isinstance(updates, dict):
         raise ValueError("메신저 설정 모양이 올바르지 않아요")
-    allowed = {"hotkey", "autostart", "brity_download_dir"}
+    allowed = {
+        "gemini_api_key", "gemini_model", "hotkey", "autostart", "brity_download_dir"
+    }
     unknown = set(updates) - allowed
     if unknown:
         raise ValueError("메신저 설정에 알 수 없는 항목이 있어요")
@@ -434,6 +470,15 @@ def save_messenger_settings(
     previous = load_settings(settings_path)
     candidate = load_settings(settings_path)
 
+    if "gemini_api_key" in updates:
+        if not isinstance(updates["gemini_api_key"], str):
+            raise ValueError("Gemini API 키 모양이 올바르지 않아요")
+        candidate.gemini_api_key = updates["gemini_api_key"].strip()
+    if "gemini_model" in updates:
+        model = updates["gemini_model"]
+        if model not in ALLOWED_GEMINI_MODELS:
+            raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
+        candidate.gemini_model = model
     if "hotkey" in updates:
         if not isinstance(updates["hotkey"], str):
             raise ValueError("단축키 모양이 올바르지 않아요")
@@ -487,11 +532,24 @@ def save_messenger_settings(
 
     restarter = restart or restart_helper
     if restarter():
+        # 저장이 확정된 뒤에만 시트로 보낸다. 되돌릴 저장이 남아 있으면 보내지 않는다.
+        sheet_push = {"state": "skipped", "detail": ""}
+        if "gemini_api_key" in updates:
+            pusher = push_key or push_gemini_key_to_attendance_sheet
+            try:
+                sheet_push = pusher(Path(config_dir))
+                if not isinstance(sheet_push, dict):
+                    sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+                elif sheet_push.get("state") == "failed":
+                    sheet_push = {**sheet_push, "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+            except Exception:  # noqa: BLE001 - 저장 자체는 이미 끝났다
+                sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
         return {
             "saved": True,
             "hotkey": candidate.hotkey,
             "restarted": True,
             "reason": "",
+            "sheet_push": sheet_push,
         }
 
     save_settings(settings_path, previous)
@@ -1198,7 +1256,12 @@ def _checked_updates(updates: dict, allowed: frozenset[str], label: str) -> dict
     return dict(updates)
 
 
-def _save_profile_scope(config_dir: Path, updates: dict, allowed: frozenset[str], label: str) -> dict:
+def _save_profile_scope(
+    config_dir: Path,
+    updates: dict,
+    allowed: frozenset[str],
+    label: str,
+) -> dict:
     checked = _checked_updates(updates, allowed, label)
     write_profile_values(Path(config_dir), checked)
     parsed, detail = run_parser(Path(config_dir), require_links=False)
@@ -1247,31 +1310,21 @@ def save_gemini(config_dir: Path, updates: dict, *, push_key=None) -> dict:
         try:
             sheet_push = pusher(Path(config_dir))
             if not isinstance(sheet_push, dict):
-                sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+                sheet_push = {
+                    "state": "failed",
+                    "detail": ATTENDANCE_SHEET_PUSH_FAILURE,
+                }
             elif sheet_push.get("state") == "failed":
-                sheet_push = {**sheet_push, "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+                sheet_push = {
+                    **sheet_push,
+                    "detail": ATTENDANCE_SHEET_PUSH_FAILURE,
+                }
         except Exception:  # noqa: BLE001 - 로컬 저장은 이미 끝났다
-            sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+            sheet_push = {
+                "state": "failed",
+                "detail": ATTENDANCE_SHEET_PUSH_FAILURE,
+            }
     return {"saved": True, "sheet_push": sheet_push}
-
-
-def prepare_attendance_draft(
-    config_dir: Path, profile_values: dict, grid: list,
-) -> tuple[dict | None, str]:
-    """화면 초안을 임시 폴더에서만 읽어 출결 준비용 값으로 바꾼다."""
-    del config_dir  # 실제 사용자 폴더에는 초안 파일을 쓰지 않는다.
-    with tempfile.TemporaryDirectory(prefix="teacher-manager-attendance-draft-") as tmp:
-        draft_dir = Path(tmp)
-        write_profile_values(draft_dir, dict(profile_values))
-        write_timetable_grid(draft_dir, list(grid))
-        parsed, detail = run_parser(draft_dir, require_links=False)
-        if not parsed:
-            return None, detail
-        profile_path = paths.profile_path(draft_dir)
-        profile = _read_json_dict(profile_path)
-        if not profile:
-            return None, "출결 준비에 필요한 내 정보와 시간표를 확인하지 못했어요."
-        return profile, ""
 
 
 # 데스크톱 Google 로그인 권한은 이 한 목록만 정본으로 쓴다. 시트 안에서 교사가
@@ -2583,6 +2636,15 @@ def ai_skill_install_enabled() -> bool:
     return isinstance(data, dict) and data.get("aiSkillInstallEnabled") is True
 
 
+def attendance_ui_enabled() -> bool:
+    """설치본에 출결 시험 화면이 명시적으로 들어간 경우에만 화면을 연다."""
+    try:
+        data = _json.loads((bundle_paths.bundle_root() / "release.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and data.get("attendanceUiEnabled") is True
+
+
 def ai_tools_status(home=None) -> list:
     home = Path(home) if home else Path.home()
     return [
@@ -3542,13 +3604,7 @@ def attendance_setup_lock(
         yield
 
 
-def ensure_attendance(
-    config_dir: Path,
-    deps: AttendanceDeps | None = None,
-    *,
-    profile_data: dict | None = None,
-    gemini_api_key: str | None = None,
-) -> AttendanceStatus:
+def ensure_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
     """저장 버튼 한 번으로 출결 자료를 처음 한 번만 준비한다. 반복 호출해도 중복 생성하지 않는다."""
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
@@ -3559,112 +3615,40 @@ def ensure_attendance(
     preflight = read_attendance_status(
         config_dir, deps.run_command, gws_executable=gws
     )
-    terminal_states = {
+    if preflight.state in (
         "gws-required", "login-required", "account-required", "auth-error",
         "profile-required", "ready", "script-check-required", "script-update-required",
         "connection-repair-required", "ai-action-required",
-    }
-    if profile_data is not None:
-        terminal_states.discard("profile-required")
-    if preflight.state in terminal_states:
+    ):
         return preflight
     with attendance_setup_lock(config_dir):
-        return _ensure_attendance_once(
-            config_dir,
-            deps,
-            gws,
-            profile_data=profile_data,
-            gemini_api_key=gemini_api_key,
-        )
+        return _ensure_attendance_once(config_dir, deps, gws)
 
 
 def _ensure_attendance_once(
     config_dir: Path,
     deps: AttendanceDeps,
     gws_executable: str | None = None,
-    *,
-    profile_data: dict | None = None,
-    gemini_api_key: str | None = None,
 ) -> AttendanceStatus:
     gws = str(gws_executable or deps.gws_resolver())
     status = read_attendance_status(
         config_dir, deps.run_command, gws_executable=gws
     )
-    terminal_states = {
+    if status.state in (
         "gws-required", "login-required", "account-required", "auth-error",
         "profile-required", "ready", "script-check-required", "script-update-required",
         "connection-repair-required", "ai-action-required",
-    }
-    if profile_data is not None:
-        terminal_states.discard("profile-required")
-    if status.state in terminal_states:
+    ):
         return status
     if paths.attendance_install_record_path(config_dir).exists():
         return status  # 깨진 설치 기록 — 자동으로 새 자료를 만들지 않는다
 
-    draft_profile_path = None
-    if profile_data is None:
-        try:
-            profile_json = parse_settings.parse_config_dir(config_dir, require_links=False)
-        except ValueError:
-            return AttendanceStatus(
-                state="profile-required", current_user=status.current_user, detail=ATTENDANCE_PROFILE_MESSAGE
-            )
-    else:
-        if not isinstance(profile_data, dict):
-            return AttendanceStatus(
-                state="profile-required", current_user=status.current_user, detail=ATTENDANCE_PROFILE_MESSAGE
-            )
-        draft_profile_dir = Path(tempfile.mkdtemp(prefix="teacher-manager-attendance-profile-")).resolve()
-        if draft_profile_dir.is_relative_to(config_dir.resolve()):
-            try:
-                shutil.rmtree(draft_profile_dir)
-            except OSError:
-                pass
-            raise RuntimeError("출결 준비용 임시 폴더를 안전하게 만들지 못했어요")
-        draft_profile_path = draft_profile_dir / "profile.generated.json"
-        _atomic_write_json(draft_profile_path, _attendance_profile_without_secrets(profile_data))
-        profile_json = draft_profile_path
-
     try:
-        return _install_attendance_from_profile(
-            config_dir,
-            deps,
-            gws,
-            status,
-            Path(profile_json),
-            gemini_api_key=gemini_api_key,
+        profile_json = parse_settings.parse_config_dir(config_dir, require_links=False)
+    except ValueError:
+        return AttendanceStatus(
+            state="profile-required", current_user=status.current_user, detail=ATTENDANCE_PROFILE_MESSAGE
         )
-    finally:
-        if draft_profile_path is not None:
-            try:
-                shutil.rmtree(draft_profile_path.parent)
-            except OSError:
-                pass
-
-
-def _attendance_profile_without_secrets(value):
-    """설치 함수에 건네는 프로필 JSON에는 Gemini 키를 섞지 않는다."""
-    if isinstance(value, dict):
-        return {
-            key: _attendance_profile_without_secrets(item)
-            for key, item in value.items()
-            if str(key).casefold() != "gemini_api_key"
-        }
-    if isinstance(value, list):
-        return [_attendance_profile_without_secrets(item) for item in value]
-    return value
-
-
-def _install_attendance_from_profile(
-    config_dir: Path,
-    deps: AttendanceDeps,
-    gws: str,
-    status: AttendanceStatus,
-    profile_json: Path,
-    *,
-    gemini_api_key: str | None = None,
-) -> AttendanceStatus:
 
     setup_status = _read_setup_status(config_dir)
     progress = setup_status.get("progress")
@@ -3689,20 +3673,16 @@ def _install_attendance_from_profile(
 
     # 미제출 할 일은 별도 목록을 만들지 않고 조종례 목록으로 통합한다.
     try:
-        installed_profile = _json.loads(Path(profile_json).read_text(encoding="utf-8"))
+        profile_data = _json.loads(Path(profile_json).read_text(encoding="utf-8"))
     except ValueError:
-        installed_profile = {}
-    homeroom_tasks_id = str((installed_profile.get("calendars") or {}).get("homeroom_tasks_id", "") or "")
+        profile_data = {}
+    homeroom_tasks_id = str((profile_data.get("calendars") or {}).get("homeroom_tasks_id", "") or "")
     try:
         result = deps.attendance_installer(
             profile_json, runner=deps.attendance_runner, resume=progress, progress=record_progress,
             attendance_task_list_id=homeroom_tasks_id,
             attendance_task_list_title="조종례시 담임학급 안내사항",
-            gemini_api_key=(
-                gemini_api_key
-                if gemini_api_key is not None
-                else install_attendance_automation.local_gemini_api_key(config_dir)
-            ),
+            gemini_api_key=install_attendance_automation.local_gemini_api_key(config_dir),
             gws_executable=gws,
         )
     except Exception as error:  # noqa: BLE001 - 설치 실패는 쉬운 문장으로 바꿔 화면에 보여준다
@@ -3752,15 +3732,7 @@ def _install_attendance_from_profile(
         )
     if isinstance(result, install_attendance_automation.AttendanceInstallResult):
         result = replace(result, setup_account=current_user.strip().lower())
-    written_record = deps.write_record(profile_json, result)
-    if profile_json.parent.resolve() != config_dir.resolve():
-        temporary_record = Path(
-            written_record or profile_json.parent / "attendance-install.generated.json"
-        )
-        record_data = _read_json_dict(temporary_record)
-        if not record_data:
-            raise RuntimeError("출결 연결 기록을 안전하게 저장하지 못했어요")
-        _atomic_write_json(paths.attendance_install_record_path(config_dir), record_data)
+    deps.write_record(profile_json, result)
     script_update_required = bool(
         getattr(result, "script_update_required", False)
     )
@@ -3892,3 +3864,20 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     else:
         results.append(StepResult("helper", "도우미 재시작", "failed", "Teacher Manager를 다시 시작해 주세요"))
     return results
+
+
+def save_wizard_inputs(config_dir: Path, profile_values: dict, grid: list, bridge_updates: dict,
+                       deps: ApplyDeps | None = None) -> tuple[bool, str]:
+    """메신저 탭 [다음] 순간의 저장 — apply_all 앞부분과 같고 멱등이다."""
+    deps = deps or ApplyDeps()
+    config_dir = Path(config_dir)
+    gws = str(deps.gws_resolver())
+    require_goedu_gws_session(deps.run_command, gws)
+    write_profile_values(config_dir, profile_values)
+    write_timetable_grid(config_dir, grid)
+    bridge = {key: value for key, value in bridge_updates.items() if key != "autostart"}
+    save_bridge_settings(config_dir, bridge)
+    parse_ok, parse_detail = run_parser(config_dir)
+    if not parse_ok:
+        return False, parse_detail
+    return True, ""

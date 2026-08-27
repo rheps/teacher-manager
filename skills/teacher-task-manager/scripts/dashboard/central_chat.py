@@ -598,16 +598,10 @@ def chat_status(
         )
         response = http_post(config["url"], "/v1/status", {
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
-            "expectedClassSpaceId": str(config.get("class_space_id", "") or ""),
         })
     except CentralChatError as error:
-        original_code = str(getattr(error, "server_code", "") or "")
         return {"connected": False, "registered": False, "account": "",
-                "reason_code": original_code or "SERVER_UNREACHABLE", "sheet_id": "",
-                "server_sheet_id": "", "class_space_id": "",
-                "class_space_matches": None, "server_class_space_id": "",
-                "class_space_name": "",
-                "reason": _safe_central_error_detail(
+                "class_space_name": "", "reason": _safe_central_error_detail(
                     error, CHAT_STATUS_FAILURE_MESSAGE
                 )}
     reason_code = str(response.get("reasonCode", "") or "")
@@ -621,20 +615,6 @@ def chat_status(
         "connected": bool(response.get("connected")),
         "registered": bool(response.get("registered")),
         "account": str(response.get("account", "") or ""),
-        # 비교에는 번역문이 아니라 서버의 원래 코드와 전체 ID를 쓴다. 비밀값은
-        # 어느 반환 필드에도 넣지 않는다.
-        "reason_code": reason_code,
-        "sheet_id": str(config.get("sheet_id", "") or ""),
-        "server_sheet_id": str(response.get("sheetId", "") or ""),
-        "class_space_id": str(config.get("class_space_id", "") or ""),
-        "class_space_matches": (
-            response.get("classSpaceMatches")
-            if type(response.get("classSpaceMatches")) is bool
-            else None
-        ),
-        # 서버는 학급방 전체 ID를 돌려주지 않는다. 옛/알 수 없는 응답에 ID처럼
-        # 보이는 값이 있어도 화면 결과로 전달하지 않는다.
-        "server_class_space_id": "",
         # 서버에 예전 선택이 남아 있어도 현재 출결 시트에 방 ID가 없으면
         # "선택 완료"처럼 보이지 않는다. 실제 발송이 읽는 시트 값을 기준으로 삼는다.
         "class_space_name": (

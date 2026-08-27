@@ -41,6 +41,13 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         ("v2.9", "3b88d94a83fad8ba7cdd" "000f2d7ff70b9acfa035"),
     ),
     (
+        "fa723393bad86d80" "b09742c38888618c"
+        "c35a7b37939a7cbd" "5f3affae1367ec93"
+    ): (
+        ("v3.2", "abd43d90b4db50d59efb" "45869600970dd914f6cd"),
+        ("v3.1", "7df58eba8455811df125" "76a5826708559d50611f"),
+    ),
+    (
         "726c78ba658c88dc" "5045ddb4ea7f87b9"
         "9d01aa6338a314cf" "6cbabf27c037c065"
     ): (
