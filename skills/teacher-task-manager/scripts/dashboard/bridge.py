@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -167,28 +168,100 @@ def _fail(error, operation: str = ""):
 
 
 def _migrate_attendance_roster_layout(
-    *, runner, workdir, gws_executable, deployment_id
+    *, runner, workdir, gws_executable, spreadsheet_id
 ) -> bool:
-    """배포된 Apps Script에서 기존 학생명단 정리 함수만 실행한다."""
+    """Apps Script 실행 API 없이 기존 학생명단의 이메일을 C열로 옮긴다."""
 
     gws = str(gws_executable or "").strip()
-    deployment = str(deployment_id or "").strip()
-    if not (callable(runner) and gws and deployment):
+    spreadsheet = str(spreadsheet_id or "").strip()
+    if not (callable(runner) and gws and spreadsheet):
         return False
     from attendance_script_update import _run_one_json
 
-    reply = _run_one_json(
+    def read_values(a1_range: str) -> list:
+        reply = _run_one_json(
+            runner,
+            [
+                gws,
+                "sheets",
+                "spreadsheets",
+                "values",
+                "get",
+                "--params",
+                json.dumps(
+                    {"spreadsheetId": spreadsheet, "range": a1_range},
+                    ensure_ascii=False,
+                ),
+                "--format",
+                "json",
+            ],
+            Path(workdir),
+        )
+        values = reply.get("values") if isinstance(reply, dict) else None
+        return values if isinstance(values, list) else []
+
+    settings = read_values("설정!A:B")
+    roster_name = "학생명단"
+    for row in settings:
+        if (
+            isinstance(row, list)
+            and len(row) >= 2
+            and str(row[0] or "").strip() == "ROSTER_SHEET_NAME"
+            and str(row[1] or "").strip()
+        ):
+            roster_name = str(row[1]).strip()
+            break
+    quoted_roster = "'" + roster_name.replace("'", "''") + "'"
+    roster_range = f"{quoted_roster}!A:D"
+    before = read_values(roster_range)
+    if not before or not isinstance(before[0], list):
+        return False
+
+    def row4(row) -> list[str]:
+        values = list(row) if isinstance(row, list) else []
+        values.extend([""] * (4 - len(values)))
+        return [str(value or "").strip() for value in values[:4]]
+
+    rows = [row4(row) for row in before]
+    headers = rows[0][:3]
+    current_headers = ["번호", "이름", "학생 Google 이메일"]
+    if headers == current_headers and all(not row[3] for row in rows):
+        return True
+    if headers == ["번호", "이름", "번호+이름"]:
+        migrated = [current_headers + [""]]
+        migrated.extend([[row[0], row[1], row[3], ""] for row in rows[1:]])
+    elif rows[0][0] == "번호+이름":
+        migrated = [current_headers + [""]]
+        for row in rows[1:]:
+            match = re.match(r"^(\d+)\s*(.+)$", row[0])
+            parsed_number = match.group(1) if match else ""
+            parsed_name = match.group(2).strip() if match else row[0]
+            migrated.append(
+                [row[1] or parsed_number, row[2] or parsed_name, row[3], ""]
+            )
+    else:
+        return False
+
+    _run_one_json(
         runner,
         [
             gws,
-            "script",
-            "scripts",
-            "run",
+            "sheets",
+            "spreadsheets",
+            "values",
+            "update",
             "--params",
-            json.dumps({"scriptId": deployment}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet,
+                    "range": f"{quoted_roster}!A1:D{len(migrated)}",
+                    "valueInputOption": "RAW",
+                },
+                ensure_ascii=False,
+            ),
             "--json",
             json.dumps(
-                {"function": "apiMigrateRosterLayoutAfterUpdate"},
+                {"majorDimension": "ROWS", "values": migrated},
                 ensure_ascii=False,
             ),
             "--format",
@@ -196,12 +269,8 @@ def _migrate_attendance_roster_layout(
         ],
         Path(workdir),
     )
-    if not isinstance(reply, dict) or reply.get("done") is not True:
-        return False
-    if reply.get("error"):
-        return False
-    response = reply.get("response")
-    return isinstance(response, dict) and response.get("result") == "ok"
+    after = [row4(row) for row in read_values(roster_range)]
+    return after == migrated
 
 
 def guarded(method):
@@ -941,7 +1010,7 @@ class Api:
                     runner=script_runner,
                     workdir=self._config_dir,
                     gws_executable=gws,
-                    deployment_id=record["deployment_id"],
+                    spreadsheet_id=record["spreadsheet_id"],
                 )
             except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
                 roster_migrated = False
