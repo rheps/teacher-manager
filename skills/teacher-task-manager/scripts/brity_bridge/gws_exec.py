@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -76,6 +77,14 @@ class ExecutionReport:
         return not self.failures
 
 
+class GoogleListError(RuntimeError):
+    """A Google list reply was unreadable, malformed, or incomplete."""
+
+
+class AmbiguousGoogleResult(RuntimeError):
+    """More than one remote item could represent the same operation."""
+
+
 def resolve_gws_command(
     _legacy_command: list | None = None,
     *,
@@ -125,6 +134,49 @@ def _run_json(runner, args: list[str]) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _run_json_strict(runner, args: list[str]) -> dict:
+    reply = runner(args)
+    try:
+        parsed = process_win.parse_first_json(reply)
+    except (TypeError, ValueError) as error:
+        raise GoogleListError("Google 목록 응답을 읽지 못했습니다") from error
+    if not isinstance(parsed, dict):
+        raise GoogleListError("Google 목록 응답 모양이 올바르지 않습니다")
+    return parsed
+
+
+def _complete_items(runner, command: list[str], params: dict) -> list[dict]:
+    """Read every page and reject any reply that cannot prove completeness."""
+
+    items: list[dict] = []
+    seen_tokens: set[str] = set()
+    page_token = ""
+    for _page in range(100):
+        page_params = dict(params)
+        if page_token:
+            page_params["pageToken"] = page_token
+        args = command + [
+            "--params", json.dumps(page_params, ensure_ascii=False),
+            "--format", "json",
+        ]
+        payload = _run_json_strict(runner, args)
+        page_items = payload.get("items")
+        if not isinstance(page_items, list) or payload.get("incompleteSearch") is True:
+            raise GoogleListError("Google 목록 전체를 확인하지 못했습니다")
+        for item in page_items:
+            if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                raise GoogleListError("Google 목록 항목을 확인하지 못했습니다")
+            items.append(item)
+        next_token = payload.get("nextPageToken")
+        if next_token in (None, ""):
+            return items
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise GoogleListError("Google 목록 다음 쪽을 확인하지 못했습니다")
+        seen_tokens.add(next_token)
+        page_token = next_token
+    raise GoogleListError("Google 목록 쪽 수가 안전 한도를 넘었습니다")
+
+
 def _safe_google_failure(error: BaseException) -> str:
     """Map external diagnostics to a fixed message that is safe for the UI."""
 
@@ -150,9 +202,31 @@ def _safe_google_failure(error: BaseException) -> str:
     return GENERAL_FAILURE_DETAIL
 
 
-def _preparation_failures(actions: list, detail: str) -> ExecutionReport:
+def _is_google_user_action(detail: str) -> bool:
+    return detail in {
+        LOGIN_FAILURE_DETAIL,
+        LOGIN_STORAGE_FAILURE_DETAIL,
+        PERMISSION_FAILURE_DETAIL,
+        GOEDU_ACCOUNT_REQUIRED_MESSAGE,
+        "처음 준비하던 Google 계정으로 다시 로그인해 주세요.",
+    }
+
+
+def _known_write_not_sent(error: BaseException, detail: str) -> bool:
+    """Retry a write only when its runner proves that execution never started."""
+
+    del detail
+    return getattr(error, "write_not_sent", False) is True
+
+
+def _preparation_failures(
+    actions: list, detail: str, *, retry_allowed: bool = True
+) -> ExecutionReport:
     return ExecutionReport(
-        results=[ActionResult(action, "failed", "", detail) for action in actions]
+        results=[
+            ActionResult(action, "failed", "", detail, retry_allowed=retry_allowed)
+            for action in actions
+        ]
     )
 
 
@@ -167,15 +241,30 @@ def _probe_calendar_duplicate(runner, gws_command, action) -> str:
     params = {
         "calendarId": action.google_id,
         "privateExtendedProperty": f"{DUPLICATE_KEY_PROPERTY}={action.action_key}",
-        "maxResults": 1,
+        "maxResults": 2500,
     }
-    args = gws_command + [
-        "calendar", "events", "list",
-        "--params", json.dumps(params, ensure_ascii=False),
-        "--format", "json",
-    ]
-    items = _run_json(runner, args).get("items") or []
-    return items[0].get("id", "") if items else ""
+    items = _complete_items(
+        runner, gws_command + ["calendar", "events", "list"], params
+    )
+    if len(items) > 1:
+        raise AmbiguousGoogleResult("같은 등록 표식의 일정이 둘 이상입니다")
+    return str(items[0].get("id") or "") if items else ""
+
+
+def _probe_calendar_three_cycles(runner, gws_command, action) -> tuple[bool, str, str]:
+    last_detail = GENERAL_FAILURE_DETAIL
+    for _attempt in range(3):
+        try:
+            return True, _probe_calendar_duplicate(runner, gws_command, action), ""
+        except AmbiguousGoogleResult:
+            return False, "", "같은 등록 표식의 일정이 둘 이상이라 자동 등록을 멈췄습니다."
+        except Exception as error:  # noqa: BLE001 - 외부 원문은 사용자 화면에 내보내지 않는다
+            detail = _safe_google_failure(error)
+            if _is_google_user_action(detail):
+                return False, "", detail
+            if last_detail == GENERAL_FAILURE_DETAIL or detail != GENERAL_FAILURE_DETAIL:
+                last_detail = detail
+    return False, "", last_detail
 
 
 def _get_calendar_event(runner, gws_command, action, event_id: str) -> dict:
@@ -206,17 +295,24 @@ def _calendar_response_preserves_local_links(action, event: dict) -> bool:
 
 
 def _probe_task_duplicate(runner, gws_command, action) -> str:
-    params = {"tasklist": action.google_id, "showCompleted": True, "maxResults": 100}
-    args = gws_command + [
-        "tasks", "tasks", "list",
-        "--params", json.dumps(params, ensure_ascii=False),
-        "--format", "json",
-    ]
+    items = _list_task_items(runner, gws_command, action)
     mark = f"{TASK_NOTE_MARK}{action.action_key}"
-    for item in _run_json(runner, args).get("items") or []:
+    for item in items:
         if mark in (item.get("notes") or ""):
             return item.get("id", "")
     return ""
+
+
+def _list_task_items(runner, gws_command, action) -> list[dict]:
+    params = {
+        "tasklist": action.google_id,
+        "showCompleted": True,
+        "showHidden": True,
+        "maxResults": 100,
+    }
+    return _complete_items(
+        runner, gws_command + ["tasks", "tasks", "list"], params
+    )
 
 
 def _insert_calendar(runner, gws_command, action) -> dict:
@@ -233,6 +329,202 @@ def _insert_calendar(runner, gws_command, action) -> dict:
     return _run_json(runner, args)
 
 
+def _calendar_intent_hash(action) -> str:
+    body = dict(action.payload)
+    body["extendedProperties"] = {
+        "private": {DUPLICATE_KEY_PROPERTY: action.action_key}
+    }
+    canonical = json.dumps(
+        {"calendarId": action.google_id, "body": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _calendar_remote_result(
+    runner,
+    gws_command,
+    action,
+    history: HistoryStore,
+    source_hash: str,
+    event_id: str,
+    *,
+    created_here: bool,
+    event: dict | None = None,
+) -> ActionResult:
+    if source_hash:
+        try:
+            history.record_action(source_hash, action.action_key, action.kind, event_id)
+            history.save()
+        except Exception:  # noqa: BLE001 - 이미 생긴 원격 결과를 다시 만들지 않는다
+            return ActionResult(
+                action,
+                "failed",
+                event_id,
+                RESULT_RECORD_FAILURE_DETAIL,
+                retry_allowed=False,
+            )
+    if _requires_local_link_verification(action):
+        if event is None:
+            try:
+                event = _get_calendar_event(runner, gws_command, action, event_id)
+            except Exception:  # noqa: BLE001 - 원격 원문은 화면에 내보내지 않는다
+                return ActionResult(
+                    action,
+                    "failed",
+                    event_id,
+                    "기존 일정의 첨부 연결을 확인하지 못했습니다.",
+                    retry_allowed=False if created_here else True,
+                )
+        if not _calendar_response_preserves_local_links(action, event):
+            detail = (
+                "일정은 만들었지만 첨부 연결이 확인되지 않았습니다."
+                if created_here
+                else "일정은 있지만 첨부 연결이 확인되지 않았습니다."
+            )
+            return ActionResult(action, "failed", event_id, detail)
+    if created_here:
+        return ActionResult(action, "created", event_id)
+    return ActionResult(action, "duplicate", event_id, "Google에 같은 항목이 있음")
+
+
+def _execute_calendar_action(
+    runner,
+    gws_command,
+    action,
+    history: HistoryStore,
+    source_hash: str,
+) -> ActionResult:
+    """Use at most one insert and spend later cycles on private-key read-back."""
+
+    expected_hash = _calendar_intent_hash(action)
+    intent = history.write_intent(source_hash, action.action_key) if source_hash else None
+    insert_sent = False
+    if intent is not None:
+        if (
+            intent.get("kind") != "calendar"
+            or intent.get("intent_hash") != expected_hash
+            or intent.get("state") not in {"write_started", "confirmed"}
+        ):
+            return ActionResult(
+                action,
+                "failed",
+                "",
+                "저장된 일정 등록 상태가 현재 내용과 달라 자동 등록을 멈췄습니다.",
+                retry_allowed=False,
+            )
+        if intent.get("state") == "confirmed" and intent.get("google_id"):
+            return ActionResult(
+                action,
+                "duplicate",
+                str(intent.get("google_id")),
+                "이미 등록된 항목",
+            )
+        insert_sent = True
+    last_detail = GENERAL_FAILURE_DETAIL
+    for _attempt in range(3):
+        try:
+            existing = _probe_calendar_duplicate(runner, gws_command, action)
+        except AmbiguousGoogleResult:
+            return ActionResult(
+                action,
+                "failed",
+                "",
+                "같은 등록 표식의 일정이 둘 이상이라 자동 등록을 멈췄습니다.",
+                retry_allowed=False,
+            )
+        except Exception as error:  # noqa: BLE001 - 외부 원문은 화면에 내보내지 않는다
+            detail = _safe_google_failure(error)
+            if _is_google_user_action(detail):
+                return ActionResult(action, "failed", "", detail, retry_allowed=False)
+            if last_detail == GENERAL_FAILURE_DETAIL or detail != GENERAL_FAILURE_DETAIL:
+                last_detail = detail
+            continue
+        if existing:
+            return _calendar_remote_result(
+                runner,
+                gws_command,
+                action,
+                history,
+                source_hash,
+                existing,
+                created_here=insert_sent,
+            )
+        if insert_sent:
+            continue
+        if source_hash:
+            try:
+                history.record_write_intent(
+                    source_hash,
+                    action.action_key,
+                    "calendar",
+                    (),
+                    expected_hash,
+                )
+                history.save()
+            except Exception:  # noqa: BLE001 - 저장 전에는 Google에 쓰지 않는다
+                history.clear_write_intent(source_hash, action.action_key)
+                last_detail = "일정 등록 준비를 안전하게 저장하지 못했습니다."
+                continue
+        insert_sent = True
+        try:
+            created_event = _insert_calendar(runner, gws_command, action)
+        except Exception as error:  # noqa: BLE001 - 응답 손실 뒤에는 조회만 한다
+            detail = _safe_google_failure(error)
+            if _is_google_user_action(detail):
+                if source_hash:
+                    history.clear_write_intent(source_hash, action.action_key)
+                    try:
+                        history.save()
+                    except Exception:
+                        pass
+                return ActionResult(action, "failed", "", detail, retry_allowed=False)
+            if _known_write_not_sent(error, detail):
+                if source_hash:
+                    history.clear_write_intent(source_hash, action.action_key)
+                    try:
+                        history.save()
+                    except Exception:
+                        pass
+                    if history.write_intent(source_hash, action.action_key) is not None:
+                        return ActionResult(
+                            action,
+                            "failed",
+                            "",
+                            RESULT_RECORD_FAILURE_DETAIL,
+                            retry_allowed=False,
+                        )
+                insert_sent = False
+                last_detail = detail
+                continue
+            if last_detail == GENERAL_FAILURE_DETAIL or detail != GENERAL_FAILURE_DETAIL:
+                last_detail = detail
+            continue
+        created_id = str(created_event.get("id") or "")
+        if not created_id:
+            last_detail = RESULT_RECORD_FAILURE_DETAIL
+            continue
+        return _calendar_remote_result(
+            runner,
+            gws_command,
+            action,
+            history,
+            source_hash,
+            created_id,
+            created_here=True,
+            event=created_event,
+        )
+    return ActionResult(
+        action,
+        "failed",
+        "",
+        RESULT_RECORD_FAILURE_DETAIL if insert_sent else last_detail,
+        retry_allowed=False,
+    )
+
+
 def _insert_task(runner, gws_command, action) -> str:
     body = dict(action.payload)
     body.pop("due", None)
@@ -244,6 +536,214 @@ def _insert_task(runner, gws_command, action) -> str:
         "--json", json.dumps(body, ensure_ascii=False),
     ]
     return _run_json(runner, args).get("id", "")
+
+
+def _task_intent_hash(action) -> str:
+    body = dict(action.payload)
+    body.pop("due", None)
+    body["notes"] = str(body.get("notes") or "").rstrip()
+    canonical = json.dumps(
+        {"tasklist": action.google_id, "body": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _task_matches_intent(item: dict, action) -> bool:
+    expected_title = str(action.payload.get("title") or "")
+    expected_notes = str(action.payload.get("notes") or "").rstrip()
+    status = str(item.get("status") or "needsAction")
+    return (
+        str(item.get("title") or "") == expected_title
+        and str(item.get("notes") or "").rstrip() == expected_notes
+        and status == "needsAction"
+        and not item.get("due")
+        and item.get("deleted") is not True
+    )
+
+
+def _execute_task_action(
+    runner,
+    gws_command,
+    action,
+    history: HistoryStore,
+    source_hash: str,
+) -> ActionResult:
+    """Persist a full ID snapshot, then use at most one task insert."""
+
+    expected_hash = _task_intent_hash(action)
+    intent = history.write_intent(source_hash, action.action_key) if source_hash else None
+    write_sent = False
+    pre_ids: set[str] = set()
+    if intent is not None:
+        if (
+            intent.get("kind") != "task"
+            or intent.get("intent_hash") != expected_hash
+            or intent.get("state") not in {"write_started", "confirmed"}
+        ):
+            return ActionResult(
+                action,
+                "failed",
+                "",
+                "저장된 할 일 등록 상태가 현재 내용과 달라 자동 등록을 멈췄습니다.",
+                retry_allowed=False,
+            )
+        if intent.get("state") == "confirmed" and intent.get("google_id"):
+            return ActionResult(
+                action,
+                "duplicate",
+                str(intent.get("google_id")),
+                "이미 등록된 항목",
+            )
+        raw_pre_ids = intent.get("pre_ids")
+        if not isinstance(raw_pre_ids, list) or any(not isinstance(item, str) for item in raw_pre_ids):
+            return ActionResult(
+                action,
+                "failed",
+                "",
+                "저장된 할 일 목록 상태를 확인하지 못했습니다.",
+                retry_allowed=False,
+            )
+        pre_ids = set(raw_pre_ids)
+        write_sent = True
+
+    last_detail = GENERAL_FAILURE_DETAIL
+    ambiguous = False
+    for _attempt in range(3):
+        try:
+            items = _list_task_items(runner, gws_command, action)
+        except Exception as error:  # noqa: BLE001 - 외부 원문은 화면에 내보내지 않는다
+            detail = _safe_google_failure(error)
+            if _is_google_user_action(detail):
+                return ActionResult(action, "failed", "", detail, retry_allowed=False)
+            if last_detail == GENERAL_FAILURE_DETAIL or detail != GENERAL_FAILURE_DETAIL:
+                last_detail = detail
+            continue
+
+        mark = f"{TASK_NOTE_MARK}{action.action_key}"
+        marked = [item for item in items if mark in str(item.get("notes") or "")]
+        if len(marked) == 1 and not write_sent:
+            return ActionResult(
+                action,
+                "duplicate",
+                str(marked[0].get("id") or ""),
+                "Google에 같은 항목이 있음",
+            )
+        if len(marked) > 1:
+            return ActionResult(
+                action,
+                "failed",
+                "",
+                "예전 등록 표식이 붙은 할 일이 둘 이상이라 자동 등록을 멈췄습니다.",
+                retry_allowed=False,
+            )
+
+        if write_sent:
+            candidates = [
+                item
+                for item in items
+                if str(item.get("id") or "") not in pre_ids
+                and _task_matches_intent(item, action)
+            ]
+            if len(candidates) == 1:
+                created_id = str(candidates[0].get("id") or "")
+                if source_hash:
+                    try:
+                        history.record_action(
+                            source_hash, action.action_key, action.kind, created_id
+                        )
+                        history.save()
+                    except Exception:  # noqa: BLE001 - 확인된 원격 결과는 다시 만들지 않는다
+                        return ActionResult(
+                            action,
+                            "failed",
+                            created_id,
+                            RESULT_RECORD_FAILURE_DETAIL,
+                            retry_allowed=False,
+                        )
+                return ActionResult(action, "created", created_id)
+            if len(candidates) > 1:
+                ambiguous = True
+            continue
+
+        pre_ids = {str(item.get("id") or "") for item in items}
+        if source_hash:
+            try:
+                history.record_write_intent(
+                    source_hash,
+                    action.action_key,
+                    "task",
+                    pre_ids,
+                    expected_hash,
+                )
+                history.save()
+            except Exception:  # noqa: BLE001 - 저장 전에는 Google에 쓰지 않는다
+                history.clear_write_intent(source_hash, action.action_key)
+                last_detail = "할 일 등록 준비를 안전하게 저장하지 못했습니다."
+                continue
+        write_sent = True
+        try:
+            created_id = _insert_task(runner, gws_command, action)
+        except Exception as error:  # noqa: BLE001 - 응답 손실 뒤에는 조회만 한다
+            detail = _safe_google_failure(error)
+            if _is_google_user_action(detail):
+                if source_hash:
+                    history.clear_write_intent(source_hash, action.action_key)
+                    try:
+                        history.save()
+                    except Exception:
+                        pass
+                return ActionResult(action, "failed", "", detail, retry_allowed=False)
+            if _known_write_not_sent(error, detail):
+                if source_hash:
+                    history.clear_write_intent(source_hash, action.action_key)
+                    try:
+                        history.save()
+                    except Exception:
+                        pass
+                    if history.write_intent(source_hash, action.action_key) is not None:
+                        return ActionResult(
+                            action,
+                            "failed",
+                            "",
+                            RESULT_RECORD_FAILURE_DETAIL,
+                            retry_allowed=False,
+                        )
+                write_sent = False
+                pre_ids = set()
+                last_detail = detail
+                continue
+            if last_detail == GENERAL_FAILURE_DETAIL or detail != GENERAL_FAILURE_DETAIL:
+                last_detail = detail
+            continue
+        created_id = str(created_id or "")
+        if not created_id:
+            last_detail = RESULT_RECORD_FAILURE_DETAIL
+            continue
+        if source_hash:
+            try:
+                history.record_action(
+                    source_hash, action.action_key, action.kind, created_id
+                )
+                history.save()
+            except Exception:  # noqa: BLE001 - 이미 생긴 항목을 다시 만들지 않는다
+                return ActionResult(
+                    action,
+                    "failed",
+                    created_id,
+                    RESULT_RECORD_FAILURE_DETAIL,
+                    retry_allowed=False,
+                )
+        return ActionResult(action, "created", created_id)
+
+    detail = (
+        "새로 생긴 할 일이 둘 이상이라 어느 항목인지 자동으로 확정하지 못했습니다."
+        if ambiguous
+        else (RESULT_RECORD_FAILURE_DETAIL if write_sent else last_detail)
+    )
+    return ActionResult(action, "failed", "", detail, retry_allowed=False)
 
 
 def _normalize_message_line(text) -> str:
@@ -360,7 +860,9 @@ def execute_actions(
             runtime_run_command=runtime_run_command,
         )
     except gws_env.GwsAccountStorageError:
-        return _preparation_failures(actions, LOGIN_STORAGE_FAILURE_DETAIL)
+        return _preparation_failures(
+            actions, LOGIN_STORAGE_FAILURE_DETAIL, retry_allowed=False
+        )
     except Exception:  # noqa: BLE001 - 실행 도구·경로 원문은 화면에 내보내지 않는다
         return _preparation_failures(actions, TOOL_PREPARATION_FAILURE_DETAIL)
     runner = runner or _default_runner
@@ -428,51 +930,31 @@ def execute_actions(
                 if owner and current_account.casefold() != owner.casefold():
                     account_error = "처음 준비하던 Google 계정으로 다시 로그인해 주세요."
         if account_error:
-            results.append(ActionResult(action, "failed", "", account_error))
+            results.append(
+                ActionResult(
+                    action,
+                    "failed",
+                    "",
+                    account_error,
+                    retry_allowed=False,
+                )
+            )
             continue
         try:
             if action.kind == "calendar":
-                existing = _probe_calendar_duplicate(runner, gws_command, action)
-                if existing:
-                    if source_hash:
-                        try:
-                            history.record_action(source_hash, action.action_key, action.kind, existing)
-                            history.save()
-                        except Exception:
-                            pass  # 원격 중복 조회가 다음 실행에서도 안전하게 다시 막는다
-                    if _requires_local_link_verification(action):
-                        try:
-                            event = _get_calendar_event(runner, gws_command, action, existing)
-                        except Exception:  # noqa: BLE001 - 원격 원문은 사용자 화면에 내보내지 않는다
-                            results.append(
-                                ActionResult(
-                                    action,
-                                    "failed",
-                                    existing,
-                                    "기존 일정의 첨부 연결을 확인하지 못했습니다.",
-                                )
-                            )
-                            continue
-                        if not _calendar_response_preserves_local_links(action, event):
-                            results.append(
-                                ActionResult(
-                                    action,
-                                    "failed",
-                                    existing,
-                                    "일정은 있지만 첨부 연결이 확인되지 않았습니다.",
-                                )
-                            )
-                            continue
-                    results.append(ActionResult(action, "duplicate", existing, "Google에 같은 항목이 있음"))
-                    continue
-                created_event = _insert_calendar(runner, gws_command, action)
-                created_id = str(created_event.get("id", ""))
+                results.append(
+                    _execute_calendar_action(
+                        runner, gws_command, action, history, source_hash
+                    )
+                )
+                continue
             elif action.kind == "task":
-                existing = _probe_task_duplicate(runner, gws_command, action)
-                if existing:
-                    results.append(ActionResult(action, "duplicate", existing, "Google에 같은 항목이 있음"))
-                    continue
-                created_id = _insert_task(runner, gws_command, action)
+                results.append(
+                    _execute_task_action(
+                        runner, gws_command, action, history, source_hash
+                    )
+                )
+                continue
             else:  # notice — 시트 쪽 dedup(단체톡)과 history가 중복을 막는다
                 # 화면을 연 뒤 Google 쪽 Apps Script가 바뀔 수도 있다. 실제 학생
                 # 안내 줄을 쓰기 직전에 한 번만 다시 읽고, 모호하면 아무것도 쓰지

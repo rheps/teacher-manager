@@ -250,6 +250,7 @@ class ScreenCapture:
     reason: str
     body: str
     attachments: list[str]
+    attempt_count: int = 1
 
 
 def _default_ps_runner(script: str, timeout: float) -> tuple[int, str]:
@@ -269,22 +270,39 @@ def capture_brity_text(runner=None, timeout: float = 20.0) -> ScreenCapture:
     last_failure = ScreenCapture(False, "화면 요소를 받지 못했습니다", "", [])
 
     for _attempt in range(_CAPTURE_ATTEMPTS):
+        attempt_count = _attempt + 1
         try:
             code, output = runner(script, timeout)
         except (OSError, subprocess.TimeoutExpired) as error:
-            return ScreenCapture(False, f"화면 읽기 실행 실패: {error}", "", [])
+            last_failure = ScreenCapture(
+                False, f"화면 읽기 실행 실패: {error}", "", [], attempt_count
+            )
+            continue
         if code == 3:
-            return ScreenCapture(False, "로그인된 Brity 창을 찾지 못했습니다", "", [])
+            return ScreenCapture(
+                False, "로그인된 Brity 창을 찾지 못했습니다", "", [], attempt_count
+            )
         if code != 0:
-            return ScreenCapture(False, f"화면 읽기 도구가 실패했습니다(코드 {code})", "", [])
+            last_failure = ScreenCapture(
+                False,
+                f"화면 읽기 도구가 실패했습니다(코드 {code})",
+                "",
+                [],
+                attempt_count,
+            )
+            continue
         start, end = output.find("["), output.rfind("]")
         if start == -1 or end <= start:
-            last_failure = ScreenCapture(False, "화면 요소를 받지 못했습니다", "", [])
+            last_failure = ScreenCapture(
+                False, "화면 요소를 받지 못했습니다", "", [], attempt_count
+            )
             continue
         elements = parse_elements(output[start : end + 1])
         body, names = assemble_message(elements)
         if len(body) < _MIN_BODY_CHARS:
-            last_failure = ScreenCapture(False, "읽은 내용이 너무 짧습니다", "", [])
+            last_failure = ScreenCapture(
+                False, "읽은 내용이 너무 짧습니다", "", [], attempt_count
+            )
             continue
         if _has_attachment_evidence(elements):
             expected_count = _attachment_expected_count(elements)
@@ -292,17 +310,18 @@ def capture_brity_text(runner=None, timeout: float = 20.0) -> ScreenCapture:
             if expected_count is not None:
                 names_complete = len(names) == expected_count
             if names_complete:
-                return ScreenCapture(True, "", body, names)
+                return ScreenCapture(True, "", body, names, attempt_count)
             attachment_failure = ScreenCapture(
-                False, "첨부파일 이름을 읽지 못했습니다", body, []
+                False, "첨부파일 이름을 읽지 못했습니다", body, [], attempt_count
             )
             continue
-        candidate = ScreenCapture(True, "", body, [])
+        candidate = ScreenCapture(True, "", body, [], attempt_count)
         if no_attachment is None or len(candidate.body) > len(no_attachment.body):
             no_attachment = candidate
 
     # 한 번이라도 첨부 흔적을 봤다면, 다른 읽기에서 잠깐 사라졌어도 본문만 등록하지 않는다.
     if attachment_failure is not None:
+        attachment_failure.attempt_count = attempt_count
         return attachment_failure
     if no_attachment is not None:
         return no_attachment
@@ -346,6 +365,8 @@ def build_screen_record(
         attachment_names=bundle.names,
         media_parts=bundle.media_parts,
         local_attachment_names=bundle.local_names,
+        screen_attempt_count=capture.attempt_count,
+        attachment_attempt_count=bundle.attempt_count,
     )
     note = ""
     if bundle.skipped_names:

@@ -61,6 +61,39 @@ class HistoryStore:
     def record_action(self, source_hash: str, action_key: str, kind: str, google_id: str) -> None:
         entry = self._ensure_entry(source_hash)
         entry["actions"][action_key] = {"kind": kind, "google_id": google_id}
+        intents = entry.get("write_intents")
+        if isinstance(intents, dict) and isinstance(intents.get(action_key), dict):
+            intents[action_key]["state"] = "confirmed"
+            intents[action_key]["google_id"] = google_id
+
+    def write_intent(self, source_hash: str, action_key: str) -> dict | None:
+        entry = self.entry(source_hash)
+        intents = entry.get("write_intents") if isinstance(entry, dict) else None
+        intent = intents.get(action_key) if isinstance(intents, dict) else None
+        return dict(intent) if isinstance(intent, dict) else None
+
+    def record_write_intent(
+        self,
+        source_hash: str,
+        action_key: str,
+        kind: str,
+        pre_ids,
+        intent_hash: str,
+    ) -> None:
+        entry = self._ensure_entry(source_hash)
+        intents = entry.setdefault("write_intents", {})
+        intents[action_key] = {
+            "kind": str(kind),
+            "pre_ids": sorted({str(item) for item in pre_ids if str(item)}),
+            "intent_hash": str(intent_hash),
+            "state": "write_started",
+        }
+
+    def clear_write_intent(self, source_hash: str, action_key: str) -> None:
+        entry = self.entry(source_hash)
+        intents = entry.get("write_intents") if isinstance(entry, dict) else None
+        if isinstance(intents, dict):
+            intents.pop(action_key, None)
 
     def mark_completed(self, source_hash: str) -> None:
         self._ensure_entry(source_hash)["completed"] = True

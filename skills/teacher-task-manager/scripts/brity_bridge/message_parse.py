@@ -35,6 +35,8 @@ class MessageRecord:
     attachment_names: tuple[str, ...] = ()
     media_parts: tuple[MediaPart, ...] = ()
     local_attachment_names: tuple[str, ...] = ()
+    screen_attempt_count: int = 0
+    attachment_attempt_count: int = 0
 
 
 def compute_source_hash(sender: str, sent_at: str, plain_text: str) -> str:

@@ -7,10 +7,13 @@ import subprocess
 import sys
 import webbrowser
 from ctypes import wintypes
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+
+from brity_bridge import recovery
 
 
 NO_EXTERNAL_BROWSER = "NO_EXTERNAL_BROWSER"
+_SUPPORT_EMAIL = "contact@big-silver.xyz"
 _NO_BROWSER_MESSAGE = (
     "이 컴퓨터에서 웹 브라우저를 열지 못했어요. "
     "기본 브라우저 또는 Microsoft Edge를 준비한 뒤 다시 눌러 주세요."
@@ -204,4 +207,37 @@ def open_external_url(
         opened = _try_windows_edge(safe_url, edge_exe=edge_exe, edge=edge, edge_state=edge_state)
         if opened is not None:
             return opened
+    raise ExternalUrlOpenError()
+
+
+def _support_mail_subject(report: str) -> str:
+    """Build a subject from the fixed safe report labels, never screen text."""
+
+    version = "알 수 없음"
+    diagnostic_id = "알 수 없음"
+    for line in str(report or "").splitlines():
+        if line.startswith("Teacher Manager 판 번호: "):
+            candidate = line.removeprefix("Teacher Manager 판 번호: ")
+            if recovery._safe_app_version(candidate) != "알 수 없음":
+                version = candidate
+        elif line.startswith("오류 식별번호: "):
+            candidate = line.removeprefix("오류 식별번호: ")
+            if recovery._safe_diagnostic_id(candidate) != "알 수 없음":
+                diagnostic_id = candidate
+    return f"Teacher Manager {version} 오류 {diagnostic_id}"
+
+
+def open_fixed_support_email(report, *, opener=None) -> dict:
+    """Open only the product's fixed support mailbox with a safe report body."""
+
+    body = str(report or "")
+    uri = f"mailto:{_SUPPORT_EMAIL}?" + urlencode({
+        "subject": _support_mail_subject(body),
+        "body": body,
+    })
+    try:
+        if bool((opener or webbrowser.open)(uri)):
+            return {"opened": True, "method": "support-email"}
+    except Exception:  # noqa: BLE001 - mail program details never leave this boundary.
+        pass
     raise ExternalUrlOpenError()

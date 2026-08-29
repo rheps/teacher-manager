@@ -600,6 +600,7 @@ class TrayApp:
                         )
                     except attach_read.AttachmentBlocked as error:
                         result_message = error.message or "첨부파일을 읽지 못했어요."
+                        queued.capture.attachment_attempt_count = error.attempt_count
                         pipeline.record_preflight_failure(
                             self.config_dir,
                             result_message,

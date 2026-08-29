@@ -34,6 +34,7 @@ _PENDING_SHEET_INTENT = "pending_spreadsheet_intent"
 _PENDING_FOLDER_INTENT = "pending_folder_intent"
 _PENDING_TASK_TITLE = "pending_task_list_title"
 _PENDING_SCRIPT_TITLE = "pending_script_project_title"
+_PENDING_SCRIPT_UPLOAD_SHA256 = "pending_script_upload_sha256"
 _PENDING_SCRIPT_VERSION_DESCRIPTION = "pending_script_version_description"
 # Apps Script 제목은 시트 승인 창(동의 화면)에 앱 이름으로 그대로 뜬다.
 # Google 검수(2026-08-11)에 맞춰 마법사·Chat 연결 동의 화면과 같은 이름으로 시작한다.
@@ -1949,28 +1950,79 @@ def install_attendance_automation(
                         gws_executable=gws_executable,
                     )
                 else:
-                    run_json(
-                        runner,
-                        [
-                            gws_executable,
-                            "script",
-                            "+push",
-                            *dry,
-                            "--script",
-                            created_ids["script_id"],
-                            "--dir",
-                            ".\\script-src",
-                            "--format",
-                            "json",
-                        ],
-                        workdir,
+                    pending_upload_sha256 = str(
+                        created_ids.get(_PENDING_SCRIPT_UPLOAD_SHA256, "") or ""
                     )
+                    if pending_upload_sha256:
+                        if pending_upload_sha256 != expected_bundle_sha256:
+                            raise CreationRecoveryPendingError(
+                                "앞서 올리던 Apps Script와 현재 정식 코드가 달라 멈췄어요."
+                            )
+                        head_reply = run_json(
+                            runner,
+                            [
+                                gws_executable,
+                                "script",
+                                "projects",
+                                "getContent",
+                                *dry,
+                                "--params",
+                                json.dumps(
+                                    {"scriptId": created_ids["script_id"]},
+                                    ensure_ascii=False,
+                                ),
+                                "--format",
+                                "json",
+                            ],
+                            workdir,
+                        )
+                        head_files = (
+                            head_reply.get("files")
+                            if isinstance(head_reply, dict)
+                            else None
+                        )
+                        try:
+                            head_sha256 = attendance_script_update.canonical_bundle_sha256(
+                                head_files or []
+                            )
+                        except Exception as error:
+                            raise CreationRecoveryPendingError(
+                                "앞서 올린 Apps Script 내용을 확인하지 못했어요. 다시 올리지 않았습니다."
+                            ) from error
+                        if head_sha256 != expected_bundle_sha256:
+                            raise CreationRecoveryPendingError(
+                                "앞서 올린 Apps Script가 현재 정식 코드인지 확인되지 않아 다시 올리지 않았어요."
+                            )
+                    else:
+                        # 업로드 답이 사라져도 다음 실행이 같은 쓰기를 되풀이하지
+                        # 않도록, 보낼 정확한 지문을 먼저 안전하게 남긴다.
+                        created_ids[_PENDING_SCRIPT_UPLOAD_SHA256] = (
+                            expected_bundle_sha256
+                        )
+                        report_progress()
+                        run_json(
+                            runner,
+                            [
+                                gws_executable,
+                                "script",
+                                "+push",
+                                *dry,
+                                "--script",
+                                created_ids["script_id"],
+                                "--dir",
+                                ".\\script-src",
+                                "--format",
+                                "json",
+                            ],
+                            workdir,
+                        )
                     pending_version_description = (
                         _VERSION_DESCRIPTION_PREFIX + secrets.token_hex(16)
                     )
                     created_ids[_PENDING_SCRIPT_VERSION_DESCRIPTION] = (
                         pending_version_description
                     )
+                    created_ids.pop(_PENDING_SCRIPT_UPLOAD_SHA256, None)
                     report_progress()
                     version = run_json(
                         runner,

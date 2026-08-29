@@ -18,6 +18,9 @@ TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 SHORT_LINK_ID_LENGTH = 16
 _SHORT_ID_RE = re.compile(rf"^[0-9a-f]{{{SHORT_LINK_ID_LENGTH}}}$")
 _FULL_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_STAGE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_ATTEMPT_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_UNSET = object()
 
 
 def messages_dir(state_dir: Path) -> Path:
@@ -133,3 +136,77 @@ def add_run(state_dir: Path, source_hash: str, run: dict) -> None:
     runs = document.get("runs")
     document["runs"] = ([*runs] if isinstance(runs, list) else []) + [run]
     _write(path, document)
+
+
+def recovery_state(state_dir: Path, source_hash: str) -> dict:
+    """Return a copy of the durable stage checkpoint for one saved message."""
+
+    document = load(Path(state_dir), source_hash)
+    recovery = document.get("recovery") if isinstance(document, dict) else None
+    if not isinstance(recovery, dict):
+        return {}
+    try:
+        return json.loads(json.dumps(recovery, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return {}
+
+
+def save_recovery_stage(
+    state_dir: Path,
+    source_hash: str,
+    stage: str,
+    *,
+    attempt_counts=_UNSET,
+    analysis_input_text=_UNSET,
+    summary_chunks=_UNSET,
+    proposal=_UNSET,
+    checked_actions=_UNSET,
+    google_results=_UNSET,
+) -> bool:
+    """Atomically extend the existing message file with a resumable checkpoint.
+
+    The message archive already contains the personal message.  Keeping the
+    checkpoint in that same file avoids creating a second personal-data store.
+    A missing, broken, or unwritable archive is never replaced.
+    """
+
+    source_hash = _text(source_hash)
+    stage = _text(stage)
+    if not source_hash or not _STAGE_RE.fullmatch(stage):
+        return False
+    path = message_path(Path(state_dir), source_hash)
+    document = _read(path)
+    if document is None:
+        return False
+    previous = document.get("recovery")
+    recovery = dict(previous) if isinstance(previous, dict) else {}
+    recovery["stage"] = stage
+
+    if attempt_counts is not _UNSET:
+        if not isinstance(attempt_counts, dict):
+            return False
+        clean_counts = {}
+        for key, value in attempt_counts.items():
+            key = _text(key)
+            if not _ATTEMPT_KEY_RE.fullmatch(key) or not isinstance(value, int) or not 0 <= value <= 3:
+                return False
+            clean_counts[key] = value
+        recovery["attempt_counts"] = clean_counts
+    for key, value in (
+        ("analysis_input_text", analysis_input_text),
+        ("summary_chunks", summary_chunks),
+        ("proposal", proposal),
+        ("checked_actions", checked_actions),
+        ("google_results", google_results),
+    ):
+        if value is not _UNSET:
+            recovery[key] = value
+
+    document["recovery"] = recovery
+    try:
+        atomic_io.atomic_write_text(
+            path, json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+    return True

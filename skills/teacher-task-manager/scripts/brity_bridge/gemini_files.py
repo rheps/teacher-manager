@@ -14,6 +14,15 @@ FILES_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 UPLOAD_ROOT = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 
 
+class UploadUncertainError(OSError):
+    """The upload body may have arrived, but its exact file reply was lost."""
+
+    def __init__(self, message: str, verify=None, cleanup=None):
+        super().__init__(message)
+        self.verify = verify
+        self.cleanup = cleanup
+
+
 @dataclass(frozen=True)
 class PreparedMedia:
     parts: tuple[dict, ...]
@@ -82,12 +91,15 @@ def _default_uploader(part: MediaPart, api_key: str) -> tuple[dict, object]:
             "X-Goog-Upload-Command": "upload, finalize",
         },
     )
-    payload, _headers = _request_json(upload)
-    file_info = _wait_until_active(payload.get("file") or payload, api_key)
+    try:
+        payload, _headers = _request_json(upload)
+    except (OSError, ValueError, TypeError) as error:
+        # finalize 요청 본문을 보낸 뒤의 오류다. 같은 내용을 다시 올리면 원격
+        # 임시 파일이 둘이 될 수 있으므로 호출자가 확인 전 재업로드하지 못하게 한다.
+        raise UploadUncertainError("Gemini 임시 업로드 결과를 확인하지 못했습니다") from error
+    file_info = payload.get("file") or payload
     name = str(file_info.get("name") or "")
-    uri = str(file_info.get("uri") or "")
-    mime_type = str(file_info.get("mimeType") or file_info.get("mime_type") or part.mime_type)
-    if not name or not uri:
+    if not name:
         raise OSError("Gemini 임시 파일 정보를 받지 못했습니다")
 
     def cleanup() -> None:
@@ -95,9 +107,39 @@ def _default_uploader(part: MediaPart, api_key: str) -> tuple[dict, object]:
         with urllib.request.urlopen(request, timeout=30.0):
             pass
 
-    return {
-        "file_data": {"mime_type": mime_type, "file_uri": uri}
-    }, cleanup
+    def prepared_from(info: dict) -> PreparedMedia:
+        verified_name = str(info.get("name") or "")
+        uri = str(info.get("uri") or "")
+        mime_type = str(
+            info.get("mimeType") or info.get("mime_type") or part.mime_type
+        )
+        if verified_name != name or not uri:
+            raise OSError("Gemini 임시 파일 정보를 확인하지 못했습니다")
+        return PreparedMedia(
+            (
+                {
+                    "file_data": {
+                        "mime_type": mime_type,
+                        "file_uri": uri,
+                    }
+                },
+            ),
+            (cleanup,),
+        )
+
+    try:
+        active_info = _wait_until_active(file_info, api_key)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        def verify() -> PreparedMedia:
+            return prepared_from(_wait_until_active(file_info, api_key))
+
+        raise UploadUncertainError(
+            "Gemini 임시 파일 상태를 확인하지 못했습니다",
+            verify=verify,
+            cleanup=cleanup,
+        ) from error
+    prepared = prepared_from(active_info)
+    return prepared.parts[0], cleanup
 
 
 def prepare_media_parts(
@@ -108,18 +150,65 @@ def prepare_media_parts(
     upload = uploader or _default_uploader
     parts: list[dict] = []
     cleanups: list[object] = []
-    for media in media_parts:
-        if len(media.data) <= INLINE_LIMIT:
-            parts.append(
-                {
-                    "inline_data": {
-                        "mime_type": media.mime_type,
-                        "data": base64.b64encode(media.data).decode("ascii"),
+    next_index = 0
+    pending_error: UploadUncertainError | None = None
+
+    def continue_preparation():
+        nonlocal next_index, pending_error
+        if pending_error is not None:
+            verify = pending_error.verify
+            if not callable(verify):
+                return None
+            verified = verify()
+            if not isinstance(verified, PreparedMedia):
+                return verified
+            parts.extend(verified.parts)
+            cleanups.extend(verified._cleanups)
+            pending_error = None
+            next_index += 1
+
+        while next_index < len(media_parts):
+            media = media_parts[next_index]
+            if len(media.data) <= INLINE_LIMIT:
+                parts.append(
+                    {
+                        "inline_data": {
+                            "mime_type": media.mime_type,
+                            "data": base64.b64encode(media.data).decode("ascii"),
+                        }
                     }
-                }
-            )
-            continue
-        request_part, cleanup = upload(media, api_key)
-        parts.append(request_part)
-        cleanups.append(cleanup)
-    return PreparedMedia(tuple(parts), tuple(cleanups))
+                )
+                next_index += 1
+                continue
+            try:
+                request_part, cleanup = upload(media, api_key)
+            except UploadUncertainError as error:
+                pending_error = error
+                raise
+            parts.append(request_part)
+            cleanups.append(cleanup)
+            next_index += 1
+        return PreparedMedia(tuple(parts), tuple(cleanups))
+
+    def cleanup_all() -> None:
+        current_cleanup = (
+            (pending_error.cleanup,)
+            if pending_error is not None and callable(pending_error.cleanup)
+            else ()
+        )
+        PreparedMedia((), tuple(cleanups) + current_cleanup).cleanup()
+
+    try:
+        return continue_preparation()
+    except UploadUncertainError as error:
+        def verify_all():
+            return continue_preparation()
+
+        raise UploadUncertainError(
+            str(error),
+            verify=verify_all if callable(error.verify) else None,
+            cleanup=cleanup_all,
+        ) from error
+    except Exception:
+        cleanup_all()
+        raise

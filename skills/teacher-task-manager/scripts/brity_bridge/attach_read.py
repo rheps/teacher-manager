@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
@@ -20,6 +21,7 @@ from brity_bridge.message_parse import MediaPart
 UNSUPPORTED_MESSAGE = "아직 읽을 수 없는 첨부파일 형식이에요."
 BROKEN_MESSAGE = "첨부파일을 읽을 수 없어요. 파일의 암호나 상태를 확인해 주세요."
 TOO_LARGE_MESSAGE = "첨부파일이 너무 커서 읽을 수 없어요."
+TEMPORARY_READ_MESSAGE = "첨부파일 저장이 끝나기를 기다렸지만 읽지 못했어요."
 IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 SUPPORTED_SUFFIXES = {
     ".hwp", ".hwpx", ".pdf", ".doc", ".docx", ".xls", ".xlsx",
@@ -61,6 +63,7 @@ class AttachmentBundle:
     local_names: tuple[str, ...]
     media_parts: tuple[MediaPart, ...] = ()
     skipped_names: tuple[str, ...] = ()
+    attempt_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,11 +76,18 @@ class AttachmentReadResult:
 
 
 class AttachmentBlocked(Exception):
-    def __init__(self, reason: str, names: tuple[str, ...], message: str):
+    def __init__(
+        self,
+        reason: str,
+        names: tuple[str, ...],
+        message: str,
+        attempt_count: int = 1,
+    ):
         super().__init__(message)
         self.reason = reason
         self.names = names
         self.message = message
+        self.attempt_count = min(3, max(1, int(attempt_count or 1)))
 
 
 def _name_parts(value: str) -> _AttachmentNameParts:
@@ -268,7 +278,11 @@ def read_attachment(path: Path) -> AttachmentReadResult:
                 reason="office-required" if legacy.message == office_read.OFFICE_REQUIRED_MESSAGE else "unreadable",
                 message=legacy.message,
             )
-    except (OSError, zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, ImportError, RuntimeError):
+    except OSError:
+        return AttachmentReadResult(
+            False, reason="temporary-read", message=TEMPORARY_READ_MESSAGE
+        )
+    except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, ImportError, RuntimeError):
         # RuntimeError: zipfile이 암호 걸린 항목을 읽을 때 — .hwp의 암호 안내와 같은 문구로.
         return AttachmentReadResult(False, reason="unreadable", message=BROKEN_MESSAGE)
     return AttachmentReadResult(False, reason="unsupported", message=UNSUPPORTED_MESSAGE)
@@ -309,20 +323,49 @@ def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBun
     fingerprints: list[str] = []
     media_parts: list[MediaPart] = []
     skipped_names: list[str] = []
+    bundle_attempt_count = 0
     for path in paths:
         path = Path(path)
-        result = read_attachment(path)
+        result = AttachmentReadResult(
+            False, reason="temporary-read", message=TEMPORARY_READ_MESSAGE
+        )
+        fingerprint = ""
+        attempt_count = 0
+        for delay in (0.0, 0.1, 0.3):
+            if delay:
+                time.sleep(delay)
+            attempt_count += 1
+            result = read_attachment(path)
+            if result.ok:
+                try:
+                    fingerprint = _fingerprint(path)
+                except OSError:
+                    result = AttachmentReadResult(
+                        False,
+                        reason="temporary-read",
+                        message=TEMPORARY_READ_MESSAGE,
+                    )
+                    continue
+                break
+            if result.reason != "temporary-read":
+                break
+        bundle_attempt_count = max(bundle_attempt_count, attempt_count)
         if not result.ok:
             if result.reason == "unsupported":
                 skipped_names.append(path.name)
                 continue
-            raise AttachmentBlocked(result.reason, (path.name,), result.message)
+            raise AttachmentBlocked(
+                result.reason,
+                (path.name,),
+                result.message,
+                attempt_count=attempt_count,
+            )
         content = result.text.strip() if result.text else "(파일 화면을 함께 읽음)"
         sections.append(f"[첨부파일: {path.name}]\n{content}")
         if result.media is not None:
             media_parts.append(result.media)
         actual_names.append(path.name)
-        fingerprints.append(_fingerprint(path))
+        fingerprints.append(fingerprint)
     return AttachmentBundle(
         block="\n\n".join(sections),
         count=len(actual_names),
@@ -331,6 +374,7 @@ def prepare_resolved_attachment_bundle(paths: tuple[Path, ...]) -> AttachmentBun
         local_names=local_names,
         media_parts=tuple(media_parts),
         skipped_names=tuple(skipped_names),
+        attempt_count=bundle_attempt_count,
     )
 
 

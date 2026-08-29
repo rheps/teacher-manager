@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -76,10 +78,11 @@ RESPONSE_SCHEMA = {
 
 
 class AnalysisError(Exception):
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", *, attempt_count: int = 1):
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
         self.detail = detail
+        self.attempt_count = attempt_count
 
 
 def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, rules_text: str) -> str:
@@ -331,29 +334,56 @@ def _summarize_long_text(
     url: str,
     headers: dict,
     transport,
+    *,
+    cached_summaries=None,
+    on_summary_chunks=None,
 ) -> str:
     chunks = _text_chunks(text)
     summaries: list[str] = []
+    saved_rows = list(cached_summaries or ())
+    current_rows: list[dict] = []
     for position, chunk in enumerate(chunks, start=1):
-        body = json.dumps(
-            _summary_request_body(chunk, position, len(chunks)), ensure_ascii=False
-        ).encode("utf-8")
-        try:
-            status, reply_body = transport(url, headers, body, TIMEOUT_SECONDS)
-        except OSError as error:
-            raise AnalysisError("network", str(error)) from error
-        reason = _classify_status(status)
-        if reason:
-            raise AnalysisError(reason, f"http {status}")
-        try:
-            payload = json.loads(reply_body)
-            summary_payload = json.loads(_reply_text(payload))
-            summary = str(summary_payload.get("summary") or "").strip()
-        except (AttributeError, TypeError, ValueError) as error:
-            raise AnalysisError("shape", "긴 첨부 정리 결과가 올바르지 않음") from error
-        if not summary:
-            raise AnalysisError("shape", "긴 첨부 정리 결과가 비어 있음")
+        chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        cached = saved_rows[position - 1] if position <= len(saved_rows) else None
+        if (
+            isinstance(cached, dict)
+            and cached.get("position") == position
+            and cached.get("total") == len(chunks)
+            and cached.get("source_chunk_hash") == chunk_hash
+            and isinstance(cached.get("summary"), str)
+            and cached.get("summary", "").strip()
+        ):
+            summary = cached["summary"].strip()
+        else:
+            body = json.dumps(
+                _summary_request_body(chunk, position, len(chunks)), ensure_ascii=False
+            ).encode("utf-8")
+            try:
+                status, reply_body = transport(url, headers, body, TIMEOUT_SECONDS)
+            except OSError as error:
+                raise AnalysisError("network", str(error)) from error
+            reason = _classify_status(status)
+            if reason:
+                raise AnalysisError(reason, f"http {status}")
+            try:
+                payload = json.loads(reply_body)
+                summary_payload = json.loads(_reply_text(payload))
+                summary = str(summary_payload.get("summary") or "").strip()
+            except (AttributeError, TypeError, ValueError) as error:
+                raise AnalysisError("shape", "긴 첨부 정리 결과가 올바르지 않음") from error
+            if not summary:
+                raise AnalysisError("shape", "긴 첨부 정리 결과가 비어 있음")
         summaries.append(summary)
+        current_rows.append(
+            {
+                "position": position,
+                "total": len(chunks),
+                "source_chunk_hash": chunk_hash,
+                "summary": summary,
+            }
+        )
+        if on_summary_chunks is not None:
+            on_summary_chunks(tuple(current_rows))
     return "\n".join(f"- {summary}" for summary in summaries)
 
 
@@ -366,6 +396,9 @@ def run_gemini_analysis(
     now: datetime | None = None,
     media_uploader=None,
     on_analysis_text=None,
+    prepared_media=None,
+    summary_chunks=None,
+    on_summary_chunks=None,
 ) -> dict:
     api_key = (bridge_settings.gemini_api_key or "").strip()
     if not api_key:
@@ -378,7 +411,14 @@ def run_gemini_analysis(
     analysis_record = record
     if len(record.plain_text) > LONG_TEXT_TRIGGER:
         body_prefix = record.plain_text.split("\n\n[첨부파일:", 1)[0].strip()
-        summaries = _summarize_long_text(record.plain_text, url, headers, transport)
+        summaries = _summarize_long_text(
+            record.plain_text,
+            url,
+            headers,
+            transport,
+            cached_summaries=summary_chunks,
+            on_summary_chunks=on_summary_chunks,
+        )
         analysis_record = replace(
             record,
             plain_text=(
@@ -391,12 +431,13 @@ def run_gemini_analysis(
         # 긴 메시지는 요약해서 보내므로 실제로 보낸 글을 기록해 둬야 나중에 다시 만들 수 있다
         on_analysis_text(analysis_record.plain_text)
     prompt = build_analysis_prompt(analysis_record, profile, now, rules_text)
+    owns_prepared_media = prepared_media is None
     try:
-        prepared = gemini_files.prepare_media_parts(
-            analysis_record.media_parts,
-            api_key,
-            uploader=media_uploader,
+        prepared = prepared_media or gemini_files.prepare_media_parts(
+            analysis_record.media_parts, api_key, uploader=media_uploader
         )
+    except gemini_files.UploadUncertainError as error:
+        raise AnalysisError("upload-uncertain", str(error)) from error
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         # 프록시가 끼운 비-JSON 200 응답(JSONDecodeError)·모양이 다른 payload도 network로.
         raise AnalysisError("network", str(error)) from error
@@ -429,7 +470,123 @@ def run_gemini_analysis(
             raise AnalysisError("shape", "; ".join(problems))
         return ensure_calendar_attachment_names(proposal, record.attachment_names)
     finally:
-        prepared.cleanup()
+        if owns_prepared_media:
+            prepared.cleanup()
+
+
+def run_gemini_analysis_with_recovery(
+    record: MessageRecord,
+    profile: dict,
+    bridge_settings,
+    skill_root: Path,
+    transport=None,
+    now: datetime | None = None,
+    media_uploader=None,
+    on_analysis_text=None,
+    *,
+    sleeper=time.sleep,
+    on_attempt=None,
+    summary_chunks=None,
+    on_summary_chunks=None,
+) -> dict:
+    """Analyze over three safe cycles, but never repeat a user-action failure."""
+
+    api_key = (bridge_settings.gemini_api_key or "").strip()
+    if not api_key:
+        raise AnalysisError("key-missing", "settings.json의 gemini_api_key가 비어 있음")
+    has_large_media = any(
+        len(part.data) > gemini_files.INLINE_LIMIT for part in record.media_parts
+    )
+    prepared = None
+    if has_large_media:
+        preparation_delays = (0.0, 2.0, 5.0)
+        for attempt_count, delay in enumerate(preparation_delays, start=1):
+            if delay:
+                sleeper(delay)
+            try:
+                prepared = gemini_files.prepare_media_parts(
+                    record.media_parts, api_key, uploader=media_uploader
+                )
+            except gemini_files.UploadUncertainError as error:
+                if on_attempt is not None:
+                    on_attempt(attempt_count, "upload-uncertain")
+                for verify_attempt in range(attempt_count + 1, 4):
+                    verify_delay = preparation_delays[verify_attempt - 1]
+                    if verify_delay:
+                        sleeper(verify_delay)
+                    if callable(error.verify):
+                        try:
+                            verified = error.verify()
+                        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                            verified = None
+                        if isinstance(verified, gemini_files.PreparedMedia):
+                            prepared = verified
+                            break
+                    if on_attempt is not None:
+                        on_attempt(verify_attempt, "upload-uncertain")
+                if prepared is None:
+                    cleanup = getattr(error, "cleanup", None)
+                    if callable(cleanup):
+                        gemini_files.PreparedMedia((), (cleanup,)).cleanup()
+                    raise AnalysisError(
+                        "upload-uncertain", str(error), attempt_count=3
+                    ) from error
+                break
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                if on_attempt is not None:
+                    on_attempt(attempt_count, "network")
+                if attempt_count == 3:
+                    raise AnalysisError(
+                        "network", str(error), attempt_count=3
+                    ) from error
+                continue
+            else:
+                break
+
+    last_error: AnalysisError | None = None
+    saved_summary_chunks = [dict(row) for row in (summary_chunks or ()) if isinstance(row, dict)]
+
+    def remember_summary_chunks(rows) -> None:
+        saved_summary_chunks[:] = [dict(row) for row in rows]
+        if on_summary_chunks is not None:
+            on_summary_chunks(tuple(saved_summary_chunks))
+
+    try:
+        for attempt_count, delay in enumerate((0.0, 2.0, 5.0), start=1):
+            if delay:
+                sleeper(delay)
+            try:
+                result = run_gemini_analysis(
+                    record,
+                    profile,
+                    bridge_settings,
+                    skill_root,
+                    transport=transport,
+                    now=now,
+                    media_uploader=media_uploader,
+                    on_analysis_text=on_analysis_text,
+                    prepared_media=prepared,
+                    summary_chunks=saved_summary_chunks,
+                    on_summary_chunks=remember_summary_chunks,
+                )
+            except AnalysisError as error:
+                error.attempt_count = attempt_count
+                if on_attempt is not None:
+                    on_attempt(attempt_count, error.reason)
+                if error.reason in {"key-missing", "key-invalid", "upload-uncertain"}:
+                    raise
+                last_error = error
+                continue
+            if on_attempt is not None:
+                on_attempt(attempt_count, "ok")
+            return result
+        if last_error is None:
+            raise AnalysisError("shape", "분석 결과를 확인하지 못함", attempt_count=3)
+        last_error.attempt_count = 3
+        raise last_error
+    finally:
+        if prepared is not None:
+            prepared.cleanup()
 
 
 def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str]:

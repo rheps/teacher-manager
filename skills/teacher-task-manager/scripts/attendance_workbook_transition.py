@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -28,6 +29,10 @@ class TransitionDeps:
     gws_executable: str
     runner: Callable | None = None
     account: str = ""
+    chat_read_config: Callable | None = None
+    chat_status: Callable | None = None
+    chat_prepare_candidate: Callable | None = None
+    chat_move: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ _INSTALL_PROGRESS_KEYS = frozenset(
         install_attendance_automation._PENDING_FOLDER_INTENT,
         install_attendance_automation._PENDING_TASK_TITLE,
         install_attendance_automation._PENDING_SCRIPT_TITLE,
+        install_attendance_automation._PENDING_SCRIPT_UPLOAD_SHA256,
         install_attendance_automation._PENDING_SCRIPT_VERSION_DESCRIPTION,
         install_attendance_automation._PENDING_DEPLOYMENT_DESCRIPTION,
         install_attendance_automation._PENDING_DEPLOYMENT_VERSION,
@@ -81,12 +87,27 @@ _GOOGLE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,200}$")
 
 
 def make_transition_deps(*, runner, gws_executable: str, account: str) -> TransitionDeps:
+    from dashboard import central_chat
+
+    def run(args):
+        return runner(args, None)
+
     return TransitionDeps(
         installer=install_attendance_automation.install_attendance_automation,
         write_record=install_attendance_automation.write_install_record,
         gws_executable=gws_executable,
         runner=runner,
         account=account,
+        chat_read_config=lambda spreadsheet_id: central_chat.read_config_for_spreadsheet(
+            spreadsheet_id, run, gws_executable=gws_executable
+        ),
+        chat_status=central_chat.status_for_config,
+        chat_prepare_candidate=lambda candidate_id, original, inherited: (
+            central_chat.prepare_handover_candidate(
+                candidate_id, original, inherited, run, gws_executable
+            )
+        ),
+        chat_move=central_chat.move_chat_connection,
     )
 
 
@@ -220,6 +241,11 @@ def _valid_install_progress(value: object, previous_id: str) -> bool:
     pending_version = value.get(
         install_attendance_automation._PENDING_SCRIPT_VERSION_DESCRIPTION
     )
+    pending_upload = value.get(
+        install_attendance_automation._PENDING_SCRIPT_UPLOAD_SHA256
+    )
+    if pending_upload is not None and re.fullmatch(r"[0-9a-f]{64}", pending_upload) is None:
+        return False
     if pending_version is not None and re.fullmatch(
         r"teacher-manager-attendance-version-[0-9a-f]{32}", pending_version
     ) is None:
@@ -257,14 +283,15 @@ def _valid_new_school_year_state(value: Mapping[str, Any]) -> bool:
         "school_year",
         "progress",
     }
-    if state == "candidate-verified":
+    if state in {"candidate-verified", "complete"}:
         required |= {"spreadsheet_id", "spreadsheet_url"}
     elif state != "building":
         return False
     previous_id = value.get("previous_spreadsheet_id")
     progress = value.get("progress")
     if not (
-        set(value) == required
+        set(value).issubset(required | {"chat_handover"})
+        and required.issubset(set(value))
         and isinstance(previous_id, str)
         and _GOOGLE_ID_PATTERN.fullmatch(previous_id) is not None
         and isinstance(value.get("school_year"), str)
@@ -274,14 +301,268 @@ def _valid_new_school_year_state(value: Mapping[str, Any]) -> bool:
         return False
     if state == "candidate-verified":
         candidate_id = value.get("spreadsheet_id")
-        return bool(
+        candidate_ok = bool(
             isinstance(candidate_id, str)
             and _GOOGLE_ID_PATTERN.fullmatch(candidate_id) is not None
             and candidate_id != previous_id
             and value.get("spreadsheet_url")
             == f"https://docs.google.com/spreadsheets/d/{candidate_id}/edit"
         )
+        return candidate_ok and _valid_chat_handover(value.get("chat_handover"))
+    if state == "complete":
+        candidate_id = value.get("spreadsheet_id")
+        return bool(
+            isinstance(candidate_id, str)
+            and _GOOGLE_ID_PATTERN.fullmatch(candidate_id) is not None
+            and candidate_id != previous_id
+            and value.get("spreadsheet_url")
+            == f"https://docs.google.com/spreadsheets/d/{candidate_id}/edit"
+            and _valid_chat_handover(value.get("chat_handover"))
+        )
     return True
+
+
+def _valid_chat_handover(value: object) -> bool:
+    if value is None:
+        return True
+    required = {
+        "state", "move_attempts", "source_settings_sha256",
+        "target_settings_sha256", "source_route_sha256", "target_route_sha256",
+    }
+    optional = {"candidate_original_settings_sha256"}
+    if not isinstance(value, Mapping) or not (
+        required.issubset(set(value)) and set(value).issubset(required | optional)
+    ):
+        return False
+    if value.get("state") not in {
+        "not-needed", "prepared", "move-requested", "moved-verified", "complete"
+    }:
+        return False
+    attempts = value.get("move_attempts")
+    if not isinstance(attempts, int) or not 0 <= attempts <= 3:
+        return False
+    fingerprint_keys = (
+        "source_settings_sha256", "target_settings_sha256",
+        "source_route_sha256", "target_route_sha256",
+    )
+    if "candidate_original_settings_sha256" in value:
+        fingerprint_keys += ("candidate_original_settings_sha256",)
+    return all(
+        isinstance(value.get(key), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value[key]) is not None
+        for key in fingerprint_keys
+    )
+
+
+def _sha256_value(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _chat_config_shape(config: Mapping[str, Any], spreadsheet_id: str) -> bool:
+    sheet_id = str(config.get("sheet_id", "") or "")
+    return bool(
+        str(config.get("spreadsheet_id", "") or "") == spreadsheet_id
+        and str(config.get("url", "") or "").startswith("https://")
+        and sheet_id.startswith(spreadsheet_id + ":")
+        and len(sheet_id.split(":", 1)[1]) >= 3
+        and str(config.get("sheet_secret", "") or "")
+    )
+
+
+def _inherited_chat_config(
+    source: Mapping[str, Any], candidate: Mapping[str, Any], candidate_id: str
+) -> dict:
+    suffix = str(source["sheet_id"]).split(":", 1)[1]
+    return {
+        **dict(candidate),
+        "url": str(source["url"]),
+        "sheet_id": f"{candidate_id}:{suffix}",
+        "sheet_secret": str(source["sheet_secret"]),
+        "class_space_id": str(source.get("class_space_id", "") or ""),
+        "class_space_name": str(source.get("class_space_name", "") or ""),
+    }
+
+
+def _chat_ledger(
+    state: str, attempts: int, source: Mapping, target: Mapping,
+    candidate_original: Mapping | None = None,
+) -> dict:
+    ledger = {
+        "state": state,
+        "move_attempts": attempts,
+        "source_settings_sha256": _sha256_value({
+            key: source.get(key, "")
+            for key in ("url", "sheet_id", "sheet_secret", "class_space_id", "class_space_name")
+        }),
+        "target_settings_sha256": _sha256_value({
+            key: target.get(key, "")
+            for key in ("url", "sheet_id", "sheet_secret", "class_space_id", "class_space_name")
+        }),
+        "source_route_sha256": _sha256_value(source.get("sheet_id", "")),
+        "target_route_sha256": _sha256_value(target.get("sheet_id", "")),
+    }
+    if candidate_original is not None:
+        ledger["candidate_original_settings_sha256"] = _chat_settings_sha256(
+            candidate_original
+        )
+    return ledger
+
+
+def _chat_settings_sha256(config: Mapping) -> str:
+    return _sha256_value({
+        key: config.get(key, "")
+        for key in ("url", "sheet_id", "sheet_secret", "class_space_id", "class_space_name")
+    })
+
+
+def _chat_move_verified(source_status: Mapping, target_status: Mapping,
+                        source: Mapping, target: Mapping) -> bool:
+    return bool(
+        str(source_status.get("movedTo", "") or "") == target["sheet_id"]
+        and str(target_status.get("movedFrom", "") or "") == source["sheet_id"]
+        and str(target_status.get("account", "") or "").lower()
+        == str(source_status.get("account", "") or "").lower()
+        and str(target_status.get("account", "") or "").lower().endswith("@goedu.kr")
+        and str(source_status.get("classSpaceResource", "") or "")
+        == str(source.get("class_space_id", "") or "")
+        and str(target_status.get("classSpaceResource", "") or "")
+        == str(source.get("class_space_id", "") or "")
+    )
+
+
+def _handover_chat_for_candidate(
+    *, deps: TransitionDeps, source_id: str, candidate_id: str,
+    transition_state: dict, state_path: Path,
+) -> None:
+    if not all((deps.chat_read_config, deps.chat_status,
+                deps.chat_prepare_candidate, deps.chat_move)):
+        return
+    source = deps.chat_read_config(source_id)
+    if not _chat_config_shape(source, source_id):
+        raise TransitionUserError("기존 Chat 연결 설정을 안전하게 확인하지 못했어요.")
+    existing = dict(transition_state.get("chat_handover") or {})
+    candidate = deps.chat_read_config(candidate_id)
+    if not _chat_config_shape(candidate, candidate_id):
+        raise TransitionUserError("새 출석부의 Chat 연결 설정을 안전하게 확인하지 못했어요.")
+    target = _inherited_chat_config(source, candidate, candidate_id)
+
+    resume_candidate_prepare = False
+    if existing.get("state") in {"prepared", "move-requested", "moved-verified"}:
+        if (
+            existing.get("source_settings_sha256") != _chat_settings_sha256(source)
+            or existing.get("target_settings_sha256") != _chat_settings_sha256(target)
+        ):
+            raise TransitionUserError("저장된 Chat 이동 준비와 현재 설정이 달라 멈췄어요.")
+        candidate_sha256 = _chat_settings_sha256(candidate)
+        if candidate_sha256 != _chat_settings_sha256(target):
+            if (
+                existing.get("state") == "prepared"
+                and existing.get("candidate_original_settings_sha256")
+                == candidate_sha256
+            ):
+                resume_candidate_prepare = True
+            else:
+                raise TransitionUserError("저장된 Chat 이동 준비와 현재 설정이 달라 멈췄어요.")
+
+    source_status = deps.chat_status(source)
+    if existing.get("state") == "moved-verified":
+        target_after = deps.chat_status(target)
+        if not _chat_move_verified(source_status, target_after, source, target):
+            raise TransitionUserError("옮긴 Chat 연결을 다시 확인하지 못했어요.")
+        return
+    if existing.get("state") == "move-requested":
+        target_after = deps.chat_status(target)
+        if _chat_move_verified(source_status, target_after, source, target):
+            transition_state["chat_handover"] = _chat_ledger(
+                "moved-verified", int(existing.get("move_attempts", 0) or 0),
+                source, target,
+            )
+            _atomic_json(state_path, transition_state)
+            return
+    connected = bool(source_status.get("connected"))
+    source_account = str(source_status.get("account", "") or "").lower()
+    if not connected or not source_account.endswith("@goedu.kr"):
+        if existing.get("state") in {"prepared", "move-requested"}:
+            raise TransitionUserError("Chat 연결 이동 상태가 서로 달라 자동으로 바꾸지 않았어요.")
+        transition_state["chat_handover"] = _chat_ledger(
+            "not-needed", int(existing.get("move_attempts", 0) or 0), source, target
+        )
+        _atomic_json(state_path, transition_state)
+        return
+
+    if resume_candidate_prepare:
+        original_status = deps.chat_status(candidate)
+        target_status = deps.chat_status(target)
+        if any(
+            status.get(key)
+            for status in (original_status, target_status)
+            for key in ("registered", "connected", "movedFrom", "movedTo")
+        ):
+            raise TransitionUserError("새 출석부의 Chat 연결 대상이 이미 사용 중이에요.")
+        candidate = deps.chat_prepare_candidate(candidate_id, candidate, target)
+        if _chat_settings_sha256(candidate) != _chat_settings_sha256(target):
+            raise TransitionUserError("새 출석부의 Chat 설정 저장을 다시 확인하지 못했어요.")
+
+    if existing.get("state") not in {"prepared", "move-requested"}:
+        if str(candidate.get("class_space_id", "") or "") or str(
+            candidate.get("class_space_name", "") or ""
+        ):
+            raise TransitionUserError("새 출석부에 다른 Chat 방 선택이 있어 바꾸지 않았어요.")
+        original_status = deps.chat_status(candidate)
+        target_status = deps.chat_status(target)
+        if any(
+            status.get(key)
+            for status in (original_status, target_status)
+            for key in ("registered", "connected", "movedFrom", "movedTo")
+        ):
+            raise TransitionUserError("새 출석부의 Chat 연결 대상이 이미 사용 중이에요.")
+        transition_state["chat_handover"] = _chat_ledger(
+            "prepared", 0, source, target, candidate_original=candidate
+        )
+        _atomic_json(state_path, transition_state)
+        candidate = deps.chat_prepare_candidate(candidate_id, candidate, target)
+        if any(str(candidate.get(key, "") or "") != str(target.get(key, "") or "")
+               for key in ("url", "sheet_id", "sheet_secret", "class_space_id", "class_space_name")):
+            raise TransitionUserError("새 출석부의 Chat 설정 저장을 다시 확인하지 못했어요.")
+
+    attempts = int(existing.get("move_attempts", 0) or 0)
+    source_before = deps.chat_status(source)
+    target_before = deps.chat_status(target)
+    if _chat_move_verified(source_before, target_before, source, target):
+        transition_state["chat_handover"] = _chat_ledger(
+            "moved-verified", attempts, source, target
+        )
+        _atomic_json(state_path, transition_state)
+        return
+    if attempts >= 3:
+        raise TransitionUserError("Chat 연결을 세 번 확인했지만 옮기지 못했어요.")
+    if not (
+        source_before.get("connected")
+        and str(source_before.get("account", "") or "").lower() == source_account
+        and str(source_before.get("classSpaceResource", "") or "")
+        == str(source.get("class_space_id", "") or "")
+        and not target_before.get("registered")
+        and not target_before.get("movedFrom")
+        and not target_before.get("movedTo")
+    ):
+        raise TransitionUserError("Chat 연결 양쪽 상태가 달라 자동으로 옮기지 않았어요.")
+    attempts += 1
+    transition_state["chat_handover"] = _chat_ledger(
+        "move-requested", attempts, source, target
+    )
+    _atomic_json(state_path, transition_state)
+    deps.chat_move(source, target["sheet_id"])
+    source_after = deps.chat_status(source)
+    target_after = deps.chat_status(target)
+    if not _chat_move_verified(source_after, target_after, source, target):
+        raise TransitionUserError("Chat 연결을 옮긴 결과를 확인하지 못했어요.")
+    transition_state["chat_handover"] = _chat_ledger(
+        "moved-verified", attempts, source, target
+    )
+    _atomic_json(state_path, transition_state)
 
 
 def _candidate_ok(result, profile: dict, current_id: str) -> bool:
@@ -420,6 +701,8 @@ def start_new_school_year_workbook(
             "school_year": school_year,
             "progress": dict(progress),
         }
+        if isinstance(saved_state.get("chat_handover"), dict):
+            transition_state["chat_handover"] = dict(saved_state["chat_handover"])
         _atomic_json(state_path, transition_state)
 
         def remember(created: dict) -> None:
@@ -462,12 +745,23 @@ def start_new_school_year_workbook(
             }
         )
         _atomic_json(state_path, transition_state)
+        _handover_chat_for_candidate(
+            deps=deps,
+            source_id=current_id,
+            candidate_id=candidate_id,
+            transition_state=transition_state,
+            state_path=state_path,
+        )
         _switch_record_last(
             record_path,
             profile_path,
             result,
             write_record=deps.write_record,
         )
+        transition_state["state"] = "complete"
+        if isinstance(transition_state.get("chat_handover"), dict):
+            transition_state["chat_handover"]["state"] = "complete"
+        _atomic_json(state_path, transition_state)
         return TransitionResult(
             state="complete",
             spreadsheet_url=str(result.spreadsheet_url),

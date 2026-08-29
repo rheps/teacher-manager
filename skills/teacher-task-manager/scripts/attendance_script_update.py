@@ -429,8 +429,13 @@ def _check_updated_deployment(
     )
 
 
-def _verified_prepared_version(runner, gws: str, script: str, target_sha: str) -> int:
-    description = "attendance-update-" + target_sha[:16]
+def _verified_named_version(
+    runner,
+    gws: str,
+    script: str,
+    description: str,
+    wanted_sha: str,
+) -> int:
     candidates = []
     for item in _list_versions(runner, gws, script):
         if item.get("description") == description:
@@ -440,13 +445,23 @@ def _verified_prepared_version(runner, gws: str, script: str, target_sha: str) -
             ))
     for version, _item in sorted(candidates, key=lambda candidate: candidate[0], reverse=True):
         bundle = _bundle_from_reply(_content(runner, gws, script, version), script)
-        if not bundle.has_extra_files and bundle.sha256 == target_sha:
+        if not bundle.has_extra_files and bundle.sha256 == wanted_sha:
             return version
     _need(
         not candidates,
         "같은 이름으로 만든 출결 기능 판의 내용을 확인할 수 없어요.",
     )
     return 0
+
+
+def _verified_prepared_version(runner, gws: str, script: str, target_sha: str) -> int:
+    return _verified_named_version(
+        runner,
+        gws,
+        script,
+        "attendance-update-" + target_sha[:16],
+        target_sha,
+    )
 
 
 def _load_target(assets_dir: Path) -> tuple[bytes, bytes, list[dict[str, str]], str]:
@@ -811,7 +826,7 @@ def _confirm_deployment_after_update(
 
     saw_previous = False
     last_error: Exception | None = None
-    for delay in (0.0, 1.0, 2.0, 4.0):
+    for delay in (0.0, 1.0, 2.0):
         if delay:
             sleeper(delay)
         try:
@@ -1001,13 +1016,18 @@ def apply_attendance_script_update(
             Path(assets_dir)
         )
         _need(fresh_target_sha == target_sha, "업데이트 파일이 확인 도중 바뀌었어요.")
+        _guard_remote_mutation(mutation_guard)
 
-        backup_version = _create_version(
-            runner, gws, script, before_description, mutation_guard
+        backup_version = _verified_named_version(
+            runner, gws, script, before_description, old_sha
         )
-        _require_bundle(
-            _content(runner, gws, script, backup_version), script, old_sha
-        )
+        if backup_version <= 0:
+            backup_version = _create_version(
+                runner, gws, script, before_description, mutation_guard
+            )
+            _require_bundle(
+                _content(runner, gws, script, backup_version), script, old_sha
+            )
         # 백업을 만드는 사이에 다른 사람이 편집했다면 그 사람의 내용을 덮지 않는다.
         # 실제 업로드 바로 앞에서 현재 편집본을 한 번 더 읽어 옛 정식본 그대로인지 본다.
         _require_bundle(_content(runner, gws, script), script, old_sha)

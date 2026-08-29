@@ -16,7 +16,10 @@ from attendance_script_update import (
     target_bundle_sha256,
 )
 from brity_bridge import bundle_paths, capture_store, message_archive, paths, status_log
-from brity_bridge.gemini_analyze import AnalysisError, run_gemini_analysis
+from brity_bridge.gemini_analyze import (
+    AnalysisError,
+    run_gemini_analysis_with_recovery,
+)
 from brity_bridge.rules_loader import load_analysis_rules
 from brity_bridge.gws_exec import (
     RESULT_RECORD_FAILURE_DETAIL,
@@ -33,6 +36,10 @@ from brity_bridge.message_parse import (
     message_identity,
     parse_clipboard_message,
 )
+from brity_bridge.message_operation import (
+    MessageOperationBusy,
+    message_operation_lock,
+)
 from brity_bridge.proposal_check import (
     BODY_MAX,
     CheckError,
@@ -48,6 +55,10 @@ GEMINI_FAILURE_MESSAGES = {
     "rate-limited": "요청 한도에 걸렸습니다. 1~2분 뒤 다시, 계속되면 내일 다시 시도해 주세요.",
     "network": "인터넷 연결(학교 방화벽)을 확인해 주세요.",
     "shape": "분석 결과가 올바르지 않아 등록하지 않았습니다. 다시 시도해 주세요.",
+    "upload-uncertain": (
+        "큰 첨부파일의 업로드 결과를 안전하게 확인하지 못했습니다. "
+        "같은 파일을 다시 올리지 않았습니다."
+    ),
 }
 
 # 기록 목록에 보여줄 대상 이름 — profile에 표시 이름이 없을 때의 대체 표기.
@@ -324,6 +335,7 @@ def _finish(
     attachment_link_detail: str = "",
     run: dict | None = None,
     retry_of_when: str = "",
+    attempt_counts: dict | None = None,
 ) -> FlowResult:
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -354,6 +366,20 @@ def _finish(
             str(attachment_link_status or ""),
         ),
     }
+    raw_attempt_counts = (
+        attempt_counts
+        if isinstance(attempt_counts, dict)
+        else ((run or {}).get("attempt_counts") if isinstance(run, dict) else {})
+    )
+    clean_attempt_counts = {
+        key: value
+        for key, value in (raw_attempt_counts or {}).items()
+        if key in {"screen", "attachment", "gemini", "google"}
+        and isinstance(value, int)
+        and 0 <= value <= 3
+    }
+    if clean_attempt_counts:
+        entry["attempt_counts"] = clean_attempt_counts
     if not result.ok:
         entry["reason"] = result.message
     if identity is not None:
@@ -391,16 +417,9 @@ def _finish(
     return result
 
 
-def _saved_actions(document: dict, notice_sheet_id: str) -> list[CheckedAction]:
-    runs = document.get("runs") if isinstance(document, dict) else None
-    if not isinstance(runs, list):
+def _actions_from_rows(saved_rows, notice_sheet_id: str) -> list[CheckedAction]:
+    if not isinstance(saved_rows, list):
         return []
-    saved_rows = []
-    for run in reversed(runs):
-        rows = run.get("checked_actions") if isinstance(run, dict) else None
-        if isinstance(rows, list) and rows:
-            saved_rows = rows
-            break
     actions = []
     for row in saved_rows:
         if not isinstance(row, dict):
@@ -429,6 +448,25 @@ def _saved_actions(document: dict, notice_sheet_id: str) -> list[CheckedAction]:
             )
         )
     return actions
+
+
+def _saved_actions(document: dict, notice_sheet_id: str) -> list[CheckedAction]:
+    if not isinstance(document, dict):
+        return []
+    recovery = document.get("recovery")
+    if isinstance(recovery, dict):
+        actions = _actions_from_rows(recovery.get("checked_actions"), notice_sheet_id)
+        if actions:
+            return actions
+    runs = document.get("runs")
+    if not isinstance(runs, list):
+        return []
+    for run in reversed(runs):
+        rows = run.get("checked_actions") if isinstance(run, dict) else None
+        actions = _actions_from_rows(rows, notice_sheet_id)
+        if actions:
+            return actions
+    return []
 
 
 def _legacy_class_notice_actions(
@@ -474,6 +512,7 @@ def retry_saved_capture(
     gws_runner=None,
     gws_executable: str | None = None,
     attendance_script_inspector=None,
+    _operation_locked: bool = False,
 ) -> FlowResult:
     """Retry only unfinished actions from a saved message run."""
 
@@ -481,10 +520,38 @@ def retry_saved_capture(
     if not re.fullmatch(r"[0-9a-f]{64}", str(source_hash or "")):
         return FlowResult(False, "retry", "다시 시도할 메시지 정보를 확인하지 못했어요.")
     state_dir = paths.bridge_state_dir(config_dir)
+    if not _operation_locked:
+        try:
+            with message_operation_lock(state_dir, source_hash):
+                return retry_saved_capture(
+                    config_dir,
+                    source_hash,
+                    capture_when=capture_when,
+                    gws_runner=gws_runner,
+                    gws_executable=gws_executable,
+                    attendance_script_inspector=attendance_script_inspector,
+                    _operation_locked=True,
+                )
+        except MessageOperationBusy:
+            return FlowResult(
+                False,
+                "execute",
+                "이 메시지는 다른 창에서 처리 중입니다. 현재 처리가 끝날 때까지 기다려 주세요.",
+            )
     capture = capture_store.find_capture(state_dir, source_hash, capture_when)
-    if not capture or capture.get("ok") is not False or not capture.get("retry"):
+    if not capture or capture.get("ok") is not False:
         return FlowResult(False, "retry", "이 기록은 안전하게 다시 시도할 수 없어요.")
     document = message_archive.load(state_dir, source_hash)
+    recovery = document.get("recovery") if isinstance(document, dict) else None
+    has_checked_resume = (
+        isinstance(recovery, dict)
+        and recovery.get("stage")
+        in {"proposal_checked", "google_registering", "google_partial"}
+        and isinstance(recovery.get("checked_actions"), list)
+        and bool(recovery.get("checked_actions"))
+    )
+    if not capture.get("retry") and not has_checked_resume:
+        return FlowResult(False, "retry", "이 기록은 안전하게 다시 시도할 수 없어요.")
     message = document.get("message") if isinstance(document, dict) else None
 
     profile = _load_profile(config_dir)
@@ -530,8 +597,19 @@ def retry_saved_capture(
     summary = _summarize_report(report)
     items = capture_store.merge_retry_items(capture.get("items"), _items_from_report(report, profile))
     run = _new_run()
+    run["attempt_counts"] = dict((recovery or {}).get("attempt_counts") or {})
     run["checked_actions"] = _checked_action_rows(actions)
     run["created"] = _created_rows(report)
+    message_archive.save_recovery_stage(
+        state_dir,
+        source_hash,
+        "google_complete" if report.all_done else "google_partial",
+        checked_actions=run["checked_actions"],
+        google_results=run["created"],
+    )
+    retry_blocked = any(
+        not getattr(row, "retry_allowed", True) for row in report.failures
+    )
     if report.all_done:
         try:
             history.mark_completed(source_hash)
@@ -575,7 +653,7 @@ def retry_saved_capture(
         summary=result.message,
         items=items,
         identity=identity,
-        retry=RETRY_MESSAGE if not result.ok else "",
+        retry=RETRY_MESSAGE if not result.ok and not retry_blocked else "",
         attachment_count=len(attachment_names),
         attachment_names=attachment_names,
         attachment_analyzed_names=attachment_names,
@@ -680,6 +758,12 @@ def record_preflight_failure(
         attachment_count=len(names),
         attachment_names=names,
         attachment_link_status="not-registered" if names else "",
+        attempt_counts={
+            "attachment": min(
+                3,
+                max(1, int(getattr(capture, "attachment_attempt_count", 1) or 1)),
+            )
+        },
     )
 
 
@@ -701,6 +785,12 @@ def record_screen_failure(config_dir: Path, capture, retry: str) -> FlowResult:
         attachment_count=len(names),
         attachment_names=names,
         attachment_link_status="not-registered" if names else "",
+        attempt_counts={
+            "screen": min(
+                3,
+                max(1, int(getattr(capture, "attempt_count", 1) or 1)),
+            )
+        },
     )
 
 
@@ -921,6 +1011,7 @@ def run_capture_flow(
     attendance_script_inspector=None,
     attachment_link_ready: bool = True,
     attachment_link_failure: str = "",
+    _operation_locked: bool = False,
 ) -> FlowResult:
     config_dir = Path(config_dir)
     now = now or datetime.now(KOREA_TIME)
@@ -941,21 +1032,86 @@ def run_capture_flow(
                 progress=progress,
             )
 
+    if not _operation_locked:
+        try:
+            with message_operation_lock(
+                paths.bridge_state_dir(config_dir), record.source_hash
+            ):
+                return run_capture_flow(
+                    context,
+                    config_dir,
+                    bridge_settings,
+                    gemini_transport=gemini_transport,
+                    gws_runner=gws_runner,
+                    now=now,
+                    record=record,
+                    progress=progress,
+                    gws_executable=gws_executable,
+                    attendance_script_inspector=attendance_script_inspector,
+                    attachment_link_ready=attachment_link_ready,
+                    attachment_link_failure=attachment_link_failure,
+                    _operation_locked=True,
+                )
+        except MessageOperationBusy:
+            return FlowResult(
+                False,
+                "execute",
+                "이 메시지는 다른 창에서 처리 중입니다. 현재 처리가 끝날 때까지 기다려 주세요.",
+            )
+
     attachment_count = max(0, int(getattr(record, "attachment_count", 0) or 0))
     attachment_names = tuple(getattr(record, "local_attachment_names", ()) or ())
     attachment_analyzed_names, attachment_skipped_names = _split_attachment_names(record)
     identity = message_identity(record)
+    state_dir = paths.bridge_state_dir(config_dir)
     message_archive.begin(
-        paths.bridge_state_dir(config_dir),
+        state_dir,
         record,
         getattr(bridge_settings, "brity_download_dir", ""),
     )
+    recovery_state = message_archive.recovery_state(state_dir, record.source_hash)
+    if not recovery_state:
+        initial_attempt_counts = {}
+        screen_attempt_count = int(getattr(record, "screen_attempt_count", 0) or 0)
+        attachment_attempt_count = int(
+            getattr(record, "attachment_attempt_count", 0) or 0
+        )
+        if 0 < screen_attempt_count <= 3:
+            initial_attempt_counts["screen"] = screen_attempt_count
+        if 0 < attachment_attempt_count <= 3:
+            initial_attempt_counts["attachment"] = attachment_attempt_count
+        if not message_archive.save_recovery_stage(
+            state_dir,
+            record.source_hash,
+            "attachments_ready",
+            attempt_counts=initial_attempt_counts,
+        ):
+            return _finish(
+                config_dir,
+                FlowResult(
+                    False,
+                    "attachment",
+                    "읽은 메시지와 첨부파일 상태를 안전하게 저장하지 못해 멈췄습니다.",
+                ),
+                record.source_hash,
+                summary="읽은 내용 저장 실패",
+                progress=progress,
+                attachment_count=attachment_count,
+                identity=identity,
+                attachment_names=attachment_names,
+                attachment_analyzed_names=attachment_analyzed_names,
+                attachment_skipped_names=attachment_skipped_names,
+                attachment_link_status="not-registered" if attachment_names else "",
+            )
+        recovery_state = message_archive.recovery_state(state_dir, record.source_hash)
     run = _new_run()
+    attempt_counts = dict(recovery_state.get("attempt_counts") or {})
+    run["attempt_counts"] = attempt_counts
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
     if history.is_completed(record.source_hash):
         original = capture_store.latest_successful_done(
-            paths.bridge_state_dir(config_dir), record.source_hash
+            state_dir, record.source_hash
         )
         return _finish(
             config_dir,
@@ -1004,79 +1160,179 @@ def run_capture_flow(
         )
 
     run["profile_snapshot"] = _profile_snapshot(profile)
+    notice_sheet_id, notice_unavailable_message = _load_notice_sheet(config_dir)
+    saved_rows = recovery_state.get("checked_actions")
+    saved_actions = _actions_from_rows(saved_rows, notice_sheet_id)
+    saved_proposal = recovery_state.get("proposal")
+    can_resume_checked = (
+        recovery_state.get("stage")
+        in {"proposal_checked", "google_registering", "google_partial", "google_complete"}
+        and isinstance(saved_proposal, dict)
+        and saved_proposal.get("source_hash") == record.source_hash
+        and isinstance(saved_rows, list)
+        and len(saved_actions) == len(saved_rows)
+    )
 
-    try:
+    if can_resume_checked:
+        proposal = dict(saved_proposal)
+        actions = saved_actions
+        run["analysis_input_text"] = str(
+            recovery_state.get("analysis_input_text") or ""
+        )
+        run["proposal"] = proposal
+        run["checked_actions"] = _checked_action_rows(actions)
+    else:
+        saved_summary_chunks = [
+            dict(row)
+            for row in (recovery_state.get("summary_chunks") or ())
+            if isinstance(row, dict)
+        ]
+
         def remember_analysis_text(text: str) -> None:
             run["analysis_input_text"] = str(text or "")
 
-        proposal = run_gemini_analysis(
-            record, profile, bridge_settings, paths.skill_root(),
-            transport=gemini_transport, now=now,
-            on_analysis_text=remember_analysis_text,
-        )
-    except AnalysisError as error:
-        message = GEMINI_FAILURE_MESSAGES.get(error.reason, GEMINI_FAILURE_MESSAGES["shape"])
-        return _finish(
-            config_dir,
-            FlowResult(False, "gemini", message),
+        def remember_summary_chunks(rows) -> None:
+            saved_summary_chunks[:] = [dict(row) for row in rows]
+            message_archive.save_recovery_stage(
+                state_dir,
+                record.source_hash,
+                "gemini_analyzing",
+                attempt_counts=attempt_counts,
+                summary_chunks=saved_summary_chunks,
+            )
+
+        def remember_gemini_attempt(attempt_count: int, _reason: str) -> None:
+            attempt_counts["gemini"] = attempt_count
+            message_archive.save_recovery_stage(
+                state_dir,
+                record.source_hash,
+                "gemini_analyzing",
+                attempt_counts=attempt_counts,
+                summary_chunks=saved_summary_chunks,
+            )
+
+        try:
+            proposal = run_gemini_analysis_with_recovery(
+                record,
+                profile,
+                bridge_settings,
+                paths.skill_root(),
+                transport=gemini_transport,
+                now=now,
+                on_analysis_text=remember_analysis_text,
+                on_attempt=remember_gemini_attempt,
+                summary_chunks=saved_summary_chunks,
+                on_summary_chunks=remember_summary_chunks,
+            )
+        except AnalysisError as error:
+            attempt_counts["gemini"] = min(3, max(0, int(error.attempt_count or 0)))
+            message_archive.save_recovery_stage(
+                state_dir,
+                record.source_hash,
+                "gemini_failed",
+                attempt_counts=attempt_counts,
+                analysis_input_text=run["analysis_input_text"],
+                summary_chunks=saved_summary_chunks,
+            )
+            message = GEMINI_FAILURE_MESSAGES.get(
+                error.reason, GEMINI_FAILURE_MESSAGES["shape"]
+            )
+            return _finish(
+                config_dir,
+                FlowResult(False, "gemini", message),
+                record.source_hash,
+                detail=f"{error.reason}; attempts={error.attempt_count}",
+                summary="분석 실패",
+                progress=progress,
+                attachment_count=attachment_count,
+                identity=identity,
+                retry="",
+                attachment_names=attachment_names,
+                attachment_analyzed_names=attachment_analyzed_names,
+                attachment_skipped_names=attachment_skipped_names,
+                attachment_link_status="not-registered" if attachment_names else "",
+                run=run,
+            )
+
+        run["proposal"] = proposal
+        try:
+            actions = check_proposal(
+                proposal, profile, notice_sheet_id=notice_sheet_id, today=now.date()
+            )
+            actions = add_work_task_copies(actions, profile)
+            actions = _remove_calendar_time_lines(actions)
+            actions = add_local_attachment_links(
+                actions, record.local_attachment_names, record.source_hash
+            )
+            actions = _add_calendar_registration_time(actions, now)
+            run["checked_actions"] = _checked_action_rows(actions)
+        except CheckError as error:
+            due_problem = any("due 형식" in problem for problem in error.problems)
+            run["check_problems"] = list(error.problems)
+            if due_problem:
+                message = capture_store.CHECK_DUE_REASON
+                summary = capture_store.CHECK_DUE_SUMMARY
+                detail = "할 일 날짜 확인 실패"
+            else:
+                message = capture_store.CHECK_GENERIC_REASON
+                summary = capture_store.CHECK_GENERIC_SUMMARY
+                detail = "등록 내용 확인 실패"
+            return _finish(
+                config_dir,
+                FlowResult(False, "check", message),
+                record.source_hash,
+                detail=detail,
+                summary=summary,
+                progress=progress,
+                attachment_count=attachment_count,
+                identity=identity,
+                retry=RETRY_MESSAGE,
+                attachment_names=attachment_names,
+                attachment_analyzed_names=attachment_analyzed_names,
+                attachment_skipped_names=attachment_skipped_names,
+                attachment_link_status="not-registered" if attachment_names else "",
+                run=run,
+            )
+
+        if not message_archive.save_recovery_stage(
+            state_dir,
             record.source_hash,
-            detail=f"{error.reason}",
-            summary="분석 실패",
-            progress=progress,
-            attachment_count=attachment_count,
-            identity=identity,
-            retry=RETRY_MESSAGE,
-            attachment_names=attachment_names,
-            attachment_analyzed_names=attachment_analyzed_names,
-            attachment_skipped_names=attachment_skipped_names,
-            attachment_link_status="not-registered" if attachment_names else "",
-            run=run,
-        )
-
-    run["proposal"] = proposal
-
-    notice_sheet_id, notice_unavailable_message = _load_notice_sheet(config_dir)
-
-    try:
-        actions = check_proposal(
-            proposal, profile, notice_sheet_id=notice_sheet_id, today=now.date()
-        )
-        actions = add_work_task_copies(actions, profile)
-        actions = _remove_calendar_time_lines(actions)
-        actions = add_local_attachment_links(
-            actions, record.local_attachment_names, record.source_hash
-        )
-        actions = _add_calendar_registration_time(actions, now)
-        run["checked_actions"] = _checked_action_rows(actions)
-    except CheckError as error:
-        due_problem = any("due 형식" in problem for problem in error.problems)
-        run["check_problems"] = list(error.problems)
-        if due_problem:
-            message = capture_store.CHECK_DUE_REASON
-            summary = capture_store.CHECK_DUE_SUMMARY
-            detail = "할 일 날짜 확인 실패"
-        else:
-            message = capture_store.CHECK_GENERIC_REASON
-            summary = capture_store.CHECK_GENERIC_SUMMARY
-            detail = "등록 내용 확인 실패"
-        return _finish(
-            config_dir,
-            FlowResult(False, "check", message),
-            record.source_hash,
-            detail=detail,
-            summary=summary,
-            progress=progress,
-            attachment_count=attachment_count,
-            identity=identity,
-            retry=RETRY_MESSAGE,
-            attachment_names=attachment_names,
-            attachment_analyzed_names=attachment_analyzed_names,
-            attachment_skipped_names=attachment_skipped_names,
-            attachment_link_status="not-registered" if attachment_names else "",
-            run=run,
-        )
+            "proposal_checked",
+            attempt_counts=attempt_counts,
+            analysis_input_text=run["analysis_input_text"],
+            summary_chunks=saved_summary_chunks,
+            proposal=proposal,
+            checked_actions=run["checked_actions"],
+        ):
+            return _finish(
+                config_dir,
+                FlowResult(
+                    False,
+                    "check",
+                    "확인한 등록 내용을 안전하게 저장하지 못해 Google 등록 전에 멈췄습니다.",
+                ),
+                record.source_hash,
+                detail="proposal checkpoint failed",
+                summary="등록 내용 저장 실패",
+                progress=progress,
+                attachment_count=attachment_count,
+                identity=identity,
+                attachment_names=attachment_names,
+                attachment_analyzed_names=attachment_analyzed_names,
+                attachment_skipped_names=attachment_skipped_names,
+                attachment_link_status="not-registered" if attachment_names else "",
+                run=run,
+            )
 
     if not actions:
+        message_archive.save_recovery_stage(
+            state_dir,
+            record.source_hash,
+            "google_complete",
+            proposal=proposal,
+            checked_actions=run["checked_actions"],
+            google_results=[],
+        )
         result = FlowResult(True, "done", "등록할 일정이나 할 일이 없는 메시지입니다.")
         return _finish(
             config_dir, result, record.source_hash, detail="actions=0",
@@ -1092,6 +1348,33 @@ def run_capture_flow(
 
     if progress is not None:
         progress("register")
+
+    if not message_archive.save_recovery_stage(
+        state_dir,
+        record.source_hash,
+        "google_registering",
+        proposal=proposal,
+        checked_actions=run["checked_actions"],
+    ):
+        return _finish(
+            config_dir,
+            FlowResult(
+                False,
+                "execute",
+                "등록할 내용을 안전하게 저장하지 못해 Google에 쓰기 전에 멈췄습니다.",
+            ),
+            record.source_hash,
+            detail="google checkpoint failed",
+            summary="Google 등록 준비 저장 실패",
+            progress=progress,
+            attachment_count=attachment_count,
+            identity=identity,
+            attachment_names=attachment_names,
+            attachment_analyzed_names=attachment_analyzed_names,
+            attachment_skipped_names=attachment_skipped_names,
+            attachment_link_status="not-registered" if attachment_names else "",
+            run=run,
+        )
 
     report = execute_actions(
         actions,
@@ -1117,6 +1400,14 @@ def run_capture_flow(
     summary = _summarize_report(report)
     items = _items_from_report(report, profile)
     run["created"] = _created_rows(report)
+    message_archive.save_recovery_stage(
+        state_dir,
+        record.source_hash,
+        "google_complete" if report.all_done else "google_partial",
+        proposal=proposal,
+        checked_actions=run["checked_actions"],
+        google_results=run["created"],
+    )
     notice_note = _notice_created_note(report)
     blocked_note = _notice_blocked_note(report)
     account_note = _account_blocked_note(report)
@@ -1168,7 +1459,16 @@ def run_capture_flow(
     retry_blocked = any(
         not getattr(row, "retry_allowed", True) for row in report.failures
     )
-    if retry_blocked:
+    preparation_failed = bool(report.failures) and all(
+        "등록 준비를 안전하게 저장하지 못했습니다" in str(row.detail or "")
+        for row in report.failures
+    )
+    if preparation_failed:
+        message = (
+            f"등록 준비를 안전하게 저장하지 못했습니다 ({summary}). "
+            "Google에 쓰기 전에 멈췄습니다."
+        )
+    elif retry_blocked:
         message = (
             f"등록 결과를 안전하게 기록하지 못했습니다 ({summary}). "
             + RESULT_RECORD_FAILURE_DETAIL

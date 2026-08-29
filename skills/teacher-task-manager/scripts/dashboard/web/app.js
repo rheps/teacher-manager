@@ -22,6 +22,7 @@ const S = {
   edit: null,
   busy: {},
   banner: null,              // {kind, text}
+  problemIssue: null,        // needs_user | failed only; normal input validation stays beside its field
   externalLinkFallback: null, // 브라우저가 안 열렸을 때만 {url}; Google 로그인 주소는 오지 않는다
   toast: null,
   applyResults: null,
@@ -33,6 +34,7 @@ const S = {
   aiTools: null,              // AI 에이전트 탭 — 도구 감지 결과 (null=미조회, "loading"=조회 중)
   aiNode: null,               // 사용자가 연결을 누른 뒤에만 읽는 전용 Node 준비 상태
   aiInstall: null,            // AI 에이전트 탭 — 연결 실행 결과
+  aiSelected: null,           // 사용자가 고른 정확한 AI 목록 — 화면을 다시 그려도 보존
   aiConnecting: false,        // 화면을 다시 그려도 두 번째 다운로드를 시작하지 않는다
   maxStep: 1,                 // 마법사에서 한 번이라도 도달한 가장 먼 단계
   login: null,
@@ -63,9 +65,11 @@ const S = {
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
+  helperRestartPending: false, // 설정은 확인했지만 도우미 시작만 다시 확인할 상태
 };
 let attendanceScriptRequestToken = 0;
 let attendanceConnectionRequestToken = 0;
+let aiToolsRequestToken = 0;
 
 const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
@@ -80,11 +84,22 @@ function attendanceUiEnabled() {
 }
 
 /* ---------- bridge ---------- */
+class AppIssueError extends Error {
+  constructor(issue) {
+    super(issue?.message || issue?.title || "작업을 마치지 못했어요.");
+    this.issue = issue || null;
+  }
+}
 function call(name, ...args) {
   return window.pywebview.api[name](...args).then((res) => {
-    if (!res || res.ok !== true) throw new Error((res && res.error) || "알 수 없는 오류가 났어요");
+    if (!res || res.ok !== true) throw new AppIssueError(res?.issue);
     return res.data;
   });
+}
+async function callWithLocalRecovery(action) {
+  // 실제 파일 읽기·저장 재시도는 브리지의 세 번 확인 경계에서 끝난다.
+  // 화면이 이미 최종 구조화 안내를 다시 호출하면 시도 횟수와 원인을 왜곡한다.
+  return await action();
 }
 
 /* ---------- 렌더 유틸 ---------- */
@@ -121,6 +136,109 @@ function showToast(text) {
   S.toast = text; render();
   setTimeout(() => { S.toast = null; render(); }, 2200);
 }
+// 문제 안내는 그 요청을 시작한 화면에만 속한다. 다른 화면으로 옮기거나 새 요청을
+// 시작하면 이전 안내와 그 안내의 재개 권한도 함께 버린다.
+let problemIssueOwner = "";
+let problemIssueToken = 0;
+let problemIssueResumeAction = "";
+function clearProblemIssue(refresh) {
+  const hadProblemIssue = Boolean(S.problemIssue);
+  problemIssueToken += 1;
+  problemIssueOwner = "";
+  problemIssueResumeAction = "";
+  S.problemIssue = null;
+  invalidateIssueResume();
+  if (refresh && hadProblemIssue) render();
+}
+function beginIssueRequest(preserveIssue, actionKey) {
+  if (!preserveIssue) clearProblemIssue(true);
+  return { screen: screenKey(), token: problemIssueToken, action: String(actionKey || "") };
+}
+function ownsIssueRequest(request) {
+  return !request || (request.screen === screenKey() && request.token === problemIssueToken);
+}
+function completeIssueRequest(request) {
+  if (ownsIssueRequest(request)) clearProblemIssue(true);
+}
+const SUPPORT_ACTION_KEYS = new Set(["copy-error", "support-email", "support-web"]);
+const DIRECT_ISSUE_ACTIONS = {
+  "google-login": "Google 로그인 설정 열기",
+  "chat-permission": "Google Chat 권한 확인",
+  "chat-space-list": "학급 단체톡방 다시 확인",
+  "attendance-first-setup": "출석부 설정 확인",
+  "attachment-download": "첨부파일 상태 다시 확인",
+  "inspect-calendar-candidates": "Google Calendar에서 직접 확인",
+  "inspect-tasklist-candidates": "Google Tasks에서 직접 확인",
+};
+const GOOGLE_TARGET_ID_FIELDS = [
+  "업무캘린더ID", "학사일정캘린더ID", "업무Tasks목록ID", "담임안내Tasks목록ID",
+];
+function clearDraftGoogleTargetIds() {
+  if (!S.draft?.profile) return;
+  GOOGLE_TARGET_ID_FIELDS.forEach((field) => { S.draft.profile[field] = ""; });
+}
+function issueValue(issue, key, fallback = "") {
+  const value = issue && typeof issue === "object" ? issue[key] : fallback;
+  return value == null ? fallback : value;
+}
+function directIssueActionHtml(issue) {
+  const actions = Array.isArray(issue?.actions) ? issue.actions : [];
+  const seen = new Set();
+  return actions
+    .map((row) => ({ key: String(row?.key || ""), label: String(row?.label || "") }))
+    .filter((row) => {
+      const allowed = Object.prototype.hasOwnProperty.call(DIRECT_ISSUE_ACTIONS, row.key)
+        || /^(select|inspect)-(calendar|tasklist):[^\s:]+$/.test(row.key);
+      return allowed && !seen.has(row.key) && (seen.add(row.key), true);
+    })
+    .map((row) => `<button class="btn-tonal" data-action="issue-direct" data-preserve-issue="true" data-issue-action="${esc(row.key)}">${esc(DIRECT_ISSUE_ACTIONS[row.key] || row.label)}</button>`)
+    .join("");
+}
+function problemPanelHtml(issue) {
+  if (!issue || !["needs_user", "failed"].includes(issue.state)) return "";
+  const needsUser = issue.state === "needs_user";
+  const details = needsUser
+    ? `<p class="problem-status">${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</p>`
+    : `<dl class="problem-details">
+        <div><dt>원인</dt><dd>${esc(issueValue(issue, "reason", "확인 중"))}</dd></div>
+        <div><dt>자료 상태</dt><dd>${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</dd></div>
+        <div><dt>시도 횟수</dt><dd>${esc(issueValue(issue, "attempt_count", 0))}회</dd></div>
+        <div><dt>마지막 시도</dt><dd>${esc(issueValue(issue, "last_failed_at", "알 수 없음"))}</dd></div>
+        <div><dt>판 번호</dt><dd>${esc(issueValue(issue, "app_version", "알 수 없음"))}</dd></div>
+        <div><dt>오류 식별번호</dt><dd>${esc(issueValue(issue, "diagnostic_id", "알 수 없음"))}</dd></div>
+      </dl>`;
+  const actions = needsUser
+    ? directIssueActionHtml(issue)
+    : (SUPPORT_ACTION_KEYS.has("copy-error") && SUPPORT_ACTION_KEYS.has("support-email") && SUPPORT_ACTION_KEYS.has("support-web")
+      ? `<button class="btn-tonal" data-action="issue-copy" data-preserve-issue="true">오류 정보 복사</button>
+         <button class="btn-tonal" data-action="issue-email" data-preserve-issue="true">메일로 문의하기</button>
+         <button class="btn-tonal" data-action="issue-web" data-preserve-issue="true">웹사이트에서 문의하기</button>`
+      : "");
+  return `<section class="problem-panel" role="alert">
+    <h2>${esc(issueValue(issue, "title", "작업을 마치지 못했어요."))}</h2>
+    <p>${esc(issueValue(issue, "message", "다시 확인해 주세요."))}</p>
+    ${details}
+    <div class="problem-actions">${actions}</div>
+  </section>`;
+}
+function showProblemIssue(error, request) {
+  if (!(error instanceof AppIssueError)) return false;
+  if (!ownsIssueRequest(request)) return true;
+  const issue = error.issue;
+  if (!issue || !["needs_user", "failed"].includes(issue.state)) return false;
+  S.problemIssue = issue;
+  problemIssueOwner = screenKey();
+  problemIssueResumeAction = String(request?.action || "");
+  problemIssueToken += 1;
+  S.banner = null;
+  render();
+  return true;
+}
+function handleCaughtError(error, request) {
+  if (showProblemIssue(error, request)) return true;
+  if (!request || ownsIssueRequest(request)) setBanner("error", error?.message || "작업을 마치지 못했어요.");
+  return false;
+}
 function bannerHtml() {
   // 기록 폴더를 여는 단추는 두지 않는다. 폴더만 열릴 뿐 거기서 뭘 하라는 안내가 없고,
   // 그 폴더에 보이는 파일은 Gemini API key가 든 settings.json이다 (2026-07-30 사용자 결정).
@@ -136,7 +254,8 @@ function bannerHtml() {
         </div>
       </div>`
     : "";
-  return banner + fallback;
+  const currentIssue = problemIssueOwner === screenKey() ? S.problemIssue : null;
+  return problemPanelHtml(currentIssue) + banner + fallback;
 }
 function toastHtml() { return S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ""; }
 
@@ -243,8 +362,15 @@ async function busyWrap(el, fn) {
   const original = hasBusyText ? el.textContent : "";
   el.disabled = true;
   if (hasBusyText) el.textContent = el.dataset.busyText;
-  try { await fn(el); }
-  catch (error) { setBanner("error", error.message); }
+  const preserveIssue = el.dataset.preserveIssue === "true";
+  const request = beginIssueRequest(preserveIssue, el.dataset.action);
+  try {
+    await fn(el, request);
+    if (!preserveIssue) completeIssueRequest(request);
+  }
+  catch (error) {
+    handleCaughtError(error, request);
+  }
   finally { el.disabled = false; if (hasBusyText) el.textContent = original; }
 }
 document.addEventListener("click", (event) => {
@@ -283,6 +409,26 @@ function linkRow(url) {
     `</span></div>`;
 }
 bindActions({
+  "issue-copy": async () => {
+    await call("copy_support_report", S.problemIssue);
+    showToast("오류 정보를 복사했어요");
+  },
+  "issue-email": async () => {
+    await call("open_support_email", S.problemIssue);
+  },
+  "issue-web": async () => {
+    await call("open_url", "https://big-silver.xyz");
+  },
+  "issue-direct": async (el, request) => {
+    if (await inspectGoogleTargetCandidate(S.problemIssue, el.dataset.issueAction, request)) return;
+    if (await openGoogleCandidateInspector(el.dataset.issueAction)) return;
+    const selection = await applyGoogleTargetSelection(S.problemIssue, el.dataset.issueAction, request);
+    if (selection) {
+      if (selection === "selected") await resumeGoogleTargetSelection();
+      return;
+    }
+    await dispatchIssueResume(S.problemIssue, el.dataset.issueAction);
+  },
   "link-open": async (el) => {
     const url = String(el.dataset.url || "");
     try {
@@ -335,7 +481,8 @@ function googleStatusKey(status) {
   if (!status) return "";
   return [status.login_state || "", status.logged_in ? "1" : "0", status.user || "", status.account_allowed === true ? "1" : "0"].join("|");
 }
-function clearGoogleDependentState() {
+function clearGoogleDependentState(options) {
+  const preserveResume = options?.preserveResume === true;
   clearAttendanceScriptDialogState();
   stopAttendancePreparePoll();
   S.attendance = null;
@@ -348,6 +495,19 @@ function clearGoogleDependentState() {
   S.lists = { calendars: [], tasklists: [] };
   S.listsLoaded = false;
   S.listsError = false;
+  S.verifiedGoogleTargetChoices = {};
+  S.pendingGoogleTarget = null;
+  S.googleTargetAccountChanged = true;
+  clearDraftGoogleTargetIds();
+  GOOGLE_TARGET_ID_FIELDS.forEach((field) => editDirtyFields.delete(field));
+  if (!preserveResume) {
+    googleLoginResumeGeneration += 1;
+    googleLoginResumeContext = null;
+    S.problemIssue = null;
+    problemIssueOwner = "";
+    problemIssueResumeAction = "";
+    invalidateIssueResume();
+  }
 }
 function startLoginWatch() {
   if (loginWatchTimer) return;
@@ -589,15 +749,18 @@ let loginTimer = null;
 function stopLoginPoll() {
   if (loginTimer) { clearTimeout(loginTimer); loginTimer = null; }
 }
-async function pollLoginOnce() {
+async function pollLoginOnce(request) {
   const snap = await call("gws_login_status");
+  if (!ownsIssueRequest(request)) return false;
   if (snap.ok === true) {
     S.login = null;
     delete S.fieldIssues["google-login"];
-    clearGoogleDependentState();  // 로그인 전 계정의 자료와 안내를 버린다
-    await refreshSettingsStatus();
-    if (isGoeduGoogleStatus(S.google)) showToast("@goedu.kr 계정으로 로그인했어요");
-    else setBanner("warn", GOEDU_REQUIRED_MESSAGE);
+    clearGoogleDependentState({ preserveResume: true });  // 로그인 전 계정의 자료와 안내를 버린다
+    await refreshSettingsStatus(request);
+    if (!ownsIssueRequest(request)) return false;
+    if (isGoeduGoogleStatus(S.google)) {
+      if (!(await resumeInterruptedGoogleScreen(request))) showToast("@goedu.kr 계정으로 로그인했어요");
+    } else setBanner("warn", GOEDU_REQUIRED_MESSAGE);
     return false;
   }
   if (snap.ok === false) {
@@ -616,16 +779,18 @@ function pollLogin() {
   stopLoginPoll();
   loginTimer = setTimeout(async () => {
     if (!S.login) return;
+    const request = beginIssueRequest(false);
     try {
-      if (await pollLoginOnce()) pollLogin();
+      if (await pollLoginOnce(request) && ownsIssueRequest(request)) pollLogin();
     } catch (error) {
+      if (!ownsIssueRequest(request)) return;
       S.login = null;
-      setBanner("error", error.message);
+      handleCaughtError(error, request);
     }
   }, 1000);
 }
 bindActions({
-  "install-gws-update": async () => {
+  "install-gws-update": async (_el, request) => {
     if (S.gwsUpdateInstalling) return;
     const offer = S.gwsUpdate && S.gwsUpdate.offer;
     if (!offer) throw new Error("승인된 Google 도구 새 판을 다시 점검해 주세요.");
@@ -650,7 +815,9 @@ bindActions({
     } finally {
       S.gwsUpdateInstalling = false;
     }
-    await refreshSettingsStatus();
+    if (!ownsIssueRequest(request)) return;
+    await refreshSettingsStatus(request);
+    if (!ownsIssueRequest(request)) return;
     if (!result.success) {
       const fallback = result.can_continue
         ? "현재 기본판으로 계속 쓸 수 있어요."
@@ -835,12 +1002,19 @@ function validateDay() {
 
 /* ---------- 4단계: 시간표 ---------- */
 const GRID_DAYS = ["월", "화", "수", "목", "금"];
-async function ensureGridLoaded() {
-  if (!S.draft.grid || !S.draft.grid.length) S.draft.grid = await call("read_grid");
+async function ensureGridLoaded(request) {
+  if (S.draft.grid && S.draft.grid.length) return true;
+  const grid = await call("read_grid");
+  if (!ownsIssueRequest(request)) return false;
+  S.draft.grid = grid;
+  return true;
 }
 function stepTimetable() {
   if (!S.draft.grid || !S.draft.grid.length) {
-    ensureGridLoaded().then(render).catch((e) => setBanner("error", e.message));
+    const request = beginIssueRequest(false);
+    ensureGridLoaded(request)
+      .then((loaded) => { if (loaded && ownsIssueRequest(request)) render(); })
+      .catch((error) => handleCaughtError(error, request));
     return `<h1>시간표를 채워주세요</h1><p class="sub">불러오는 중이에요…</p>`;
   }
   const head = `<tr><th></th>${GRID_DAYS.map((d) => `<th>${d}</th>`).join("")}</tr>`;
@@ -942,6 +1116,7 @@ async function finishHotkeyRecording() {
   hotkeyCapture.timer = null;
   if (S.hk) S.hk.recording = false;
   let autoSaveWhenDone = false;
+  let request = null;
   try {
     if (!text) {
       S.hk.status = { kind: "bad", text: "한 조합으로 함께 눌러 주세요" };
@@ -952,8 +1127,9 @@ async function finishHotkeyRecording() {
       S.hk.status = { kind: "ok", text: "지금 쓰는 단축키예요" };
       return;
     }
+    request = beginIssueRequest(false);
     const result = await call("probe_hotkey", text);
-    if (hotkeyCapture.generation !== generation) return;
+    if (hotkeyCapture.generation !== generation || !ownsIssueRequest(request)) return;
     if (result.status === "available") {
       S.draft.bridge.hotkey = text;
       if (S.mode === "edit" && S.edit === "settings") {
@@ -970,6 +1146,7 @@ async function finishHotkeyRecording() {
       S.hk.status = { kind: "bad", text: PROBE_MESSAGES.invalid };
     }
   } catch (error) {
+    if (!ownsIssueRequest(request) || showProblemIssue(error, request)) return;
     if (hotkeyCapture.generation === generation && S.hk) {
       S.hk.status = { kind: "bad", text: error.message };
     }
@@ -984,10 +1161,10 @@ async function finishHotkeyRecording() {
       }
       if (autoSaveWhenDone) {
         try {
-          await autoSaveSettings(true);
+          await autoSaveSettings(true, request);
         } catch (error) {
           if (S.hk) S.hk.status = { kind: "bad", text: error.message };
-          setBanner("error", error.message);
+          handleCaughtError(error, request);
         }
       }
       render();
@@ -1074,16 +1251,20 @@ async function loadLinkLists() {
   if (!isGoeduGoogleStatus(S.google)) return;
   S.linkLoading = true;
   S.listsError = false;
+  const request = beginIssueRequest(false);
   render();
   try {
     const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
+    if (!ownsIssueRequest(request)) return;
     S.lists = { calendars, tasklists };
     S.listsLoaded = true;
   } catch (error) {
+    if (!ownsIssueRequest(request)) return;
+    if (showProblemIssue(error, request)) return;
     S.listsError = true;  // 기존 S.lists와 선택 ID는 그대로 둔다
   } finally {
     S.linkLoading = false;
-    render();
+    if (ownsIssueRequest(request)) render();
   }
 }
 function linkSelectRow(idField, title, options, value, excludeId, savedName) {
@@ -1177,10 +1358,13 @@ function messengerTabHtml() {
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>
       <p class="sub" style="margin-top:14px">Google 연결과 로그인 상태는 설정 화면에서 확인해요.</p>`;
   }
+  const listProgress = S.linkLoading
+    ? `<p class="sub">목록을 다시 확인하고 있어요</p>` : "";
   return `<div class="attendance-head"><div>
       <h2>메신저 내용을 어디에 등록할지 정해요</h2>
       <p>Google 연결과 로그인 상태는 설정 화면에서 확인해요.</p>
     </div></div>
+    ${listProgress}
     ${listsErrorNoticeHtml()}
     <div class="connect-section">${linkGroupHtml("cal")}</div>
     <div class="connect-section">${linkGroupHtml("task")}</div>
@@ -1196,30 +1380,52 @@ const ATTENDANCE_CHAT_GUIDE_URL = "";  // 유튜브 안내 영상 — 링크가 
 function loadChatStatus(force) {
   if (!force && S.chatStatus != null) return;  // 결과가 없을 때(null)만 새로 묻는다
   S.chatStatus = "loading";
+  const request = beginIssueRequest(true);
   call("attendance_chat_status")
-    .then((data) => { S.chatStatus = data; })
-    .catch(() => { S.chatStatus = { connected: false, registered: false, account: "", class_space_name: "", reason: "" }; })
-    .finally(render);
+    .then((data) => {
+      if (!ownsIssueRequest(request)) return;
+      S.chatStatus = data;
+      render();
+    })
+    .catch((error) => {
+      if (showProblemIssue(error, request)) return;
+      if (!ownsIssueRequest(request)) return;
+      S.chatStatus = { connected: false, registered: false, account: "", class_space_name: "", class_space_id: "", reason: "" };
+      render();
+    });
 }
 /* 연결하기 뒤 재확인 — 출결 탭에 있는 동안 3초 간격, 최대 10분 */
 let chatPollTimer = null;
 let chatPollUntil = 0;
+let chatPollGen = 0;
 function stopChatConnectPoll() {
+  chatPollGen += 1;
   if (chatPollTimer) { clearTimeout(chatPollTimer); chatPollTimer = null; }
 }
 function startChatConnectPoll() {
   stopChatConnectPoll();
+  const gen = chatPollGen;
   chatPollUntil = Date.now() + 10 * 60 * 1000;
+  const stillOnAttendanceTab = () => S.connectTab === "attendance" &&
+    ((S.mode === "edit" && S.edit === "connect") ||
+      (S.mode === "wizard" && WIZARD_CARD_BY_STEP[S.step] === "connect"));
   const tick = async () => {
     chatPollTimer = null;
-    const onTab = S.connectTab === "attendance" &&
-      ((S.mode === "edit" && S.edit === "connect") || (S.mode === "wizard" && WIZARD_CARD_BY_STEP[S.step] === "connect"));
-    if (!onTab || Date.now() > chatPollUntil) return;
+    if (gen !== chatPollGen || !stillOnAttendanceTab() || Date.now() > chatPollUntil) return;
+    const request = beginIssueRequest(true);
     try {
       const data = await call("attendance_chat_status");
+      if (gen !== chatPollGen || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
       S.chatStatus = data;
       if (data.connected) { showToast("Google Chat 연결이 끝났어요"); return; }
-    } catch (error) { /* 다음 틱에 다시 */ }
+    } catch (error) {
+      if (gen !== chatPollGen || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
+      if (showProblemIssue(error, request)) {
+        stopChatConnectPoll();
+        return;
+      }
+    }
+    if (gen !== chatPollGen || !stillOnAttendanceTab()) return;
     render();
     chatPollTimer = setTimeout(tick, 3000);
   };
@@ -1246,6 +1452,7 @@ function startAttendancePreparePoll() {
     const onTab = S.mode === "wizard" && S.connectTab === "attendance" &&
       WIZARD_CARD_BY_STEP[S.step] === "connect";
     if (!onTab) { attendancePreparePollOn = false; return; }
+    const issueRequest = beginIssueRequest(true);
     const before = JSON.stringify([
       S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
     ]);
@@ -1277,7 +1484,16 @@ function startAttendancePreparePoll() {
           keepPolling = true;
         }
       }
-    } catch (error) { keepPolling = true; /* 다음 틱에 다시 */ }
+    } catch (error) {
+      if (gen !== attendancePrepareGen) return;
+      // 문제 화면을 그리는 동안에는 일반 상태 읽기가 끼어들어 안내를 지우지
+      // 않게 폴링 소유권을 유지하고, 그린 직후에만 폴링을 끝낸다.
+      if (showProblemIssue(error, issueRequest)) {
+        attendancePreparePollOn = false;
+        return;
+      }
+      keepPolling = true; /* 구조화되지 않은 옛 오류만 다음 틱에 다시 */
+    }
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
     if (JSON.stringify([
@@ -1296,17 +1512,43 @@ function defaultClassSpaceName() {
   const room = pick("담임학년") && pick("담임반") ? `${pick("담임학년")}-${pick("담임반")}` : "";
   return [pick("학교명"), room].filter(Boolean).join(" ");
 }
+function classSpaceCheckCodes(spaces) {
+  const tokens = spaces.map((space) => String(space?.name || "")
+    .replace(/^spaces\//, "").replace(/[^A-Za-z0-9]/g, "").toUpperCase());
+  return tokens.map((token, index) => {
+    for (let length = Math.min(4, token.length); length <= Math.min(token.length, 12); length += 1) {
+      const code = token.slice(-length);
+      if (tokens.every((other, otherIndex) => otherIndex === index || other.slice(-length) !== code)) {
+        return code;
+      }
+    }
+    return `${token.slice(-8) || "확인"}-${index + 1}`;
+  });
+}
 function classSpaceSubrowHtml(a) {
   const cs = S.chatStatus;
   if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return "";
   if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
+  if (hasCurrentAttendanceFinalIssue([
+    "attendance_chat_create_space", "attendance_chat_set_space",
+  ])) return "";
   if (S.chatSpaces === undefined) {
     S.chatSpaces = null;
     S.chatSpacesError = false;
+    const request = beginIssueRequest(true);
     call("attendance_chat_spaces")
-      .then((rows) => { S.chatSpaces = rows; })
-      .catch(() => { S.chatSpaces = []; S.chatSpacesError = true; })
-      .finally(render);
+      .then((rows) => {
+        if (!ownsIssueRequest(request)) return;
+        S.chatSpaces = rows;
+        render();
+      })
+      .catch((error) => {
+        if (showProblemIssue(error, request)) return;
+        if (!ownsIssueRequest(request)) return;
+        S.chatSpaces = [];
+        S.chatSpacesError = true;
+        render();
+      });
   }
   const current = S.chatSpaceName !== undefined ? S.chatSpaceName : (cs.class_space_name || "");
   const openChat = `<button class="btn-tonal" data-action="link-open" data-url="https://chat.google.com/">${
@@ -1337,7 +1579,7 @@ function classSpaceSubrowHtml(a) {
 
   if (S.chatSpaces === null) {
     return `<div class="svc-subrow">
-      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오는 중이에요…</small></span></div>`;
+      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오는 중이에요…</small></span></div>${madeNote}`;
   }
 
   // 목록을 못 읽었다 — "방이 없다"와 다르다. 못 읽은 것을 없는 것으로 보고 만들기를 권하면,
@@ -1363,20 +1605,22 @@ function classSpaceSubrowHtml(a) {
     </div>${madeNote}`;
   }
 
-  // ㄱ. 방이 있다 — 골라 둔다.
-  const options = S.chatSpaces.map((s) =>
-    `<option value="${esc(s.name)}" ${s.displayName === current ? "selected" : ""}>${esc(s.displayName)}</option>`
-  ).join("");
-  // 고른 방이 목록에 있으면 맨 위 자리표시 줄을 뺀다 — 같은 이름이 두 줄로 보여
-  // 방이 두 개인 줄 알게 된다(사용자 지적 2026-07-30). 자리표시 줄은 아직 안 골랐거나,
-  // 골라 둔 방이 목록에서 사라졌을 때(이름 바뀜·나감)만 남긴다.
-  const hasCurrent = !!current && S.chatSpaces.some((s) => s.displayName === current);
-  const placeholder = hasCurrent ? "" :
-    `<option value="">${current ? esc(current) : "학급 단톡방을 골라 주세요"}</option>`;
+  // ㄱ. 방이 있다 — 같은 이름도 번호로 구분하고, 확인은 선택 저장과 분리한다.
+  const checkCodes = classSpaceCheckCodes(S.chatSpaces);
+  const candidates = S.chatSpaces.map((s, index) => {
+    const code = checkCodes[index];
+    const suffix = String(s.name || "").replace(/^spaces\//, "");
+    const roomUrl = `https://chat.google.com/room/${encodeURIComponent(suffix)}`;
+    const selected = String(cs.class_space_id || "") === String(s.name || "");
+    return `<div class="chat-space-candidate">
+      <span class="nameblock"><b>${esc(s.displayName)}</b><small>확인번호 ${esc(code)}${selected ? " · 현재 선택" : ""}</small></span>
+      <button class="btn-quiet" data-action="link-open" data-url="${esc(roomUrl)}" aria-label="${esc(code)} 방 확인">확인</button>
+      <button class="btn-tonal" data-action="class-space-choose" data-space-name="${esc(s.name)}" data-space-label="${esc(s.displayName)}" aria-label="${esc(code)} 방 고르기">고르기</button>
+    </div>`;
+  }).join("");
   return `<div class="svc-subrow">
     <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>
-    <select data-action-change="class-space-pick">
-      ${placeholder}${options}</select>
+    <div class="chat-space-candidates">${candidates}</div>
   </div>${madeNote}`;
 }
 /* 서비스 줄 오른쪽 단추 묶음(.svc-acts) — 그 서비스에서 선생님이 누를 수 있는 일을 모은다.
@@ -1456,6 +1700,9 @@ function serviceStatusHtml(entry, a) {
     if (a.state === "ready" && (!cs || cs === "loading")) {
       return `<span class="svc-status muted">확인 중…</span>`;
     }
+    if (a.state === "ready" && cs && cs.moved) {
+      return `<span class="svc-status warn">이동됨</span>`;
+    }
     if (a.state === "ready") {
       return `<span class="svc-status warn">연결 필요</span>`;
     }
@@ -1476,14 +1723,18 @@ function attendanceServiceRow(entry, a) {
   let chatActs = "";
   if (entry.service === "chat") {
     const cs = S.chatStatus;
-    const needsConnect = a.state === "ready" && cs && cs !== "loading" && !cs.connected;
+    const statusFailed = hasCurrentAttendanceFinalIssue(["attendance_chat_status"]);
+    const needsConnect = a.state === "ready" && cs && cs !== "loading"
+      && !cs.connected && !cs.moved && !statusFailed;
     const connect = needsConnect
       ? `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…">연결하기</button>` : "";
     const guide = `<button class="btn-tonal youtube" data-action="chat-guide">${icon("youtube", "small")} 연결방법</button>`;
     chatActs = connect + guide;
   }
   const note = (a.state === "failed" && a.failed_service === entry.service)
-    ? `<span class="field-error">${esc(a.detail || "")}</span>` : "";
+    ? `<span class="field-error">${esc(a.detail || "")}</span>`
+    : (entry.service === "chat" && S.chatStatus && S.chatStatus.moved)
+      ? `<span class="field-error">${esc(S.chatStatus.reason || "")}</span>` : "";
   const connectionCode = entry.service === "sheet" && a.connection_code
     ? `<small class="attendance-connection-code">연결 확인번호 ${esc(a.connection_code)}</small>`
     : "";
@@ -1512,27 +1763,39 @@ function refreshAttendanceStatus() {
 function loadAttendanceStatus() {
   if (S.attendance || S.attendanceLoading) return;
   S.attendanceLoading = true;
+  const request = beginIssueRequest(false);
   // 켠 직후에는 마지막으로 확인해 둔 상태부터 즉시 보여준다 — "확인하는 중이에요…"를
   // 프로그램을 켤 때마다 보여주지 않는다(사용자 결정 2026-07-30). 저장본을 보여준 뒤에도
   // 실제 확인은 반드시 다시 한다 — 로그인이 풀린 것을 저장본은 모른다.
   call("attendance_status_cached")
     .then((saved) => {
-      if (saved && !S.attendance) { S.attendance = saved; render(); }
+      if (ownsIssueRequest(request) && saved && !S.attendance) { S.attendance = saved; render(); }
     })
     .catch(() => {});
   call("attendance_status")
-    .then((data) => { S.attendance = data; })
+    .then((data) => { if (ownsIssueRequest(request)) S.attendance = data; })
     .catch((error) => {
+      if (!ownsIssueRequest(request) || showProblemIssue(error, request)) return;
       S.attendance = {
         state: "failed", account: "", current_user: "", spreadsheet_url: "",
         detail: error.message, failed_service: "setup", created: false,
       };
     })
-    .finally(() => { S.attendanceLoading = false; render(); });
+    .finally(() => { S.attendanceLoading = false; if (ownsIssueRequest(request)) render(); });
+}
+function hasCurrentAttendanceFinalIssue(operations) {
+  return hasCurrentFinalIssue(operations, ["failed"]);
+}
+function hasCurrentFinalIssue(operations, states = ["failed", "needs_user"]) {
+  if (problemIssueOwner !== screenKey() || !states.includes(S.problemIssue?.state)) return false;
+  return operations.includes(String(S.problemIssue.operation || ""));
 }
 function attendanceScriptUpdateHtml(a) {
   if (!a || !["ready", "script-check-required", "script-update-required"].includes(a.state)) return "";
   if (a.state === "ready") return "";
+  if (hasCurrentAttendanceFinalIssue([
+    "attendance_script_update_status", "attendance_script_update_apply",
+  ])) return "";
   const update = S.attendanceScriptUpdate;
   if (update?.state === "ai-action-required") {
     const detail = String(update.detail || "").trim()
@@ -1725,7 +1988,9 @@ function attendanceTabHtml() {
       ${rows}
     </div>
     ${S.mode === "wizard" && a.state === "ready" ? firstSetupCardHtml(a) : ""}
-    ${S.mode === "wizard" && a.state === "failed"
+    ${S.mode === "wizard" && a.state === "failed" && !hasCurrentAttendanceFinalIssue([
+      "ensure_attendance", "attendance_prepare_start", "attendance_first_setup_status",
+    ])
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
       : ""}
     ${ready
@@ -1745,18 +2010,27 @@ function aiTabHtml() {
   }
   if (S.aiTools === null) {
     S.aiTools = "loading";
+    const requestToken = ++aiToolsRequestToken;
+    const requestScreen = screenKey();
     call("ai_tools_status")
-      .then((rows) => { S.aiTools = rows; })
-      .catch(() => { S.aiTools = []; })
-      .finally(render);
+      .then((rows) => {
+        if (requestToken === aiToolsRequestToken && requestScreen === screenKey()) S.aiTools = rows;
+      })
+      .catch(() => {
+        if (requestToken === aiToolsRequestToken && requestScreen === screenKey()) S.aiTools = [];
+      })
+      .finally(() => {
+        if (requestToken === aiToolsRequestToken && requestScreen === screenKey()) render();
+      });
   }
   if (S.aiTools === "loading" || S.aiTools === null) {
     return `<p class="sub">이 컴퓨터의 AI 도구를 찾는 중이에요…</p>`;
   }
   const anyFound = S.aiTools.some((tool) => tool.found);
+  const selected = Array.isArray(S.aiSelected) ? new Set(S.aiSelected) : null;
   const rows = S.aiTools.map((tool) => `
     <label class="ai-row${tool.found ? "" : " off"}">
-      <input type="checkbox" name="ai-${esc(tool.key)}" ${tool.found ? "checked" : "disabled"}>
+      <input type="checkbox" name="ai-${esc(tool.key)}" ${tool.found && (!selected || selected.has(tool.key)) ? "checked" : ""} ${tool.found ? "" : "disabled"}>
       <b>${esc(tool.name)}</b>
       <span class="st${tool.found ? " ok" : ""}">${tool.found ? "발견됨" : "설치 안 됨"}</span>
     </label>`).join("");
@@ -1776,7 +2050,7 @@ function aiTabHtml() {
       <p>연결하면 AI에게 말로 학교 업무(일정·결석·신고서·문자)를 시킬 수 있어요. 안 써도 프로그램 사용에는 지장 없어요.</p>
     </div></div>
     <div class="ai-rows">${rows}</div>
-    ${anyFound
+    ${anyFound && !hasCurrentFinalIssue(["ai_node_status", "ai_node_prepare", "ai_skills_install"])
       ? `<div class="attendance-action"><button class="btn" data-action="ai-connect" data-busy-text="연결하는 중… (1~2분 걸릴 수 있어요)" ${S.aiConnecting ? "disabled" : ""}>${S.aiConnecting ? "연결하는 중…" : "선택한 AI와 연결"}</button></div>`
       : `<p class="hint" style="margin-top:12px">이 컴퓨터에서 AI 도구를 찾지 못했어요. AI 도구를 설치한 뒤 이 탭에 다시 들어오면 돼요.</p>`}
     ${nodeLine}${result}`;
@@ -1808,45 +2082,38 @@ bindActions({
       S.aiTools = null;
       S.aiNode = null;
       S.aiInstall = null;
+    } else {
+      aiToolsRequestToken += 1;
     }
     S.chatSpaces = undefined;
     S.chatSpaceName = undefined;
     render();
   },
-  "update-check": async () => {
-    try {
-      const update = await call("get_update_info");
-      S.updateInfo = update && update.available ? update : null;
-      S.updateCheck = update && update.status ? update.status : "failed";
-      if (S.updateCheck === "failed") {
-        showToast(updateFailureText(
-          update && update.reason,
-          "업데이트 확인을 하지 못했어요.",
-          "업데이트 다시 확인"
-        ));
-      }
-    } catch (error) {
-      S.updateInfo = null;
-      S.updateCheck = "failed";
-      showToast(updateFailureText("", "업데이트 확인을 하지 못했어요.", "업데이트 다시 확인"));
-    }
+  "update-check": async (_el, request) => {
+    const update = await call("get_update_info");
+    if (!ownsIssueRequest(request)) return;
+    S.updateInfo = update && update.available ? update : null;
+    S.updateCheck = update && update.status ? update.status : "failed";
     render();
   },
-  "update-now": async () => {
+  "update-now": async (_el, request) => {
     if (S.updating) return;  // 다운로드 중 재클릭 방지
     if (!S.updateInfo || !S.updateInfo.available) { showToast("먼저 업데이트를 확인해 주세요"); return; }
+    const exactOffer = S.updateInfo;
     S.updating = true; render();
     try {
       // 화면이 이미 아는 주소를 넘겨 재조회 없이 받는다(통신 깜빡임 오안내 방지).
-      const result = await call("start_update", S.updateInfo.url, S.updateInfo.latest, S.updateInfo.sha256);
-      if (!result.started) { S.updating = false; showToast(updateFailureText(result.reason, "업데이트를 시작하지 못했어요.", "지금 업데이트")); render(); return; }
+      const result = await call("start_update", exactOffer.url, exactOffer.latest, exactOffer.sha256);
+      if (!result.started) throw new Error(result.reason || "업데이트를 시작하지 못했어요.");
       setTimeout(() => { call("quit_app").catch(() => {}); }, 300);
-      showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
+      if (ownsIssueRequest(request)) showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
     } catch (error) {
-      S.updating = false; showToast(updateFailureText("", "업데이트를 시작하지 못했어요.", "지금 업데이트")); render();
+      S.updating = false;
+      if (ownsIssueRequest(request)) render();
+      throw error;
     }
   },
-  "ai-connect": async () => {
+  "ai-connect": async (_el, request) => {
     if (S.aiConnecting) return;
     if (!S.info?.features?.ai_skill_install_enabled) {
       showToast("AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요");
@@ -1855,17 +2122,26 @@ bindActions({
     const keys = Array.from(document.querySelectorAll('.ai-row input:checked'))
       .map((box) => box.name.replace(/^ai-/, ""));
     if (!keys.length) { showToast("연결할 AI를 하나 이상 선택해 주세요"); return; }
+    S.aiSelected = [...keys];
     S.aiConnecting = true;
     S.aiInstall = null;
     render();
     try {
-      S.aiNode = await call("ai_node_status");
+      const nodeStatus = await call("ai_node_status");
+      if (!ownsIssueRequest(request)) return;
+      S.aiNode = nodeStatus;
       if (!S.aiNode.success) {
+        if (String(S.aiNode.code || "") !== "NODE_NOT_INSTALLED") {
+          S.aiInstall = S.aiNode;
+          return;
+        }
         const approved = window.confirm(
           "AI 연결에 필요한 Teacher Manager 전용 도구를 받을까요?\nNode 공식 주소의 확인된 파일을 이 Windows 계정의 앱 폴더에만 저장해요."
         );
         if (!approved) return;
-        S.aiNode = await call("ai_node_prepare");
+        const prepared = await call("ai_node_prepare");
+        if (!ownsIssueRequest(request)) return;
+        S.aiNode = prepared;
         if (!S.aiNode.success) {
           S.aiInstall = S.aiNode;
           return;
@@ -1881,10 +2157,12 @@ bindActions({
         "이 내용을 확인했고 선택한 AI에 연결할까요?"
       );
       if (!permissionApproved) return;
-      S.aiInstall = await call("ai_skills_install", keys, true);
+      const installed = await call("ai_skills_install", keys, true);
+      if (!ownsIssueRequest(request)) return;
+      S.aiInstall = installed;
     } finally {
       S.aiConnecting = false;
-      render();
+      if (ownsIssueRequest(request)) render();
     }
   },
   "save-attendance": async () => {
@@ -1894,7 +2172,12 @@ bindActions({
     try {
       S.attendance = await call("ensure_attendance");
       S.checks = await call("home_checks");
-      S.chatStatus = null;
+      // 출결 준비가 끝난 직후 현재 Chat 허용 상태까지 읽어야 별도의 "연결하기"
+      // 단추를 바로 보여 줄 수 있다. 화면을 먼저 그리면 바깥 클릭 작업이 끝날 때
+      // 그 읽기가 취소되어 "확인 중"에 계속 머물 수 있다.
+      S.chatStatus = S.attendance.state === "ready"
+        ? await call("attendance_chat_status")
+        : null;
       if (S.attendance.state === "ready") showToast("출결 업무 준비를 마쳤어요");
     } finally {
       S.attendanceSaving = false;
@@ -2102,7 +2385,10 @@ bindActions({
       S.spaceCreate = "ok";
       S.chatSpaceName = data.display_name;
       S.chatSpaces = undefined;   // 방금 만든 방이 목록에 잡히게 다시 읽는다
-      S.chatStatus = null;
+      if (S.chatStatus && typeof S.chatStatus === "object") {
+        S.chatStatus.class_space_id = data.space_name;
+        S.chatStatus.class_space_name = data.display_name;
+      }
       showToast("학급 단톡방을 만들고 골라 뒀어요");
     } else if (data.state === "blocked") {
       S.spaceCreate = "blocked";
@@ -2116,6 +2402,26 @@ bindActions({
       }
     }
     render();
+  },
+  "class-space-choose": async (el) => {
+    const spaceName = String(el.dataset.spaceName || "");
+    const label = String(el.dataset.spaceLabel || "");
+    const expected = String((S.chatStatus && S.chatStatus.class_space_id) || "");
+    if (!spaceName) return;
+    const request = beginIssueRequest(false);
+    try {
+      await call("attendance_chat_set_space", spaceName, label, expected);
+      if (!ownsIssueRequest(request)) return;
+      S.chatSpaceName = label;
+      if (S.chatStatus && typeof S.chatStatus === "object") {
+        S.chatStatus.class_space_id = spaceName;
+        S.chatStatus.class_space_name = label;
+      }
+      showToast("학급 단톡방을 골랐어요");
+      render();
+    } catch (error) {
+      handleCaughtError(error, request);
+    }
   },
   "class-space-reload": async () => {
     S.spaceCreate = null;
@@ -2175,14 +2481,18 @@ document.addEventListener("change", (event) => {
     const spaceName = select.value;
     if (!spaceName) return;
     const label = select.options[select.selectedIndex].textContent;
+    const request = beginIssueRequest(false);
     call("attendance_chat_set_space", spaceName, label)
-      .then(() => { S.chatSpaceName = label; showToast("학급 단톡방을 골랐어요"); })
-      .catch((error) => setBanner("error", error.message));
+      .then(() => { if (ownsIssueRequest(request)) { S.chatSpaceName = label; showToast("학급 단톡방을 골랐어요"); } })
+      .catch((error) => handleCaughtError(error, request));
   }
 });
 function stepConnect() {
   if (!S.google) {
-    call("google_status").then((data) => { S.google = data; render(); }).catch((e) => setBanner("error", e.message));
+    const request = beginIssueRequest(false);
+    call("google_status")
+      .then((data) => { if (ownsIssueRequest(request)) { S.google = data; render(); } })
+      .catch((error) => handleCaughtError(error, request));
     return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>`;
   }
   if (googleAuthCheckFailed(S.google)) {
@@ -2229,6 +2539,7 @@ async function validateConnect() {
     return firstIssueMessage(blocking);
   }
   await provisionConnectTargets();
+  S.googleTargetAccountChanged = false;
   return "";
 }
 /* '새로 만들기'를 고른 캘린더·Tasks 목록을 구글에 실제로 만들고 그 ID를 프로필에 채운다.
@@ -2240,19 +2551,19 @@ async function provisionConnectTargets() {
   const homeroom = p["담임여부"] === "예";
   const modes = linkModes();
   if (modes.cal === "new") {
-    const work = await call("ensure_calendar_named", p["업무캘린더이름"]);
+    const work = await ensureConnectTarget("업무캘린더ID", "ensure_calendar_named", p["업무캘린더이름"]);
     p["업무캘린더ID"] = work.id;
     markEditDirtyField("업무캘린더ID");
-    const school = await call("ensure_calendar_named", p["학사일정캘린더이름"]);
+    const school = await ensureConnectTarget("학사일정캘린더ID", "ensure_calendar_named", p["학사일정캘린더이름"]);
     p["학사일정캘린더ID"] = school.id;
     markEditDirtyField("학사일정캘린더ID");
   }
   if (modes.task === "new") {
-    const workTasks = await call("ensure_tasklist_named", p["업무Tasks목록이름"]);
+    const workTasks = await ensureConnectTarget("업무Tasks목록ID", "ensure_tasklist_named", p["업무Tasks목록이름"]);
     p["업무Tasks목록ID"] = workTasks.id;
     markEditDirtyField("업무Tasks목록ID");
     if (homeroom) {
-      const homeTasks = await call("ensure_tasklist_named", p["담임안내Tasks목록이름"]);
+      const homeTasks = await ensureConnectTarget("담임안내Tasks목록ID", "ensure_tasklist_named", p["담임안내Tasks목록이름"]);
       p["담임안내Tasks목록ID"] = homeTasks.id;
       markEditDirtyField("담임안내Tasks목록ID");
     }
@@ -2270,34 +2581,161 @@ function readinessRow(title, note, state, retryAction) {
       (retryAction ? `<button class="btn-tonal" data-action="${retryAction}" data-busy-text="준비 중…">다시 설치하기</button>` : "");
   return `<div class="row"><span class="nameblock"><b>${esc(title)}</b><small>${esc(note)}</small></span><span class="row-actions">${right}</span></div>`;
 }
-async function refreshSettingsStatus() {
+let settingsStatusRequest = null;
+function hasCurrentSettingsStatusRequest() {
+  return Boolean(settingsStatusRequest && ownsIssueRequest(settingsStatusRequest));
+}
+async function refreshSettingsStatus(request) {
+  const owner = request || beginIssueRequest(false);
+  // 같은 요청만 막는다. 닫은 화면의 늦은 요청은 이미 소유권을 잃었으므로,
+  // 다시 연 설정 화면의 새 점검을 가로막으면 안 된다.
+  if (hasCurrentSettingsStatusRequest()
+      && settingsStatusRequest.screen === owner.screen
+      && settingsStatusRequest.token === owner.token) return false;
+  settingsStatusRequest = owner;
   // 컴퓨터 → Google → 로그인 시 Calendar·Tasks 목록까지 한 번에 재점검한다.
-  S.computer = await call("computer_status");
-  const previousGoogle = S.google;
-  const nextGoogle = await call("google_status");
-  const previousAccount = String(previousGoogle?.user || "").trim().toLowerCase();
-  const nextAccount = String(nextGoogle?.user || "").trim().toLowerCase();
-  S.google = nextGoogle;
-  if (previousGoogle && previousAccount !== nextAccount) {
-    clearGoogleDependentState();
-  }
-  S.gwsUpdate = await call("gws_update_status");
-  if (isGoeduGoogleStatus(S.google)) {
-    try {
-      const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
-      S.lists = { calendars, tasklists };
-      S.listsLoaded = true;
-      S.listsError = false;
-      // 새 목록에도 기존 선택 ID가 있으면 select가 같은 값으로 유지된다.
-    } catch (error) {
-      // 한 목록이라도 실패하면 기존 목록과 선택 ID를 그대로 둔다.
+  try {
+    const computer = await call("computer_status");
+    if (!ownsIssueRequest(owner)) return false;
+    const previousGoogle = S.google;
+    const nextGoogle = await call("google_status");
+    if (!ownsIssueRequest(owner)) return false;
+    const previousAccount = String(previousGoogle?.user || "").trim().toLowerCase();
+    const nextAccount = String(nextGoogle?.user || "").trim().toLowerCase();
+    S.computer = computer;
+    S.google = nextGoogle;
+    if (previousGoogle && previousAccount !== nextAccount) {
+      clearGoogleDependentState();
     }
-  } else {
-    S.lists = { calendars: [], tasklists: [] };
-    S.listsLoaded = false;
-    S.listsError = false;
+    const gwsUpdate = await call("gws_update_status");
+    if (!ownsIssueRequest(owner)) return false;
+    S.gwsUpdate = gwsUpdate;
+    if (isGoeduGoogleStatus(S.google)) {
+      try {
+        const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
+        if (!ownsIssueRequest(owner)) return false;
+        S.lists = { calendars, tasklists };
+        S.listsLoaded = true;
+        S.listsError = false;
+        // 새 목록에도 기존 선택 ID가 있으면 select가 같은 값으로 유지된다.
+      } catch (error) {
+        if (!ownsIssueRequest(owner)) return false;
+        if (showProblemIssue(error, owner)) return false;
+        // 한 목록이라도 실패하면 기존 목록과 선택 ID를 그대로 둔다.
+      }
+    } else {
+      S.lists = { calendars: [], tasklists: [] };
+      S.listsLoaded = false;
+      S.listsError = false;
+    }
+    if (ownsIssueRequest(owner)) render();
+    return true;
+  } catch (error) {
+    handleCaughtError(error, owner);
+    return false;
+  } finally {
+    if (settingsStatusRequest === owner) settingsStatusRequest = null;
   }
-  render();
+}
+
+async function ensureConnectTarget(idField, apiName, name) {
+  const chosen = S.verifiedGoogleTargetChoices?.[idField];
+  if (chosen) return { id: chosen, name };
+  const pending = {
+    field: idField,
+    kind: idField.includes("Tasks") ? "tasklist" : "calendar",
+    name,
+    account: String(S.google?.user || "").trim().toLowerCase(),
+    screen: screenKey(),
+  };
+  S.pendingGoogleTarget = pending;
+  const result = await call(apiName, name);
+  if (S.pendingGoogleTarget === pending) S.pendingGoogleTarget = null;
+  return result;
+}
+
+async function openGoogleCandidateInspector(actionKey) {
+  const urls = {
+    "inspect-calendar-candidates": "https://calendar.google.com/calendar/u/0/r/settings",
+    "inspect-tasklist-candidates": "https://tasks.google.com/",
+  };
+  const url = urls[String(actionKey || "")];
+  if (!url) return false;
+  await call("open_url", url);
+  return true;
+}
+
+async function inspectGoogleTargetCandidate(issue, actionKey, request) {
+  const match = /^inspect-(calendar|tasklist):([^\s:]+)$/.exec(String(actionKey || ""));
+  const pending = S.pendingGoogleTarget;
+  if (!match || !pending) return false;
+  const declaredAction = Array.isArray(issue?.actions)
+    ? issue.actions.find((row) => String(row?.key || "") === actionKey)
+    : null;
+  if (!declaredAction || match[1] !== pending.kind || pending.screen !== screenKey()) return false;
+  const codeMatch = /확인코드 ([0-9A-F]{6,})/.exec(String(declaredAction.label || ""));
+  const displayCode = codeMatch ? codeMatch[1] : "선택한";
+  const reply = await call(
+    "verify_google_target_candidate",
+    pending.kind,
+    match[2],
+    pending.name,
+    pending.account,
+  );
+  if (!ownsIssueRequest(request) || S.pendingGoogleTarget !== pending) return true;
+  const displayedAccount = String(S.google?.user || "").trim().toLowerCase();
+  if (!reply?.verified || displayedAccount !== pending.account) {
+    setBanner("warn", `확인코드 ${displayCode} 후보를 현재 Google 계정에서 확인하지 못했어요. 계정과 목록을 다시 확인해 주세요.`);
+    return true;
+  }
+  setBanner("ok", `확인코드 ${displayCode} 후보가 현재 Google 계정에 그대로 있어요. 연결하려면 같은 확인코드의 선택 단추를 눌러 주세요.`);
+  return true;
+}
+
+async function applyGoogleTargetSelection(issue, actionKey, request) {
+  const match = /^select-(calendar|tasklist):([^\s:]+)$/.exec(String(actionKey || ""));
+  const pending = S.pendingGoogleTarget;
+  if (!match || !pending || !S.draft.profile) return "";
+  const declared = Array.isArray(issue?.actions)
+    && issue.actions.some((row) => String(row?.key || "") === actionKey);
+  if (!declared || match[1] !== pending.kind || pending.screen !== screenKey()) return "";
+  const reply = await call(
+    "verify_google_target_candidate",
+    pending.kind,
+    match[2],
+    pending.name,
+    pending.account,
+  );
+  if (!ownsIssueRequest(request) || S.pendingGoogleTarget !== pending) return "rejected";
+  const displayedAccount = String(S.google?.user || "").trim().toLowerCase();
+  if (!reply?.verified || displayedAccount !== pending.account) {
+    clearGoogleDependentState();
+    setBanner("warn", "Google 계정이 바뀌었어요. 현재 계정에서 Calendar와 Tasks를 다시 골라 주세요.");
+    return "rejected";
+  }
+  S.draft.profile[pending.field] = match[2];
+  if (!S.verifiedGoogleTargetChoices) S.verifiedGoogleTargetChoices = {};
+  S.verifiedGoogleTargetChoices[pending.field] = match[2];
+  markEditDirtyField(pending.field);
+  S.pendingGoogleTarget = null;
+  clearProblemIssue();
+  showToast("연결할 Google 항목을 골랐어요");
+  return "selected";
+}
+async function resumeGoogleTargetSelection() {
+  const request = beginIssueRequest(false);
+  try {
+    if (S.mode === "wizard" && S.step === 7) {
+      await goNextAsync();
+      return;
+    }
+    if (S.mode === "edit" && S.edit === "connect") {
+      await provisionConnectTargets();
+      await autoSaveEdit({ leaving: true, request });
+    }
+  } catch (error) {
+    handleCaughtError(error, request);
+  }
 }
 const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인을 다시 점검해 주세요.";
 function updateFailureText(reason, fallback, buttonLabel) {
@@ -2374,6 +2812,7 @@ function googleLoginRowsHtml() {
     ? `<br><span data-gws-update-note="true">${offerExplanation}</span>`
     : "";
   const updateButton = update && update.offer && runtimeReady
+    && !hasCurrentFinalIssue(["gws_update_status", "install_gws_update"])
     ? `<button class="btn-tonal" data-action="install-gws-update" data-busy-text="갱신 중…" ${S.gwsUpdateInstalling ? "disabled" : ""}>승인된 Google 도구 ${esc(update.offer.version)}로 갱신</button>`
     : "";
   const cliRight = accountStorageProblem
@@ -2475,18 +2914,20 @@ async function refreshComputerStatus() {
   render();
 }
 function ensureComputerStatus() {
-  if ((S.computer && S.google && S.gwsUpdate) || S.computerLoading) return;
+  if ((S.computer && S.google && S.gwsUpdate) || S.computerLoading || hasCurrentSettingsStatusRequest()) return;
   S.computerLoading = true;
+  const request = beginIssueRequest(false);
   Promise.all([
     S.computer ? Promise.resolve(S.computer) : call("computer_status"),
     S.google ? Promise.resolve(S.google) : call("google_status"),
     S.gwsUpdate ? Promise.resolve(S.gwsUpdate) : call("gws_update_status"),
   ])
     .then(([computer, google, gwsUpdate]) => {
+      if (!ownsIssueRequest(request)) return;
       S.computer = computer; S.google = google; S.gwsUpdate = gwsUpdate;
     })
-    .catch((error) => { S.banner = { kind: "error", text: error.message }; })
-    .finally(() => { S.computerLoading = false; render(); });
+    .catch((error) => handleCaughtError(error, request))
+    .finally(() => { S.computerLoading = false; if (ownsIssueRequest(request)) render(); });
 }
 function attachmentFolderRow(d) {
   const value = d.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER;
@@ -2595,12 +3036,12 @@ stepBodies[7] = stepConnect;
 validators[7] = validateConnect;
 
 bindActions({
-  "settings-refresh": () => refreshSettingsStatus(),
+  "settings-refresh": (_el, request) => refreshSettingsStatus(request),
   "goto-settings": async () => {
     if (S.mode === "wizard") { await goStepAsync(2); return; }
     await openCard("settings");
   },
-  "attachment-folder-choose": async () => {
+  "attachment-folder-choose": async (_el, request) => {
     syncMessengerDraft();
     const result = await call(
       "choose_attachment_folder", S.draft.bridge.brity_download_dir || ""
@@ -2610,7 +3051,7 @@ bindActions({
     editDirtyFields.add("brity_download_dir");
     S.attachmentFolderStatus = await call("check_attachment_folder", result.path);
     render();
-    await autoSaveSettings();
+    await autoSaveSettings(false, request);
   },
   "hk-record": async () => {
     syncMessengerDraft();
@@ -3080,10 +3521,10 @@ async function loadCapturePage(page, options = {}) {
   if (S.capsLoading) return;
   S.capsLoading = true;
   try {
-    let data = await call("capture_history_page", page, CAP_PAGE_SIZE);
+    let data = await callWithLocalRecovery(() => call("capture_history_page", page, CAP_PAGE_SIZE));
     // 오래된 화면 시험 도구와 함께 열렸을 때는 기존 최근 목록 응답도 받아들인다.
     if (!data || !Array.isArray(data.items)) {
-      const rows = await call("recent_captures");
+      const rows = await callWithLocalRecovery(() => call("recent_captures"));
       data = {
         items: rows.slice(0, CAP_PAGE_SIZE), page: 1, page_size: CAP_PAGE_SIZE,
         total: rows.length, total_pages: Math.ceil(rows.length / CAP_PAGE_SIZE),
@@ -3093,7 +3534,7 @@ async function loadCapturePage(page, options = {}) {
     S.capsOpen = {};
     if (options.markFresh) S.freshWhen = S.caps.length ? S.caps[0].when : "";
   } catch (error) {
-    if (!options.quiet) {
+    if (!options.quiet && S.caps === null) {
       S.caps = [];
       S.capsPage = 1;
       S.capsTotalPages = 0;
@@ -3193,17 +3634,25 @@ function cardDetail(card) {
 }
 /* 점검 실패 → 배너 → 재렌더 → 재조회의 자기지속 루프를 끊는다:
    진행 중이면 겹쳐 부르지 않고, 실패 뒤에는 30초 지나야 자동 재조회한다. */
-const checksRetry = { inflight: false, failedAt: 0 };
+const checksRetry = { inflight: false, failedAt: 0, lastGood: [] };
 async function refreshChecks() {
   if (checksRetry.inflight) return;
   checksRetry.inflight = true;
+  const request = beginIssueRequest(false);
   try {
-    S.checks = await call("home_checks");
+    if (S.checks.length) render();
+    const checks = await call("home_checks");
+    if (!ownsIssueRequest(request)) return;
+    S.checks = checks;
+    checksRetry.lastGood = checks;
     checksRetry.failedAt = 0;
     render();
+    return;
   } catch (error) {
+    if (!ownsIssueRequest(request)) return;
     checksRetry.failedAt = Date.now();
-    setBanner("error", error.message);
+    if (checksRetry.lastGood.length) S.checks = checksRetry.lastGood;
+    handleCaughtError(error, request);
   } finally {
     checksRetry.inflight = false;
   }
@@ -3235,6 +3684,7 @@ function homeHtml(behind) {
       <button class="x" data-action="dismiss-first-notice" title="닫기">✕</button></div>`
     : "";
   const updateBanner = S.updateInfo && S.updateInfo.available
+    && !hasCurrentFinalIssue(["start_update"])
     ? `<div class="update-banner"><span><b>새 버전(${esc(S.updateInfo.latest)})이 나왔어요.</b> ${esc(S.updateInfo.notes || "")}</span>
         <button class="btn" data-action="update-now" ${S.updating ? "disabled" : ""} data-busy-text="받는 중… (1~2분)">${S.updating ? "받는 중…" : "지금 업데이트"}</button></div>`
     : "";
@@ -3243,6 +3693,7 @@ function homeHtml(behind) {
     ${updateBanner}
     ${firstNotice}
     <div class="hero"><span class="hi">${esc(name)}안녕하세요</span><span class="pill">${pill}</span></div>
+    ${checksRetry.inflight && S.checks.length ? '<p class="sub" style="margin:-6px 0 10px">다시 확인하고 있어요</p>' : ""}
     ${liveCardHtml()}
     <div class="tiles">${tiles}</div>
     <div class="section-h" style="margin-top:22px">처리한 메시지</div>
@@ -3278,16 +3729,18 @@ function windowHtml(title, body, big) {
    저장을 마친 뒤에만 닫힌다. 저장이 실패하면 창은 남고 배너에 이유가 적힌다. */
 async function closeWindow() {
   if (S.mode !== "edit" && S.mode !== "about") return true;
+  const request = beginIssueRequest(false);
   clearAttendanceScriptDialogState();
   await stopHotkeyRecording();
   let saved = false;
-  try { saved = await flushEditSave(); } catch (error) { setBanner("error", error.message); return false; }
+  try { saved = await flushEditSave(); } catch (error) { handleCaughtError(error, request); return false; }
   if (!saved) return false;  // 배너에 이유가 적혀 있다
   stopChatConnectPoll();
   S.fieldIssues = {};
   S.chatStatus = null;
   S.chatSpaces = undefined;
   S.chatSpaceName = undefined;
+  clearProblemIssue();
   S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
   return true;
 }
@@ -3306,13 +3759,28 @@ function showSaveState(text, fadeAfter) {
    저장(도우미 재시작)이 도는 사이의 새 변경은 버리지 않고 끝난 뒤 한 번 더 저장한다. */
 let settingsAutoSaveBusy = false;
 let settingsAutoSavePending = false;
-async function autoSaveSettings(afterHotkey) {
+function isHelperStartFailure(error) {
+  return error instanceof AppIssueError && error.issue?.operation === "helper_start";
+}
+async function autoSaveSettings(afterHotkey, request) {
   if (!(S.mode === "edit" && S.edit === "settings")) return; // 마법사는 마지막에 한꺼번에 적용
   if (settingsAutoSaveBusy) { settingsAutoSavePending = true; return; }
+  const owner = request || beginIssueRequest(false);
   settingsAutoSaveBusy = true;
   try {
     do {
+      if (!ownsIssueRequest(owner)) return false;
       settingsAutoSavePending = false;
+      if (S.helperRestartPending) {
+        try {
+          await call("restart_helper");
+          if (!ownsIssueRequest(owner)) return false;
+          S.helperRestartPending = false;
+        } catch (error) {
+          handleCaughtError(error, owner);
+          return false;
+        }
+      }
       const dirtyFields = new Set(editDirtyFields);
       editDirtyFields.clear();
       syncMessengerDraft();
@@ -3329,7 +3797,22 @@ async function autoSaveSettings(afterHotkey) {
         updates.brity_download_dir = S.draft.bridge.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER;
       }
       if (!Object.keys(updates).length) continue;
-      const result = await call("save_messenger", updates);
+      let result = null;
+      try {
+        showSaveState("저장 중…");
+        result = await callWithLocalRecovery(() => call("save_messenger", updates));
+      } catch (error) {
+        if (isHelperStartFailure(error)) {
+          // 파일과 자동 시작 선택은 이미 확인했다. 다음 화면 동작에서는 도우미만 다시 시작한다.
+          S.helperRestartPending = true;
+          handleCaughtError(error, owner);
+          return false;
+        }
+        dirtyFields.forEach((name) => editDirtyFields.add(name));
+        handleCaughtError(error, owner);
+        return false;
+      }
+      if (!ownsIssueRequest(owner)) return false;
       if (!result.saved) {
         dirtyFields.forEach((name) => editDirtyFields.add(name));
         S.hk.status = { kind: "bad", text: result.reason };
@@ -3340,9 +3823,12 @@ async function autoSaveSettings(afterHotkey) {
       S.hk.current = result.hotkey;
       if (afterHotkey) S.hk.status = { kind: "ok", text: `${prettyHotkey(result.hotkey)} · 저장했어요` };
       S.checks = [];
+      completeIssueRequest(owner);
       showToast("저장했어요 — 도우미가 새 설정으로 실행 중이에요");
       render();
+      showSaveState("저장됨", 2500);
     } while (settingsAutoSavePending || editDirtyFields.size);
+    return true;
   } finally {
     settingsAutoSaveBusy = false;
   }
@@ -3406,6 +3892,7 @@ async function autoSaveEdit(options) {
   // 저장이 끝난 뒤에 내리면 그 사이의 수정을 놓친다.
   editAutoSaveBusy = true;
   showSaveState("저장 중…");
+  const request = options?.request || beginIssueRequest(false);
   const savePromise = (async () => {
     do {
       editAutoSavePending = false;
@@ -3417,15 +3904,15 @@ async function autoSaveEdit(options) {
         const calendars = dirtyValues(S.draft.profile, SCOPED_CALENDAR_FIELDS, dirtyFields);
         const tasks = dirtyValues(S.draft.profile, SCOPED_TASK_FIELDS, dirtyFields);
         const gemini = dirtyValues(S.draft.bridge, SCOPED_GEMINI_FIELDS, dirtyFields);
-        if (Object.keys(identity).length) await call("save_identity", identity);
+        if (Object.keys(identity).length) await callWithLocalRecovery(() => call("save_identity", identity));
         if (dirtyFields.has("__timetable__")) {
-          await ensureGridLoaded();
-          await call("save_timetable", S.draft.grid);
+          if (!(await ensureGridLoaded(request))) return false;
+          await callWithLocalRecovery(() => call("save_timetable", S.draft.grid));
         }
-        if (Object.keys(calendars).length) await call("save_calendars", calendars);
-        if (Object.keys(tasks).length) await call("save_tasks", tasks);
+        if (Object.keys(calendars).length) await callWithLocalRecovery(() => call("save_calendars", calendars));
+        if (Object.keys(tasks).length) await callWithLocalRecovery(() => call("save_tasks", tasks));
         if (Object.keys(gemini).length) {
-          const saved = await call("save_gemini", gemini);
+          const saved = await callWithLocalRecovery(() => call("save_gemini", gemini));
           // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지
           // 않는다. 타자를 칠 때마다 경고를 띄우면 쓰던 것이 끊기므로 나갈 때만 알린다.
           const push = saved.sheet_push;
@@ -3438,9 +3925,12 @@ async function autoSaveEdit(options) {
         // 실패한 묶음은 다음 저장에서 다시 시도한다. 저장 도중 들어온 새 변경은 이미
         // editDirtyFields에 있으므로 합치기만 하고 지우지 않는다.
         dirtyFields.forEach((name) => editDirtyFields.add(name));
-        throw error;
+        handleCaughtError(error, request);
+        return false;
       }
+      if (!ownsIssueRequest(request)) return false;
     } while (editAutoSavePending || editDirtyFields.size);
+    completeIssueRequest(request);
     showSaveState("저장됨", 2500);
     return true;
   })();
@@ -3456,7 +3946,8 @@ function scheduleEditAutoSave() {
   if (!autoSaveScreen()) return;
   clearTimeout(editAutoSaveTimer);
   editAutoSaveTimer = setTimeout(() => {
-    autoSaveEdit().catch((error) => setBanner("error", error.message));
+    const request = beginIssueRequest(false);
+    autoSaveEdit({ request }).catch((error) => handleCaughtError(error, request));
   }, AUTO_SAVE_DELAY_MS);
 }
 /* 창을 닫을 때 기다리던 저장을 지금 끝내고, 끝난 뒤에 홈으로 간다. */
@@ -3469,7 +3960,7 @@ async function flushEditSave() {
     // 설정도 같은 규칙 — 열어 보기만 하고 나오면 저장(도우미 재시작)도, 홈 점검
     // 다시 돌기도 없어야 한다(사용자 확인 2026-07-31). 값을 바꾸면 그 자리에서
     // 이미 저장되므로, 여기서는 저장이 미처 못 따라온 경우만 마저 저장한다.
-    if (editDirtyFields.size) await autoSaveSettings();
+    if (S.helperRestartPending || editDirtyFields.size) return await autoSaveSettings();
     return true;
   }
   if (!autoSaveScreen()) return true;
@@ -3480,9 +3971,9 @@ async function flushEditSave() {
   if (!editDirtyFields.size && !inFlightSave) return true;
   if (S.edit === "connect") {
     // '새로 만들기'를 고른 캘린더·Tasks 목록은 여기서 실제로 만들어 ID를 채운다.
-    // 타자를 칠 때마다 만들면 안 되므로 나갈 때 한 번만 한다. 실패해도 입력한 값은
-    // 그대로 저장하고 홈으로 보낸다 — 남은 문제는 홈 점검이 알려 준다.
-    try { await provisionConnectTargets(); } catch (error) { /* 홈 점검이 알려 준다 */ }
+    // 타자를 칠 때마다 만들면 안 되므로 나갈 때 한 번만 한다. 로그인이 필요하거나
+    // 최종 실패가 나면 현재 화면에서 안내하고, 해결 뒤 이 닫기 동작을 자동으로 잇는다.
+    await provisionConnectTargets();
   }
   if (!editDirtyFields.size) return true;
   return await autoSaveEdit({ leaving: true });
@@ -3492,6 +3983,10 @@ for (const eventName of ["input", "change"]) {
     const box = event.target;
     // 학급 단톡방 이름은 치는 즉시 상태로 보관한다 — 폴링 render가 지우지 않게 (검토 C3)
     if (box && box.name === "class-space-name") S.spaceDraftName = box.value;
+    if (box && /^ai-/.test(String(box.name || ""))) {
+      S.aiSelected = Array.from(document.querySelectorAll('.ai-row input:checked'))
+        .map((input) => input.name.replace(/^ai-/, ""));
+    }
     if (S.mode === "wizard" && S.step >= 3 && S.step <= 5 && S.attendance
         && (S.attendance.state === "ready" || S.attendance.state === "installing")) {
       // 화면을 보기만 한 것은 변경이 아니다. 이 세 단계에서 실제 input/change가 난 뒤에만
@@ -3508,7 +4003,8 @@ for (const eventName of ["input", "change"]) {
       if (eventName === "change"
           && (changedField === "autostart" || changedField === "brity_download_dir")) {
         // 저장 예외(레지스트리 거부 등)가 무통지로 사라지면 화면과 실제 값이 어긋난다.
-        autoSaveSettings().catch((error) => setBanner("error", error.message));
+        const request = beginIssueRequest(false);
+        autoSaveSettings(false, request).catch((error) => handleCaughtError(error, request));
       }
       return;
     }
@@ -3528,6 +4024,9 @@ function settingsEditBody() {
 }
 // 업데이트 상태·버튼 — '버전 및 제작 정보' 화면의 한 줄에서 쓴다.
 function updateControls() {
+  if (hasCurrentFinalIssue(["get_update_info", "start_update"])) {
+    return { st: `<span class="st warn">위 문제 안내를 확인해 주세요</span>`, btn: "" };
+  }
   if (S.updating) {
     return { st: `<span class="st new">설치 파일을 받는 중… (1~2분)</span>`,
              btn: `<button class="btn" disabled>받는 중…</button>` };
@@ -3568,15 +4067,26 @@ function syncEditFields(key) {
   if (key === "connect") syncConnectFields();
   if (key === "settings") syncMessengerDraft();
 }
-async function loadForEdit(key) {
-  const profile = await call("read_profile");
+async function loadForEdit(key, request) {
+  const profile = await callWithLocalRecovery(() => call("read_profile"));
+  if (!ownsIssueRequest(request)) return false;
+  let grid = null;
+  let settings = null;
+  if (key === "timetable" || key === "identity") {
+    grid = await callWithLocalRecovery(() => call("read_grid"));
+    if (!ownsIssueRequest(request)) return false;
+  }
+  if (key === "connect" || key === "settings") {
+    settings = await callWithLocalRecovery(() => call("get_messenger_settings"));
+    if (!ownsIssueRequest(request)) return false;
+  }
   S.profileCache = profile;
   // 저장본이 이긴다 — 저장 없이 홈으로 나가며 버린 편집이 재진입 화면에
   // 남거나 연결 화면 저장에 편승 커밋되면 안 된다. (bridge·grid와 같은 규칙)
   S.draft.profile = Object.assign({}, profile);
-  if (key === "timetable" || key === "identity") S.draft.grid = await call("read_grid");
-  if (key === "connect" || key === "settings") {
-    const settings = await call("get_messenger_settings");
+  if (key === "connect" && S.googleTargetAccountChanged) clearDraftGoogleTargetIds();
+  if (grid !== null) S.draft.grid = grid;
+  if (settings !== null) {
     S.draft.bridge = Object.assign({}, settings);
     S.hk = {
       current: settings.hotkey || DEFAULT_HOTKEY,
@@ -3586,8 +4096,11 @@ async function loadForEdit(key) {
   }
   if (key === "connect" && attendanceUiEnabled()) {
     try {
-      S.attendance = await call("attendance_status");
+      const attendance = await call("attendance_status");
+      if (!ownsIssueRequest(request)) return false;
+      S.attendance = attendance;
     } catch (_error) {
+      if (!ownsIssueRequest(request)) return false;
       S.attendance = null;
     }
     S.attendanceScriptUpdate = null;
@@ -3603,8 +4116,9 @@ async function loadForEdit(key) {
     S.chatStatus = null;
     S.connectTab = "messenger";
   }
-  // 설정 화면은 열 때마다 실제 상태를 다시 확인한다 — 홈 점검과 화면이 어긋나지 않게.
-  if (key === "settings") refreshSettingsStatus().catch(() => {});
+  // openCard가 화면 소유권을 먼저 settings로 바꾼 뒤 refreshSettingsStatus()를 시작한다.
+  if (key === "settings") S.settingsRefreshOnOpen = true;
+  return true;
 }
 
 /* ---------- 버전 및 제작 정보 ---------- */
@@ -3636,13 +4150,27 @@ async function openCard(key) {
   }
   S.banner = null;
   S.firstHomeNotice = false;  // 카드에 다녀오면 처음 안내 띠는 접는다
-  await loadForEdit(key);
+  const request = beginIssueRequest(false);
+  if (!(await loadForEdit(key, request))) return;
+  // 연결 자료를 읽으며 출결 수리가 필요한 것을 확인하면 첫 탭을 출결로 바꾼다.
+  // 이 변화는 사용자가 다른 화면으로 옮긴 것이 아니므로, 방금 끝난 읽기의 소유 화면도
+  // 새 탭으로 맞춘 뒤 창을 연다. 각 await 직후의 검사는 늦은 응답을 이미 걸러 냈다.
+  if (key === "connect") request.screen = screenKey();
+  if (!ownsIssueRequest(request)) return;
   // 저장된 점검에서 이 카드의 문제를 실제 입력칸 오류로 옮겨 보여준다.
   S.fieldIssues = {};
   uniqueChecks(S.checks)
     .filter((c) => c.card === key && c.ok === false)
     .forEach((c) => { S.fieldIssues[c.target] = issue(c.key, c.target, c.fix || c.detail || c.label, c.tab); });
-  S.mode = "edit"; S.edit = key; editDirtyFields.clear(); render();
+  if (!ownsIssueRequest(request)) return;
+  S.mode = "edit"; S.edit = key; editDirtyFields.clear();
+  // 설정 화면은 열 때마다 실제 상태를 다시 확인한다 — 홈 점검과 화면이 어긋나지 않게.
+  // 화면을 먼저 지정해야 늦은 결과가 홈 요청으로 잘못 귀속되지 않는다.
+  if (S.settingsRefreshOnOpen) {
+    S.settingsRefreshOnOpen = false;
+    refreshSettingsStatus().catch(() => {});
+  }
+  render();
 }
 bindActions({
   "field-eye": (el) => {
@@ -3709,12 +4237,121 @@ document.addEventListener("keydown", (event) => {
 
 /* ---------- 라우터 ---------- */
 function screenKey() { return `${S.mode}|${S.step}|${S.edit}|${S.connectTab}`; }
+const resumeHandlers = {
+  "google-login": null,
+  "chat-permission": null,
+  "chat-space-list": null,
+  "attendance-first-setup": null,
+  "attachment-download": null,
+};
+let googleLoginResumeContext = null;
+let googleLoginResumeGeneration = 0;
+let resumeRequestToken = 0;
+function registerResumeHandler(key, handler) {
+  if (!Object.prototype.hasOwnProperty.call(resumeHandlers, key)) return false;
+  resumeHandlers[key] = typeof handler === "function" ? handler : null;
+  return true;
+}
+async function openGoogleLoginSettings() {
+  const request = beginIssueRequest(false);
+  if (!(await loadForEdit("settings", request)) || !ownsIssueRequest(request)) return false;
+  S.fieldIssues = {};
+  S.mode = "edit";
+  S.edit = "settings";
+  editDirtyFields.clear();
+  render();
+  refreshSettingsStatus().catch(() => {});
+  return true;
+}
+function copyGoogleResumeValue(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+function captureGoogleResumeContext() {
+  if (S.mode === "edit" && S.edit === "settings") return null;
+  if (S.mode !== "edit" && S.mode !== "wizard") return null;
+  return {
+    generation: googleLoginResumeGeneration,
+    originScreen: screenKey(),
+    interruptedAction: problemIssueResumeAction,
+    mode: S.mode,
+    step: S.step,
+    edit: S.edit,
+    connectTab: S.connectTab,
+    draft: copyGoogleResumeValue(S.draft),
+    fieldIssues: copyGoogleResumeValue(S.fieldIssues),
+  };
+}
+async function replayInterruptedGoogleAction(context) {
+  const actionKey = String(context?.interruptedAction || "");
+  if (!actionKey || screenKey() !== context.originScreen) return false;
+  const request = beginIssueRequest(false, actionKey);
+  try {
+    if (actionKey === "go-next") await goNextAsync();
+    else if (actionKey === "back-home") await closeWindow();
+    else return false;
+  } catch (error) {
+    handleCaughtError(error, request);
+  }
+  return true;
+}
+async function resumeInterruptedGoogleScreen(request) {
+  const context = googleLoginResumeContext;
+  googleLoginResumeContext = null;
+  if (!context
+      || context.generation !== googleLoginResumeGeneration
+      || !ownsIssueRequest(request)
+      || !(S.mode === "edit" && S.edit === "settings")) return false;
+  S.mode = context.mode;
+  S.step = context.step;
+  S.edit = context.edit;
+  S.connectTab = context.connectTab;
+  S.draft = context.draft;
+  if (S.googleTargetAccountChanged) clearDraftGoogleTargetIds();
+  S.fieldIssues = context.fieldIssues || {};
+  S.banner = null;
+  clearProblemIssue();
+  render();
+  await replayInterruptedGoogleAction(context);
+  return true;
+}
+registerResumeHandler("google-login", async () => {
+  googleLoginResumeGeneration += 1;
+  googleLoginResumeContext = captureGoogleResumeContext();
+  await openGoogleLoginSettings();
+});
+registerResumeHandler("chat-space-list", async ({ ownsRequest }) => {
+  const status = await call("attendance_chat_status");
+  if (!ownsRequest()) return;
+  const spaces = await call("attendance_chat_spaces");
+  if (!ownsRequest()) return;
+  S.chatStatus = status;
+  S.chatSpaces = spaces;
+  S.chatSpaceName = String(status?.class_space_name || "");
+  S.chatSpacesError = false;
+  S.spaceCreate = null;
+  clearProblemIssue();
+  render();
+});
+function invalidateIssueResume() { resumeRequestToken += 1; }
+async function dispatchIssueResume(issue, actionKey) {
+  const resume = String(issue?.resume || "");
+  if (!resume || actionKey !== resume) return;
+  const handler = resumeHandlers[resume];
+  if (typeof handler !== "function") return;
+  const requestToken = ++resumeRequestToken;
+  const requestScreen = screenKey();
+  const ownsRequest = () => requestToken === resumeRequestToken && requestScreen === screenKey();
+  await handler({ issue, ownsRequest });
+}
 let lastScreenKey = "";
 function render() {
+  if (S.problemIssue && problemIssueOwner !== screenKey()) clearProblemIssue();
   const onLoginScreen = (S.mode === "wizard" && S.step === 2) || (S.mode === "edit" && S.edit === "settings");
   if (S.login && !onLoginScreen) {
     stopLoginPoll();
     S.login = null;
+    googleLoginResumeGeneration += 1;
+    googleLoginResumeContext = null;
     call("gws_login_cancel").catch(() => {});
   }
   if (S.mode !== "home") stopCapturePoll();
@@ -3728,6 +4365,7 @@ function render() {
   const prevWin = document.querySelector(".win-body");
   const prevWinScroll = prevWin ? prevWin.scrollTop : 0;
   const sameScreen = lastScreenKey === screenKey();
+  if (!sameScreen) invalidateIssueResume();
   if (S.mode === "wizard") renderWizard();
   else if (S.mode === "edit") renderEdit(S.edit);
   else if (S.mode === "about") renderAbout();
@@ -3762,8 +4400,10 @@ function render() {
 // 마치고 홈에 온 뒤, 다음에 켤 때 물으면 된다.
 async function askUpdateOnStart() {
   if (S.mode === "wizard") return;
+  const request = beginIssueRequest(true, "update_offer");
   let offer = null;
   try { offer = await call("update_offer"); } catch (_) { return; }
+  if (!ownsIssueRequest(request)) return;
   // '버전 및 제작 정보' 배너·상태도 이 응답 하나로 채운다 — get_update_info를 따로
   // 부르면 부팅할 때마다 같은 배포 정보를 인터넷에서 두 번 받아 오게 된다.
   if (offer && offer.available) S.updateInfo = offer;
@@ -3777,23 +4417,25 @@ async function askUpdateOnStart() {
     // 설정의 '지금 업데이트'(update-now)와 같은 마무리여야 한다 — 설치가 시작되면
     // 프로그램이 스스로 닫혀야 파일 잠금 때문에 설치가 되돌려지지 않는다. 되돌려져도
     // /SUPPRESSMSGBOXES라 아무 말 없이 끝나서 선생님은 이유를 알 수 없다.
+    const startRequest = beginIssueRequest(false, "start_update");
     S.updating = true; render();
     try {
       const result = await call("start_update", offer.url, offer.latest, offer.sha256);
       if (!result.started) {
-        S.updating = false;
-        showToast(updateFailureText(result.reason, "업데이트를 시작하지 못했어요.", "지금 업데이트"));
-        render();
-        return;
+        throw new Error(result.reason || "업데이트를 시작하지 못했어요.");
       }
       setTimeout(() => { call("quit_app").catch(() => {}); }, 300);
-      showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
+      if (ownsIssueRequest(startRequest)) showToast("설치 파일을 확인했어요. 설치 창을 열게요.");
     } catch (error) {
-      // call()은 실패하면 던진다 — 감싸지 않으면 화면이 '받는 중…'에 멈춘 채 남는다.
-      S.updating = false; showToast(updateFailureText("", "업데이트를 시작하지 못했어요.", "지금 업데이트")); render();
+      S.updating = false;
+      if (ownsIssueRequest(startRequest)) {
+        render();
+        handleCaughtError(error, startRequest);
+      }
     }
     return;
   }
+  if (!ownsIssueRequest(request)) return;
   try {
     await call("decline_update", offer.latest);
   } catch (error) {

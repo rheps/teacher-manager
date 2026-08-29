@@ -21,6 +21,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brity_bridge import (
+    ai_skill_install,
     bundle_paths,
     capture_store,
     component_lock,
@@ -28,6 +29,7 @@ from brity_bridge import (
     paths,
     pipeline,
     process_win,
+    recovery,
 )
 from brity_bridge.settings import load_settings
 from dashboard import engine
@@ -146,8 +148,22 @@ def _ok(data):
 
 
 def _fail(error, operation: str = ""):
+    if isinstance(error, (recovery.UserActionRequired, recovery.FinalOperationFailure)):
+        return _issue_reply(error.issue)
+
     message = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
-    reply = {"ok": False, "error": message}
+    if isinstance(error, ScreenSafeError):
+        needs_user = _screen_safe_user_issue(error, operation)
+        if needs_user is not None:
+            return _issue_reply(needs_user)
+
+    issue = recovery.unexpected_final_issue(
+        operation=str(operation or "unknown_operation"),
+        title=message,
+        change_status="확인된 자료는 바꾸지 않았습니다.",
+        app_version=version.APP_VERSION,
+    )
+    reply = _issue_reply(issue, error_text=message)
     if isinstance(error, external_url.ExternalUrlOpenError):
         reply["error"] = str(error)
         reply["code"] = external_url.NO_EXTERNAL_BROWSER
@@ -165,6 +181,49 @@ def _fail(error, operation: str = ""):
         except ImportError:
             pass
     return reply
+
+
+def _issue_reply(issue: recovery.UserIssue, *, error_text: str | None = None) -> dict:
+    """Keep the old safe sentence while moving JS consumers to the issue record."""
+
+    return {
+        "ok": False,
+        "issue": issue.to_dict(),
+        "error": error_text or issue.message or issue.title,
+    }
+
+
+def _screen_safe_user_issue(error: ScreenSafeError, operation: str) -> recovery.UserIssue | None:
+    """Only fixed messages that ask for a teacher action become direct actions."""
+
+    message = str(error)
+    if message == engine.ATTENDANCE_ACCOUNT_MESSAGE:
+        return recovery.UserIssue.needs_user(
+            operation=str(operation or "attendance_account"),
+            title="Google 계정을 확인해 주세요.",
+            message=message,
+            change_status="기존 출결 자료는 그대로입니다.",
+            actions=(recovery.IssueAction("google-login", "Google 로그인 설정 열기"),),
+            resume="google-login",
+        )
+    if message == _ATTENDANCE_AI_PROOF_MESSAGE:
+        return recovery.UserIssue.needs_user(
+            operation=str(operation or "attendance_first_setup"),
+            title="출석부의 처음 설정을 마쳐 주세요.",
+            message=message,
+            change_status="기존 출결 자료는 그대로입니다.",
+            actions=(recovery.IssueAction("attendance-first-setup", "출석부 설정 확인"),),
+            resume="attendance-first-setup",
+        )
+    return None
+
+
+def _write_support_clipboard(text: str) -> None:
+    """Use the Windows clipboard writer only after the report has been rebuilt."""
+
+    from brity_bridge import clipboard_win
+
+    clipboard_win.write_text_for_test(text)
 
 
 def _migrate_attendance_roster_layout(
@@ -297,6 +356,8 @@ class BridgeDeps:
     apply_deps: object = None
     attendance_deps: object = None
     helper_restart: object = None
+    helper_window_exists: object = None
+    recovery_sleeper: object = None
     helper_stop: object = None
     helper_hotkey_pause: object = None
     helper_hotkey_resume: object = None
@@ -318,6 +379,21 @@ class BridgeDeps:
     node_local_app_data: object = None
     node_opener: object = None
     node_run_command: object = None
+    node_preparer: object = None
+    node_runtime_resolver: object = None
+    ai_skill_approval_loader: object = None
+    ai_skill_installer: object = None
+    ai_skill_completion_reader: object = None
+    update_checker: object = None
+    update_starter: object = None
+    update_completion_reader: object = None
+    update_opener: object = None
+    update_launcher: object = None
+    update_dest_dir: object = None
+    update_helper_is_running: object = None
+    update_helper_resume: object = None
+    update_setup_is_open: object = None
+    update_setup_process_paths: object = None
     gws_update_checker: object = None
     gws_update_installer: object = None
     gws_runtime_resolver: object = None
@@ -328,6 +404,8 @@ class BridgeDeps:
     attendance_roster_migrator: object = None
     attendance_ai_inspector: object = None
     attendance_remote_work_timeout_seconds: object = None
+    support_clipboard_writer: object = None
+    support_mail_opener: object = None
 
 
 class Api:
@@ -339,16 +417,23 @@ class Api:
         self._gws_update_offer_key = ""
         self._gws_update_last_status = None
         self._gws_update_install_lock = threading.Lock()
+        self._app_update_offer = None
+        self._app_update_offer_key = ""
         self._attendance_script_update_lock = threading.Lock()
         self._gws_login_start_lock = threading.Lock()
         self._attendance_prepare_lock = threading.Lock()
         self._capture_retry_lock = threading.Lock()
         self._attendance_prepare_thread = None
         self._attendance_prepare_result = None
+        self._attendance_prepare_issue = None
         # 완료 확인 폴링용 gws 경로 캐시 — 3초 폴마다 resolve_gws(동봉본 SHA-256 검증
         # + 판 확인 실행)를 통째로 다시 돌리지 않는다(검토 C7). 승인된 갱신을 설치하면
         # 실행 파일이 바뀔 수 있어 install_gws_update 성공 시 비운다.
         self._attendance_gws_cache = None
+        self._support_clipboard_writer = (
+            self._deps.support_clipboard_writer or _write_support_clipboard
+        )
+        self._support_mail_opener = self._deps.support_mail_opener
 
     def _open_external_url(self, url) -> dict:
         return external_url.open_external_url(
@@ -478,7 +563,10 @@ class Api:
 
     @guarded
     def get_update_info(self):
-        return engine.check_update(version.APP_VERSION)
+        return self._read_app_update_offer(
+            "get_update_info",
+            "업데이트를 확인하지 못했어요.",
+        )
 
     @guarded
     def update_offer(self, fetch=None, today=None):
@@ -492,13 +580,32 @@ class Api:
         import datetime as _dt
 
         day = str(today or _dt.date.today().isoformat())
-        info = engine.check_update(version.APP_VERSION, fetch=fetch)
+        try:
+            info = self._read_app_update_offer(
+                "update_offer",
+                "업데이트를 확인하지 못했어요.",
+                fetch=fetch,
+            )
+        except recovery.FinalOperationFailure as error:
+            # 켤 때의 자동 확인은 사용을 막거나 문제 화면을 띄우지 않는다.
+            # 사용자가 직접 누르는 get_update_info만 공통 문제 화면으로 이어진다.
+            info = {
+                "status": "failed",
+                "code": "UPDATE_INFO_UNAVAILABLE",
+                "available": False,
+                "latest": "",
+                "notes": "",
+                "url": "",
+                "sha256": "",
+                "reason": str(error.issue.reason or "업데이트 확인을 하지 못했어요."),
+            }
         # 확인 자체가 실패(인터넷 끊김 등)했으면 '오늘 확인함'으로 남기지 않는다 —
         # 남기면 와이파이가 돌아온 뒤에도 그날 하루는 다시 확인할 길이 없어진다.
         if info.get("status") != "failed":
             engine.remember_update_checked(self._config_dir, day)
         base = {
             "status": info.get("status", "failed"),
+            "code": str(info.get("code") or ""),
             "available": bool(info.get("available")),
             "latest": str(info.get("latest", "") or ""),
             "notes": str(info.get("notes", "") or ""),
@@ -532,13 +639,97 @@ class Api:
     @guarded
     def start_update(self, url="", latest="", sha256=""):
         # 화면이 이미 아는 url을 넘겨받아 재조회 없이 바로 받는다(통신 깜빡임 오안내 방지).
-        return engine.start_update(
-            version.APP_VERSION,
-            url=url or "",
-            latest=latest or "",
-            sha256=sha256 or "",
-            stop_before_launch=self._deps.helper_stop or engine.stop_helper,
-            config_dir=self._config_dir,
+        shown = {
+            "url": str(url or ""),
+            "latest": str(latest or ""),
+            "sha256": str(sha256 or ""),
+        }
+        if (
+            self._app_update_offer is None
+            or self._app_offer_key(shown) != self._app_update_offer_key
+        ):
+            return self._component_operation(
+                "start_update",
+                "앱 업데이트를 시작하지 못했어요.",
+                "update_setup_launch",
+                lambda: {
+                    "started": False,
+                    "code": "UPDATE_OFFER_CHANGED",
+                    "latest": shown["latest"],
+                    "reason": "화면에서 확인한 업데이트 정보가 달라 안전하게 중단했어요.",
+                },
+                change_status="현재 앱과 기존 설정은 그대로입니다.",
+            )
+
+        exact = dict(self._app_update_offer)
+        starter = self._deps.update_starter or engine.start_update
+        completion_reader = (
+            self._deps.update_completion_reader or engine.verify_update_run_stage
+        )
+        start_kwargs = {
+            **exact,
+            "stop_before_launch": self._deps.helper_stop or engine.stop_helper,
+            "config_dir": self._config_dir,
+        }
+        if self._deps.update_opener is not None:
+            start_kwargs["opener"] = self._deps.update_opener
+        if self._deps.update_launcher is not None:
+            start_kwargs["launch"] = self._deps.update_launcher
+        if self._deps.update_dest_dir is not None:
+            start_kwargs["dest_dir"] = self._deps.update_dest_dir
+        if self._deps.update_helper_is_running is not None:
+            start_kwargs["helper_is_running"] = self._deps.update_helper_is_running
+        if self._deps.update_helper_resume is not None:
+            start_kwargs["resume_after_launch_failure"] = self._deps.update_helper_resume
+        if self._deps.update_setup_is_open is not None:
+            start_kwargs["setup_is_open"] = self._deps.update_setup_is_open
+        else:
+            start_kwargs["setup_is_open"] = lambda path: engine.setup_process_is_open(
+                path,
+                process_paths=self._deps.update_setup_process_paths,
+            )
+
+        def start_once():
+            result = dict(starter(version.APP_VERSION, **start_kwargs) or {})
+            code = str(
+                result.get("code")
+                or ("UPDATE_SETUP_LAUNCHED" if result.get("started") else "UPDATE_DOWNLOAD_UNAVAILABLE")
+            )
+            result["code"] = code
+            if code == "UPDATE_SETUP_LAUNCHED":
+                result.update({"started": True, "stage": "setup_opened", "reason": ""})
+            return result
+
+        def readback():
+            complete, status = completion_reader(
+                self._config_dir,
+                **exact,
+                expected_stage="setup_opened",
+            )
+            if not complete:
+                return False, status
+            return True, {
+                **status,
+                "started": True,
+                "stage": "setup_opened",
+                "reason": "",
+            }
+
+        def update_stage(value):
+            code = str(value.get("code") or "") if isinstance(value, dict) else ""
+            if code == "UPDATE_HELPER_BUSY":
+                return "update_helper_stop"
+            if code in {"UPDATE_SETUP_LAUNCHED", "UPDATE_SETUP_LAUNCH_FAILED"}:
+                return "update_setup_launch"
+            return "update_download"
+
+        return self._component_operation(
+            "start_update",
+            "앱 업데이트를 시작하지 못했어요.",
+            update_stage,
+            start_once,
+            verify=readback,
+            change_status="현재 앱과 기존 설정은 그대로입니다.",
         )
 
     @guarded
@@ -569,7 +760,15 @@ class Api:
             kwargs["local_app_data"] = self._deps.node_local_app_data
         if self._deps.node_run_command is not None:
             kwargs["run_command"] = self._deps.node_run_command
-        return engine.ai_node_status(**kwargs)
+        if self._deps.node_runtime_resolver is not None:
+            kwargs["resolver"] = self._deps.node_runtime_resolver
+        return self._component_operation(
+            "ai_node_status",
+            "AI 연결 도구의 현재 상태를 안전하게 확인하지 못했어요.",
+            "node_status",
+            lambda: engine.ai_node_status(**kwargs),
+            change_status="기존 AI 설정과 선택한 연결 대상은 그대로입니다.",
+        )
 
     @guarded
     def ai_node_prepare(self):
@@ -580,14 +779,110 @@ class Api:
             kwargs["opener"] = self._deps.node_opener
         if self._deps.node_run_command is not None:
             kwargs["run_command"] = self._deps.node_run_command
-        return engine.ai_node_prepare(**kwargs)
+        prepare = self._deps.node_preparer or engine.ai_node_prepare
+        return self._component_operation(
+            "ai_node_prepare",
+            "AI 연결 도구를 준비하지 못했어요.",
+            "node_prepare",
+            lambda: prepare(**kwargs),
+            verify=lambda: engine.verify_managed_node_completion(
+                local_app_data=self._deps.node_local_app_data,
+                run_command=(self._deps.node_run_command or engine.process_win.run_captured),
+                resolver=self._deps.node_runtime_resolver,
+            ),
+            change_status="기존 AI 설정과 선택한 연결 대상은 그대로입니다.",
+        )
 
     @guarded
     def ai_skills_install(self, keys, permission_ack=False):
+        requested = {str(key) for key in (keys or [])}
+        selected = [
+            tool["key"] for tool in engine.AI_TOOLS if tool["key"] in requested
+        ]
+        # Missing selection and permission are explicit teacher decisions, not
+        # temporary failures.  Keep the existing ordinary response for them.
+        if not selected or permission_ack is not True:
+            return engine.ai_skills_install(
+                keys,
+                permission_ack=permission_ack,
+                **(
+                    {"run_command": self._deps.node_run_command}
+                    if self._deps.node_run_command is not None
+                    else {}
+                ),
+            )
+        if self._deps.ai_skill_installer is None and not engine.ai_skill_install_enabled():
+            return engine.ai_skills_install(
+                selected,
+                permission_ack=True,
+                **(
+                    {"run_command": self._deps.node_run_command}
+                    if self._deps.node_run_command is not None
+                    else {}
+                ),
+            )
+
         kwargs = {}
         if self._deps.node_run_command is not None:
             kwargs["run_command"] = self._deps.node_run_command
-        return engine.ai_skills_install(keys, permission_ack=permission_ack, **kwargs)
+        installer = self._deps.ai_skill_installer or engine.ai_skills_install
+        completion_reader = (
+            self._deps.ai_skill_completion_reader
+            or engine.verify_ai_skills_completion
+        )
+        approval_loader = self._deps.ai_skill_approval_loader or (
+            lambda: ai_skill_install.load_approved_skill(
+                bundle_paths.bundle_root() / engine.AI_SKILL_APPROVAL_FILENAME
+            )
+        )
+        approval_box = []
+
+        def exact_approval():
+            if not approval_box:
+                approval_box.append(approval_loader())
+            return approval_box[0]
+
+        def readback():
+            return completion_reader(selected, approval=exact_approval())
+
+        def install_once():
+            try:
+                approval = exact_approval()
+            except ai_skill_install.AiSkillInstallError as error:
+                return {
+                    "success": False,
+                    "code": error.code,
+                    "detail": error.detail,
+                    "version": "",
+                }
+            result = installer(
+                selected,
+                permission_ack=True,
+                approval=approval,
+                **kwargs,
+            )
+            result = {
+                **result,
+                "selected": list(selected),
+                "receipt": str(getattr(approval, "commit", "") or ""),
+            }
+            if result.get("code") == "AI_SKILLS_BACKUP_CLEANUP_INCOMPLETE":
+                complete, verified = readback()
+                if complete:
+                    return {
+                        **verified,
+                        "cleanup_warning": str(result.get("detail") or ""),
+                    }
+            return result
+
+        return self._component_operation(
+            "ai_skills_install",
+            "선택한 AI 연결을 준비하지 못했어요.",
+            "ai_skill_install",
+            install_once,
+            verify=readback,
+            change_status="선택하지 않은 AI와 기존 개인 설정은 바꾸지 않았습니다.",
+        )
 
     @guarded
     def save_setup_state(self, state):
@@ -678,7 +973,10 @@ class Api:
     @guarded
     def home_checks(self):
         self._require_safe_gws_account_storage()
-        results = engine.home_checks(self._config_dir, deps=self._deps.home_check_deps)
+        results = self._local_read(
+            "home_checks", "이 컴퓨터의 점검 내용을 읽지 못했어요.",
+            lambda: engine.home_checks(self._config_dir, deps=self._deps.home_check_deps),
+        )
         return [asdict(r) for r in results]
 
     @guarded
@@ -707,10 +1005,14 @@ class Api:
             run_command=self._attendance_remote_run()
         )
         return asdict(
-            engine.attendance_connection_candidates(
+            self._attendance_operation(
+                "attendance_connection_candidates",
+                "기존 정식 출석부 목록을 확인하지 못했어요.",
+                lambda: engine.attendance_connection_candidates(
                 self._config_dir,
                 deps=deps,
                 include_row_counts=False,
+                ),
             )
         )
 
@@ -720,8 +1022,12 @@ class Api:
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
             run_command=self._attendance_remote_run()
         )
-        result = engine.select_attendance_connection(
-            self._config_dir, str(spreadsheet_id or ""), deps=deps
+        result = self._attendance_operation(
+            "select_attendance_connection",
+            "고른 출석부 연결을 확인하지 못했어요.",
+            lambda: engine.select_attendance_connection(
+                self._config_dir, str(spreadsheet_id or ""), deps=deps
+            ),
         )
         if result.state == "selected":
             try:
@@ -741,9 +1047,21 @@ class Api:
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
             run_command=self._attendance_remote_run()
         )
-        result = engine.select_attendance_connection_by_code(
-            self._config_dir, str(connection_code or ""), deps=deps
-        )
+        def action():
+            return engine.select_attendance_connection_by_code(
+                self._config_dir, str(connection_code or ""), deps=deps
+            )
+        checked_code = str(connection_code or "").strip().upper()
+        if re.fullmatch(r"TM-[0-9A-F]{6}-[0-9A-F]{6}", checked_code) is None:
+            # 모양이 틀린 번호는 선생님이 바로 고칠 일이다. Google 재시도로
+            # 바꾸거나 공통 문제 화면으로 보내지 않는다.
+            result = action()
+        else:
+            result = self._attendance_operation(
+                "select_attendance_connection_by_code",
+                "확인번호로 출석부 연결을 확인하지 못했어요.",
+                action,
+            )
         if result.state == "selected":
             try:
                 (self._config_dir / engine.ATTENDANCE_STATUS_CACHE_NAME).unlink()
@@ -757,7 +1075,11 @@ class Api:
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
             run_command=self._attendance_remote_run()
         )
-        status = asdict(engine.ensure_attendance(self._config_dir, deps=deps))
+        status = asdict(self._attendance_operation(
+            "ensure_attendance",
+            "출결 자료를 준비하지 못했어요.",
+            lambda: engine.ensure_attendance(self._config_dir, deps=deps),
+        ))
         # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
         if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
             engine.save_attendance_status_cache(self._config_dir, status)
@@ -769,7 +1091,11 @@ class Api:
         deps = self._deps.attendance_deps or engine.AttendanceDeps(
             run_command=self._attendance_remote_run()
         )
-        status = asdict(engine.start_new_attendance(self._config_dir, deps=deps))
+        status = asdict(self._attendance_operation(
+            "start_new_attendance",
+            "새 학년도 출석부를 시작하지 못했어요.",
+            lambda: engine.start_new_attendance(self._config_dir, deps=deps),
+        ))
         # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
         if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
             engine.save_attendance_status_cache(self._config_dir, status)
@@ -816,12 +1142,24 @@ class Api:
                 # 성공이든 실패든 결과를 남겨 attendance_prepare_status가 보여준다.
                 try:
                     status = asdict(
-                        engine.ensure_attendance(self._config_dir, deps=att_deps)
+                        self._attendance_operation(
+                            "attendance_prepare_start",
+                            "출결 자료를 준비하지 못했어요.",
+                            lambda: engine.ensure_attendance(
+                                self._config_dir, deps=att_deps
+                            ),
+                        )
                     )
                     # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
                     if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
                         engine.save_attendance_status_cache(self._config_dir, status)
                 except Exception as error:  # noqa: BLE001 - 사람이 읽을 문장으로 바꾼다
+                    if isinstance(
+                        error,
+                        (recovery.UserActionRequired, recovery.FinalOperationFailure),
+                    ):
+                        self._attendance_prepare_issue = error
+                        return
                     failed_service, detail = engine.friendly_attendance_error(error)
                     status = asdict(engine.AttendanceStatus(
                         state="failed", failed_service=failed_service,
@@ -830,6 +1168,7 @@ class Api:
                 self._attendance_prepare_result = status
 
             self._attendance_prepare_result = None
+            self._attendance_prepare_issue = None
             thread = threading.Thread(
                 target=_prepare, name="attendance-prepare", daemon=True
             )
@@ -856,6 +1195,9 @@ class Api:
         result = self._attendance_prepare_result
         if result is not None:
             return {"running": False, "status": dict(result)}
+        issue = self._attendance_prepare_issue
+        if issue is not None:
+            raise issue
         # 이 창에서 준비를 돌린 적이 없을 때(재시작 등)만 실제 상태를 읽는다.
         # 폴마다 부를 수 있는 네트워크 명령이므로 제한 시간 없는 self._run() 대신
         # 자식 작업까지 제한 시간이 있는 감독 실행 경로를 쓴다(검토 C7).
@@ -875,8 +1217,25 @@ class Api:
         if self._attendance_gws_cache is None:
             # gws 경로 찾기(동봉본 검증 포함)는 폴마다가 아니라 한 번만(검토 C7).
             self._attendance_gws_cache = str(engine.resolve_gws(run))
-        return engine.read_first_time_setup_done(
-            self._config_dir, run, self._attendance_gws_cache
+
+        def read_once():
+            saved = engine._read_setup_status(self._config_dir)
+            owner = str(saved.get("account", "") or "").strip()
+            engine._require_google_target_account(
+                run, self._attendance_gws_cache, owner
+            )
+            return engine.read_first_time_setup_done(
+                self._config_dir, run, self._attendance_gws_cache
+            )
+
+        return recovery.run_operation(
+            "attendance_first_setup_status",
+            "출석부의 처음 설정 상태를 확인하지 못했어요.",
+            read_once,
+            delays=recovery.NETWORK_DELAYS,
+            change_status="기존 출결 자료는 그대로입니다.",
+            app_version=version.APP_VERSION,
+            **self._network_recovery_options(),
         )
 
     def _attendance_script_update(
@@ -1209,7 +1568,12 @@ class Api:
     @guarded
     def attendance_script_update_status(self):
         # 이 길은 Apps Script와 배포 상태만 읽는다. Sheet나 설치 기록은 쓰지 않는다.
-        return self._attendance_script_update(apply=False)
+        return self._attendance_operation(
+            "attendance_script_update_status",
+            "출결 기능 상태를 확인하지 못했어요.",
+            lambda: self._attendance_script_update(apply=False),
+            retry_states={"hold"},
+        )
 
     @guarded
     def attendance_script_update_apply(self):
@@ -1229,14 +1593,24 @@ class Api:
                 if not paths.attendance_install_record_path(
                     self._config_dir
                 ).exists():
-                    return self._attendance_script_update(apply=True)
+                    return self._attendance_operation(
+                        "attendance_script_update_apply",
+                        "출결 기능을 바꾸지 못했어요.",
+                        lambda: self._attendance_script_update(apply=True),
+                        retry_states=frozenset(),
+                    )
                 run, gws, account = (
                     self._resolve_attendance_goedu_gws_context_or_fail()
                 )
-                return self._attendance_script_update(
-                    apply=True,
-                    resolved=(run, gws),
-                    account=account,
+                return self._attendance_operation(
+                    "attendance_script_update_apply",
+                    "출결 기능을 바꾸지 못했어요.",
+                    lambda: self._attendance_script_update(
+                        apply=True,
+                        resolved=(run, gws),
+                        account=account,
+                    ),
+                    retry_states=frozenset(),
                 )
         finally:
             self._attendance_script_update_lock.release()
@@ -1249,10 +1623,24 @@ class Api:
             run, gws = self._resolve_attendance_goedu_gws_or_fail()
         else:
             run, gws = self._run(), None
-        return central_chat.chat_status(
-            self._config_dir,
-            run,
-            gws_executable=gws,
+        def read_status():
+            value = central_chat.chat_status(
+                self._config_dir,
+                run,
+                gws_executable=gws,
+            )
+            if value.get("reason") == central_chat.CHAT_STATUS_FAILURE_MESSAGE:
+                raise recovery.RetryableOperationError(
+                    "CHAT_STATUS_READ",
+                    central_chat.CHAT_STATUS_FAILURE_MESSAGE,
+                )
+            return value
+
+        return self._attendance_operation(
+            "attendance_chat_status",
+            "학급 단톡방 상태를 확인하지 못했어요.",
+            read_status,
+            retry_states=frozenset(),
         )
 
     @guarded
@@ -1271,40 +1659,99 @@ class Api:
     @guarded
     def attendance_chat_spaces(self):
         from dashboard import central_chat
-        return self._run_attendance_chat_action(
-            lambda run, gws, record: central_chat.list_spaces(
-                self._config_dir,
-                run,
-                gws_executable=gws,
-                attendance_record=record,
-            )
+
+        def read_spaces():
+            try:
+                return self._run_attendance_chat_action(
+                    lambda run, gws, record: central_chat.list_spaces(
+                        self._config_dir,
+                        run,
+                        gws_executable=gws,
+                        attendance_record=record,
+                    )
+                )
+            except central_chat.CentralChatError as error:
+                raise recovery.RetryableOperationError(
+                    "CHAT_SPACE_LIST_READ",
+                    central_chat._safe_central_error_detail(error),
+                ) from error
+
+        return self._attendance_operation(
+            "attendance_chat_spaces",
+            "학급 단톡방 목록을 가져오지 못했어요.",
+            read_spaces,
+            retry_states=frozenset(),
         )
 
     @guarded
-    def attendance_chat_set_space(self, space_name, display_name):
+    def attendance_chat_set_space(self, space_name, display_name, expected_current=""):
         from dashboard import central_chat
-        return self._run_attendance_chat_action(
-            lambda run, gws, record: central_chat.set_class_space(
-                self._config_dir,
-                str(space_name),
-                str(display_name),
-                run,
-                gws_executable=gws,
-                attendance_record=record,
-            )
+
+        def reconcile_selection():
+            try:
+                return self._run_attendance_chat_action(
+                    lambda run, gws, record: central_chat.set_class_space(
+                        self._config_dir,
+                        str(space_name),
+                        str(display_name),
+                        run,
+                        gws_executable=gws,
+                        attendance_record=record,
+                        expected_current=str(expected_current or ""),
+                    )
+                )
+            except central_chat.CentralChatError as error:
+                if getattr(error, "code", "") == (
+                    central_chat.CLASS_SPACE_SELECTION_CHANGED_CODE
+                ):
+                    raise recovery.UserActionRequired(recovery.UserIssue.needs_user(
+                        operation="attendance_chat_set_space",
+                        title="학급 단톡방 선택이 다른 창에서 바뀌었어요.",
+                        message="현재 상태와 방 목록을 다시 확인해 주세요.",
+                        change_status="다른 창에서 고른 학급 단톡방은 그대로입니다.",
+                        actions=(recovery.IssueAction(
+                            "chat-space-list", "학급 단체톡방 다시 확인"
+                        ),),
+                        resume="chat-space-list",
+                    )) from error
+                raise recovery.RetryableOperationError(
+                    "CHAT_SPACE_SELECTION",
+                    central_chat._safe_central_error_detail(error),
+                ) from error
+
+        return self._attendance_operation(
+            "attendance_chat_set_space",
+            "학급 단톡방 선택을 저장하지 못했어요.",
+            reconcile_selection,
+            retry_states=frozenset(),
         )
 
     @guarded
     def attendance_chat_create_space(self, display_name=""):
         from dashboard import central_chat
-        return self._run_attendance_chat_action(
-            lambda run, gws, record: central_chat.create_class_space(
-                self._config_dir,
-                str(display_name),
-                run,
-                gws_executable=gws,
-                attendance_record=record,
-            )
+
+        def create_or_resume():
+            try:
+                return self._run_attendance_chat_action(
+                    lambda run, gws, record: central_chat.create_class_space(
+                        self._config_dir,
+                        str(display_name),
+                        run,
+                        gws_executable=gws,
+                        attendance_record=record,
+                    )
+                )
+            except central_chat.CentralChatError as error:
+                raise recovery.RetryableOperationError(
+                    "CHAT_SPACE_CREATE",
+                    central_chat._safe_central_error_detail(error),
+                ) from error
+
+        return self._attendance_operation(
+            "attendance_chat_create_space",
+            "학급 단톡방을 만들지 못했어요.",
+            create_or_resume,
+            retry_states={"failed", "in-progress"},
         )
 
     @guarded
@@ -1341,7 +1788,7 @@ class Api:
             gws = ""
             runtime_error = error.code
         auth = (
-            engine.gws_auth_status(run, gws)
+            self._google_auth_status_with_recovery(run, gws)
             if gws
             else {
                 "logged_in": False,
@@ -1365,11 +1812,32 @@ class Api:
             "user": auth["user"],
         }
 
+    def _google_auth_status_with_recovery(self, run, gws) -> dict:
+        def read_once():
+            status = engine.gws_auth_status(run, gws)
+            if status.get("login_state") == "error":
+                raise recovery.RetryableOperationError(
+                    "GOOGLE_AUTH_STATUS", "Google 로그인 상태를 확인하지 못했습니다."
+                )
+            return status
+
+        return recovery.run_operation(
+            "google_status",
+            "Google 연결 상태를 확인하지 못했어요.",
+            read_once,
+            delays=recovery.NETWORK_DELAYS,
+            change_status="Google 자료는 바꾸지 않았습니다.",
+            app_version=version.APP_VERSION,
+            **self._network_recovery_options(),
+        )
+
     @guarded
     def gws_update_status(self):
+        # 새 확인을 시작한 순간 이전 승인 제안은 더 이상 설치 근거가 아니다.
+        # 최종 문제로 중간에 끝나도 옛 화면 버튼이 그 값을 다시 쓸 수 없게 먼저 비운다.
+        self._gws_update_offer = None
+        self._gws_update_offer_key = ""
         if self._unsafe_gws_account_storage():
-            self._gws_update_offer = None
-            self._gws_update_offer_key = ""
             self._gws_update_last_status = {
                 "success": False,
                 "code": gws_env.ACCOUNT_STORAGE_ERROR_CODE,
@@ -1384,13 +1852,33 @@ class Api:
                 "runtime_error_code": gws_env.ACCOUNT_STORAGE_ERROR_CODE,
             }
             return dict(self._gws_update_last_status)
-        status, exact_offer = engine.read_gws_update_status(
-            version.APP_VERSION,
-            self._run(),
-            component_root=self._deps.gws_component_root,
-            checker=self._deps.gws_update_checker,
-            resolver=self._deps.gws_runtime_resolver,
+        exact = {"offer": None}
+
+        def read_once():
+            try:
+                status, exact_offer = engine.read_gws_update_status(
+                    version.APP_VERSION,
+                    self._run(),
+                    component_root=self._deps.gws_component_root,
+                    checker=self._deps.gws_update_checker,
+                    resolver=self._deps.gws_runtime_resolver,
+                )
+            except (OSError, TimeoutError) as error:
+                raise recovery.RetryableOperationError(
+                    "NETWORK_TIMEOUT",
+                    "Google 연결 기능의 갱신 상태를 다시 확인하고 있어요.",
+                ) from error
+            exact["offer"] = exact_offer
+            return status
+
+        status = self._component_operation(
+            "gws_update_status",
+            "Google 연결 기능의 갱신 상태를 확인하지 못했어요.",
+            "gws_check",
+            read_once,
+            change_status="현재 Google 연결 기능과 기존 설정은 그대로입니다.",
         )
+        exact_offer = exact["offer"]
         self._gws_update_offer = exact_offer
         self._gws_update_offer_key = self._screen_offer_key(status.get("offer"))
         self._gws_update_last_status = dict(status)
@@ -1398,21 +1886,49 @@ class Api:
 
     @guarded
     def read_profile(self):
-        return engine.read_profile_values(self._config_dir)
+        return self._local_read(
+            "read_profile", "이 컴퓨터에 저장된 내 정보를 읽지 못했어요.",
+            lambda: engine.read_profile_values(self._config_dir, strict=True),
+        )
 
     @guarded
     def read_grid(self):
-        return engine.read_timetable_grid(self._config_dir)
+        return self._local_read(
+            "read_grid", "이 컴퓨터에 저장된 시간표를 읽지 못했어요.",
+            lambda: engine.read_timetable_grid(self._config_dir, strict=True),
+        )
 
     @guarded
     def list_calendars(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_calendars(run, gws)
+        return engine.list_google_targets_with_recovery(
+            run, gws, "calendar", **self._network_recovery_options()
+        )
 
     @guarded
     def list_tasklists(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_tasklists(run, gws)
+        return engine.list_google_targets_with_recovery(
+            run, gws, "tasklist", **self._network_recovery_options()
+        )
+
+    @guarded
+    def verify_google_target_candidate(self, kind, candidate_id, name, account):
+        if kind not in {"calendar", "tasklist"}:
+            raise ValueError("Google 연결 종류를 다시 확인해 주세요")
+        if not all(isinstance(value, str) and value.strip() for value in (candidate_id, name, account)):
+            raise ValueError("Google 연결 후보를 다시 확인해 주세요")
+        run, gws = self._resolve_gws_or_fail()
+        verified = engine.verify_google_target_candidate(
+            run,
+            gws,
+            account.strip(),
+            kind,
+            candidate_id.strip(),
+            name.strip(),
+            **self._network_recovery_options(),
+        )
+        return {"verified": verified}
 
     @guarded
     def verify_gemini_key(self, key, model=None):
@@ -1435,7 +1951,10 @@ class Api:
 
     @guarded
     def recent_captures(self, limit=20):
-        rows = capture_store.read_captures(paths.bridge_state_dir(self._config_dir), int(limit))
+        rows = self._local_read(
+            "recent_captures", "처리한 메시지 기록을 읽지 못했어요.",
+            lambda: capture_store.read_captures(paths.bridge_state_dir(self._config_dir), int(limit)),
+        )
         return [self._capture_retry_state(row) for row in rows]
 
     def _capture_retry_state(self, row):
@@ -1449,15 +1968,21 @@ class Api:
 
     @guarded
     def capture_history_page(self, page=1, page_size=10):
-        result = capture_store.read_capture_page(
-            paths.bridge_state_dir(self._config_dir), int(page), int(page_size)
+        result = self._local_read(
+            "capture_history_page", "처리한 메시지 기록을 읽지 못했어요.",
+            lambda: capture_store.read_capture_page(
+                paths.bridge_state_dir(self._config_dir), int(page), int(page_size)
+            ),
         )
         result["items"] = [self._capture_retry_state(row) for row in result["items"]]
         return result
 
     @guarded
     def capture_progress(self):
-        return capture_store.read_progress(paths.bridge_state_dir(self._config_dir))
+        return self._local_read(
+            "capture_progress", "처리 상태를 읽지 못했어요.",
+            lambda: capture_store.read_progress(paths.bridge_state_dir(self._config_dir)),
+        )
 
     @guarded
     def retry_capture(self, source_hash, capture_when=""):
@@ -1498,6 +2023,54 @@ class Api:
         except (TypeError, ValueError):
             return ""
 
+    @staticmethod
+    def _app_offer_key(offer) -> str:
+        if not isinstance(offer, dict):
+            return ""
+        exact = {
+            "latest": str(offer.get("latest") or ""),
+            "url": str(offer.get("url") or ""),
+            "sha256": str(offer.get("sha256") or ""),
+        }
+        if not all(exact.values()):
+            return ""
+        return json.dumps(exact, sort_keys=True, separators=(",", ":"))
+
+    def _remember_app_update_offer(self, info) -> None:
+        if not isinstance(info, dict) or info.get("available") is not True:
+            self._app_update_offer = None
+            self._app_update_offer_key = ""
+            return
+        exact = {
+            "latest": str(info.get("latest") or ""),
+            "url": str(info.get("url") or ""),
+            "sha256": str(info.get("sha256") or ""),
+        }
+        key = self._app_offer_key(exact)
+        if not key:
+            self._app_update_offer = None
+            self._app_update_offer_key = ""
+            return
+        self._app_update_offer = exact
+        self._app_update_offer_key = key
+
+    def _read_app_update_offer(self, operation: str, title: str, *, fetch=None):
+        checker = self._deps.update_checker or engine.check_update
+
+        def read_once():
+            kwargs = {"fetch": fetch} if fetch is not None else {}
+            return checker(version.APP_VERSION, **kwargs)
+
+        info = self._component_operation(
+            operation,
+            title,
+            "update_offer",
+            read_once,
+            change_status="현재 앱과 기존 설정은 그대로입니다.",
+        )
+        self._remember_app_update_offer(info)
+        return info
+
     def _gws_update_failure(self, code: str, detail: str) -> dict:
         previous = self._gws_update_last_status or {}
         return {
@@ -1531,12 +2104,26 @@ class Api:
                     "UPDATE_OFFER_CHANGED",
                     "처음 확인한 승인 정보와 달라 적용하지 않았어요. 다시 점검해 주세요.",
                 )
-            result = engine.apply_gws_update(
-                self._gws_update_offer,
-                self._run(),
-                component_root=self._deps.gws_component_root,
-                installer=self._deps.gws_update_installer,
-                resolver=self._deps.gws_runtime_resolver,
+            exact_offer = self._gws_update_offer
+            result = self._component_operation(
+                "install_gws_update",
+                "Google 연결 기능을 갱신하지 못했어요.",
+                "gws_install",
+                lambda: engine.apply_gws_update(
+                    exact_offer,
+                    self._run(),
+                    component_root=self._deps.gws_component_root,
+                    installer=self._deps.gws_update_installer,
+                    resolver=self._deps.gws_runtime_resolver,
+                ),
+                verify=lambda: engine.verify_gws_update_completion(
+                    exact_offer,
+                    self._run(),
+                    component_root=self._deps.gws_component_root,
+                    resolver=self._deps.gws_runtime_resolver,
+                ),
+                return_stop_result=True,
+                change_status="현재 Google 연결 기능과 기존 로그인 정보는 그대로입니다.",
             )
             self._gws_update_last_status = {
                 **(self._gws_update_last_status or {}),
@@ -1635,7 +2222,7 @@ class Api:
         snapshot = self._login.snapshot()
         if snapshot.get("ok") is True:
             run, gws = self._resolve_gws_or_fail()
-            auth = engine.gws_auth_status(run, gws)
+            auth = self._google_auth_status_with_recovery(run, gws)
             if auth.get("logged_in") and auth.get("account_allowed"):
                 engine.record_gws_scope_grant(self._config_dir, auth.get("user", ""))
         return engine.annotate_login_snapshot(snapshot)
@@ -1703,7 +2290,10 @@ class Api:
         if not name:
             raise ValueError("캘린더 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
-        made_id = engine.ensure_calendar(run, gws, name)
+        account = self._google_auth_status_with_recovery(run, gws).get("user", "")
+        made_id = engine.ensure_calendar_verified(
+            run, gws, account, name, **self._network_recovery_options()
+        )
         if not made_id:
             raise ScreenSafeError("캘린더를 만들지 못했어요. 이름을 확인하고 잠시 뒤 다시 시도해 주세요.")
         return {"id": made_id, "name": name}
@@ -1714,7 +2304,10 @@ class Api:
         if not name:
             raise ValueError("할일 목록 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
-        made_id = engine.ensure_tasklist(run, gws, name)
+        account = self._google_auth_status_with_recovery(run, gws).get("user", "")
+        made_id = engine.ensure_tasklist_verified(
+            run, gws, account, name, **self._network_recovery_options()
+        )
         if not made_id:
             raise ScreenSafeError("할 일 목록을 만들지 못했어요. 이름을 확인하고 잠시 뒤 다시 시도해 주세요.")
         return {"id": made_id, "name": name}
@@ -1761,13 +2354,16 @@ class Api:
 
     @guarded
     def get_messenger_settings(self):
-        saved = load_settings(paths.settings_path(self._config_dir))
         checker = self._deps.autostart_checker or engine.autostart_enabled
+        saved, autostart = self._local_read(
+            "get_messenger_settings", "이 컴퓨터에 저장된 메신저 설정을 읽지 못했어요.",
+            lambda: (engine.read_messenger_settings(self._config_dir), bool(checker())),
+        )
         return {
             "gemini_api_key": saved.gemini_api_key,
             "gemini_model": saved.gemini_model,
             "hotkey": saved.hotkey,
-            "autostart": bool(checker()),
+            "autostart": autostart,
             "brity_download_dir": saved.brity_download_dir,
         }
 
@@ -1793,6 +2389,160 @@ class Api:
             autostart_checker=self._deps.autostart_checker,
             autostart_enable=self._deps.autostart_enable,
             autostart_disable=self._deps.autostart_disable,
+            helper_exists=self._deps.helper_window_exists,
+        )
+
+    @guarded
+    def restart_helper(self):
+        return engine.restart_helper_verified(
+            stop=self._deps.helper_stop,
+            start=self._deps.helper_restart,
+            exists=self._deps.helper_window_exists,
+            app_version=version.APP_VERSION,
+        )
+
+    def _local_read(self, operation: str, title: str, reader):
+        """Run the shared three-cycle local recovery before returning a UI issue."""
+        def once():
+            try:
+                return reader()
+            except recovery.RetryableOperationError:
+                raise
+            except (OSError, ValueError) as error:
+                raise recovery.RetryableOperationError(
+                    "LOCAL_READ", "이 컴퓨터의 저장 내용을 다시 읽고 있어요."
+                ) from error
+
+        kwargs = {}
+        if self._deps.recovery_sleeper is not None:
+            kwargs["sleeper"] = self._deps.recovery_sleeper
+        return recovery.run_operation(
+            operation, title, once, delays=recovery.LOCAL_DELAYS,
+            change_status="확인한 화면 내용은 그대로입니다.",
+            app_version=version.APP_VERSION, **kwargs,
+        )
+
+    def _network_recovery_options(self) -> dict:
+        if self._deps.recovery_sleeper is None:
+            return {}
+        return {"sleeper": self._deps.recovery_sleeper}
+
+    def _component_operation(
+        self,
+        operation: str,
+        title: str,
+        stage: str,
+        action,
+        *,
+        verify=None,
+        return_stop_result: bool = False,
+        change_status: str,
+    ):
+        """Run one component step through the shared three recovery cycles.
+
+        The lower-level component code remains responsible for downloading,
+        validating, installing, and reading the exact active state.  This
+        adapter only turns its stable result code into complete/retry/stop and
+        lets ``recovery.run_operation`` own the three-cycle timing.
+        """
+        cycle = 0
+        verified_this_cycle = False
+
+        def stop_now(code, detail):
+            del code  # The support report deliberately contains no component detail.
+            raise recovery.FinalOperationFailure(
+                recovery.final_issue(
+                    operation=operation,
+                    title=title,
+                    attempts=max(1, min(3, cycle)),
+                    reason=str(detail or "현재 상태를 안전하게 확인하지 못했습니다."),
+                    change_status=change_status,
+                    app_version=version.APP_VERSION,
+                )
+            )
+
+        def action_once():
+            nonlocal cycle, verified_this_cycle
+            if not verified_this_cycle:
+                cycle += 1
+            verified_this_cycle = False
+            value = action()
+            code = str(value.get("code") or "") if isinstance(value, dict) else ""
+            current_stage = stage(value) if callable(stage) else stage
+            disposition = engine.component_recovery_disposition(current_stage, code)
+            if disposition == "complete":
+                return value
+            detail = (
+                str(value.get("detail") or "")
+                if isinstance(value, dict)
+                else ""
+            )
+            if disposition == "retry":
+                raise recovery.RetryableOperationError(
+                    code,
+                    detail or "현재 상태를 다시 확인하고 있어요.",
+                )
+            if return_stop_result:
+                return value
+            stop_now(code, detail)
+
+        def verify_once():
+            nonlocal cycle, verified_this_cycle
+            cycle += 1
+            verified_this_cycle = True
+            try:
+                return verify()
+            except engine.ComponentRecoveryStop as error:
+                stop_now(error.code, error.detail)
+
+        return recovery.run_operation(
+            operation,
+            title,
+            action_once,
+            verify=verify_once if verify is not None else None,
+            delays=recovery.NETWORK_DELAYS,
+            change_status=change_status,
+            app_version=version.APP_VERSION,
+            **self._network_recovery_options(),
+        )
+
+    def _attendance_operation(
+        self,
+        operation: str,
+        title: str,
+        action,
+        *,
+        retry_states=frozenset({"failed"}),
+    ):
+        """Run one public attendance action over the shared three cycles."""
+
+        def once():
+            value = action()
+            state = (
+                value.get("state", "")
+                if isinstance(value, dict)
+                else getattr(value, "state", "")
+            )
+            if state in retry_states:
+                detail = (
+                    value.get("detail", "")
+                    if isinstance(value, dict)
+                    else getattr(value, "detail", "")
+                )
+                raise recovery.RetryableOperationError(
+                    "ATTENDANCE_OPERATION",
+                    str(detail or "Google 출결 자료를 다시 확인하고 있어요."),
+                )
+            return value
+
+        return recovery.run_operation(
+            operation,
+            title,
+            once,
+            delays=recovery.NETWORK_DELAYS,
+            change_status="기존 출결 자료와 현재 연결은 그대로입니다.",
+            app_version=version.APP_VERSION,
+            **self._network_recovery_options(),
         )
 
     @guarded
@@ -1816,6 +2566,19 @@ class Api:
     @guarded
     def open_url(self, url):
         return self._open_external_url(url)
+
+    @guarded
+    def copy_support_report(self, issue):
+        text = recovery.support_report_text(dict(issue or {}))
+        self._support_clipboard_writer(text)
+        return {"copied": True}
+
+    @guarded
+    def open_support_email(self, issue):
+        text = recovery.support_report_text(dict(issue or {}))
+        return external_url.open_fixed_support_email(
+            text, opener=self._support_mail_opener
+        )
 
     @guarded
     def open_current_attendance(self):

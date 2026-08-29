@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import errno
 import hashlib
+import io
 import json as _json
 import os
 import platform
@@ -24,6 +25,7 @@ import urllib.error
 from urllib.parse import unquote, urlsplit
 
 import install_attendance_automation
+import attendance_connection_handover
 import attendance_script_update
 import attendance_workbook_identity
 import attendance_workbook_transition
@@ -45,6 +47,7 @@ from attendance_install_record import (
     write_attendance_install_record,
 )
 from brity_bridge import (
+    atomic_io,
     ai_skill_install,
     autostart_win,
     bundle_paths,
@@ -58,12 +61,13 @@ from brity_bridge import (
     process_supervision,
     process_win,
     tool_runtime,
+    recovery,
 )
 from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, run_doctor_checks
 from brity_bridge.gemini_analyze import check_gemini_key
 from brity_bridge.hotkey import MODIFIER_ORDER, parse_hotkey
 from brity_bridge.settings import ALLOWED_GEMINI_MODELS, load_settings, save_settings
-from dashboard import external_url
+from dashboard import central_chat, external_url, version
 
 HELPER_WINDOW_CLASS = "BrityBridgeTrayWindow"
 _WM_CLOSE = 0x0010
@@ -415,8 +419,11 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
         return {"done": False, "value": ""}
     try:
         rows = central_chat._read_settings_rows(spreadsheet_id, run_command, gws_executable)
-    except Exception:  # noqa: BLE001 - 네트워크·권한 실패는 '아직'으로만 보인다
-        return {"done": False, "value": ""}
+    except Exception as error:  # noqa: BLE001 - 외부 원문은 숨기고 공통 세 차례 확인으로 넘긴다
+        raise recovery.RetryableOperationError(
+            "ATTENDANCE_FIRST_SETUP_READ",
+            "출석부의 처음 설정 상태를 다시 읽고 있어요.",
+        ) from error
     done_values = []
     connection_codes = []
     for row in rows or []:
@@ -455,8 +462,9 @@ def save_messenger_settings(
     autostart_enable=None,
     autostart_disable=None,
     push_key=None,
+    helper_exists=None,
 ) -> dict:
-    """메신저 화면의 네 가지 선택을 한 번에 저장하고 실패하면 모두 되돌린다."""
+    """메신저 선택을 확인해 저장한 뒤, 도우미 시작은 별도로 회복한다."""
     if not isinstance(updates, dict):
         raise ValueError("메신저 설정 모양이 올바르지 않아요")
     allowed = {
@@ -514,56 +522,87 @@ def save_messenger_settings(
     checker = autostart_checker or autostart_enabled
     enable = autostart_enable or autostart_win.enable_autostart
     disable = autostart_disable or autostart_win.disable_autostart
-    old_autostart = checker() if "autostart" in updates else None
-    new_autostart = updates.get("autostart", old_autostart)
-    autostart_changed = old_autostart is not None and new_autostart != old_autostart
+    autostart_requested = "autostart" in updates
+    new_autostart = bool(updates.get("autostart")) if autostart_requested else None
+    old_autostart = {"value": None}
 
-    save_settings(settings_path, candidate)
-    try:
-        if autostart_changed:
-            (enable if new_autostart else disable)()
-    except Exception:
-        save_settings(settings_path, previous)
-        try:
-            (enable if old_autostart else disable)()
-        except Exception:
-            pass
-        raise
-
-    restarter = restart or restart_helper
-    if restarter():
-        # 저장이 확정된 뒤에만 시트로 보낸다. 되돌릴 저장이 남아 있으면 보내지 않는다.
-        sheet_push = {"state": "skipped", "detail": ""}
-        if "gemini_api_key" in updates:
-            pusher = push_key or push_gemini_key_to_attendance_sheet
+    def original_autostart() -> bool:
+        if old_autostart["value"] is None:
             try:
-                sheet_push = pusher(Path(config_dir))
-                if not isinstance(sheet_push, dict):
-                    sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
-                elif sheet_push.get("state") == "failed":
-                    sheet_push = {**sheet_push, "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
-            except Exception:  # noqa: BLE001 - 저장 자체는 이미 끝났다
-                sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
-        return {
-            "saved": True,
-            "hotkey": candidate.hotkey,
-            "restarted": True,
-            "reason": "",
-            "sheet_push": sheet_push,
-        }
+                old_autostart["value"] = bool(checker())
+            except Exception as error:  # noqa: BLE001 - local shell check can be briefly unavailable
+                raise recovery.RetryableOperationError(
+                    "AUTOSTART_READ", "자동 시작 선택을 다시 확인하고 있어요."
+                ) from error
+        return old_autostart["value"]
 
-    save_settings(settings_path, previous)
-    if autostart_changed:
+    settings_updates = {key: value for key, value in updates.items() if key != "autostart"}
+    if settings_updates or autostart_requested:
+        expected = {key: getattr(candidate, key) for key in settings_updates}
+
+        def verified() -> tuple[bool, dict]:
+            try:
+                saved = _read_settings_scope(settings_path, expected)
+                autostart_ok = (not autostart_requested) or bool(checker()) == new_autostart
+            except recovery.RetryableOperationError:
+                raise
+            except Exception as error:  # noqa: BLE001 - local checker failures are recoverable
+                raise recovery.RetryableOperationError(
+                    "AUTOSTART_READ", "자동 시작 선택을 다시 확인하고 있어요."
+                ) from error
+            return saved == expected and autostart_ok, saved
+
+        def write_and_verify() -> dict:
+            if settings_updates:
+                _write_settings_scope(settings_path, candidate, expected)
+            if autostart_requested and original_autostart() != new_autostart:
+                try:
+                    (enable if new_autostart else disable)()
+                except Exception as error:  # noqa: BLE001 - restore the observed old choice when possible
+                    try:
+                        (enable if original_autostart() else disable)()
+                    except Exception:
+                        pass
+                    raise recovery.RetryableOperationError(
+                        "AUTOSTART_WRITE", "자동 시작 선택을 적용하지 못했어요."
+                    ) from error
+            complete, saved = verified()
+            if not complete:
+                raise recovery.RetryableOperationError(
+                    "AUTOSTART_VERIFY", "자동 시작 선택을 다시 확인하고 있어요."
+                )
+            return saved
+
+        recovery.run_operation(
+            "messenger_save", "설정을 저장하지 못했어요.", write_and_verify,
+            verify=verified, delays=recovery.LOCAL_DELAYS,
+            change_status="기존 설정은 그대로입니다.", app_version=version.APP_VERSION,
+        )
+
+    # 설정을 다시 쓰지 않는다. 이미 읽어 확인한 값은 그대로 두고 도우미 시작만 다시 한다.
+    restart_result = restart_helper_verified(
+        stop=stop_helper,
+        start=restart or start_helper,
+        exists=helper_exists or helper_window_exists,
+        app_version=version.APP_VERSION,
+    )
+    sheet_push = {"state": "skipped", "detail": ""}
+    if "gemini_api_key" in updates:
+        pusher = push_key or push_gemini_key_to_attendance_sheet
         try:
-            (enable if old_autostart else disable)()
-        except Exception:
-            pass
-    restored = bool(restarter())
+            sheet_push = pusher(Path(config_dir))
+            if not isinstance(sheet_push, dict):
+                sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+            elif sheet_push.get("state") == "failed":
+                sheet_push = {**sheet_push, "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
+        except Exception:  # noqa: BLE001 - 저장 자체는 이미 끝났다
+            sheet_push = {"state": "failed", "detail": ATTENDANCE_SHEET_PUSH_FAILURE}
     return {
-        "saved": False,
-        "hotkey": previous.hotkey,
-        "restarted": restored,
-        "reason": "새 설정을 켜지 못해 이전 설정으로 되돌렸어요.",
+        "saved": True,
+        "hotkey": candidate.hotkey,
+        "restarted": bool(restart_result["restarted"]),
+        "reason": "",
+        "sheet_push": sheet_push,
     }
 
 
@@ -620,6 +659,59 @@ def restart_helper() -> bool:
     if not stop_helper():
         return False
     return start_helper()
+
+
+def restart_helper_verified(
+    *,
+    stop=None,
+    start=None,
+    exists=None,
+    app_version: str = version.APP_VERSION,
+) -> dict:
+    """Restart once, then retry only the start while checking for a live helper."""
+
+    stopper = stop or stop_helper
+    starter = start or start_helper
+    checker = exists or helper_window_exists
+
+    def stop_once() -> dict:
+        if stopper():
+            return {"stopped": True}
+        try:
+            # 종료 요청의 반환값이 늦어도 창이 이미 사라졌다면 안전하게 다음 단계로 간다.
+            if not checker():
+                return {"stopped": True}
+        except Exception as error:  # noqa: BLE001 - Windows readiness can be briefly unavailable
+            raise recovery.RetryableOperationError(
+                "HELPER_STOP_READ", "Brity 도우미 종료 상태를 다시 확인하고 있어요."
+            ) from error
+        raise recovery.RetryableOperationError(
+            "HELPER_STOP", "기존 Brity 도우미가 아직 종료되지 않았어요."
+        )
+
+    recovery.run_operation(
+        "helper_start",
+        "설정은 저장했지만 Brity 도우미를 시작하지 못했어요.",
+        stop_once,
+        delays=recovery.LOCAL_DELAYS,
+        change_status="저장한 설정은 그대로입니다.",
+        app_version=app_version,
+    )
+
+    def start_once() -> dict:
+        if starter():
+            return {"restarted": True}
+        raise recovery.RetryableOperationError("HELPER_START", "Brity 도우미를 아직 시작하지 못했어요.")
+
+    return recovery.run_operation(
+        "helper_start",
+        "설정은 저장했지만 Brity 도우미를 시작하지 못했어요.",
+        start_once,
+        verify=lambda: (bool(checker()), {"restarted": True}),
+        delays=recovery.LOCAL_DELAYS,
+        change_status="저장한 설정은 그대로입니다.",
+        app_version=app_version,
+    )
 
 
 def ensure_helper_running(exists=None, start=None) -> None:
@@ -1191,11 +1283,18 @@ TASK_FIELDS = frozenset({
 GEMINI_FIELDS = frozenset({"gemini_api_key", "gemini_model"})
 
 
-def read_profile_values(config_dir: Path) -> dict[str, str]:
+def read_profile_values(config_dir: Path, *, strict: bool = False) -> dict[str, str]:
     path = Path(config_dir) / "teacher-profile.csv"
-    if not path.exists():
-        return {}
-    return parse_settings._read_profile_csv(path)
+    try:
+        if not path.exists():
+            return {}
+        return parse_settings._read_profile_csv(path)
+    except (OSError, ValueError, csv.Error) as error:
+        if strict:
+            raise recovery.RetryableOperationError(
+                "LOCAL_PROFILE_READ", "내 정보를 다시 읽고 있어요."
+            ) from error
+        raise
 
 
 def write_profile_values(config_dir: Path, updates: dict[str, str]) -> Path:
@@ -1206,21 +1305,26 @@ def write_profile_values(config_dir: Path, updates: dict[str, str]) -> Path:
     ordered += [key for key in merged if key not in PROFILE_FIELD_ORDER]
     path = config_dir / "teacher-profile.csv"
     config_dir.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
-        writer.writerow(["항목", "값"])
-        for key in ordered:
-            writer.writerow([key, merged[key]])
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(["항목", "값"])
+    for key in ordered:
+        writer.writerow([key, merged[key]])
+    atomic_io.atomic_write_text(path, "\ufeff" + buffer.getvalue(), encoding="utf-8")
     return path
 
 
-def read_timetable_grid(config_dir: Path) -> list[list[str]]:
+def read_timetable_grid(config_dir: Path, *, strict: bool = False) -> list[list[str]]:
     path = Path(config_dir) / "weekly-timetable.xlsx"
     rows: dict[str, dict[str, str]] = {}
     if path.exists():
         try:
             rows = parse_settings._read_timetable_xlsx(path)
-        except (ValueError, zipfile.BadZipFile, OSError):
+        except (ValueError, zipfile.BadZipFile, OSError) as error:
+            if strict:
+                raise recovery.RetryableOperationError(
+                    "LOCAL_TIMETABLE_READ", "시간표를 다시 읽고 있어요."
+                ) from error
             rows = {}  # 손상/판독불가 파일은 빈 격자로 — 대시보드가 안 열리는 것보다 낫다
     grid = []
     for period in range(1, 8):
@@ -1232,7 +1336,21 @@ def read_timetable_grid(config_dir: Path) -> list[list[str]]:
 def write_timetable_grid(config_dir: Path, grid: list[list[str]]) -> Path:
     path = Path(config_dir) / "weekly-timetable.xlsx"
     rows = [["교시", *parse_settings.DAYS]] + [[str(cell or "") for cell in row] for row in grid]
-    parse_settings.write_timetable_xlsx(path, rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        parse_settings.write_timetable_xlsx(temporary, rows)
+        with zipfile.ZipFile(temporary) as workbook:
+            if workbook.testzip() is not None:
+                raise OSError("시간표 파일을 확인하지 못했어요")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
     return path
 
 
@@ -1256,16 +1374,96 @@ def _checked_updates(updates: dict, allowed: frozenset[str], label: str) -> dict
     return dict(updates)
 
 
+def _retryable_local_error(error: Exception) -> None:
+    if isinstance(error, recovery.RetryableOperationError):
+        raise error
+    if isinstance(error, (OSError, zipfile.BadZipFile)):
+        raise recovery.RetryableOperationError("LOCAL_IO", "이 컴퓨터의 설정을 다시 확인하고 있어요.") from error
+    raise error
+
+
+def _saved_scope(reader, updates: dict) -> dict:
+    values = reader()
+    if not isinstance(values, dict):
+        raise recovery.RetryableOperationError("LOCAL_READ", "저장한 내용을 다시 읽지 못했어요.")
+    return {key: values.get(key) for key in updates}
+
+
+def _verify_saved_fields(updates: dict, reader) -> tuple[bool, dict]:
+    try:
+        saved = _saved_scope(reader, updates)
+    except Exception as error:  # noqa: BLE001 - known local read failures are retryable
+        _retryable_local_error(error)
+    return saved == updates, saved
+
+
+def _write_then_read(updates: dict, writer, reader) -> dict:
+    try:
+        writer()
+    except Exception as error:  # noqa: BLE001 - preserve a classified filesystem failure
+        _retryable_local_error(error)
+    complete, saved = _verify_saved_fields(updates, reader)
+    if not complete:
+        raise recovery.RetryableOperationError("LOCAL_VERIFY", "저장한 내용을 다시 확인하고 있어요.")
+    return saved
+
+
+def _save_scope_with_recovery(
+    config_dir: Path,
+    updates: dict,
+    writer,
+    reader,
+    *,
+    operation: str,
+    app_version: str,
+) -> dict:
+    """Write one local scope and return only after its requested fields read back."""
+
+    del config_dir  # writers and readers retain their one approved local path.
+    return recovery.run_operation(
+        operation,
+        "설정을 저장하지 못했어요.",
+        lambda: _write_then_read(updates, writer, reader),
+        verify=lambda: _verify_saved_fields(updates, reader),
+        delays=recovery.LOCAL_DELAYS,
+        change_status="기존 설정은 그대로입니다.",
+        app_version=app_version,
+    )
+
+
+def save_and_verify_profile_scope(
+    config_dir: Path,
+    updates: dict,
+    allowed: frozenset[str],
+    label: str,
+    *,
+    operation: str,
+    app_version: str = version.APP_VERSION,
+) -> dict:
+    checked = _checked_updates(updates, allowed, label)
+    expected = {key: (value or "").strip() for key, value in checked.items()}
+    config_dir = Path(config_dir)
+    _save_scope_with_recovery(
+        config_dir,
+        expected,
+        lambda: write_profile_values(config_dir, expected),
+        lambda: {key: read_profile_values(config_dir).get(key, "") for key in expected},
+        operation=operation,
+        app_version=app_version,
+    )
+    parsed, detail = run_parser(config_dir, require_links=False)
+    return {"parsed": parsed, "detail": detail}
+
+
 def _save_profile_scope(
     config_dir: Path,
     updates: dict,
     allowed: frozenset[str],
     label: str,
 ) -> dict:
-    checked = _checked_updates(updates, allowed, label)
-    write_profile_values(Path(config_dir), checked)
-    parsed, detail = run_parser(Path(config_dir), require_links=False)
-    return {"parsed": parsed, "detail": detail}
+    return save_and_verify_profile_scope(
+        config_dir, updates, allowed, label, operation="profile_save"
+    )
 
 
 def save_identity(config_dir: Path, updates: dict) -> dict:
@@ -1283,9 +1481,81 @@ def save_tasks(config_dir: Path, updates: dict) -> dict:
 def save_timetable(config_dir: Path, grid: list) -> dict:
     if not isinstance(grid, list):
         raise ValueError("시간표 저장 내용의 모양이 올바르지 않아요")
-    write_timetable_grid(Path(config_dir), list(grid))
-    parsed, detail = run_parser(Path(config_dir), require_links=False)
+    config_dir = Path(config_dir)
+    expected = [[str(cell or "") for cell in row] for row in grid]
+    _save_scope_with_recovery(
+        config_dir,
+        {"grid": expected},
+        lambda: write_timetable_grid(config_dir, expected),
+        lambda: {"grid": read_timetable_grid(config_dir)},
+        operation="timetable_save",
+        app_version=version.APP_VERSION,
+    )
+    parsed, detail = run_parser(config_dir, require_links=False)
     return {"parsed": parsed, "detail": detail}
+
+
+def _settings_json(path: Path) -> dict | None:
+    """Keep unknown existing values; only a truly absent file may start empty."""
+    path = Path(path)
+    try:
+        if not path.exists():
+            return None
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise recovery.RetryableOperationError(
+            "LOCAL_SETTINGS_READ", "기존 설정을 다시 읽고 있어요."
+        ) from error
+    if not isinstance(raw, dict):
+        raise recovery.RetryableOperationError(
+            "LOCAL_SETTINGS_READ", "기존 설정의 모양을 다시 확인하고 있어요."
+        )
+    return dict(raw)
+
+
+def _write_settings_scope(path: Path, candidate, updates: dict) -> None:
+    """Atomically change only requested setting fields, retaining future JSON values."""
+
+    raw = _settings_json(path)
+    if raw is None:
+        raw = asdict(load_settings(path))
+    for key in updates:
+        raw[key] = getattr(candidate, key)
+    atomic_io.atomic_write_text(
+        Path(path), _json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
+    )
+
+
+def _read_settings_scope(path: Path, updates: dict) -> dict:
+    _settings_json(path)
+    saved = load_settings(path)
+    return {key: getattr(saved, key) for key in updates}
+
+
+def read_messenger_settings(config_dir: Path):
+    settings_path = paths.settings_path(Path(config_dir))
+    _settings_json(settings_path)
+    return load_settings(settings_path)
+
+
+def save_and_verify_messenger(
+    config_dir: Path,
+    candidate,
+    updates: dict,
+    *,
+    operation: str,
+    app_version: str = version.APP_VERSION,
+) -> dict:
+    settings_path = paths.settings_path(Path(config_dir))
+    expected = {key: getattr(candidate, key) for key in updates}
+    return _save_scope_with_recovery(
+        Path(config_dir),
+        expected,
+        lambda: _write_settings_scope(settings_path, candidate, expected),
+        lambda: _read_settings_scope(settings_path, expected),
+        operation=operation,
+        app_version=app_version,
+    )
 
 
 def save_gemini(config_dir: Path, updates: dict, *, push_key=None) -> dict:
@@ -1302,7 +1572,9 @@ def save_gemini(config_dir: Path, updates: dict, *, push_key=None) -> dict:
         if model not in ALLOWED_GEMINI_MODELS:
             raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
         candidate.gemini_model = model
-    save_settings(settings_path, candidate)
+    save_and_verify_messenger(
+        config_dir, candidate, checked, operation="gemini_save"
+    )
 
     sheet_push = {"state": "skipped", "detail": ""}
     if "gemini_api_key" in checked:
@@ -1412,6 +1684,170 @@ def install_gws(run_command=_default_run_command) -> tuple[bool, str]:
     except tool_runtime.GwsRuntimeError:
         return False, "Google 연결 기능을 준비하지 못했어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
     return True, executable
+
+
+_COMPONENT_RECOVERY_COMPLETE_CODES = {
+    "gws_check": frozenset({
+        "UP_TO_DATE", "UPDATE_AVAILABLE", "APPROVAL_NOT_PUBLISHED",
+        "COMPONENT_VERSION_REJECTED",
+    }),
+    "gws_install": frozenset({
+        "COMPONENT_UPDATE_INSTALLED", "COMPONENT_UPDATE_ALREADY_INSTALLED",
+    }),
+    "node_status": frozenset({"NODE_READY", "NODE_NOT_INSTALLED"}),
+    "node_prepare": frozenset({"NODE_READY"}),
+    "ai_skill_install": frozenset({"AI_SKILLS_READY"}),
+    "update_offer": frozenset({"UPDATE_AVAILABLE", "UPDATE_LATEST"}),
+    "update_download": frozenset({"UPDATE_SETUP_READY"}),
+    "update_helper_stop": frozenset({"UPDATE_HELPER_STOPPED"}),
+    "update_setup_launch": frozenset({"UPDATE_SETUP_LAUNCHED"}),
+}
+_COMPONENT_RECOVERY_RETRYABLE_CODES = {
+    "gws_check": frozenset({
+        "NETWORK_OFFLINE", "NETWORK_TIMEOUT", "APPROVAL_SERVER_UNAVAILABLE",
+        "COMPONENT_CHECK_BUSY",
+    }),
+    "gws_install": frozenset({
+        "NETWORK_OFFLINE", "NETWORK_TIMEOUT", "COMPONENT_FILE_LOCKED",
+        "COMPONENT_UPDATE_BUSY", "GWS_DOWNLOAD_NOT_FOUND",
+        "GWS_DOWNLOAD_SERVER_UNAVAILABLE",
+    }),
+    "node_prepare": frozenset({
+        "NETWORK_OFFLINE", "NETWORK_TIMEOUT", "COMPONENT_FILE_LOCKED",
+        "COMPONENT_UPDATE_BUSY", "NODE_DOWNLOAD_NOT_FOUND",
+        "NODE_DOWNLOAD_SERVER_UNAVAILABLE",
+    }),
+    "ai_skill_install": frozenset({
+        "NETWORK_TIMEOUT", "AI_SKILLS_ARCHIVE_DOWNLOAD_FAILED",
+        "AI_SKILLS_INSTALL_BUSY", "AI_SKILLS_APPLY_FAILED",
+    }),
+    "update_offer": frozenset({
+        "NETWORK_OFFLINE", "NETWORK_TIMEOUT", "UPDATE_INFO_UNAVAILABLE",
+    }),
+    "update_download": frozenset({
+        "NETWORK_OFFLINE", "NETWORK_TIMEOUT", "UPDATE_DOWNLOAD_UNAVAILABLE",
+        "COMPONENT_FILE_LOCKED", "UPDATE_RUN_BUSY",
+    }),
+    "update_helper_stop": frozenset({"UPDATE_HELPER_BUSY"}),
+    # Setup launch is deliberately absent: an uncertain launch is read back,
+    # never issued a second time.
+    "update_setup_launch": frozenset(),
+}
+
+
+class ComponentRecoveryStop(RuntimeError):
+    """A safe component read proves that another automatic write must not run."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = str(code or "COMPONENT_RECOVERY_STOP")
+        self.detail = str(detail or "이 작업을 안전하게 계속할 수 없습니다.")
+        super().__init__(self.detail)
+
+
+def component_recovery_disposition(stage: str, code: str) -> str:
+    """Tell the bridge whether a component stage is done, retryable, or unsafe.
+
+    Lower-level installers keep ownership of validation and rollback.  This
+    function only turns their stable result code into the next recovery step;
+    an unknown code therefore stops instead of being guessed retryable.
+    """
+
+    safe_stage = str(stage or "").strip()
+    safe_code = str(code or "").strip().upper()
+    if safe_code in _COMPONENT_RECOVERY_COMPLETE_CODES.get(safe_stage, frozenset()):
+        return "complete"
+    if safe_code in _COMPONENT_RECOVERY_RETRYABLE_CODES.get(safe_stage, frozenset()):
+        return "retry"
+    return "stop"
+
+
+def verify_gws_update_completion(
+    offer: component_update.GwsUpdateOffer,
+    run_command=_default_run_command,
+    *,
+    component_root: Path | None = None,
+    resolver=None,
+) -> tuple[bool, dict]:
+    """Read the active executable again and accept only the exact approved GWS."""
+
+    if not isinstance(offer, component_update.GwsUpdateOffer):
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_NOT_APPROVED",
+            "확인했던 Google 연결 기능 갱신 정보를 다시 확인할 수 없습니다.",
+        )
+    resolver = resolver or tool_runtime.resolve_gws
+    try:
+        resolution = resolver(
+            component_root=component_root,
+            run_command=run_command,
+            force_refresh=True,
+        )
+    except tool_runtime.GwsRuntimeError as error:
+        raise ComponentRecoveryStop(
+            error.code,
+            "현재 Google 연결 기능을 안전하게 확인하지 못했습니다.",
+        ) from error
+    except OSError as error:
+        raise recovery.RetryableOperationError(
+            "GWS_RUNTIME_CHECK_FAILED",
+            "현재 Google 연결 기능을 다시 확인하고 있어요.",
+        ) from error
+    complete = bool(
+        resolution.version == offer.manifest.version
+        and resolution.source == "approved-update"
+    )
+    code = "COMPONENT_UPDATE_ALREADY_INSTALLED" if complete else "COMPONENT_UPDATE_NOT_ACTIVE"
+    detail = (
+        "승인된 Google 연결 기능이 이미 준비돼 있습니다."
+        if complete
+        else "승인된 Google 연결 기능이 아직 적용되지 않았습니다."
+    )
+    return complete, {
+        "success": complete,
+        "code": code,
+        "detail": detail,
+        "runtime_ready": True,
+        "can_continue": True,
+        "repair_required": False,
+        "current_version": str(resolution.version),
+        "current_source": str(resolution.source),
+        "runtime_error_code": "",
+    }
+
+
+def verify_managed_node_completion(
+    *,
+    local_app_data=None,
+    run_command=process_win.run_captured,
+    resolver=None,
+) -> tuple[bool, dict]:
+    """Read the managed Node again; only its full runtime check proves completion."""
+
+    resolver = resolver or tool_runtime.resolve_node
+    try:
+        runtime = resolver(
+            local_app_data=local_app_data,
+            run_command=run_command,
+        )
+    except OSError as error:
+        raise recovery.RetryableOperationError(
+            "NODE_RUNTIME_CHECK_FAILED",
+            "AI 연결 도구의 준비 상태를 다시 확인하고 있어요.",
+        ) from error
+    if not isinstance(runtime, tool_runtime.NodeRuntime):
+        raise ComponentRecoveryStop(
+            "NODE_RUNTIME_CHECK_INVALID",
+            "AI 연결 도구의 준비 상태를 안전하게 확인하지 못했습니다.",
+        )
+    payload = _ai_node_result(runtime)
+    if runtime.ready:
+        return True, payload
+    if runtime.code == "NODE_NOT_INSTALLED":
+        return False, payload
+    raise ComponentRecoveryStop(
+        runtime.code,
+        "AI 연결 도구의 현재 파일을 안전하게 확인하지 못했습니다.",
+    )
 
 
 def _gws_offer_for_screen(offer: component_update.GwsUpdateOffer) -> dict:
@@ -1873,9 +2309,15 @@ def _fetch_update_json() -> dict:
     return value
 
 
-def _empty_update(status: str = "latest", reason: str = "", latest: str = "") -> dict:
+def _empty_update(
+    status: str = "latest",
+    reason: str = "",
+    latest: str = "",
+    code: str = "",
+) -> dict:
     return {
         "status": status,
+        "code": str(code or ("UPDATE_LATEST" if status == "latest" else "UPDATE_INFO_UNAVAILABLE")),
         "available": False,
         "latest": latest,
         "url": "",
@@ -1997,45 +2439,71 @@ def check_update(current: str, fetch=None) -> dict:
     except (ssl.SSLError, ssl.CertificateError) as error:
         # SSLCertVerificationError는 ValueError를 물려받는다. 아래 ValueError보다
         # 먼저 잡지 않으면 인증서 문제가 `버전 모양이 올바르지 않아요`로 나온다.
-        return _empty_update("failed", _update_check_failure_reason(error))
+        return _empty_update(
+            "failed", _update_check_failure_reason(error), code="UPDATE_INFO_TLS_UNSAFE"
+        )
     except _UpdateInfoTooLarge:
         return _empty_update(
-            "failed", "배포 정보가 너무 커서 안전하게 읽기를 중단했어요."
+            "failed", "배포 정보가 너무 커서 안전하게 읽기를 중단했어요.",
+            code="UPDATE_INFO_TOO_LARGE",
         )
     except (_UpdateInfoMalformed, _json.JSONDecodeError, UnicodeError):
         return _empty_update(
-            "failed", "배포 정보를 읽을 수 없어 업데이트 확인을 중단했어요."
+            "failed", "배포 정보를 읽을 수 없어 업데이트 확인을 중단했어요.",
+            code="UPDATE_INFO_MALFORMED",
         )
     except _UpdateInfoUnsafeRedirect:
         return _empty_update(
-            "failed", "배포 정보가 안전하지 않은 주소로 이동해 확인을 중단했어요."
+            "failed", "배포 정보가 안전하지 않은 주소로 이동해 확인을 중단했어요.",
+            code="UPDATE_INFO_REDIRECT_UNSAFE",
         )
     except ValueError as error:
         marker = str(error or "")
         if marker == "UPDATE_INFO_TOO_LARGE":
             return _empty_update(
-                "failed", "배포 정보가 너무 커서 안전하게 읽기를 중단했어요."
+                "failed", "배포 정보가 너무 커서 안전하게 읽기를 중단했어요.",
+                code="UPDATE_INFO_TOO_LARGE",
             )
         if marker in {"UPDATE_INFO_MALFORMED"}:
             return _empty_update(
-                "failed", "배포 정보를 읽을 수 없어 업데이트 확인을 중단했어요."
+                "failed", "배포 정보를 읽을 수 없어 업데이트 확인을 중단했어요.",
+                code="UPDATE_INFO_MALFORMED",
             )
         if marker in {"UNSAFE_UPDATE_INFO_REDIRECT", "unsafe final update URL"}:
             return _empty_update(
-                "failed", "배포 정보가 안전하지 않은 주소로 이동해 확인을 중단했어요."
+                "failed", "배포 정보가 안전하지 않은 주소로 이동해 확인을 중단했어요.",
+                code="UPDATE_INFO_REDIRECT_UNSAFE",
             )
-        return _empty_update("failed", "배포 정보의 버전 모양이 올바르지 않아요.")
+        return _empty_update(
+            "failed", "배포 정보의 버전 모양이 올바르지 않아요.",
+            code="UPDATE_INFO_VERSION_INVALID",
+        )
     except Exception as error:  # noqa: BLE001 - 실행은 계속하되 화면에는 확인 실패를 정확히 알린다
-        return _empty_update("failed", _update_check_failure_reason(error))
+        code = (
+            "UPDATE_INFO_TLS_UNSAFE"
+            if isinstance(
+                getattr(error, "reason", error),
+                (ssl.SSLCertVerificationError, ssl.CertificateError),
+            )
+            else "UPDATE_INFO_UNAVAILABLE"
+        )
+        return _empty_update("failed", _update_check_failure_reason(error), code=code)
 
     if not newer:
-        return _empty_update("latest", "", latest)
+        return _empty_update("latest", "", latest, code="UPDATE_LATEST")
     if not _valid_https_update_url(url):
-        return _empty_update("failed", "업데이트 주소가 공식 배포 주소가 아니어서 안전하게 중단했어요.", latest)
+        return _empty_update(
+            "failed", "업데이트 주소가 공식 배포 주소가 아니어서 안전하게 중단했어요.",
+            latest, code="UPDATE_URL_UNSAFE",
+        )
     if not sha256:
-        return _empty_update("failed", "설치 파일의 안전 확인 정보가 없어 업데이트를 중단했어요.", latest)
+        return _empty_update(
+            "failed", "설치 파일의 안전 확인 정보가 없어 업데이트를 중단했어요.",
+            latest, code="UPDATE_SHA256_REQUIRED",
+        )
     return {
         "status": "available",
+        "code": "UPDATE_AVAILABLE",
         "available": True,
         "latest": latest,
         "url": url,
@@ -2262,20 +2730,28 @@ def _remove_download(path: Path) -> None:
 
 _UPDATE_THREAD_LOCKS: dict[str, threading.Lock] = {}
 _UPDATE_THREAD_LOCKS_GUARD = threading.Lock()
-_UPDATE_LAUNCHED: set[str] = set()
-_HELD_UPDATE_FILE_LOCKS: dict[str, object] = {}
+_UPDATE_RUN_RECORD_NAME = "update-run.generated.json"
+_UPDATE_RUN_RECORD_SCHEMA = 1
+_UPDATE_RUN_STAGE_ORDER = {
+    "offer_verified": 1,
+    "setup_verified": 2,
+    "helper_stopped": 3,
+    "setup_opened": 4,
+}
+_UPDATE_RUN_STAGE_CODES = {
+    "offer_verified": "UPDATE_AVAILABLE",
+    "setup_verified": "UPDATE_SETUP_READY",
+    "helper_stopped": "UPDATE_HELPER_STOPPED",
+    "setup_opened": "UPDATE_SETUP_LAUNCHED",
+}
 
 
 @dataclass
 class _UpdateRunLease:
     acquired: bool
-    hold_until_exit: bool = False
 
     def __bool__(self) -> bool:
         return self.acquired
-
-    def keep_until_app_exits(self) -> None:
-        self.hold_until_exit = True
 
 
 def _update_lock_key(config_dir: Path) -> str:
@@ -2289,16 +2765,243 @@ def _update_thread_lock(config_dir: Path) -> threading.Lock:
         return _UPDATE_THREAD_LOCKS.setdefault(key, threading.Lock())
 
 
-def _update_installer_was_launched(config_dir: Path) -> bool:
-    key = _update_lock_key(config_dir)
-    with _UPDATE_THREAD_LOCKS_GUARD:
-        return key in _UPDATE_LAUNCHED
+def _update_offer_token(*, latest: str, url: str, sha256: str) -> str:
+    safe_latest = str(latest or "").strip()
+    safe_url = str(url or "").strip()
+    safe_sha256 = _valid_update_sha256(sha256)
+    try:
+        _version_parts(safe_latest)
+    except ValueError as error:
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_CHANGED",
+            "확인했던 앱 업데이트 판을 다시 확인할 수 없습니다.",
+        ) from error
+    if not _valid_https_update_url(safe_url) or not safe_sha256:
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_CHANGED",
+            "확인했던 앱 업데이트 정보를 다시 확인할 수 없습니다.",
+        )
+    raw = _json.dumps(
+        [safe_latest, safe_url, safe_sha256],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-def _mark_update_installer_launched(config_dir: Path) -> None:
-    key = _update_lock_key(config_dir)
-    with _UPDATE_THREAD_LOCKS_GUARD:
-        _UPDATE_LAUNCHED.add(key)
+def _public_update_run_status(record: dict | None) -> dict:
+    if not record:
+        return {
+            "complete": False,
+            "code": "UPDATE_RUN_NOT_STARTED",
+            "stage": "",
+            "latest": "",
+        }
+    stage = str(record["stage"])
+    return {
+        "complete": stage == "setup_opened",
+        "code": _UPDATE_RUN_STAGE_CODES[stage],
+        "stage": stage,
+        "latest": str(record["latest"]),
+    }
+
+
+def _update_run_state_unclear(detail: str = "앱 업데이트 진행 기록을 안전하게 확인할 수 없습니다.") -> ComponentRecoveryStop:
+    return ComponentRecoveryStop("UPDATE_RUN_STATE_UNCLEAR", detail)
+
+
+def _validated_update_run_record(value) -> dict:
+    allowed = {
+        "schema_version", "offer_token", "latest", "stage", "setup_name",
+        "setup_identity", "helper_stopped_by_flow", "launch_attempted",
+    }
+    if not isinstance(value, dict) or not set(value).issubset(allowed):
+        raise _update_run_state_unclear()
+    stage = value.get("stage")
+    token = value.get("offer_token")
+    latest = value.get("latest")
+    if (
+        value.get("schema_version") != _UPDATE_RUN_RECORD_SCHEMA
+        or not isinstance(stage, str)
+        or stage not in _UPDATE_RUN_STAGE_ORDER
+        or not isinstance(token, str)
+        or re.fullmatch(r"[0-9a-f]{64}", token) is None
+        or not isinstance(latest, str)
+        or not latest.strip()
+        or len(latest) > 64
+        or not isinstance(value.get("launch_attempted"), bool)
+    ):
+        raise _update_run_state_unclear()
+    try:
+        _version_parts(latest)
+    except ValueError as error:
+        raise _update_run_state_unclear() from error
+
+    normalized = {
+        "schema_version": _UPDATE_RUN_RECORD_SCHEMA,
+        "offer_token": token,
+        "latest": latest.strip(),
+        "stage": stage,
+        "launch_attempted": bool(value["launch_attempted"]),
+    }
+    if _UPDATE_RUN_STAGE_ORDER[stage] >= _UPDATE_RUN_STAGE_ORDER["setup_verified"]:
+        setup_name = value.get("setup_name")
+        identity = value.get("setup_identity")
+        if (
+            not isinstance(setup_name, str)
+            or not setup_name
+            or len(setup_name) > 260
+            or Path(setup_name).name != setup_name
+            or not isinstance(identity, list)
+            or len(identity) != 2
+            or any(not isinstance(part, int) or part < 0 for part in identity)
+        ):
+            raise _update_run_state_unclear()
+        normalized["setup_name"] = setup_name
+        normalized["setup_identity"] = list(identity)
+    if _UPDATE_RUN_STAGE_ORDER[stage] >= _UPDATE_RUN_STAGE_ORDER["helper_stopped"]:
+        if not isinstance(value.get("helper_stopped_by_flow"), bool):
+            raise _update_run_state_unclear()
+        normalized["helper_stopped_by_flow"] = bool(value["helper_stopped_by_flow"])
+    if (
+        normalized["launch_attempted"]
+        and _UPDATE_RUN_STAGE_ORDER[stage] < _UPDATE_RUN_STAGE_ORDER["helper_stopped"]
+    ):
+        raise _update_run_state_unclear()
+    if stage == "setup_opened" and not normalized["launch_attempted"]:
+        raise _update_run_state_unclear()
+    return normalized
+
+
+def _load_update_run_record(config_dir: Path) -> dict | None:
+    try:
+        base = component_lock.prepare_direct_directory(Path(config_dir))
+        path = base / _UPDATE_RUN_RECORD_NAME
+        if not os.path.lexists(path):
+            return None
+        path = component_lock.prepare_direct_file_path(path)
+        with path.open("r", encoding="utf-8") as source:
+            component_lock.assert_open_file_is_direct(path, source)
+            value = _json.load(source)
+            component_lock.assert_open_file_is_direct(path, source)
+    except ComponentRecoveryStop:
+        raise
+    except (OSError, ValueError, TypeError, component_lock.UnsafeLockPathError) as error:
+        raise _update_run_state_unclear() from error
+    return _validated_update_run_record(value)
+
+
+def _write_update_run_record(config_dir: Path, record: dict) -> None:
+    safe = _validated_update_run_record(record)
+    try:
+        base = component_lock.prepare_direct_directory(Path(config_dir))
+        path = component_lock.prepare_direct_file_path(base / _UPDATE_RUN_RECORD_NAME)
+        component_lock.atomic_write_text_unique(
+            path,
+            _json.dumps(safe, ensure_ascii=True, indent=2) + "\n",
+        )
+        if _load_update_run_record(base) != safe:
+            raise OSError("update run record read-back mismatch")
+    except ComponentRecoveryStop:
+        raise
+    except (OSError, ValueError, component_lock.UnsafeLockPathError) as error:
+        raise _update_run_state_unclear() from error
+
+
+def record_update_run_stage(
+    config_dir: Path,
+    *,
+    latest: str,
+    url: str,
+    sha256: str,
+    stage: str,
+    setup_path: Path | None = None,
+    helper_stopped_by_flow: bool | None = None,
+    launch_attempted: bool | None = None,
+) -> dict:
+    """Atomically record a non-personal stage for the exact approved offer."""
+
+    safe_stage = str(stage or "")
+    if safe_stage not in _UPDATE_RUN_STAGE_ORDER:
+        raise ValueError("unknown update run stage")
+    token = _update_offer_token(latest=latest, url=url, sha256=sha256)
+    current = _load_update_run_record(Path(config_dir))
+    if current is not None and current["offer_token"] != token:
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_CHANGED",
+            "화면에서 확인한 앱 업데이트 정보가 달라졌습니다.",
+        )
+    if current is None:
+        current = {
+            "schema_version": _UPDATE_RUN_RECORD_SCHEMA,
+            "offer_token": token,
+            "latest": str(latest).strip(),
+            "stage": safe_stage,
+            "launch_attempted": False,
+        }
+    elif _UPDATE_RUN_STAGE_ORDER[safe_stage] > _UPDATE_RUN_STAGE_ORDER[current["stage"]]:
+        current = {**current, "stage": safe_stage}
+    if setup_path is not None:
+        path = Path(setup_path)
+        try:
+            identity = component_lock.direct_file_identity(path)
+        except (OSError, component_lock.UnsafeLockPathError) as error:
+            raise _update_run_state_unclear() from error
+        current["setup_name"] = path.name
+        current["setup_identity"] = [int(identity[0]), int(identity[1])]
+    if helper_stopped_by_flow is not None:
+        current["helper_stopped_by_flow"] = bool(helper_stopped_by_flow)
+    if launch_attempted is not None:
+        current["launch_attempted"] = bool(launch_attempted)
+    _write_update_run_record(Path(config_dir), current)
+    return _public_update_run_status(current)
+
+
+def verify_update_run_stage(
+    config_dir: Path,
+    *,
+    latest: str,
+    url: str,
+    sha256: str,
+    expected_stage: str,
+) -> tuple[bool, dict]:
+    """Read an update stage without returning its URL, hash, or local file path."""
+
+    if expected_stage not in _UPDATE_RUN_STAGE_ORDER:
+        raise ValueError("unknown update run stage")
+    token = _update_offer_token(latest=latest, url=url, sha256=sha256)
+    current = _load_update_run_record(Path(config_dir))
+    if current is not None and current["offer_token"] != token:
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_CHANGED",
+            "화면에서 확인한 앱 업데이트 정보가 달라졌습니다.",
+        )
+    status = _public_update_run_status(current)
+    complete = bool(
+        current is not None
+        and _UPDATE_RUN_STAGE_ORDER[current["stage"]]
+        >= _UPDATE_RUN_STAGE_ORDER[expected_stage]
+    )
+    return complete, status
+
+
+def _read_update_run_record(
+    config_dir: Path,
+    *,
+    latest: str,
+    url: str,
+    sha256: str,
+) -> dict | None:
+    """Read private cross-process resume fields without returning them to a screen."""
+
+    token = _update_offer_token(latest=latest, url=url, sha256=sha256)
+    current = _load_update_run_record(Path(config_dir))
+    if current is not None and current["offer_token"] != token:
+        raise ComponentRecoveryStop(
+            "UPDATE_OFFER_CHANGED",
+            "화면에서 확인한 앱 업데이트 정보가 달라졌습니다.",
+        )
+    return dict(current) if current is not None else None
 
 
 def _try_lock_update_file(lock_path: Path, lock_file) -> bool:
@@ -2350,8 +3053,6 @@ def update_run_lock(config_dir: Path | None = None):
     except (OSError, component_lock.UnsafeLockPathError):
         yield _UpdateRunLease(False)
         return
-    key = _update_lock_key(base)
-
     local_lock = _update_thread_lock(base)
     if not local_lock.acquire(blocking=False):
         yield _UpdateRunLease(False)
@@ -2387,16 +3088,10 @@ def update_run_lock(config_dir: Path | None = None):
     finally:
         try:
             if lock_file is not None:
-                if lease.hold_until_exit:
-                    # 파일 객체를 앱이 끝날 때까지 붙잡아 둔다. 다른 프로그램 창은 같은
-                    # 1바이트 잠금을 얻지 못하고, 앱이 끝나면 운영체제가 자동으로 풀어 준다.
-                    with _UPDATE_THREAD_LOCKS_GUARD:
-                        _HELD_UPDATE_FILE_LOCKS[key] = lock_file
-                else:
-                    try:
-                        _unlock_update_file(lock_file)
-                    finally:
-                        lock_file.close()
+                try:
+                    _unlock_update_file(lock_file)
+                finally:
+                    lock_file.close()
         finally:
             local_lock.release()
 
@@ -2458,10 +3153,172 @@ def should_ask_update(config_dir, latest: str, today: str) -> bool:
         return True
 
 
+def _windows_process_image_paths(executable_name: str) -> tuple[str, ...]:
+    """Read full image paths for Windows processes with the same executable name."""
+
+    if sys.platform != "win32":
+        raise OSError("Windows process scan is unavailable")
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "process snapshot failed")
+    wanted = str(executable_name or "").casefold()
+    paths_found: list[str] = []
+    uncertain_match = False
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ctypes.set_last_error(0)
+        has_entry = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        if not has_entry:
+            scan_error = ctypes.get_last_error()
+            if scan_error != 18:
+                raise OSError(scan_error, "process snapshot read failed")
+        while has_entry:
+            if str(entry.szExeFile).casefold() == wanted:
+                handle = kernel32.OpenProcess(0x1000, False, entry.th32ProcessID)
+                if not handle:
+                    uncertain_match = True
+                else:
+                    try:
+                        buffer = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(len(buffer))
+                        if kernel32.QueryFullProcessImageNameW(
+                            handle, 0, buffer, ctypes.byref(size)
+                        ):
+                            paths_found.append(buffer.value)
+                        else:
+                            uncertain_match = True
+                    finally:
+                        kernel32.CloseHandle(handle)
+            ctypes.set_last_error(0)
+            has_entry = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+            if not has_entry:
+                scan_error = ctypes.get_last_error()
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if scan_error != 18:
+        raise OSError(scan_error, "process snapshot read failed")
+    if uncertain_match:
+        raise OSError("matching process path could not be read")
+    return tuple(paths_found)
+
+
+def _normalized_process_image_path(value) -> str:
+    text = os.path.abspath(os.fspath(value))
+    if text.startswith("\\\\?\\"):
+        text = text[4:]
+    return os.path.normcase(os.path.normpath(text))
+
+
+def setup_process_is_open(setup_path: Path, *, process_paths=None) -> bool | None:
+    """Return True/False only after full image paths can be compared exactly."""
+
+    try:
+        safe_path = component_lock.prepare_direct_file_path(Path(setup_path))
+        component_lock.direct_file_identity(safe_path)
+        reader = process_paths or _windows_process_image_paths
+        running_paths = reader(safe_path.name)
+        if running_paths is None:
+            return None
+        expected = _normalized_process_image_path(safe_path)
+        return any(
+            _normalized_process_image_path(candidate) == expected
+            for candidate in running_paths
+        )
+    except (OSError, TypeError, ValueError, component_lock.UnsafeLockPathError):
+        return None
+
+
+def _recorded_update_setup(record: dict, dest_dir, expected_sha256: str) -> Path | None:
+    """Re-open only the exact direct Setup named and identified by the work record."""
+    if _UPDATE_RUN_STAGE_ORDER[record["stage"]] < _UPDATE_RUN_STAGE_ORDER["setup_verified"]:
+        return None
+    requested_folder = (
+        Path(dest_dir)
+        if dest_dir
+        else Path(tempfile.gettempdir()) / "TeacherManager-Update"
+    )
+    try:
+        folder = component_lock.prepare_direct_directory(requested_folder)
+        candidate = component_lock.prepare_direct_file_path(folder / record["setup_name"])
+        identity = component_lock.direct_file_identity(candidate)
+    except (OSError, component_lock.UnsafeLockPathError) as error:
+        raise _update_run_state_unclear(
+            "앞서 확인한 Setup 파일을 같은 자리에서 다시 확인할 수 없습니다."
+        ) from error
+    saved_identity = tuple(record["setup_identity"])
+    if identity != saved_identity:
+        raise _update_run_state_unclear(
+            "앞서 확인한 Setup 파일이 다른 파일로 바뀌어 자동 실행하지 않았습니다."
+        )
+    _remember_owned_download(candidate, identity)
+    try:
+        digest = _file_sha256(candidate)
+    except (OSError, component_lock.UnsafeLockPathError) as error:
+        raise _update_run_state_unclear(
+            "앞서 확인한 Setup 파일을 안전하게 다시 읽지 못했습니다."
+        ) from error
+    if digest != expected_sha256:
+        _remove_download(candidate)
+        raise _UpdateDownloadHashMismatch("UPDATE_SETUP_HASH_MISMATCH")
+    return candidate
+
+
+def _update_stop_result(error: ComponentRecoveryStop, latest: str) -> dict:
+    reason = (
+        "화면에서 확인한 업데이트 정보가 달라 안전하게 중단했어요."
+        if error.code == "UPDATE_OFFER_CHANGED"
+        else error.detail
+    )
+    return {
+        "started": False,
+        "code": error.code,
+        "latest": latest,
+        "reason": reason,
+    }
+
+
 def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=None,
                  url: str = "", latest: str = "", sha256: str = "",
                  stop_before_launch=None, config_dir=None,
-                 resume_after_launch_failure=None, helper_is_running=None) -> dict:
+                 resume_after_launch_failure=None, helper_is_running=None,
+                 setup_is_open=None) -> dict:
     """새 설치 파일을 받아 설치 창을 연다 — 기존 위에 덮어써서 삭제·재설치가 필요 없다.
 
     화면이 이미 확인한 url을 넘겨주면(url) 다시 조회하지 않는다 — 재조회 중 통신이
@@ -2473,6 +3330,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
         if not (_valid_https_update_url(target_url) and target_sha256):
             return {
                 "started": False,
+                "code": "UPDATE_OFFER_CHANGED",
                 "latest": target_latest,
                 "reason": "업데이트 파일을 안전하게 확인할 수 없어요. 다시 확인한 뒤 시도해 주세요.",
             }
@@ -2480,98 +3338,269 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
         info = check_update(current, fetch=fetch)
         if not info["available"]:
             reason = info.get("reason") or "지금이 최신 버전이에요"
-            return {"started": False, "latest": info["latest"], "reason": reason}
+            return {
+                "started": False,
+                "code": str(info.get("code") or "UPDATE_INFO_UNAVAILABLE"),
+                "latest": info["latest"],
+                "reason": reason,
+            }
         target_url, target_latest, target_sha256 = info["url"], info["latest"], info["sha256"]
-
-    if config_dir is not None and _update_installer_was_launched(Path(config_dir)):
-        return {
-            "started": False,
-            "latest": target_latest,
-            "reason": "다른 창에서 업데이트가 이미 진행 중이에요. 잠시 기다려 주세요.",
-        }
 
     with update_run_lock(config_dir) as lease:
         if not lease:
             return {
                 "started": False,
+                "code": "UPDATE_RUN_BUSY",
                 "latest": target_latest,
                 "reason": "다른 창에서 업데이트가 이미 진행 중이에요. 잠시 기다려 주세요.",
             }
-        if config_dir is not None and _update_installer_was_launched(Path(config_dir)):
+        progress = None
+        if config_dir is not None:
+            try:
+                progress = _load_update_run_record(Path(config_dir))
+                target_token = _update_offer_token(
+                    latest=target_latest,
+                    url=target_url,
+                    sha256=target_sha256,
+                )
+                if progress is not None and progress["offer_token"] != target_token:
+                    try:
+                        prior_offer_is_newer = _is_newer(progress["latest"], str(current))
+                    except ValueError as error:
+                        raise _update_run_state_unclear(
+                            "현재 앱 판 번호를 확인할 수 없어 새 업데이트를 시작하지 않았습니다."
+                        ) from error
+                    if prior_offer_is_newer:
+                        raise ComponentRecoveryStop(
+                            "UPDATE_OFFER_CHANGED",
+                            "화면에서 확인한 앱 업데이트 정보가 달라졌습니다.",
+                        )
+                    # 이전 Setup 판 이상으로 앱이 실제 올라온 뒤에만 다음 제안 기록을 시작한다.
+                    progress = {
+                        "schema_version": _UPDATE_RUN_RECORD_SCHEMA,
+                        "offer_token": target_token,
+                        "latest": str(target_latest).strip(),
+                        "stage": "offer_verified",
+                        "launch_attempted": False,
+                    }
+                    _write_update_run_record(Path(config_dir), progress)
+                if progress is None:
+                    record_update_run_stage(
+                        Path(config_dir),
+                        latest=target_latest,
+                        url=target_url,
+                        sha256=target_sha256,
+                        stage="offer_verified",
+                    )
+                    progress = _read_update_run_record(
+                        Path(config_dir),
+                        latest=target_latest,
+                        url=target_url,
+                        sha256=target_sha256,
+                    )
+            except ComponentRecoveryStop as error:
+                return _update_stop_result(error, target_latest)
+            if progress and progress["stage"] == "setup_opened":
+                return {
+                    "started": False,
+                    "code": "UPDATE_SETUP_LAUNCHED",
+                    "stage": "setup_opened",
+                    "latest": target_latest,
+                    "reason": "업데이트가 이미 진행 중이며 Setup 창을 열었습니다. 같은 창에서 계속해 주세요.",
+                }
+
+        path = None
+        if progress is not None:
+            try:
+                path = _recorded_update_setup(progress, dest_dir, target_sha256)
+            except _UpdateDownloadHashMismatch:
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
+                    "latest": target_latest,
+                    "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 다시 실행하지 않았습니다.",
+                }
+            except ComponentRecoveryStop as error:
+                return _update_stop_result(error, target_latest)
+
+        if progress and progress.get("launch_attempted"):
+            if setup_is_open is None:
+                return {
+                    "started": False,
+                    "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
+                    "latest": target_latest,
+                    "reason": "Setup 창을 앞서 열었는지 확실히 확인할 수 없어 다시 열지 않았어요.",
+                }
+            try:
+                opened = setup_is_open(path)
+            except Exception:  # noqa: BLE001 - 확인 불능이면 절대로 두 번째 창을 열지 않는다
+                opened = None
+            if opened is True:
+                try:
+                    record_update_run_stage(
+                        Path(config_dir),
+                        latest=target_latest,
+                        url=target_url,
+                        sha256=target_sha256,
+                        stage="setup_opened",
+                        setup_path=path,
+                        helper_stopped_by_flow=bool(progress.get("helper_stopped_by_flow")),
+                        launch_attempted=True,
+                    )
+                except ComponentRecoveryStop as error:
+                    return _update_stop_result(error, target_latest)
+                return {
+                    "started": False,
+                    "code": "UPDATE_SETUP_LAUNCHED",
+                    "stage": "setup_opened",
+                    "latest": target_latest,
+                    "reason": "업데이트가 이미 진행 중이며 Setup 창을 열었습니다. 같은 창에서 계속해 주세요.",
+                }
             return {
                 "started": False,
+                "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
                 "latest": target_latest,
-                "reason": "다른 창에서 업데이트가 이미 진행 중이에요. 잠시 기다려 주세요.",
+                "reason": "Setup 창을 앞서 열었는지 확실히 확인할 수 없어 다시 열지 않았어요.",
             }
-        try:
-            path = _download_file(
-                target_url,
-                dest_dir,
-                target_sha256,
-                opener=opener,
-            )
-        except _UpdateDownloadHashMismatch:
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
-            }
-        except _UpdateDownloadTooLarge:
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "받으려는 설치 파일이 허용된 크기보다 커서 중단했어요.",
-            }
-        except _UpdateDownloadTimeout:
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "설치 파일을 받는 시간이 너무 길어 중단했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
-            }
-        except component_lock.UnsafeLockPathError:
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "업데이트를 저장할 폴더와 파일을 안전하게 확인하지 못했어요.",
-            }
-        except Exception:  # noqa: BLE001 - 통신 실패를 사람 말로
-            return {"started": False, "latest": target_latest,
-                    "reason": "새 버전 다운로드에 실패했어요. 인터넷 연결을 확인하고 다시 시도해 주세요."}
-        try:
-            actual_sha256 = _file_sha256(path)
-        except OSError:
-            _remove_download(path)
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "받은 업데이트 파일을 안전하게 확인하지 못했어요. 다시 시도해 주세요.",
-            }
-        if actual_sha256 != target_sha256:
-            _remove_download(path)
-            return {
-                "started": False,
-                "latest": target_latest,
-                "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
-            }
+
+        if path is None:
+            try:
+                path = _download_file(
+                    target_url,
+                    dest_dir,
+                    target_sha256,
+                    opener=opener,
+                )
+            except _UpdateDownloadHashMismatch:
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
+                    "latest": target_latest,
+                    "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
+                }
+            except _UpdateDownloadTooLarge:
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_TOO_LARGE",
+                    "latest": target_latest,
+                    "reason": "받으려는 설치 파일이 허용된 크기보다 커서 중단했어요.",
+                }
+            except _UpdateDownloadTimeout:
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
+                    "latest": target_latest,
+                    "reason": "설치 파일을 받는 시간이 너무 길어 중단했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
+                }
+            except component_lock.UnsafeLockPathError:
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_PATH_UNSAFE",
+                    "latest": target_latest,
+                    "reason": "업데이트를 저장할 폴더와 파일을 안전하게 확인하지 못했어요.",
+                }
+            except Exception:  # noqa: BLE001 - 통신 실패를 사람 말로
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
+                    "latest": target_latest,
+                    "reason": "새 버전 다운로드에 실패했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
+                }
+            try:
+                actual_sha256 = _file_sha256(path)
+            except OSError:
+                _remove_download(path)
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
+                    "latest": target_latest,
+                    "reason": "받은 업데이트 파일을 안전하게 확인하지 못했어요. 다시 시도해 주세요.",
+                }
+            if actual_sha256 != target_sha256:
+                _remove_download(path)
+                return {
+                    "started": False,
+                    "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
+                    "latest": target_latest,
+                    "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
+                }
+
+        if config_dir is not None:
+            try:
+                record_update_run_stage(
+                    Path(config_dir),
+                    latest=target_latest,
+                    url=target_url,
+                    sha256=target_sha256,
+                    stage="setup_verified",
+                    setup_path=path,
+                )
+                progress = _read_update_run_record(
+                    Path(config_dir),
+                    latest=target_latest,
+                    url=target_url,
+                    sha256=target_sha256,
+                )
+            except ComponentRecoveryStop as error:
+                return _update_stop_result(error, target_latest)
 
         checker = helper_is_running or helper_window_exists
+        helper_stage_done = bool(
+            progress
+            and _UPDATE_RUN_STAGE_ORDER[progress["stage"]]
+            >= _UPDATE_RUN_STAGE_ORDER["helper_stopped"]
+        )
+        helper_stopped_by_flow = bool((progress or {}).get("helper_stopped_by_flow"))
         try:
-            helper_was_running = bool(checker())
-        except Exception:  # noqa: BLE001 - 상태를 못 읽으면 복구를 시도하는 쪽이 안전하다
-            helper_was_running = True
-
-        stopper = stop_before_launch or stop_helper
-        try:
-            stopped = bool(stopper())
-        except Exception:  # noqa: BLE001 - 설치기를 열지 않는 쪽으로 안전하게 멈춘다
-            stopped = False
-        if not stopped:
-            _remove_download(path)
+            helper_running_now = bool(checker())
+        except Exception:  # noqa: BLE001 - 알 수 없는 상태를 "켜짐"으로 짐작하지 않는다
             return {
                 "started": False,
+                "code": "UPDATE_HELPER_BUSY",
                 "latest": target_latest,
-                "reason": "도우미를 먼저 종료하지 못해 설치를 시작하지 않았어요. 앱을 닫고 다시 시도해 주세요.",
+                "reason": "도우미 상태를 확인하지 못해 설치를 시작하지 않았어요. 앱을 닫고 다시 시도해 주세요.",
             }
+
+        if not helper_stage_done or helper_running_now:
+            stopper = stop_before_launch or stop_helper
+            try:
+                stopped = bool(stopper())
+            except Exception:  # noqa: BLE001 - 응답 손실이면 실제 종료 상태를 바로 다시 읽는다
+                stopped = False
+            if not stopped and helper_running_now:
+                try:
+                    stopped = not bool(checker())
+                except Exception:  # noqa: BLE001 - 확인할 수 없으면 설치기를 열지 않는다
+                    stopped = False
+            if not stopped:
+                return {
+                    "started": False,
+                    "code": "UPDATE_HELPER_BUSY",
+                    "latest": target_latest,
+                    "reason": "도우미를 먼저 종료하지 못해 설치를 시작하지 않았어요. 앱을 닫고 다시 시도해 주세요.",
+                }
+            if helper_running_now:
+                helper_stopped_by_flow = True
+
+            if config_dir is not None:
+                try:
+                    record_update_run_stage(
+                        Path(config_dir),
+                        latest=target_latest,
+                        url=target_url,
+                        sha256=target_sha256,
+                        stage="helper_stopped",
+                        setup_path=path,
+                        helper_stopped_by_flow=helper_stopped_by_flow,
+                    )
+                    progress = _read_update_run_record(
+                        Path(config_dir),
+                        latest=target_latest,
+                        url=target_url,
+                        sha256=target_sha256,
+                    )
+                except ComponentRecoveryStop as error:
+                    return _update_stop_result(error, target_latest)
 
         # 받기가 끝난 뒤 파일이 바뀔 수 있으므로, 도우미를 닫은 다음 설치 창을
         # 열기 바로 전에 같은 확인값을 다시 계산한다.
@@ -2581,15 +3610,27 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
             launch_sha256 = ""
         if launch_sha256 != target_sha256:
             _remove_download(path)
-            reason = "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요."
-            if helper_was_running:
-                try:
-                    restored = bool((resume_after_launch_failure or start_helper)())
-                except Exception:  # noqa: BLE001
-                    restored = False
-                if not restored:
-                    reason += " 도우미도 다시 켜지지 않았어요. 앱을 다시 실행해 주세요."
-            return {"started": False, "latest": target_latest, "reason": reason}
+            return {
+                "started": False,
+                "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
+                "latest": target_latest,
+                "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 다시 실행하지 않았습니다.",
+            }
+
+        if config_dir is not None:
+            try:
+                record_update_run_stage(
+                    Path(config_dir),
+                    latest=target_latest,
+                    url=target_url,
+                    sha256=target_sha256,
+                    stage="helper_stopped",
+                    setup_path=path,
+                    helper_stopped_by_flow=helper_stopped_by_flow,
+                    launch_attempted=True,
+                )
+            except ComponentRecoveryStop as error:
+                return _update_stop_result(error, target_latest)
 
         try:
             # 설치 진행과 오류를 사용자가 바로 볼 수 있게 마법사 전체를 보여 준다.
@@ -2598,21 +3639,85 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
             )
             run(path)
         except Exception:  # noqa: BLE001
-            # 설치기 창을 열지 못했다면, 원래 켜져 있던 도우미만 되살린다.
+            opened = False
+            if setup_is_open is None:
+                return {
+                    "started": False,
+                    "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
+                    "latest": target_latest,
+                    "reason": "Setup 창을 열었는지 확인할 수 없어 다시 열지 않았어요.",
+                }
+            try:
+                observed = setup_is_open(path)
+            except Exception:  # noqa: BLE001
+                observed = None
+            if observed is True:
+                opened = True
+            elif observed is not False:
+                return {
+                    "started": False,
+                    "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
+                    "latest": target_latest,
+                    "reason": "Setup 창을 열었는지 확인할 수 없어 다시 열지 않았어요.",
+                }
+            if opened:
+                if config_dir is not None:
+                    try:
+                        record_update_run_stage(
+                            Path(config_dir),
+                            latest=target_latest,
+                            url=target_url,
+                            sha256=target_sha256,
+                            stage="setup_opened",
+                            setup_path=path,
+                            helper_stopped_by_flow=helper_stopped_by_flow,
+                            launch_attempted=True,
+                        )
+                    except ComponentRecoveryStop as error:
+                        return _update_stop_result(error, target_latest)
+                return {
+                    "started": True,
+                    "code": "UPDATE_SETUP_LAUNCHED",
+                    "stage": "setup_opened",
+                    "latest": target_latest,
+                    "reason": "",
+                }
+            # Setup을 열지 못한 것이 확인됐을 때만, 이 흐름이 실제로 끈 도우미를 되살린다.
             reason = "설치 파일을 실행하지 못했어요. 다운로드 페이지에서 직접 받아 주세요."
-            if helper_was_running:
+            if helper_stopped_by_flow:
                 try:
                     restored = bool((resume_after_launch_failure or start_helper)())
                 except Exception:  # noqa: BLE001
                     restored = False
                 if not restored:
                     reason += " 도우미도 다시 켜지지 않았어요. 앱을 다시 실행해 주세요."
-            return {"started": False, "latest": target_latest, "reason": reason}
+            return {
+                "started": False,
+                "code": "UPDATE_SETUP_LAUNCH_FAILED",
+                "latest": target_latest,
+                "reason": reason,
+            }
         if config_dir is not None:
-            _mark_update_installer_launched(Path(config_dir))
-        if launch is None:
-            lease.keep_until_app_exits()
-        return {"started": True, "latest": target_latest, "reason": ""}
+            try:
+                record_update_run_stage(
+                    Path(config_dir),
+                    latest=target_latest,
+                    url=target_url,
+                    sha256=target_sha256,
+                    stage="setup_opened",
+                    setup_path=path,
+                    helper_stopped_by_flow=helper_stopped_by_flow,
+                    launch_attempted=True,
+                )
+            except ComponentRecoveryStop as error:
+                return _update_stop_result(error, target_latest)
+        return {
+            "started": True,
+            "code": "UPDATE_SETUP_LAUNCHED",
+            "stage": "setup_opened",
+            "latest": target_latest,
+            "reason": "",
+        }
 
 
 AI_TOOLS = [
@@ -2653,6 +3758,61 @@ def ai_tools_status(home=None) -> list:
     ]
 
 
+def verify_ai_skills_completion(
+    keys,
+    *,
+    approval,
+    environ=None,
+    plan_builder=None,
+    approved_checker=None,
+) -> tuple[bool, dict]:
+    """Check only the selected AI destinations and their exact approved receipt."""
+
+    if isinstance(keys, (str, bytes)):
+        raw_keys = {str(keys)}
+    else:
+        raw_keys = {str(key) for key in (keys or [])}
+    known_keys = {tool["key"] for tool in AI_TOOLS}
+    if not raw_keys or not raw_keys.issubset(known_keys):
+        raise ComponentRecoveryStop(
+            "AI_SELECTION_REQUIRED",
+            "연결할 AI 선택을 안전하게 이어갈 수 없습니다.",
+        )
+    selected_tools = [tool for tool in AI_TOOLS if tool["key"] in raw_keys]
+    selected = [tool["key"] for tool in selected_tools]
+    agents = [agent for tool in selected_tools for agent in tool["agents"]]
+    try:
+        approved = ai_skill_install.validate_approved_skill(approval)
+        plan = (plan_builder or ai_skill_install.prepare_install_plan)(
+            agents,
+            environ=environ,
+        )
+        complete = bool(
+            (approved_checker or ai_skill_install.plan_is_already_approved)(
+                plan,
+                approved,
+            )
+        )
+    except ai_skill_install.AiSkillInstallError as error:
+        raise ComponentRecoveryStop(error.code, error.detail) from error
+    except OSError as error:
+        raise recovery.RetryableOperationError(
+            "AI_SKILLS_READ_FAILED",
+            "선택한 AI 연결 상태를 다시 확인하고 있어요.",
+        ) from error
+    return complete, {
+        "success": complete,
+        "code": "AI_SKILLS_READY" if complete else "AI_SKILLS_NOT_READY",
+        "detail": (
+            "선택한 AI에 검토한 연결이 이미 준비돼 있습니다."
+            if complete
+            else "선택한 AI에 검토한 연결이 아직 준비되지 않았습니다."
+        ),
+        "selected": selected,
+        "receipt": approved.commit,
+    }
+
+
 def _ai_node_result(runtime: tool_runtime.NodeRuntime) -> dict:
     return {
         "success": bool(runtime.ready),
@@ -2662,9 +3822,12 @@ def _ai_node_result(runtime: tool_runtime.NodeRuntime) -> dict:
     }
 
 
-def ai_node_status(*, local_app_data=None, run_command=process_win.run_captured) -> dict:
+def ai_node_status(
+    *, local_app_data=None, run_command=process_win.run_captured, resolver=None,
+) -> dict:
     """시스템 Node를 보지 않고 Teacher Manager 전용 Node만 확인한다."""
-    return _ai_node_result(tool_runtime.resolve_node(
+    read_runtime = resolver or tool_runtime.resolve_node
+    return _ai_node_result(read_runtime(
         local_app_data=local_app_data,
         run_command=run_command,
     ))
@@ -2909,6 +4072,8 @@ LIST_CALENDARS_FAILURE = "Calendar 목록을 가져오지 못했어요. 설정�
 LIST_TASKLISTS_FAILURE = "Tasks 목록을 가져오지 못했어요. 설정에서 다시 점검해 주세요."
 CREATE_CALENDAR_FAILURE = "Calendar를 만들지 못했어요. 잠시 뒤 다시 시도해 주세요."
 CREATE_TASKLIST_FAILURE = "Tasks 목록을 만들지 못했어요. 잠시 뒤 다시 시도해 주세요."
+GOOGLE_LISTS_FINAL_FAILURE = "Calendar와 할 일 목록을 불러오지 못했어요."
+GOOGLE_UNCHANGED = "Google 자료는 바꾸지 않았습니다."
 
 
 def _run_gws_json(run_command, args: list[str], failure_message: str) -> dict:
@@ -2923,6 +4088,315 @@ def _run_gws_json(run_command, args: list[str], failure_message: str) -> dict:
     if not isinstance(parsed, dict):
         raise RuntimeError(failure_message)
     return parsed
+
+
+def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> list[dict]:
+    code, output = run_command(args)
+    if code != 0:
+        raise RuntimeError(failure_message)
+    text = str(output or "").strip()
+    if not text:
+        raise RuntimeError(failure_message)
+    decoder = _json.JSONDecoder()
+    pages: list[dict] = []
+    offset = 0
+    while offset < len(text):
+        try:
+            page, end = decoder.raw_decode(text, offset)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError(failure_message) from error
+        if not isinstance(page, dict):
+            raise RuntimeError(failure_message)
+        pages.append(page)
+        offset = end
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+    return pages
+
+
+def _google_login_issue(*, personal: bool = False) -> recovery.UserActionRequired:
+    message = (
+        "현재 개인 Google 계정으로 로그인되어 있어요. 학교 @goedu.kr 계정으로 바꿔 주세요."
+        if personal
+        else "학교 @goedu.kr Google 계정으로 로그인해 주세요."
+    )
+    return recovery.UserActionRequired(
+        recovery.UserIssue.needs_user(
+            operation="google_login",
+            title="학교 Google 로그인이 필요해요.",
+            message=message,
+            change_status=GOOGLE_UNCHANGED,
+            actions=(recovery.IssueAction("google-login", "학교 계정으로 로그인"),),
+            resume="google-login",
+        )
+    )
+
+
+def _require_google_target_account(run_command, gws: str, expected_account: str = "") -> str:
+    if not gws:
+        raise recovery.RetryableOperationError(
+            "GWS_NOT_READY", "Google 연결 도구를 확인하지 못했습니다."
+        )
+    auth = gws_auth_status(run_command, gws)
+    if auth.get("login_state") == "error":
+        raise recovery.RetryableOperationError(
+            "GOOGLE_AUTH_STATUS", "Google 로그인 상태를 확인하지 못했습니다."
+        )
+    if not auth.get("logged_in"):
+        raise _google_login_issue()
+    account = str(auth.get("user") or "").strip()
+    if not auth.get("account_allowed"):
+        raise _google_login_issue(personal=True)
+    expected = str(expected_account or "").strip()
+    if expected and account.casefold() != expected.casefold():
+        raise _google_login_issue()
+    return account
+
+
+def _google_targets_once(
+    run_command, gws: str, kind: str, *, expected_account: str = ""
+) -> list[dict]:
+    _require_google_target_account(run_command, gws, expected_account)
+    if kind == "calendar":
+        args = [
+            gws, "calendar", "calendarList", "list", "--params",
+            '{"maxResults":250}', "--format", "json",
+            "--page-all", "--page-limit", "1000",
+        ]
+        title_key = "summary"
+    elif kind == "tasklist":
+        args = [
+            gws, "tasks", "tasklists", "list", "--format", "json",
+            "--page-all", "--page-limit", "1000",
+        ]
+        title_key = "title"
+    else:
+        raise ValueError("kind must be calendar or tasklist")
+    try:
+        pages = _run_gws_json_pages(run_command, args, GOOGLE_LISTS_FINAL_FAILURE)
+    except RuntimeError as error:
+        raise recovery.RetryableOperationError(
+            "GOOGLE_LISTS", "Google 목록 응답을 받지 못했습니다."
+        ) from error
+    rows = []
+    seen_ids: set[str] = set()
+    for reply in pages:
+        for item in reply.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            target_id = str(item.get("id") or "").strip()
+            name = str(item.get(title_key) or "").strip()
+            if not target_id or target_id in seen_ids:
+                continue
+            seen_ids.add(target_id)
+            owned = kind == "tasklist" or str(item.get("accessRole", "")) == "owner"
+            row = {"id": target_id, "name": name, "owned": owned}
+            if kind == "calendar":
+                color = str(item.get("backgroundColor") or "").strip().lower()
+                row["primary"] = item.get("primary") is True
+                row["color"] = color if re.fullmatch(r"#[0-9a-f]{6}", color) else ""
+            else:
+                updated = str(item.get("updated") or "").strip()
+                row["updated"] = updated[:10] if re.match(r"^\d{4}-\d{2}-\d{2}T", updated) else ""
+            rows.append(row)
+    return rows
+
+
+def list_google_targets_with_recovery(
+    run_command, gws: str, kind: str, *, sleeper=time.sleep
+) -> list[dict]:
+    """Read Calendar or Tasks targets over three network cycles."""
+
+    rows = recovery.run_operation(
+        "google_lists",
+        GOOGLE_LISTS_FINAL_FAILURE,
+        lambda: _google_targets_once(run_command, gws, kind),
+        delays=recovery.NETWORK_DELAYS,
+        change_status=GOOGLE_UNCHANGED,
+        app_version=version.APP_VERSION,
+        sleeper=sleeper,
+    )
+    return [
+        {key: value for key, value in row.items() if key != "owned"}
+        for row in rows
+    ]
+
+
+def _target_selection_issue(kind: str, matches: list[dict]) -> recovery.UserActionRequired:
+    noun = "Calendar" if kind == "calendar" else "할 일 목록"
+    descriptors = []
+    for row in matches:
+        if kind == "calendar" and row.get("primary"):
+            descriptors.append("기본")
+        elif kind == "calendar" and row.get("color"):
+            descriptors.append(f"색상 {row['color'].upper()}")
+        elif kind == "tasklist" and row.get("updated"):
+            descriptors.append(f"마지막 변경 {row['updated']}")
+        else:
+            descriptors.append("")
+    fingerprints = [
+        hashlib.sha256(str(row["id"]).encode("utf-8")).hexdigest().upper()
+        for row in matches
+    ]
+    code_length = 6
+    while code_length < 64 and len({value[:code_length] for value in fingerprints}) < len(fingerprints):
+        code_length += 2
+    codes = [value[:code_length] for value in fingerprints]
+    actions = []
+    for row, descriptor, code in zip(matches, descriptors, codes):
+        detail = f" · {descriptor}" if descriptor else ""
+        actions.extend((
+            recovery.IssueAction(
+                f"select-{kind}:{row['id']}",
+                f"확인코드 {code}{detail} · {noun} 선택",
+            ),
+            recovery.IssueAction(
+                f"inspect-{kind}:{row['id']}",
+                f"확인코드 {code} · 이 {noun} 확인",
+            ),
+        ))
+    return recovery.UserActionRequired(
+        recovery.UserIssue.needs_user(
+            operation=f"{kind}_selection",
+            title=f"같은 이름의 {noun}이 여러 개 있어요.",
+            message=f"연결할 {noun}을 직접 골라 주세요.",
+            change_status=f"{noun}을 새로 만들지 않았습니다.",
+            actions=tuple(actions),
+        )
+    )
+
+
+def _exact_owned_targets(rows: list[dict], name: str) -> list[dict]:
+    return [row for row in rows if row["owned"] and row["name"] == name]
+
+
+def verify_google_target_candidate(
+    run_command,
+    gws: str,
+    account: str,
+    kind: str,
+    candidate_id: str,
+    name: str,
+    *,
+    sleeper=time.sleep,
+) -> bool:
+    expected_account = str(account or "").strip()
+
+    def verify_once() -> bool:
+        current_account = _require_google_target_account(run_command, gws)
+        if not expected_account or current_account.casefold() != expected_account.casefold():
+            return False
+        rows = _google_targets_once(
+            run_command, gws, kind, expected_account=expected_account
+        )
+        return any(
+            row["owned"] and row["id"] == candidate_id and row["name"] == name
+            for row in rows
+        )
+
+    return recovery.run_operation(
+        f"{kind}_candidate_check",
+        "Google 연결 후보를 다시 확인하지 못했어요.",
+        verify_once,
+        delays=recovery.NETWORK_DELAYS,
+        change_status=GOOGLE_UNCHANGED,
+        app_version=version.APP_VERSION,
+        sleeper=sleeper,
+    )
+
+
+def _ensure_google_target_verified(
+    run_command,
+    gws: str,
+    account: str,
+    name: str,
+    kind: str,
+    *,
+    sleeper=time.sleep,
+) -> str:
+    operation = "calendar_create" if kind == "calendar" else "tasklist_create"
+    title = "Calendar를 만들지 못했어요." if kind == "calendar" else "할 일 목록을 만들지 못했어요."
+    change_status = (
+        "확인되지 않은 Calendar는 추가로 만들지 않았습니다."
+        if kind == "calendar"
+        else "확인되지 않은 할 일 목록은 추가로 만들지 않았습니다."
+    )
+    first_cycle = {"pending": True}
+
+    def inspect() -> tuple[bool, str | None]:
+        rows = _google_targets_once(
+            run_command, gws, kind, expected_account=account
+        )
+        matches = _exact_owned_targets(rows, name)
+        if len(matches) > 1:
+            raise _target_selection_issue(kind, matches)
+        if len(matches) == 1:
+            return True, matches[0]["id"]
+        return False, None
+
+    def create_once() -> str:
+        if first_cycle["pending"]:
+            first_cycle["pending"] = False
+            complete, found = inspect()
+            if complete:
+                return str(found)
+        payload_key = "summary" if kind == "calendar" else "title"
+        args = (
+            [gws, "calendar", "calendars", "insert"]
+            if kind == "calendar"
+            else [gws, "tasks", "tasklists", "insert"]
+        )
+        try:
+            reply = _run_gws_json(
+                run_command,
+                [
+                    *args, "--json", _json.dumps({payload_key: name}, ensure_ascii=False),
+                    "--format", "json",
+                ],
+                title,
+            )
+        except RuntimeError as error:
+            safe_reason = (
+                "Calendar 만들기 응답을 받지 못했습니다."
+                if kind == "calendar"
+                else "할 일 목록 만들기 응답을 받지 못했습니다."
+            )
+            raise recovery.RetryableOperationError(
+                "GOOGLE_CREATE", safe_reason
+            ) from error
+        target_id = str(reply.get("id") or "").strip()
+        if not target_id:
+            raise recovery.RetryableOperationError(
+                "GOOGLE_CREATE_RESULT", "만든 Google 자료의 확인번호를 받지 못했습니다."
+            )
+        return target_id
+
+    return recovery.run_operation(
+        operation,
+        title,
+        create_once,
+        verify=inspect,
+        delays=recovery.NETWORK_DELAYS,
+        change_status=change_status,
+        app_version=version.APP_VERSION,
+        sleeper=sleeper,
+    )
+
+
+def ensure_calendar_verified(
+    run_command, gws: str, account: str, name: str, *, sleeper=time.sleep
+) -> str:
+    return _ensure_google_target_verified(
+        run_command, gws, account, name, "calendar", sleeper=sleeper
+    )
+
+
+def ensure_tasklist_verified(
+    run_command, gws: str, account: str, name: str, *, sleeper=time.sleep
+) -> str:
+    return _ensure_google_target_verified(
+        run_command, gws, account, name, "tasklist", sleeper=sleeper
+    )
 
 
 def list_calendars(run_command, gws: str) -> list[dict]:
@@ -3058,6 +4532,10 @@ class AttendanceDeps:
     write_record: object = install_attendance_automation.write_install_record
     transition_deps_factory: object = attendance_workbook_transition.make_transition_deps
     new_school_year_starter: object = attendance_workbook_transition.start_new_school_year_workbook
+    connection_record_handover: object = attendance_connection_handover.handover_sheet_records
+    chat_connection_mover: object = central_chat.move_sheet_connection
+    chat_connection_rollback: object = central_chat.rollback_sheet_connection
+    chat_connection_complete: object = central_chat.complete_sheet_connection
     gws_resolver: object = tool_runtime.resolve_gws_executable
 
 
@@ -3445,7 +4923,10 @@ def select_attendance_connection_by_code(
                 "시트의 연결 상태 확인 창에 나온 번호를 다시 확인해 주세요."
             )
         )
-        return AttendanceConnectionSelection(state="failed", detail=detail)
+        return AttendanceConnectionSelection(
+            state="choose" if len(matched) > 1 else "not-found",
+            detail=detail,
+        )
     return select_attendance_connection(
         config_dir, matched[0].spreadsheet_id, deps=deps
     )
@@ -3456,12 +4937,14 @@ def select_attendance_connection(
     spreadsheet_id: str,
     deps: AttendanceDeps | None = None,
 ) -> AttendanceConnectionSelection:
-    """고른 기존 Sheet를 다시 확인하고 Google 변경 없이 로컬 정본 번호만 교체한다."""
+    """고른 정식 Sheet로 업무 자료와 Chat 연결을 인계한 뒤 로컬 연결을 교체한다."""
 
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
     candidate_id = str(spreadsheet_id or "").strip()
     record_path = paths.attendance_install_record_path(config_dir)
+    google_handover_started = False
+    chat_rollback_failed = False
     try:
         with attendance_remote_work_lock(config_dir):
             (
@@ -3548,6 +5031,45 @@ def select_attendance_connection(
                 raise AttendanceInstallRecordError(
                     "고른 정식 출석부 번호와 복구할 연결번호가 달라요."
                 )
+            if snapshot is not None and snapshot.record == verified_wanted:
+                return AttendanceConnectionSelection(
+                    state="selected",
+                    spreadsheet_url=str(verified_wanted["spreadsheet_url"]),
+                )
+            chat_move_result = None
+            source_id = (
+                str(snapshot.record.get("spreadsheet_id", "") or "").strip()
+                if snapshot is not None
+                else ""
+            )
+            if source_id and source_id != candidate_id:
+                google_handover_started = True
+                handed_over = deps.connection_record_handover(
+                    config_dir=config_dir,
+                    source_spreadsheet_id=source_id,
+                    target_spreadsheet_id=candidate_id,
+                    runner=deps.attendance_runner,
+                    gws_executable=gws,
+                )
+                if getattr(handed_over, "state", "") != "complete":
+                    raise AttendanceInstallRecordError(
+                        "기존 출석부 자료를 새 연결로 옮긴 결과를 확인하지 못했어요."
+                    )
+                chat_move_result = deps.chat_connection_mover(
+                    config_dir,
+                    candidate_id,
+                    deps.run_command,
+                    gws_executable=gws,
+                    attendance_record=dict(snapshot.record),
+                )
+                if (
+                    not isinstance(chat_move_result, dict)
+                    or chat_move_result.get("outcome")
+                    not in {"moved", "not_registered", "same"}
+                ):
+                    raise AttendanceInstallRecordError(
+                        "Google Chat 연결을 새 출석부로 옮긴 결과를 확인하지 못했어요."
+                    )
             if snapshot is None:
                 # 후보를 확인하는 동안 다른 창이 연결 기록을 만들었다면 그 결과를
                 # 덮지 않는다. 아직 없을 때만 검증된 로컬 연결 기록 하나를 만든다.
@@ -3558,15 +5080,33 @@ def select_attendance_connection(
                 written = write_attendance_install_record(record_path, wanted)
                 verified = validate_verified_canonical_record(written)
             else:
-                backup_path = config_dir / (
-                    "attendance-install.before-connection-repair."
-                    + snapshot.sha256[:12]
-                    + ".json"
-                )
-                ensure_create_only_install_backup(backup_path, snapshot)
-                final = replace_attendance_install_record(
-                    record_path, wanted, snapshot
-                )
+                try:
+                    backup_path = config_dir / (
+                        "attendance-install.before-connection-repair."
+                        + snapshot.sha256[:12]
+                        + ".json"
+                    )
+                    ensure_create_only_install_backup(backup_path, snapshot)
+                    final = replace_attendance_install_record(
+                        record_path, wanted, snapshot
+                    )
+                except Exception:
+                    if (
+                        isinstance(chat_move_result, dict)
+                        and chat_move_result.get("moved") is True
+                    ):
+                        try:
+                            rolled_back = deps.chat_connection_rollback(
+                                config_dir,
+                                chat_move_result,
+                                deps.run_command,
+                                gws_executable=gws,
+                            )
+                            if rolled_back is not True:
+                                chat_rollback_failed = True
+                        except Exception:  # noqa: BLE001 - 복구 불명확 상태를 별도로 알린다.
+                            chat_rollback_failed = True
+                    raise
                 # replace 함수가 교체 뒤 바이트를 다시 읽어 돌려주므로 같은 파일을 한 번
                 # 더 열지 않는다. 두 번째 읽기만 실패해 선택 실패로 보이는 일을 막는다.
                 verified = validate_verified_canonical_record(final.record)
@@ -3574,19 +5114,40 @@ def select_attendance_connection(
                     raise AttendanceInstallRecordError(
                         "교체한 정식 출석부 기록이 다시 읽은 값과 달라요."
                     )
+                if (
+                    isinstance(chat_move_result, dict)
+                    and chat_move_result.get("moved") is True
+                ):
+                    try:
+                        deps.chat_connection_complete(config_dir, chat_move_result)
+                    except Exception:
+                        pass  # 보호 기록을 못 지워도 이미 확인한 연결 교체는 되돌리지 않는다.
             if verified["spreadsheet_id"] != candidate_id:
                 raise AttendanceInstallRecordError("교체한 정식 출석부 번호가 달라요.")
             return AttendanceConnectionSelection(
                 state="selected",
                 spreadsheet_url=str(verified["spreadsheet_url"]),
             )
-    except Exception:  # noqa: BLE001 - 현재 연결과 후보를 보존하고 쉬운 문장만 돌려준다.
-        return AttendanceConnectionSelection(
-            state="failed",
-            detail=(
+    except Exception:  # noqa: BLE001 - 내부값과 외부 원문은 화면에 섞지 않는다.
+        if chat_rollback_failed:
+            detail = (
+                "컴퓨터의 출석부 연결은 바꾸지 않았지만 Google Chat 연결을 "
+                "원래대로 되돌렸는지 확인하지 못했어요. 다시 누르지 말고 설정의 "
+                "출결 문제 해결에서 연결 상태를 확인해 주세요."
+            )
+        elif google_handover_started:
+            detail = (
+                "컴퓨터의 출석부 연결은 바꾸지 않았어요. 대상 출석부에 이미 확인된 "
+                "자료는 그대로 두었으며, 다시 고르면 중복 없이 이어서 확인합니다."
+            )
+        else:
+            detail = (
                 "고른 출석부 연결을 끝까지 확인하지 못했어요. "
                 "현재 연결과 Google 파일은 그대로입니다."
-            ),
+            )
+        return AttendanceConnectionSelection(
+            state="failed",
+            detail=detail,
         )
 
 
