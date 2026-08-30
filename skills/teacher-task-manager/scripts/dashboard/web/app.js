@@ -18,6 +18,7 @@ const S = {
   linkLoading: false,
   listsLoaded: false,
   listsError: false,
+  googleAccessNeedsLogin: false, // Calendar·Tasks 최종 실패를 설정·연결이 함께 보는 로그인 경고
   maps: { calendars: {}, tasklists: {} },
   edit: null,
   busy: {},
@@ -65,6 +66,8 @@ const S = {
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
+  chatNewSpaceBrowserOpen: false, // 새 단톡방을 만들려고 Google Chat을 열었는지
+  chatNewSpaceBrowserBlurred: false, // 실제로 브라우저로 자리를 옮겼다가 돌아왔는지
   helperRestartPending: false, // 설정은 확인했지만 도우미 시작만 다시 확인할 상태
 };
 let attendanceScriptRequestToken = 0;
@@ -76,6 +79,7 @@ const WIZARD_STEPS = [
   "이 컴퓨터 설정", "Google 연결", "학생 계정 준비", "모두 저장",
 ];
 const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
+const GOOGLE_LIST_LOGIN_MESSAGE = "Calendar와 할 일 목록을 읽지 못했어요. 설정에서 본인의 @goedu.kr 계정으로 다시 로그인해 주세요.";
 function isGoeduGoogleStatus(status) {
   return Boolean(status && status.logged_in && status.account_allowed === true);
 }
@@ -481,6 +485,17 @@ function googleStatusKey(status) {
   if (!status) return "";
   return [status.login_state || "", status.logged_in ? "1" : "0", status.user || "", status.account_allowed === true ? "1" : "0"].join("|");
 }
+function markGoogleAccessLoginRequired(_error) {
+  // 세 번 재시도까지 끝난 Calendar·Tasks 실패는 네 번째 재시도 화면으로 보내지 않는다.
+  // 설정에서 사람이 다시 로그인해야 하는 하나의 상태로 만들고 연결 화면도 함께 잠근다.
+  S.googleAccessNeedsLogin = true;
+  S.listsLoaded = false;
+  S.listsError = true;
+}
+function clearGoogleAccessLoginRequired() {
+  S.googleAccessNeedsLogin = false;
+  S.listsError = false;
+}
 function clearGoogleDependentState(options) {
   const preserveResume = options?.preserveResume === true;
   clearAttendanceScriptDialogState();
@@ -494,7 +509,7 @@ function clearGoogleDependentState(options) {
   S.checks = [];
   S.lists = { calendars: [], tasklists: [] };
   S.listsLoaded = false;
-  S.listsError = false;
+  clearGoogleAccessLoginRequired();
   S.verifiedGoogleTargetChoices = {};
   S.pendingGoogleTarget = null;
   S.googleTargetAccountChanged = true;
@@ -1258,10 +1273,10 @@ async function loadLinkLists() {
     if (!ownsIssueRequest(request)) return;
     S.lists = { calendars, tasklists };
     S.listsLoaded = true;
+    clearGoogleAccessLoginRequired();
   } catch (error) {
     if (!ownsIssueRequest(request)) return;
-    if (showProblemIssue(error, request)) return;
-    S.listsError = true;  // 기존 S.lists와 선택 ID는 그대로 둔다
+    markGoogleAccessLoginRequired(error); // 기존 S.lists와 선택 ID는 그대로 둔다
   } finally {
     S.linkLoading = false;
     if (ownsIssueRequest(request)) render();
@@ -1512,19 +1527,6 @@ function defaultClassSpaceName() {
   const room = pick("담임학년") && pick("담임반") ? `${pick("담임학년")}-${pick("담임반")}` : "";
   return [pick("학교명"), room].filter(Boolean).join(" ");
 }
-function classSpaceCheckCodes(spaces) {
-  const tokens = spaces.map((space) => String(space?.name || "")
-    .replace(/^spaces\//, "").replace(/[^A-Za-z0-9]/g, "").toUpperCase());
-  return tokens.map((token, index) => {
-    for (let length = Math.min(4, token.length); length <= Math.min(token.length, 12); length += 1) {
-      const code = token.slice(-length);
-      if (tokens.every((other, otherIndex) => otherIndex === index || other.slice(-length) !== code)) {
-        return code;
-      }
-    }
-    return `${token.slice(-8) || "확인"}-${index + 1}`;
-  });
-}
 function classSpaceSubrowHtml(a) {
   const cs = S.chatStatus;
   if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return "";
@@ -1551,7 +1553,7 @@ function classSpaceSubrowHtml(a) {
       });
   }
   const current = S.chatSpaceName !== undefined ? S.chatSpaceName : (cs.class_space_name || "");
-  const openChat = `<button class="btn-tonal" data-action="link-open" data-url="https://chat.google.com/">${
+  const openChat = `<button class="btn-tonal" data-action="open-chat-new-space">${
     icon("external-link", "small")} Google Chat 열기</button>`;
 
   // ㄷ. 학교가 막아 두었다 — 손으로 만드는 순서를 보여준다.
@@ -1563,9 +1565,8 @@ function classSpaceSubrowHtml(a) {
         2. 왼쪽 위 + → 스페이스 만들기 를 누릅니다<br>
         3. 방 이름을 "${esc(S.spaceDraftName || defaultClassSpaceName())}"으로 적습니다<br>
         4. 우리 반 학생을 goedu.kr 아이디로 초대합니다<br>
-        5. 이 화면으로 돌아와 [다시 불러오기]를 누릅니다</small></span>
-      ${openChat}
-      <button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…">다시 불러오기</button>
+        5. 이 화면으로 돌아오면 방 목록을 자동으로 다시 읽습니다</small></span>
+      <div class="class-space-actions action-line">${openChat}</div>
     </div>`;
   }
 
@@ -1574,7 +1575,7 @@ function classSpaceSubrowHtml(a) {
     ? `<div class="svc-subrow">
         <span class="nameblock"><small>학생의 goedu.kr 아이디로 직접 친구등록 및 초대해야 합니다.<br>
           (Teacher Manager에서 단체 톡방 인원 초대는 불가능합니다. 직접 진행해 주세요.)</small></span>
-        ${openChat}</div>`
+        <div class="class-space-actions action-line">${openChat}</div></div>`
     : "";
 
   if (S.chatSpaces === null) {
@@ -1601,26 +1602,26 @@ function classSpaceSubrowHtml(a) {
       <span class="nameblock"><b>학급 단톡방</b><small>아직 만든 방이 없어요.
         이름을 정하고 만들면 바로 골라 둡니다</small>${problem}</span>
       <input name="class-space-name" value="${esc(name)}" placeholder="${esc(defaultClassSpaceName())}">
-      <button class="btn-tonal" data-action="class-space-create" data-busy-text="만드는 중…">방 만들기</button>
+      <div class="class-space-actions action-line"><button class="btn-tonal" data-action="class-space-create" data-busy-text="만드는 중…">방 만들기</button></div>
     </div>${madeNote}`;
   }
 
-  // ㄱ. 방이 있다 — 같은 이름도 번호로 구분하고, 확인은 선택 저장과 분리한다.
-  const checkCodes = classSpaceCheckCodes(S.chatSpaces);
-  const candidates = S.chatSpaces.map((s, index) => {
-    const code = checkCodes[index];
-    const suffix = String(s.name || "").replace(/^spaces\//, "");
-    const roomUrl = `https://chat.google.com/room/${encodeURIComponent(suffix)}`;
+  // ㄱ. 방이 있다 — 실제 방 이름을 그대로 드롭다운에 나열한다. 같은 이름도 빼지 않는다.
+  const options = S.chatSpaces.map((s) => {
     const selected = String(cs.class_space_id || "") === String(s.name || "");
-    return `<div class="chat-space-candidate">
-      <span class="nameblock"><b>${esc(s.displayName)}</b><small>확인번호 ${esc(code)}${selected ? " · 현재 선택" : ""}</small></span>
-      <button class="btn-quiet" data-action="link-open" data-url="${esc(roomUrl)}" aria-label="${esc(code)} 방 확인">확인</button>
-      <button class="btn-tonal" data-action="class-space-choose" data-space-name="${esc(s.name)}" data-space-label="${esc(s.displayName)}" aria-label="${esc(code)} 방 고르기">고르기</button>
-    </div>`;
+    return `<option value="${esc(s.name)}"${selected ? " selected" : ""}>${esc(s.displayName)}</option>`;
   }).join("");
+  const placeholder = current && !S.chatSpaces.some((s) => String(s.name || "") === String(cs.class_space_id || ""))
+    ? `<option value="">${esc(current)}</option>`
+    : `<option value="">학급 단톡방을 골라 주세요</option>`;
   return `<div class="svc-subrow">
     <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>
-    <div class="chat-space-candidates">${candidates}</div>
+    <select name="class-space-select" data-action-change="class-space-pick"
+      data-current-space="${esc(cs.class_space_id || "")}">${placeholder}${options}</select>
+    <div class="chat-new-space-guide action-line" data-purpose="create-another-room">
+      <small>지금 목록에 없는 새 단톡방을 만들고 싶으면 Google Chat에서 만든 뒤 돌아오세요.<br>돌아오면 목록을 자동으로 다시 읽어요. 새 방은 이 드롭다운에서 고르면 됩니다.</small>
+      <button class="btn-tonal" data-action="open-chat-new-space">${icon("external-link", "small")} Google Chat 열기</button>
+    </div>
   </div>${madeNote}`;
 }
 /* 서비스 줄 오른쪽 단추 묶음(.svc-acts) — 그 서비스에서 선생님이 누를 수 있는 일을 모은다.
@@ -2376,6 +2377,11 @@ bindActions({
     showToast("브라우저에서 구글 허용을 마쳐 주세요");
     startChatConnectPoll();
   },
+  "open-chat-new-space": async () => {
+    S.chatNewSpaceBrowserOpen = true;
+    S.chatNewSpaceBrowserBlurred = false;
+    await call("open_url", "https://chat.google.com/");
+  },
   "class-space-create": async () => {
     const box = document.querySelector('input[name="class-space-name"]');
     const name = (box ? box.value : "").trim() || defaultClassSpaceName();
@@ -2402,26 +2408,6 @@ bindActions({
       }
     }
     render();
-  },
-  "class-space-choose": async (el) => {
-    const spaceName = String(el.dataset.spaceName || "");
-    const label = String(el.dataset.spaceLabel || "");
-    const expected = String((S.chatStatus && S.chatStatus.class_space_id) || "");
-    if (!spaceName) return;
-    const request = beginIssueRequest(false);
-    try {
-      await call("attendance_chat_set_space", spaceName, label, expected);
-      if (!ownsIssueRequest(request)) return;
-      S.chatSpaceName = label;
-      if (S.chatStatus && typeof S.chatStatus === "object") {
-        S.chatStatus.class_space_id = spaceName;
-        S.chatStatus.class_space_name = label;
-      }
-      showToast("학급 단톡방을 골랐어요");
-      render();
-    } catch (error) {
-      handleCaughtError(error, request);
-    }
   },
   "class-space-reload": async () => {
     S.spaceCreate = null;
@@ -2481,11 +2467,34 @@ document.addEventListener("change", (event) => {
     const spaceName = select.value;
     if (!spaceName) return;
     const label = select.options[select.selectedIndex].textContent;
+    const expected = String(select.dataset.currentSpace || "");
     const request = beginIssueRequest(false);
-    call("attendance_chat_set_space", spaceName, label)
-      .then(() => { if (ownsIssueRequest(request)) { S.chatSpaceName = label; showToast("학급 단톡방을 골랐어요"); } })
+    call("attendance_chat_set_space", spaceName, label, expected)
+      .then(() => {
+        if (!ownsIssueRequest(request)) return;
+        S.chatSpaceName = label;
+        if (S.chatStatus && typeof S.chatStatus === "object") {
+          S.chatStatus.class_space_id = spaceName;
+          S.chatStatus.class_space_name = label;
+        }
+        showToast("학급 단톡방을 골랐어요");
+        render();
+      })
       .catch((error) => handleCaughtError(error, request));
   }
+});
+window.addEventListener("blur", () => {
+  if (S.chatNewSpaceBrowserOpen) S.chatNewSpaceBrowserBlurred = true;
+});
+window.addEventListener("focus", () => {
+  if (!S.chatNewSpaceBrowserOpen || !S.chatNewSpaceBrowserBlurred) return;
+  S.chatNewSpaceBrowserOpen = false;
+  S.chatNewSpaceBrowserBlurred = false;
+  if (S.connectTab !== "attendance") return;
+  S.spaceCreate = null;
+  S.chatSpacesError = false;
+  S.chatSpaces = undefined;
+  render();
 });
 function stepConnect() {
   if (!S.google) {
@@ -2494,6 +2503,11 @@ function stepConnect() {
       .then((data) => { if (ownsIssueRequest(request)) { S.google = data; render(); } })
       .catch((error) => handleCaughtError(error, request));
     return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>`;
+  }
+  if (S.googleAccessNeedsLogin) {
+    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_LIST_LOGIN_MESSAGE)}</span>
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
+      <p class="sub">설정에서 로그인을 마치면 Calendar·Tasks·Google Chat 연결을 자동으로 다시 확인해요.</p>`;
   }
   if (googleAuthCheckFailed(S.google)) {
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
@@ -2519,6 +2533,7 @@ function stepConnect() {
 }
 async function validateConnect() {
   if (!S.google) S.google = await call("google_status");
+  if (S.googleAccessNeedsLogin) return GOOGLE_LIST_LOGIN_MESSAGE;
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return "구글 로그인을 마쳐야 다음으로 갈 수 있어요.";
   if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
@@ -2616,12 +2631,13 @@ async function refreshSettingsStatus(request) {
         if (!ownsIssueRequest(owner)) return false;
         S.lists = { calendars, tasklists };
         S.listsLoaded = true;
-        S.listsError = false;
+        clearGoogleAccessLoginRequired();
         // 새 목록에도 기존 선택 ID가 있으면 select가 같은 값으로 유지된다.
       } catch (error) {
         if (!ownsIssueRequest(owner)) return false;
-        if (showProblemIssue(error, owner)) return false;
-        // 한 목록이라도 실패하면 기존 목록과 선택 ID를 그대로 둔다.
+        // 한 목록이라도 최종 실패하면 큰 오류 화면 대신 설정·연결의 같은 로그인 경고로 보낸다.
+        // 기존 목록과 선택 ID는 그대로 두어 다시 로그인하기 전에도 사용자 자료를 잃지 않는다.
+        markGoogleAccessLoginRequired(error);
       }
     } else {
       S.lists = { calendars: [], tasklists: [] };
@@ -2794,7 +2810,9 @@ function googleLoginRowsHtml() {
   if (!g) return `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span><span class="st">확인 중이에요…</span></div>`;
-  const loginError = fieldError("google-login");
+  const loginError = S.googleAccessNeedsLogin
+    ? GOOGLE_LIST_LOGIN_MESSAGE
+    : fieldError("google-login");
   const update = S.gwsUpdate;
   const accountStorageProblem = g.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
     ? OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER
@@ -2845,7 +2863,7 @@ function googleLoginRowsHtml() {
       : "Google 로그인 준비 파일이 필요해요";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
-    : g.logged_in
+    : g.logged_in && !S.googleAccessNeedsLogin
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st ok">${esc(g.user || "완료")}</span><button class="btn-quiet" data-action="gws-logout">로그아웃</button></span></div>`
       : accountStorageProblem
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
@@ -2967,6 +2985,7 @@ async function validateGoogleLogin() {
   if (S.google.oauth_client_conflict) return "Google 로그인 준비를 확인해야 해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (!S.google.oauth_client_ready) return "Google 로그인 준비 파일이 필요해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
+  if (S.googleAccessNeedsLogin) return GOOGLE_LIST_LOGIN_MESSAGE;
   if (!S.google.logged_in) return FIELD_MESSAGES["google-login"];
   if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
   return "";
@@ -3038,6 +3057,11 @@ validators[7] = validateConnect;
 bindActions({
   "settings-refresh": (_el, request) => refreshSettingsStatus(request),
   "goto-settings": async () => {
+    // 연결 화면에서 로그인 문제를 발견해 설정으로 보낸 경우에는 출발 화면을 기억한다.
+    // 선생님이 로그인을 마치면 별도 "다시 불러오기" 없이 그 화면으로 돌아가
+    // Calendar·Tasks 목록을 자동으로 다시 읽는다.
+    googleLoginResumeGeneration += 1;
+    googleLoginResumeContext = captureGoogleResumeContext();
     if (S.mode === "wizard") { await goStepAsync(2); return; }
     await openCard("settings");
   },
@@ -3258,11 +3282,23 @@ function effectiveChecks() {
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
+  const sharedGoogle = S.googleAccessNeedsLogin ? [
+    {
+      key: "settings.google-list-login", label: "Google 로그인", ok: false,
+      detail: "", fix: GOOGLE_LIST_LOGIN_MESSAGE,
+      card: "settings", tab: "", target: "google-login",
+    },
+    {
+      key: "connect.google-list-login", label: "Google 로그인", ok: false,
+      detail: "", fix: GOOGLE_LIST_LOGIN_MESSAGE,
+      card: "connect", tab: "messenger", target: "google-login",
+    },
+  ] : [];
   const live = Object.values(S.fieldIssues || {}).map((row) => ({
     key: row.key, label: row.target, ok: false, detail: "", fix: row.message,
     card: editing || "", tab: row.tab || "", target: row.target,
   }));
-  return uniqueChecks(kept.concat(live));
+  return uniqueChecks(kept.concat(sharedGoogle, live));
 }
 function checksForCard(card) {
   return effectiveChecks().filter((row) => row.card === card);
@@ -4297,10 +4333,12 @@ async function replayInterruptedGoogleAction(context) {
 async function resumeInterruptedGoogleScreen(request) {
   const context = googleLoginResumeContext;
   googleLoginResumeContext = null;
+  const onGoogleLoginScreen = (S.mode === "edit" && S.edit === "settings")
+    || (S.mode === "wizard" && S.step === 2);
   if (!context
       || context.generation !== googleLoginResumeGeneration
       || !ownsIssueRequest(request)
-      || !(S.mode === "edit" && S.edit === "settings")) return false;
+      || !onGoogleLoginScreen) return false;
   S.mode = context.mode;
   S.step = context.step;
   S.edit = context.edit;

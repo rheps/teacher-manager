@@ -61,8 +61,14 @@ _ATTENDANCE_AI_PROOF_MESSAGE = (
     "연결 확인하고 계속해 주세요."
 )
 _ATTENDANCE_ROSTER_MIGRATION_MESSAGE = (
-    "새 출결 기능은 올라갔지만 학생명단의 이메일을 C열로 옮기지 못했어요. "
-    "기존 학생 자료는 그대로이며, 같은 계정으로 갱신을 다시 눌러 주세요."
+    "새 출결 기능은 올라갔지만 기존 출석부의 학생명단·월별 학생 선택·메신저 상태 정리를 "
+    "끝내지 못했어요. 기존 학생 자료는 그대로입니다. Teacher Manager에서 [설정]을 열고 "
+    "[경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)] 줄에서 로그아웃한 뒤, "
+    "본인의 @goedu.kr 계정으로 로그인하고 Google Sheets 권한을 허용해 주세요."
+)
+_ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE = (
+    "기존 출석부의 학생 선택목록과 메신저 상태를 현재 방식으로 정리해야 해요. "
+    "기존 학생·출결·메시지 내용은 그대로 둡니다."
 )
 _DEFAULT_SCREEN_FAILURE = (
     "작업을 마치지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요."
@@ -226,10 +232,176 @@ def _write_support_clipboard(text: str) -> None:
     clipboard_win.write_text_for_test(text)
 
 
+def _attendance_workbook_layout_is_current(
+    *, runner, workdir, gws_executable, spreadsheet_id
+) -> bool:
+    """기존 출석부의 학생 선택과 메신저 상태가 현재 모양인지 읽기만 한다."""
+
+    gws = str(gws_executable or "").strip()
+    spreadsheet = str(spreadsheet_id or "").strip()
+    if not (callable(runner) and gws and spreadsheet):
+        return False
+
+    from attendance_script_update import _run_one_json
+
+    def read_values(a1_range: str) -> list:
+        result = _run_one_json(
+            runner,
+            [
+                gws,
+                "sheets",
+                "spreadsheets",
+                "values",
+                "get",
+                "--params",
+                json.dumps(
+                    {"spreadsheetId": spreadsheet, "range": a1_range},
+                    ensure_ascii=False,
+                ),
+                "--format",
+                "json",
+            ],
+            Path(workdir),
+        )
+        values = result.get("values", []) if isinstance(result, dict) else []
+        return values if isinstance(values, list) else []
+
+    def first_column(values: list) -> list[str]:
+        return [
+            str(row[0] if isinstance(row, list) and row else "").strip()
+            for row in values
+        ]
+
+    def quote_sheet(name: str) -> str:
+        return "'" + str(name).replace("'", "''") + "'"
+
+    settings = read_values("설정!A:B")
+    settings_map = {
+        str(row[0] or "").strip(): str(row[1] or "").strip()
+        for row in settings
+        if isinstance(row, list) and len(row) >= 2 and str(row[0] or "").strip()
+    }
+    roster_name = settings_map.get("ROSTER_SHEET_NAME") or "학생명단"
+    roster = read_values(f"{quote_sheet(roster_name)}!A:D")
+
+    def row4(row) -> list[str]:
+        values = [str(value or "").strip() for value in list(row or [])[:4]]
+        return values + [""] * (4 - len(values))
+
+    rows = [row4(row) for row in roster]
+    if (
+        not rows
+        or rows[0][:3] != ["번호", "이름", "학생 Google 이메일"]
+        or any(row[3] for row in rows)
+        or len(rows) - 1 > 199
+    ):
+        return False
+
+    combined = [row[0] + row[1] for row in rows[1:] if row[0] and row[1]]
+    if first_column(read_values("'드롭다운'!J1:J200")) != [
+        "학생_번호이름",
+        *combined,
+    ]:
+        return False
+    if settings_map.get("STUDENT_DROPDOWN_RANGE") != "J2:J200":
+        return False
+
+    queue_status_options = ["대기", "발송중", "제외", "보냄", "실패"]
+    if first_column(read_values("'드롭다운'!G1:G6")) != [
+        "쪽지_상태",
+        *queue_status_options,
+    ]:
+        return False
+    for status_range in (
+        "'메신저 개인톡 내용'!G:G",
+        "'메신저 단체톡 내용'!E:E",
+    ):
+        if "확인필요" in first_column(read_values(status_range)):
+            return False
+
+    month_names = [
+        value.strip()
+        for value in settings_map.get(
+            "MONTH_SHEET_NAMES",
+            "3월,4월,5월,6월,7월,8월,9월,10월,11월,12월,1월,2월",
+        ).split(",")
+        if value.strip()
+    ]
+    validation_ranges = [f"{quote_sheet(name)}!B3" for name in month_names]
+    validation_ranges.extend(
+        ["'메신저 개인톡 내용'!G2", "'메신저 단체톡 내용'!E2"]
+    )
+    validation_state = _run_one_json(
+        runner,
+        [
+            gws,
+            "sheets",
+            "spreadsheets",
+            "get",
+            "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet,
+                    "ranges": validation_ranges,
+                    "includeGridData": True,
+                    "fields": "sheets(properties(title),data(rowData(values(dataValidation))))",
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        Path(workdir),
+    )
+    validations = {}
+    for item in validation_state.get("sheets", []) if isinstance(validation_state, dict) else []:
+        title = str(((item.get("properties") or {}).get("title")) or "")
+        try:
+            rule = item["data"][0]["rowData"][0]["values"][0]["dataValidation"]
+        except (KeyError, IndexError, TypeError):
+            rule = None
+        if title and isinstance(rule, dict):
+            validations[title] = rule
+
+    def condition_values(rule: dict) -> list[str]:
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        return [
+            str(item.get("userEnteredValue") or "")
+            for item in (condition or {}).get("values", [])
+            if isinstance(item, dict)
+        ]
+
+    for name in month_names:
+        rule = validations.get(name)
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        values = [
+            value.replace("'드롭다운'", "드롭다운")
+            for value in condition_values(rule)
+        ]
+        if (
+            not isinstance(condition, dict)
+            or condition.get("type") != "ONE_OF_RANGE"
+            or values != ["=드롭다운!$J$2:$J$200"]
+            or rule.get("strict") is True
+        ):
+            return False
+    for name in ("메신저 개인톡 내용", "메신저 단체톡 내용"):
+        rule = validations.get(name)
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        if (
+            not isinstance(condition, dict)
+            or condition.get("type") != "ONE_OF_LIST"
+            or condition_values(rule) != queue_status_options
+            or rule.get("strict") is not True
+        ):
+            return False
+    return True
+
+
 def _migrate_attendance_roster_layout(
     *, runner, workdir, gws_executable, spreadsheet_id
 ) -> bool:
-    """Apps Script 실행 API 없이 기존 학생명단의 이메일을 C열로 옮긴다."""
+    """Apps Script 실행 API 없이 기존 출결 시트의 연결 목록까지 함께 갱신한다."""
 
     gws = str(gws_executable or "").strip()
     spreadsheet = str(spreadsheet_id or "").strip()
@@ -260,17 +432,19 @@ def _migrate_attendance_roster_layout(
         return values if isinstance(values, list) else []
 
     settings = read_values("설정!A:B")
+    settings_map = {
+        str(row[0] or "").strip(): str(row[1] or "").strip()
+        for row in settings
+        if isinstance(row, list) and len(row) >= 2 and str(row[0] or "").strip()
+    }
     roster_name = "학생명단"
-    for row in settings:
-        if (
-            isinstance(row, list)
-            and len(row) >= 2
-            and str(row[0] or "").strip() == "ROSTER_SHEET_NAME"
-            and str(row[1] or "").strip()
-        ):
-            roster_name = str(row[1]).strip()
-            break
-    quoted_roster = "'" + roster_name.replace("'", "''") + "'"
+    if settings_map.get("ROSTER_SHEET_NAME"):
+        roster_name = settings_map["ROSTER_SHEET_NAME"]
+
+    def quote_sheet(name: str) -> str:
+        return "'" + str(name).replace("'", "''") + "'"
+
+    quoted_roster = quote_sheet(roster_name)
     roster_range = f"{quoted_roster}!A:D"
     before = read_values(roster_range)
     if not before or not isinstance(before[0], list):
@@ -285,8 +459,8 @@ def _migrate_attendance_roster_layout(
     headers = rows[0][:3]
     current_headers = ["번호", "이름", "학생 Google 이메일"]
     if headers == current_headers and all(not row[3] for row in rows):
-        return True
-    if headers == ["번호", "이름", "번호+이름"]:
+        migrated = rows
+    elif headers == ["번호", "이름", "번호+이름"]:
         migrated = [current_headers + [""]]
         migrated.extend([[row[0], row[1], row[3], ""] for row in rows[1:]])
     elif rows[0][0] == "번호+이름":
@@ -301,26 +475,39 @@ def _migrate_attendance_roster_layout(
     else:
         return False
 
-    _run_one_json(
+    if len(migrated) - 1 > 199:
+        return False
+
+    personal_sheet = "메신저 개인톡 내용"
+    class_sheet = "메신저 단체톡 내용"
+    personal_status_range = f"{quote_sheet(personal_sheet)}!G:G"
+    class_status_range = f"{quote_sheet(class_sheet)}!E:E"
+    personal_statuses = read_values(personal_status_range)
+    class_statuses = read_values(class_status_range)
+    if not personal_statuses or not class_statuses:
+        return False
+
+    def queue_status_values(values: list) -> list[list[str]]:
+        normalized = []
+        for row in values:
+            value = str(row[0] if isinstance(row, list) and row else "").strip()
+            normalized.append(["대기" if value == "확인필요" else value])
+        return normalized
+
+    metadata = _run_one_json(
         runner,
         [
             gws,
             "sheets",
             "spreadsheets",
-            "values",
-            "update",
+            "get",
             "--params",
             json.dumps(
                 {
                     "spreadsheetId": spreadsheet,
-                    "range": f"{quoted_roster}!A1:D{len(migrated)}",
-                    "valueInputOption": "RAW",
+                    "includeGridData": False,
+                    "fields": "sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))",
                 },
-                ensure_ascii=False,
-            ),
-            "--json",
-            json.dumps(
-                {"majorDimension": "ROWS", "values": migrated},
                 ensure_ascii=False,
             ),
             "--format",
@@ -328,8 +515,277 @@ def _migrate_attendance_roster_layout(
         ],
         Path(workdir),
     )
-    after = [row4(row) for row in read_values(roster_range)]
-    return after == migrated
+    sheet_properties = {}
+    for item in metadata.get("sheets", []) if isinstance(metadata, dict) else []:
+        props = item.get("properties") if isinstance(item, dict) else None
+        title = str((props or {}).get("title") or "")
+        if title:
+            sheet_properties[title] = props
+
+    month_names = [
+        value.strip()
+        for value in settings_map.get(
+            "MONTH_SHEET_NAMES", "3월,4월,5월,6월,7월,8월,9월,10월,11월,12월,1월,2월"
+        ).split(",")
+        if value.strip()
+    ]
+    required_sheets = month_names + [personal_sheet, class_sheet]
+    if any(name not in sheet_properties for name in required_sheets):
+        return False
+
+    combined = [
+        row[0] + row[1]
+        for row in migrated[1:]
+        if str(row[0]).strip() and str(row[1]).strip()
+    ]
+    hidden_students = [["학생_번호이름"]]
+    hidden_students.extend([[value] for value in combined])
+    hidden_students.extend([[""]] * (200 - len(hidden_students)))
+    queue_status_options = ["대기", "발송중", "제외", "보냄", "실패"]
+    value_updates = [
+        {
+            "range": "'드롭다운'!J1:J200",
+            "majorDimension": "ROWS",
+            "values": hidden_students,
+        },
+        {
+            "range": "'드롭다운'!G1:G6",
+            "majorDimension": "ROWS",
+            "values": [["쪽지_상태"]] + [[value] for value in queue_status_options],
+        },
+        {
+            "range": f"{quote_sheet(personal_sheet)}!G1:G{len(personal_statuses)}",
+            "majorDimension": "ROWS",
+            "values": queue_status_values(personal_statuses),
+        },
+        {
+            "range": f"{quote_sheet(class_sheet)}!E1:E{len(class_statuses)}",
+            "majorDimension": "ROWS",
+            "values": queue_status_values(class_statuses),
+        },
+    ]
+    if migrated != rows:
+        value_updates.insert(
+            0,
+            {
+                "range": f"{quoted_roster}!A1:D{len(migrated)}",
+                "majorDimension": "ROWS",
+                "values": migrated,
+            },
+        )
+    dropdown_setting_found = False
+    for row_number, row in enumerate(settings, start=1):
+        if (
+            isinstance(row, list)
+            and row
+            and str(row[0] or "").strip() == "STUDENT_DROPDOWN_RANGE"
+        ):
+            dropdown_setting_found = True
+            value_updates.append(
+                {
+                    "range": f"'설정'!B{row_number}",
+                    "majorDimension": "ROWS",
+                    "values": [["J2:J200"]],
+                }
+            )
+            break
+    if not dropdown_setting_found:
+        setting_row = len(settings) + 1
+        value_updates.append(
+            {
+                "range": f"'설정'!A{setting_row}:B{setting_row}",
+                "majorDimension": "ROWS",
+                "values": [["STUDENT_DROPDOWN_RANGE", "J2:J200"]],
+            }
+        )
+
+    _run_one_json(
+        runner,
+        [
+            gws,
+            "sheets",
+            "spreadsheets",
+            "values",
+            "batchUpdate",
+            "--params",
+            json.dumps({"spreadsheetId": spreadsheet}, ensure_ascii=False),
+            "--json",
+            json.dumps(
+                {"valueInputOption": "RAW", "data": value_updates},
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        Path(workdir),
+    )
+
+    def validation_rule(values: list[str], *, allow_invalid: bool) -> dict:
+        return {
+            "condition": {
+                "type": "ONE_OF_RANGE" if len(values) == 1 and values[0].startswith("=") else "ONE_OF_LIST",
+                "values": [{"userEnteredValue": value} for value in values],
+            },
+            "strict": not allow_invalid,
+            "showCustomUi": True,
+        }
+
+    validation_requests = []
+    for name in month_names:
+        props = sheet_properties[name]
+        validation_requests.append(
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": int(props["sheetId"]),
+                        "startRowIndex": 2,
+                        "endRowIndex": int(props["gridProperties"]["rowCount"]),
+                        "startColumnIndex": 1,
+                        "endColumnIndex": 2,
+                    },
+                    "rule": validation_rule(
+                        ["='드롭다운'!$J$2:$J$200"], allow_invalid=True
+                    ),
+                }
+            }
+        )
+    for name, column_index in ((personal_sheet, 6), (class_sheet, 4)):
+        props = sheet_properties[name]
+        validation_requests.append(
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": int(props["sheetId"]),
+                        "startRowIndex": 1,
+                        "endRowIndex": int(props["gridProperties"]["rowCount"]),
+                        "startColumnIndex": column_index,
+                        "endColumnIndex": column_index + 1,
+                    },
+                    "rule": validation_rule(queue_status_options, allow_invalid=False),
+                }
+            }
+        )
+
+    _run_one_json(
+        runner,
+        [
+            gws,
+            "sheets",
+            "spreadsheets",
+            "batchUpdate",
+            "--params",
+            json.dumps({"spreadsheetId": spreadsheet}, ensure_ascii=False),
+            "--json",
+            json.dumps({"requests": validation_requests}, ensure_ascii=False),
+            "--format",
+            "json",
+        ],
+        Path(workdir),
+    )
+
+    def first_column(values: list) -> list[str]:
+        return [
+            str(row[0] if isinstance(row, list) and row else "").strip()
+            for row in values
+        ]
+
+    expected_hidden = ["학생_번호이름"] + combined
+    if first_column(read_values("'드롭다운'!J1:J200")) != expected_hidden:
+        return False
+    if first_column(read_values("'드롭다운'!G1:G6")) != [
+        "쪽지_상태",
+        *queue_status_options,
+    ]:
+        return False
+    if first_column(read_values(personal_status_range)) != first_column(
+        queue_status_values(personal_statuses)
+    ):
+        return False
+    if first_column(read_values(class_status_range)) != first_column(
+        queue_status_values(class_statuses)
+    ):
+        return False
+    if migrated != rows:
+        after_roster = [row4(row) for row in read_values(roster_range)]
+        if after_roster != migrated:
+            return False
+
+    verified_settings = read_values("설정!A:B")
+    verified_settings_map = {
+        str(row[0] or "").strip(): str(row[1] or "").strip()
+        for row in verified_settings
+        if isinstance(row, list) and len(row) >= 2 and str(row[0] or "").strip()
+    }
+    if verified_settings_map.get("STUDENT_DROPDOWN_RANGE") != "J2:J200":
+        return False
+
+    validation_ranges = [f"{quote_sheet(name)}!B3" for name in month_names]
+    validation_ranges.extend(
+        [f"{quote_sheet(personal_sheet)}!G2", f"{quote_sheet(class_sheet)}!E2"]
+    )
+    validation_state = _run_one_json(
+        runner,
+        [
+            gws,
+            "sheets",
+            "spreadsheets",
+            "get",
+            "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet,
+                    "ranges": validation_ranges,
+                    "includeGridData": True,
+                    "fields": "sheets(properties(title),data(rowData(values(dataValidation))))",
+                },
+                ensure_ascii=False,
+            ),
+            "--format",
+            "json",
+        ],
+        Path(workdir),
+    )
+
+    validations = {}
+    for item in validation_state.get("sheets", []) if isinstance(validation_state, dict) else []:
+        title = str(((item.get("properties") or {}).get("title")) or "")
+        try:
+            rule = item["data"][0]["rowData"][0]["values"][0]["dataValidation"]
+        except (KeyError, IndexError, TypeError):
+            rule = None
+        if title and isinstance(rule, dict):
+            validations[title] = rule
+
+    def condition_values(rule: dict) -> list[str]:
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        return [
+            str(item.get("userEnteredValue") or "")
+            for item in (condition or {}).get("values", [])
+            if isinstance(item, dict)
+        ]
+
+    for name in month_names:
+        rule = validations.get(name)
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        values = [value.replace("'드롭다운'", "드롭다운") for value in condition_values(rule)]
+        if (
+            not isinstance(condition, dict)
+            or condition.get("type") != "ONE_OF_RANGE"
+            or values != ["=드롭다운!$J$2:$J$200"]
+            or rule.get("strict") is True
+        ):
+            return False
+    for name in (personal_sheet, class_sheet):
+        rule = validations.get(name)
+        condition = rule.get("condition") if isinstance(rule, dict) else None
+        if (
+            not isinstance(condition, dict)
+            or condition.get("type") != "ONE_OF_LIST"
+            or condition_values(rule) != queue_status_options
+            or rule.get("strict") is not True
+        ):
+            return False
+    return True
 
 
 def guarded(method):
@@ -401,6 +857,7 @@ class BridgeDeps:
     gemini_key_pusher: object = None
     attendance_script_updater: object = None
     attendance_script_runner: object = None
+    attendance_roster_inspector: object = None
     attendance_roster_migrator: object = None
     attendance_ai_inspector: object = None
     attendance_remote_work_timeout_seconds: object = None
@@ -947,6 +1404,39 @@ class Api:
 
         return run
 
+    def _attendance_script_runner(self):
+        """출결 시트·Apps Script 명령을 작업 폴더와 함께 제한 시간 안에 실행한다."""
+
+        if self._deps.attendance_script_runner is not None:
+            return self._deps.attendance_script_runner
+        base = self._gws_base_environ()
+        environment = gws_env.gws_environ(
+            base,
+            gws_config_dir=self._gws_config_dir(base),
+        )
+
+        def script_runner(args, cwd):
+            try:
+                return engine.attendance_remote_runner(
+                    args, cwd, environment=environment
+                )
+            except subprocess.CalledProcessError as error:
+                output = error.stderr or error.output or ""
+                try:
+                    process_win.write_process_log(
+                        paths.logs_dir(self._config_dir),
+                        list(error.cmd)
+                        if isinstance(error.cmd, (list, tuple))
+                        else list(args),
+                        int(error.returncode),
+                        str(output),
+                    )
+                except OSError:
+                    pass
+                raise
+
+        return script_runner
+
     def _gws_base_environ(self) -> dict:
         """GWS가 물려받을 Windows 환경값의 읽기 전용 사본."""
 
@@ -989,6 +1479,39 @@ class Api:
         if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
             return asdict(status_value)
         status = asdict(status_value)
+        if status_value.state == "ready":
+            from attendance_install_record import load_attendance_install_record
+
+            record = load_attendance_install_record(
+                paths.attendance_install_record_path(self._config_dir)
+            )
+            layout_inspector = (
+                self._deps.attendance_roster_inspector
+                or _attendance_workbook_layout_is_current
+            )
+            try:
+                _run, gws, _account = (
+                    self._resolve_attendance_goedu_gws_context_or_fail()
+                )
+                layout_current = layout_inspector(
+                    runner=self._attendance_script_runner(),
+                    workdir=self._config_dir,
+                    gws_executable=gws,
+                    spreadsheet_id=record["spreadsheet_id"],
+                )
+            except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
+                layout_current = None
+            if layout_current is not True:
+                status["state"] = (
+                    "script-update-required"
+                    if layout_current is False
+                    else "script-check-required"
+                )
+                status["detail"] = (
+                    _ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE
+                    if layout_current is False
+                    else engine.ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
+                )
         # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다.
         engine.save_attendance_status_cache(self._config_dir, status)
         return status
@@ -1290,35 +1813,7 @@ class Api:
             from attendance_script_update import inspect_or_update_attendance_script
 
             updater = inspect_or_update_attendance_script
-        script_runner = self._deps.attendance_script_runner
-        if script_runner is None:
-            # Apps Script의 +push는 임시 폴더 위치를 꼭 넘겨야 한다. 자식 작업까지
-            # 제한 시간 안에 끝내는 출결 전용 실행기를 사용한다.
-            base = self._gws_base_environ()
-            environment = gws_env.gws_environ(
-                base,
-                gws_config_dir=self._gws_config_dir(base),
-            )
-
-            def script_runner(args, cwd):
-                try:
-                    return engine.attendance_remote_runner(
-                        args, cwd, environment=environment
-                    )
-                except subprocess.CalledProcessError as error:
-                    output = error.stderr or error.output or ""
-                    try:
-                        process_win.write_process_log(
-                            paths.logs_dir(self._config_dir),
-                            list(error.cmd)
-                            if isinstance(error.cmd, (list, tuple))
-                            else list(args),
-                            int(error.returncode),
-                            str(output),
-                        )
-                    except OSError:
-                        pass
-                    raise
+        script_runner = self._attendance_script_runner()
         assets_dir = bundle_paths.bundle_root() / "assets"
         update_options = {
             "assets_dir": assets_dir,

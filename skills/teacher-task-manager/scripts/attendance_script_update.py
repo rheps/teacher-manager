@@ -26,6 +26,13 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
     (
+        "e3e50df0a1901fef" "1a9a3a3894a6ba30"
+        "f51e078cdfe7face" "4531dd7eac2d810a"
+    ): (
+        ("v3.6", "92bad0349a8d54be306d" "816de77c3bdb43e098e1"),
+        ("v3.5", "97d64b0aba77c14c0d5a" "946c70eb7404ca8e5fbb"),
+    ),
+    (
         "b9af31535c4bc374" "ab9cfa3091bfee04"
         "cf1807a45b5f9236" "58659b2d35082a24"
     ): (

@@ -138,6 +138,24 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
     doctor_deps = deps.doctor_deps or DoctorDeps()
 
     results = list(run_doctor_checks(config_dir, doctor_deps))
+    login_problem = next(
+        (
+            row
+            for row in results
+            if row.key in {"settings.google-login", "settings.goedu-account"}
+            and row.ok is False
+        ),
+        None,
+    )
+    if login_problem is not None:
+        # 같은 로그인 하나가 설정과 연결을 함께 막는다. 설정이 왼쪽 카드이므로
+        # 선생님은 먼저 설정에서 고치고, 다음 홈 점검에서 두 경고가 함께 사라진다.
+        results.append(CheckResult(
+            "connect.google-login", "Google 로그인", False,
+            login_problem.detail,
+            login_problem.fix,
+            card="connect", tab="messenger", target="google-login",
+        ))
     results.append(_timetable_check(config_dir))
 
     readiness = computer_readiness(doctor_deps.run_command, deps.document_probe)

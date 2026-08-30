@@ -433,6 +433,11 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .svc-subrow input[name="class-space-name"]:focus { border-color:var(--tm-blue); }
 .svc-subrow select { font-family:inherit; font-size:13px; padding:6px 9px;
   border:1.5px solid var(--tm-line); border-radius:9px; }
+.class-space-actions { margin-top:0; margin-left:auto; }
+.chat-new-space-guide { flex:1 1 420px; margin-top:0; margin-left:auto; }
+.chat-new-space-guide small { color:var(--tm-faint); font-size:12px; line-height:1.45;
+  text-align:right; }
+.chat-new-space-guide button { flex:none; }
 .service-logo { width:24px; height:24px; flex:none; object-fit:contain; }
 .attendance-service .nameblock { flex:1; min-width:0; }
 /* 출결 탭 상태 셀 — 글자 색만, 모든 줄 같은 폭, 맨 오른쪽 (2026-07-31 설계) */
