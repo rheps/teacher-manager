@@ -2059,13 +2059,31 @@ def gws_auth_status(run_command, gws: str) -> dict:
     logged_in = code == 0 and bool(email)
     account_allowed = logged_in and google_account.is_goedu_email(email)
     lowered = str(output or "").lower()
+    status_document = None
+    if code == 0 and not logged_in:
+        try:
+            parsed = process_win.parse_first_json(output)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            status_document = parsed
+    credentials_absent = bool(
+        status_document is not None
+        and (
+            str(status_document.get("storage") or "").casefold() == "none"
+            or (
+                status_document.get("encrypted_credentials_exists") is False
+                and status_document.get("plain_credentials_exists") is False
+            )
+        )
+    )
     logged_out_markers = (
         "not logged in", "not authenticated", "no credentials", "login required",
     )
     if logged_in:
         login_state = "logged_in"
         error_code = ""
-    elif code != 0 and any(mark in lowered for mark in logged_out_markers):
+    elif credentials_absent or any(mark in lowered for mark in logged_out_markers):
         login_state = "logged_out"
         error_code = ""
     else:
@@ -4119,6 +4137,14 @@ def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> l
     pages: list[dict] = []
     offset = 0
     while offset < len(text):
+        starts = [
+            index
+            for index in (text.find("{", offset), text.find("[", offset))
+            if index != -1
+        ]
+        if not starts:
+            break
+        offset = min(starts)
         try:
             page, end = decoder.raw_decode(text, offset)
         except (ValueError, TypeError) as error:
@@ -4129,6 +4155,8 @@ def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> l
         offset = end
         while offset < len(text) and text[offset].isspace():
             offset += 1
+    if not pages:
+        raise RuntimeError(failure_message)
     return pages
 
 
@@ -4418,23 +4446,13 @@ def ensure_tasklist_verified(
 
 
 def list_calendars(run_command, gws: str) -> list[dict]:
-    require_goedu_gws_session(run_command, gws)
-    reply = _run_gws_json(
-        run_command,
-        [gws, "calendar", "calendarList", "list", "--params", '{"maxResults":250}', "--format", "json"],
-        LIST_CALENDARS_FAILURE,
-    )
-    return [{"id": item.get("id", ""), "name": item.get("summary", "")} for item in reply.get("items", [])]
+    rows = _google_targets_once(run_command, gws, "calendar")
+    return [{key: value for key, value in row.items() if key != "owned"} for row in rows]
 
 
 def list_tasklists(run_command, gws: str) -> list[dict]:
-    require_goedu_gws_session(run_command, gws)
-    reply = _run_gws_json(
-        run_command,
-        [gws, "tasks", "tasklists", "list", "--format", "json"],
-        LIST_TASKLISTS_FAILURE,
-    )
-    return [{"id": item.get("id", ""), "name": item.get("title", "")} for item in reply.get("items", [])]
+    rows = _google_targets_once(run_command, gws, "tasklist")
+    return [{key: value for key, value in row.items() if key != "owned"} for row in rows]
 
 
 def ensure_calendar(run_command, gws: str, name: str) -> str:

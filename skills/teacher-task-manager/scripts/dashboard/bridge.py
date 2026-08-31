@@ -2165,10 +2165,22 @@ class Api:
                         attendance_record=record,
                     )
                 )
+            except (ScreenSafeError, gws_env.GwsAccountStorageError):
+                # 로그인·계정·현재 출결 연결처럼 선생님이 바로잡아야 하는 일은
+                # 같은 읽기를 세 번 되풀이하지 않고 원래 안내를 그대로 보낸다.
+                raise
             except central_chat.CentralChatError as error:
                 raise recovery.RetryableOperationError(
                     "CHAT_SPACE_LIST_READ",
                     central_chat._safe_central_error_detail(error),
+                ) from error
+            except Exception as error:  # noqa: BLE001 - 방 목록 전 준비 과정도 같은 세 번 안에 둔다.
+                # 실제 설치 기록이 있으면 목록 호출 전에 계정, 로컬 출결 기능,
+                # Google Apps Script 현재 상태를 읽는다. 이 앞단의 잠깐 겹침·시간
+                # 초과·실행기 오류도 목록 호출과 똑같이 세 번 안에서 처리해야 한다.
+                raise recovery.RetryableOperationError(
+                    "CHAT_SPACE_PREFLIGHT_READ",
+                    "학급 단톡방 목록을 읽기 위한 Google 확인을 다시 진행하고 있어요.",
                 ) from error
 
         return self._attendance_operation(
@@ -2283,7 +2295,7 @@ class Api:
             gws = ""
             runtime_error = error.code
         auth = (
-            self._google_auth_status_with_recovery(run, gws)
+            engine.gws_auth_status(run, gws)
             if gws
             else {
                 "logged_in": False,
@@ -2306,25 +2318,6 @@ class Api:
             "account_allowed": bool(auth.get("account_allowed")),
             "user": auth["user"],
         }
-
-    def _google_auth_status_with_recovery(self, run, gws) -> dict:
-        def read_once():
-            status = engine.gws_auth_status(run, gws)
-            if status.get("login_state") == "error":
-                raise recovery.RetryableOperationError(
-                    "GOOGLE_AUTH_STATUS", "Google 로그인 상태를 확인하지 못했습니다."
-                )
-            return status
-
-        return recovery.run_operation(
-            "google_status",
-            "Google 연결 상태를 확인하지 못했어요.",
-            read_once,
-            delays=recovery.NETWORK_DELAYS,
-            change_status="Google 자료는 바꾸지 않았습니다.",
-            app_version=version.APP_VERSION,
-            **self._network_recovery_options(),
-        )
 
     @guarded
     def gws_update_status(self):
@@ -2396,16 +2389,12 @@ class Api:
     @guarded
     def list_calendars(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_google_targets_with_recovery(
-            run, gws, "calendar", **self._network_recovery_options()
-        )
+        return engine.list_calendars(run, gws)
 
     @guarded
     def list_tasklists(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_google_targets_with_recovery(
-            run, gws, "tasklist", **self._network_recovery_options()
-        )
+        return engine.list_tasklists(run, gws)
 
     @guarded
     def verify_google_target_candidate(self, kind, candidate_id, name, account):
@@ -2717,7 +2706,7 @@ class Api:
         snapshot = self._login.snapshot()
         if snapshot.get("ok") is True:
             run, gws = self._resolve_gws_or_fail()
-            auth = self._google_auth_status_with_recovery(run, gws)
+            auth = engine.gws_auth_status(run, gws)
             if auth.get("logged_in") and auth.get("account_allowed"):
                 engine.record_gws_scope_grant(self._config_dir, auth.get("user", ""))
         return engine.annotate_login_snapshot(snapshot)
@@ -2785,7 +2774,7 @@ class Api:
         if not name:
             raise ValueError("캘린더 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
-        account = self._google_auth_status_with_recovery(run, gws).get("user", "")
+        account = engine.gws_auth_status(run, gws).get("user", "")
         made_id = engine.ensure_calendar_verified(
             run, gws, account, name, **self._network_recovery_options()
         )
@@ -2799,7 +2788,7 @@ class Api:
         if not name:
             raise ValueError("할일 목록 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
-        account = self._google_auth_status_with_recovery(run, gws).get("user", "")
+        account = engine.gws_auth_status(run, gws).get("user", "")
         made_id = engine.ensure_tasklist_verified(
             run, gws, account, name, **self._network_recovery_options()
         )

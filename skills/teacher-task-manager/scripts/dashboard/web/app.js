@@ -18,7 +18,6 @@ const S = {
   linkLoading: false,
   listsLoaded: false,
   listsError: false,
-  googleAccessNeedsLogin: false, // Calendar·Tasks 최종 실패를 설정·연결이 함께 보는 로그인 경고
   maps: { calendars: {}, tasklists: {} },
   edit: null,
   busy: {},
@@ -79,7 +78,6 @@ const WIZARD_STEPS = [
   "이 컴퓨터 설정", "Google 연결", "학생 계정 준비", "모두 저장",
 ];
 const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
-const GOOGLE_LIST_LOGIN_MESSAGE = "Calendar와 할 일 목록을 읽지 못했어요. 설정에서 본인의 @goedu.kr 계정으로 다시 로그인해 주세요.";
 function isGoeduGoogleStatus(status) {
   return Boolean(status && status.logged_in && status.account_allowed === true);
 }
@@ -485,17 +483,6 @@ function googleStatusKey(status) {
   if (!status) return "";
   return [status.login_state || "", status.logged_in ? "1" : "0", status.user || "", status.account_allowed === true ? "1" : "0"].join("|");
 }
-function markGoogleAccessLoginRequired(_error) {
-  // 세 번 재시도까지 끝난 Calendar·Tasks 실패는 네 번째 재시도 화면으로 보내지 않는다.
-  // 설정에서 사람이 다시 로그인해야 하는 하나의 상태로 만들고 연결 화면도 함께 잠근다.
-  S.googleAccessNeedsLogin = true;
-  S.listsLoaded = false;
-  S.listsError = true;
-}
-function clearGoogleAccessLoginRequired() {
-  S.googleAccessNeedsLogin = false;
-  S.listsError = false;
-}
 function clearGoogleDependentState(options) {
   const preserveResume = options?.preserveResume === true;
   clearAttendanceScriptDialogState();
@@ -509,7 +496,7 @@ function clearGoogleDependentState(options) {
   S.checks = [];
   S.lists = { calendars: [], tasklists: [] };
   S.listsLoaded = false;
-  clearGoogleAccessLoginRequired();
+  S.listsError = false;
   S.verifiedGoogleTargetChoices = {};
   S.pendingGoogleTarget = null;
   S.googleTargetAccountChanged = true;
@@ -1273,10 +1260,10 @@ async function loadLinkLists() {
     if (!ownsIssueRequest(request)) return;
     S.lists = { calendars, tasklists };
     S.listsLoaded = true;
-    clearGoogleAccessLoginRequired();
+    S.listsError = false;
   } catch (error) {
     if (!ownsIssueRequest(request)) return;
-    markGoogleAccessLoginRequired(error); // 기존 S.lists와 선택 ID는 그대로 둔다
+    S.listsError = true; // 실제 로그인 상태는 바꾸지 않고 기존 목록과 선택 ID는 그대로 둔다
   } finally {
     S.linkLoading = false;
     if (ownsIssueRequest(request)) render();
@@ -1545,10 +1532,12 @@ function classSpaceSubrowHtml(a) {
         render();
       })
       .catch((error) => {
-        if (showProblemIssue(error, request)) return;
         if (!ownsIssueRequest(request)) return;
         S.chatSpaces = [];
         S.chatSpacesError = true;
+        // 최종 실패 안내를 그리더라도 목록 상태부터 끝낸다. null을 남기면 안내를
+        // 닫거나 다시 들어왔을 때도 "방 목록을 가져오는 중"에 영구 정지한다.
+        if (showProblemIssue(error, request)) return;
         render();
       });
   }
@@ -2504,11 +2493,6 @@ function stepConnect() {
       .catch((error) => handleCaughtError(error, request));
     return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>`;
   }
-  if (S.googleAccessNeedsLogin) {
-    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_LIST_LOGIN_MESSAGE)}</span>
-      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
-      <p class="sub">설정에서 로그인을 마치면 Calendar·Tasks·Google Chat 연결을 자동으로 다시 확인해요.</p>`;
-  }
   if (googleAuthCheckFailed(S.google)) {
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
@@ -2533,7 +2517,6 @@ function stepConnect() {
 }
 async function validateConnect() {
   if (!S.google) S.google = await call("google_status");
-  if (S.googleAccessNeedsLogin) return GOOGLE_LIST_LOGIN_MESSAGE;
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return "구글 로그인을 마쳐야 다음으로 갈 수 있어요.";
   if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
@@ -2631,13 +2614,12 @@ async function refreshSettingsStatus(request) {
         if (!ownsIssueRequest(owner)) return false;
         S.lists = { calendars, tasklists };
         S.listsLoaded = true;
-        clearGoogleAccessLoginRequired();
+        S.listsError = false;
         // 새 목록에도 기존 선택 ID가 있으면 select가 같은 값으로 유지된다.
       } catch (error) {
         if (!ownsIssueRequest(owner)) return false;
-        // 한 목록이라도 최종 실패하면 큰 오류 화면 대신 설정·연결의 같은 로그인 경고로 보낸다.
-        // 기존 목록과 선택 ID는 그대로 두어 다시 로그인하기 전에도 사용자 자료를 잃지 않는다.
-        markGoogleAccessLoginRequired(error);
+        // 목록 실패를 로그인 실패로 바꾸지 않는다. 기존 목록과 선택 ID는 그대로 둔다.
+        S.listsError = true;
       }
     } else {
       S.lists = { calendars: [], tasklists: [] };
@@ -2810,9 +2792,7 @@ function googleLoginRowsHtml() {
   if (!g) return `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span><span class="st">확인 중이에요…</span></div>`;
-  const loginError = S.googleAccessNeedsLogin
-    ? GOOGLE_LIST_LOGIN_MESSAGE
-    : fieldError("google-login");
+  const loginError = fieldError("google-login");
   const update = S.gwsUpdate;
   const accountStorageProblem = g.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
     ? OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER
@@ -2863,7 +2843,7 @@ function googleLoginRowsHtml() {
       : "Google 로그인 준비 파일이 필요해요";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
-    : g.logged_in && !S.googleAccessNeedsLogin
+    : g.logged_in
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st ok">${esc(g.user || "완료")}</span><button class="btn-quiet" data-action="gws-logout">로그아웃</button></span></div>`
       : accountStorageProblem
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
@@ -2985,7 +2965,6 @@ async function validateGoogleLogin() {
   if (S.google.oauth_client_conflict) return "Google 로그인 준비를 확인해야 해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (!S.google.oauth_client_ready) return "Google 로그인 준비 파일이 필요해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
-  if (S.googleAccessNeedsLogin) return GOOGLE_LIST_LOGIN_MESSAGE;
   if (!S.google.logged_in) return FIELD_MESSAGES["google-login"];
   if (!isGoeduGoogleStatus(S.google)) return GOEDU_REQUIRED_MESSAGE;
   return "";
@@ -3282,23 +3261,11 @@ function effectiveChecks() {
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
-  const sharedGoogle = S.googleAccessNeedsLogin ? [
-    {
-      key: "settings.google-list-login", label: "Google 로그인", ok: false,
-      detail: "", fix: GOOGLE_LIST_LOGIN_MESSAGE,
-      card: "settings", tab: "", target: "google-login",
-    },
-    {
-      key: "connect.google-list-login", label: "Google 로그인", ok: false,
-      detail: "", fix: GOOGLE_LIST_LOGIN_MESSAGE,
-      card: "connect", tab: "messenger", target: "google-login",
-    },
-  ] : [];
   const live = Object.values(S.fieldIssues || {}).map((row) => ({
     key: row.key, label: row.target, ok: false, detail: "", fix: row.message,
     card: editing || "", tab: row.tab || "", target: row.target,
   }));
-  return uniqueChecks(kept.concat(sharedGoogle, live));
+  return uniqueChecks(kept.concat(live));
 }
 function checksForCard(card) {
   return effectiveChecks().filter((row) => row.card === card);

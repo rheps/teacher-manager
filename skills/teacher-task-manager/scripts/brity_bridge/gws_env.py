@@ -2,10 +2,10 @@
 
 일반 Google 명령과 로그인 명령을 분리한다. 제품이 가진 데스크톱 OAuth 값은
 ``gws auth login`` 자식 한 번에만 넘기고, status·Calendar·Tasks·Sheets 같은
-일반 명령에는 새로 넣지 않는다. 기존 로그인 파일, 암호화 키, token cache와
-사용자가 고른 keyring 방식은 읽거나 옮기거나 지우지 않는다. 다만 공개 2.0이
-강제로 만들었던 완전한 file 방식 로그인 파일이 그대로 있으면, 그 사용자만
-자식 명령에서 같은 방식을 이어 받아 업데이트 뒤 재로그인을 막는다.
+일반 명령에는 새로 넣지 않는다. 기존 로그인 파일, 암호화 키, token cache는
+읽거나 옮기거나 지우지 않는다. Windows의 새 로그인은 실제 성공했던 기본
+자격 증명 보관함을 그대로 쓴다. 공개 2.0의 완전한 file 로그인 한 쌍이 남은
+사용자만 그 보관함을 계속 읽어 업데이트 뒤 갑자기 로그아웃되지 않게 한다.
 """
 from __future__ import annotations
 
@@ -417,19 +417,11 @@ def gws_environ(
         )
     if "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" in unsafe:
         made.pop("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE", None)
-    # 새 설치는 Windows 기본 자격 증명 관리자를 그대로 쓴다. 공개 2.0이
-    # file 방식을 강제로 사용해 완전한 로그인 파일 한 쌍을 남긴 경우에만,
-    # 그 파일을 읽거나 옮기지 않고 이 자식 명령 하나에 기존 방식을 이어 준다.
-    # 호출자가 실제 os.environ을 쓰는 일반 실행은 현재 계정 폴더를 직접 보고,
-    # 시험용 환경 사전은 명시적으로 폴더를 건넨 때만 본다.
-    should_inspect_legacy = (
-        gws_config_dir is not None or base is None or values is os.environ
-    )
-    if (
-        should_inspect_legacy
-        and _running_on_windows()
-        and not str(made.get("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND") or "").strip()
-    ):
+    if _running_on_windows():
+        # 컴퓨터 환경값 하나 때문에 로그인과 이후 조회가 서로 다른 보관함을
+        # 보지 않게 한다. 새 로그인은 실제 현장에서 성공했던 Windows 기본값을
+        # 쓰고, 완전한 옛 file 로그인 한 쌍이 있을 때만 그 한 쌍을 이어 읽는다.
+        made.pop("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND", None)
         config_dir = (
             Path(gws_config_dir)
             if gws_config_dir is not None
