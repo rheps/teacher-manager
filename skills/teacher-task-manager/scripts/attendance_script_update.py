@@ -29,6 +29,7 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         "e3e50df0a1901fef" "1a9a3a3894a6ba30"
         "f51e078cdfe7face" "4531dd7eac2d810a"
     ): (
+        ("v3.8", "3ff0554624ffe709fbd6" "b274a87be6a159196e8f"),
         ("v3.7", "35e135d1ddf2c53b2cf1" "d462549c0345e964e8a0"),
         ("v3.6", "92bad0349a8d54be306d" "816de77c3bdb43e098e1"),
         ("v3.5", "97d64b0aba77c14c0d5a" "946c70eb7404ca8e5fbb"),
@@ -120,6 +121,16 @@ TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
         "7edbd4a815086a0a" "de2b0ccdb19cc36c"
     ): (
         ("2.3-standard-test-pc", "d7fd551-before-final-ai-fixes"),
+    ),
+    # 2026-09-01 17:47 KST 작업용 스크립트가 실제 정식 출석부 한 곳의 Apps Script
+    # 편집본에 판·배포 없이 올린 5.13.0 초안. 2026-09-03 읽기 전용으로 원문을 회수해
+    # 커밋 ff2e01d와 ea15a2e 사이 상태임을 줄 단위로 대조했고 manifest는 공개 3.8과
+    # 같다. 이 정확한 한 판만 같은 출석부에서 정식 업데이트로 이어 간다.
+    (
+        "273103d7301ccc4a" "a2ffb96e4aa669a7"
+        "bb2d059b03b5d8e3" "026667d3178358eb"
+    ): (
+        ("5.13.0-draft-live-workbook-2026-09-01", "between-ff2e01d-and-ea15a2e"),
     ),
 }
 TRUSTED_PRERELEASE_BUNDLE_SHA256 = frozenset(
@@ -566,13 +577,25 @@ def inspect_attendance_script_update(
                 or _is_trusted_teacher_manager_bundle(head.sha256)
             )
             fixed_is_official = _is_trusted_teacher_manager_bundle(fixed.sha256)
-            _need(
+            if not (
                 head_is_official
                 and fixed_is_official
                 and not head.has_extra_files
-                and not fixed.has_extra_files,
-                "현재 편집본과 실제 배포 중인 버전이 달라요.",
-            )
+                and not fixed.has_extra_files
+            ):
+                # 편집본과 배포판이 다르고 한쪽이 정식 목록 밖이면 읽기가 모호한
+                # 것이 아니라 프로그램 밖에서 바뀐 것이다. 같은 읽기를 되풀이하지
+                # 않고 사용자 수정본으로 보호한다(2026-09-03 실제 사고).
+                return _result(
+                    "customized",
+                    sheet=sheet,
+                    script=script,
+                    deployment=deployment,
+                    current_sha=current_sha,
+                    target_sha=target_sha,
+                    deployed_version=deployed_version,
+                    detail="현재 편집본과 실제 배포 중인 버전이 달라요.",
+                )
             if head.sha256 == target_sha:
                 # 업로드 뒤 판 만들기나 배포 연결 전에 앱이 꺼졌어도 같은 시트에서
                 # 이어간다. 판이 이미 있으면 그 번호를 쓰고, 없으면 적용 버튼에서

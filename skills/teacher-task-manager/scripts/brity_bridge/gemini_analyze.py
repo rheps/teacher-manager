@@ -120,7 +120,7 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
             {
                 "target": "homeroom_tasks",
                 "title": "[학생안내] 제목",
-                "due": "RFC3339 (예: 2026-07-11T00:00:00Z)",
+                "due": "YYYY-MM-DD, 기한이 전혀 없으면 빈 문자열",
                 "notes": "메모",
             }
         ],
@@ -151,6 +151,9 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
         "- plain_text는 화면에서 읽어 왔을 수 있다 — 글자 사이 공백이나 줄바꿈이 어색해도",
         "  자연스럽게 이어 읽는다.",
         "- homeroom_enabled가 false이면 tasks는 항상 빈 배열이다.",
+        "- 기준 정보의 now로 오늘·내일·이번 주 토요일과 일요일을 실제 날짜로 계산한다.",
+        "- tasks의 due는 YYYY-MM-DD로만 쓰고, 기한이 전혀 없으면 빈 문자열로 둔다.",
+        "- tasks의 due는 Google Tasks에 날짜를 보내는 값이 아닙니다. 상대 날짜 해석과 중복 확인에만 쓴다.",
         "- 학생이나 학급에게 전달할 안내가 명시적으로 있을 때만 student_notices에 넣는다.",
         "  감독·회의·서류 제출 같은 선생님 업무는 넣지 않는다. 없으면 빈 배열로 두거나 생략한다.",
         "- 학급 전체 대상 안내는 audience \"class\" 항목 하나로, 특정·몇몇 학생 대상은 학생마다",

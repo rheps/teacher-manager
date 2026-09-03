@@ -22,6 +22,8 @@ class BridgeSettings:
     gemini_api_key: str = ""
     gemini_model: str = DEFAULT_GEMINI_MODEL
     brity_download_dir: str = r"C:\BrityWorks\BrityMessenger\download"
+    # 실패 화면이 뜰 때 개발자에게 자동 보고할지. 기본은 켬(2026-09-02 사용자 결정).
+    error_reports_enabled: bool = True
     # 예전 settings.json을 잃지 않고 다시 저장하기 위한 읽기 전용 호환 자료다.
     # 실행할 때는 이 값을 쓰지 않고 tool_runtime이 검증한 전체 경로만 쓴다.
     gws_command: list[str] = field(default_factory=lambda: list(DEFAULT_GWS_COMMAND))

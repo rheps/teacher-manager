@@ -6,7 +6,7 @@ application version so the common contract can be used by every bridge stage.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone, timedelta
 import re
 import time
@@ -43,9 +43,34 @@ class UserIssue:
     reason: str = ""
     app_version: str = ""
     diagnostic_id: str = ""
+    # 교사가 지금 할 수 있는 일. 화면은 이 문장들만 행동 안내로 그린다.
+    steps: tuple[str, ...] = ()
+    # 개발자에게 자동 보고 대기열에 들어갔는지. 화면의 "보고됐어요" 한 줄 근거.
+    reported: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "actions": [asdict(row) for row in self.actions]}
+        return {
+            **asdict(self),
+            "actions": [asdict(row) for row in self.actions],
+            "steps": list(self.steps),
+        }
+
+    def with_guidance(
+        self,
+        *,
+        steps: tuple[str, ...],
+        actions: tuple[IssueAction, ...] | None = None,
+        reason: str | None = None,
+    ) -> "UserIssue":
+        return replace(
+            self,
+            steps=tuple(str(step) for step in steps if str(step).strip()),
+            actions=self.actions if actions is None else tuple(actions),
+            reason=self.reason if reason is None else str(reason),
+        )
+
+    def mark_reported(self) -> "UserIssue":
+        return replace(self, reported=True)
 
     @classmethod
     def needs_user(
@@ -102,11 +127,8 @@ class FinalOperationFailure(Exception):
         super().__init__(issue.message)
 
 
-_SUPPORT_ACTIONS = (
-    IssueAction("copy-error", "오류 정보 복사"),
-    IssueAction("support-email", "메일로 문의하기"),
-    IssueAction("support-web", "웹사이트에서 문의하기"),
-)
+# 분류되지 않은 결함도 교사에게는 쉬운 말로만 보인다. 개발자 표현을 화면에 쓰지 않는다.
+UNEXPECTED_MESSAGE = "프로그램 안에서 처리하지 못한 문제가 있었어요."
 
 
 def _required_text(name: str, value: Any) -> str:
@@ -134,6 +156,7 @@ def final_issue(
     change_status: str,
     app_version: str,
     now: Callable[[], datetime] | datetime | None = None,
+    steps: tuple[str, ...] = (),
 ) -> UserIssue:
     """Build a safe, user-facing final failure record."""
 
@@ -151,12 +174,13 @@ def final_issue(
         title=title,
         message=f"총 {attempts}회 시도했지만 끝내지 못했습니다.",
         change_status=change_status,
-        actions=_SUPPORT_ACTIONS,
+        actions=(),
         attempt_count=attempts,
         last_failed_at=_timestamp(now),
         reason=reason,
         app_version=app_version,
         diagnostic_id=str(uuid.uuid4()),
+        steps=tuple(steps),
     )
 
 
@@ -166,11 +190,14 @@ def unexpected_final_issue(
     change_status: str,
     app_version: str,
     now: Callable[[], datetime] | datetime | None = None,
+    steps: tuple[str, ...] = (),
 ) -> UserIssue:
     """Build a failure for an unclassified developer defect.
 
     No operation cycles were completed by this helper, so it intentionally
     reports zero attempts instead of borrowing the normal three-attempt claim.
+    The attempt count stays in the record for the local journal and the
+    developer report only; the screen never shows it.
     """
 
     operation = _required_text("operation", operation)
@@ -180,14 +207,15 @@ def unexpected_final_issue(
         state="failed",
         operation=operation,
         title=title,
-        message="예기치 않은 문제가 발생했습니다.",
+        message=UNEXPECTED_MESSAGE,
         change_status=change_status,
-        actions=_SUPPORT_ACTIONS,
+        actions=(),
         attempt_count=0,
         last_failed_at=_timestamp(now),
-        reason="예기치 않은 문제가 발생했습니다.",
+        reason=UNEXPECTED_MESSAGE,
         app_version=app_version,
         diagnostic_id=str(uuid.uuid4()),
+        steps=tuple(steps),
     )
 
 
@@ -236,6 +264,8 @@ def run_operation(
             raise
         except RetryableOperationError as error:
             last = error
+    # 마지막 재시도 예외를 원인으로 달아 두면 로컬 오류 기록이 어떤 확인이 어떻게
+    # 어긋났는지 사슬을 따라 남길 수 있다. 화면 issue 자체에는 들어가지 않는다.
     raise FinalOperationFailure(
         final_issue(
             operation=operation,
@@ -246,7 +276,7 @@ def run_operation(
             app_version=app_version,
             now=now,
         )
-    )
+    ) from last
 
 
 def _issue_value(issue: UserIssue | Mapping[str, Any], key: str, default: Any = "") -> Any:

@@ -10,11 +10,13 @@ from __future__ import annotations
 import functools
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 import threading
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -25,6 +27,8 @@ from brity_bridge import (
     bundle_paths,
     capture_store,
     component_lock,
+    error_reports,
+    google_account,
     gws_env,
     paths,
     pipeline,
@@ -34,6 +38,7 @@ from brity_bridge import (
 from brity_bridge.settings import load_settings
 from dashboard import engine
 from dashboard import external_url
+from dashboard import problem_guidance
 from dashboard import version
 
 SETUP_STATE_NAME = "setup-state.json"
@@ -70,62 +75,64 @@ _ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE = (
     "기존 출석부의 학생 선택목록과 메신저 상태를 현재 방식으로 정리해야 해요. "
     "기존 학생·출결·메시지 내용은 그대로 둡니다."
 )
-_DEFAULT_SCREEN_FAILURE = (
-    "작업을 마치지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요."
-)
+# 실패 화면의 제목이다. 무엇을 못 했는지 한 문장만 적고, 사용자가 할 일은 여기에
+# 쓰지 않는다 — 행동 안내는 problem_guidance의 작업 종류 표가 정한다(2026-09-02).
+_DEFAULT_SCREEN_FAILURE = "작업을 마치지 못했어요."
 _SCREEN_FAILURES = {
-    "get_app_info": (
-        "프로그램을 여는 데 필요한 정보를 읽지 못했어요. "
-        "Teacher Manager를 다시 시작해 주세요."
-    ),
-    "save_setup_state": "처음 설정 내용을 저장하지 못했어요. 프로그램을 다시 시작한 뒤 다시 시도해 주세요.",
-    "finish_setup": "처음 설정을 마무리하지 못했어요. @goedu.kr Google 로그인과 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
-    "restart_setup": "처음 설정 안내를 다시 열지 못했어요. Teacher Manager를 다시 시작해 주세요.",
-    "read_profile": "이 컴퓨터에 저장된 내 정보를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
-    "read_grid": "이 컴퓨터에 저장된 시간표를 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
-    "get_messenger_settings": "이 컴퓨터에 저장된 메신저 설정을 읽지 못했어요. 프로그램을 다시 시작해 주세요.",
-    "save_profile_grid": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
-    "save_messenger": "이 컴퓨터 설정을 저장하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
-    "apply_all": "이 컴퓨터 설정을 저장하고 적용하지 못했어요. 입력한 내용을 확인한 뒤 다시 시도해 주세요.",
-    "choose_attachment_folder": (
-        "첨부파일 폴더를 열지 못했어요. 폴더 위치를 직접 입력하거나 "
-        "Teacher Manager를 다시 시작해 주세요."
-    ),
-    "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요. 폴더 위치를 다시 확인해 주세요.",
-    "attendance_status": "출결 상태를 확인하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
-    "attendance_connection_candidates": "기존 정식 출석부 목록을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
-    "select_attendance_connection": "고른 출석부 연결을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
-    "select_attendance_connection_by_code": "붙여 넣은 확인번호로 출석부 연결을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
-    "ensure_attendance": "출결 자료를 준비하지 못했어요. 현재 Windows 계정의 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "start_new_attendance": "새 학년도 출석부를 시작하지 못했어요. 기존 자료는 그대로입니다. Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_prepare_start": "출결 준비를 시작하지 못했어요. 이 컴퓨터 설정과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_prepare_status": "출결 준비 상태를 확인하지 못했어요. 설정에서 Google 로그인과 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_first_setup_status": "출석부의 처음 설정 상태를 확인하지 못했어요. 출석부가 열리는지 확인한 뒤 다시 시도해 주세요.",
-    "attendance_script_update_status": "출결 기능 상태를 확인하지 못했어요. 처음 준비하던 @goedu.kr Google 계정으로 로그인한 뒤 다시 시도해 주세요. 기존 자료는 그대로입니다.",
-    "attendance_script_update_apply": "출결 기능을 바꾸지 못했어요. 처음 준비하던 @goedu.kr Google 계정으로 로그인한 뒤 다시 시도해 주세요. 기존 자료는 그대로입니다.",
-    "attendance_chat_status": "학급 단톡방 상태를 확인하지 못했어요. 출결 준비와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_chat_connect": "학급 단톡방 연결을 시작하지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_chat_spaces": "학급 단톡방 목록을 가져오지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요. 출결 기능 안내와 @goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요. Teacher Manager를 다시 시작해 주세요.",
-    "google_status": "Google 연결 상태를 확인하지 못했어요. 현재 Windows 계정의 설정과 인터넷 연결을 확인해 주세요.",
-    "list_calendars": "캘린더 목록을 가져오지 못했어요. 현재 Windows 계정의 @goedu.kr Google 로그인을 확인해 주세요.",
-    "list_tasklists": "할 일 목록을 가져오지 못했어요. 현재 Windows 계정의 @goedu.kr Google 로그인을 확인해 주세요.",
-    "gws_login_start": "Google 로그인 준비 파일을 확인하지 못했어요. 현재 Windows 계정의 설정을 점검한 뒤 다시 시도해 주세요.",
-    "gws_login_status": "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검해 주세요.",
-    "gws_logout": "Google 로그아웃을 마치지 못했어요. 현재 Windows 계정의 Google 도구 상태를 점검해 주세요.",
-    "ensure_calendar_named": "캘린더를 만들지 못했어요. 이름과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "ensure_tasklist_named": "할 일 목록을 만들지 못했어요. 이름과 Google 로그인을 확인한 뒤 다시 시도해 주세요.",
-    "open_logs": "기록 폴더를 열지 못했어요. Teacher Manager를 다시 시작한 뒤 다시 시도해 주세요.",
-    "open_url": "안전한 https 주소만 열 수 있어요. 주소를 다시 확인해 주세요.",
-    "retry_capture": "실패한 항목을 다시 처리하지 못했어요. 잠시 뒤 다시 시도해 주세요.",
+    "get_app_info": "프로그램을 여는 데 필요한 정보를 읽지 못했어요.",
+    "save_setup_state": "처음 설정 내용을 저장하지 못했어요.",
+    "finish_setup": "처음 설정을 마무리하지 못했어요.",
+    "restart_setup": "처음 설정 안내를 다시 열지 못했어요.",
+    "read_profile": "이 컴퓨터에 저장된 내 정보를 읽지 못했어요.",
+    "read_grid": "이 컴퓨터에 저장된 시간표를 읽지 못했어요.",
+    "get_messenger_settings": "이 컴퓨터에 저장된 메신저 설정을 읽지 못했어요.",
+    "save_profile_grid": "이 컴퓨터 설정을 저장하지 못했어요.",
+    "save_messenger": "이 컴퓨터 설정을 저장하지 못했어요.",
+    "apply_all": "이 컴퓨터 설정을 저장하고 적용하지 못했어요.",
+    "choose_attachment_folder": "첨부파일 폴더를 열지 못했어요.",
+    "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요.",
+    "attendance_status": "출결 상태를 확인하지 못했어요.",
+    "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요.",
+    "attendance_connection_candidates": "기존 정식 출석부 목록을 확인하지 못했어요.",
+    "select_attendance_connection": "고른 출석부 연결을 확인하지 못했어요.",
+    "select_attendance_connection_by_code": "붙여 넣은 확인번호로 출석부 연결을 확인하지 못했어요.",
+    "ensure_attendance": "출결 자료를 준비하지 못했어요.",
+    "start_new_attendance": "새 학년도 출석부를 시작하지 못했어요.",
+    "attendance_prepare_start": "출결 준비를 시작하지 못했어요.",
+    "attendance_prepare_status": "출결 준비 상태를 확인하지 못했어요.",
+    "attendance_first_setup_status": "출석부의 처음 설정 상태를 확인하지 못했어요.",
+    "attendance_script_update_status": "출결 기능 상태를 확인하지 못했어요.",
+    "attendance_script_update_apply": "출결 기능을 바꾸지 못했어요.",
+    "attendance_chat_status": "학급 단톡방 상태를 확인하지 못했어요.",
+    "attendance_chat_connect": "학급 단톡방 연결을 시작하지 못했어요.",
+    "attendance_chat_spaces": "학급 단톡방 목록을 가져오지 못했어요.",
+    "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
+    "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
+    "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요.",
+    "google_status": "Google 연결 상태를 확인하지 못했어요.",
+    "list_calendars": "캘린더 목록을 가져오지 못했어요.",
+    "list_tasklists": "할 일 목록을 가져오지 못했어요.",
+    "gws_login_start": "Google 로그인 준비 파일을 확인하지 못했어요.",
+    "gws_login_status": "Google 로그인 상태를 확인하지 못했어요.",
+    "gws_logout": "Google 로그아웃을 마치지 못했어요.",
+    "ensure_calendar_named": "캘린더를 만들지 못했어요.",
+    "ensure_tasklist_named": "할 일 목록을 만들지 못했어요.",
+    "open_logs": "기록 폴더를 열지 못했어요.",
+    "open_url": "안전한 https 주소만 열 수 있어요.",
+    "retry_capture": "실패한 항목을 다시 처리하지 못했어요.",
 }
 
 
 class ScreenSafeError(RuntimeError):
     """A fixed Korean sentence intentionally prepared for the screen."""
+
+
+class AttendanceScriptRecheckError(ScreenSafeError):
+    """원격 출결 기능 확인이 일시적으로 모호함 — 같은 세 번 묶음에서 다시 확인한다."""
+
+
+class AttendanceScriptChangedOutsideError(ScreenSafeError):
+    """편집본이 프로그램 밖에서 바뀐 결정적 상태 — 되풀이하지 않고 출결 탭·도움 요청을 안내한다."""
 
 
 class _AttendanceRemoteWorkLease:
@@ -153,30 +160,39 @@ def _ok(data):
     return {"ok": True, "data": data}
 
 
-def _fail(error, operation: str = ""):
+def _fail(error, operation: str = "", config_dir=None, reporter=None):
+    error_text = None
     if isinstance(error, (recovery.UserActionRequired, recovery.FinalOperationFailure)):
-        return _issue_reply(error.issue)
-
-    message = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
-    if isinstance(error, ScreenSafeError):
-        needs_user = _screen_safe_user_issue(error, operation)
-        if needs_user is not None:
-            return _issue_reply(needs_user)
-
-    issue = recovery.unexpected_final_issue(
-        operation=str(operation or "unknown_operation"),
-        title=message,
-        change_status="확인된 자료는 바꾸지 않았습니다.",
-        app_version=version.APP_VERSION,
-    )
-    reply = _issue_reply(issue, error_text=message)
+        issue = error.issue
+    else:
+        message = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
+        if isinstance(error, (ScreenSafeError, gws_env.GwsAccountStorageError)):
+            # 화면용으로 준비된 문장을 작업 이름 기반 고정 제목으로 덮지 않는다.
+            # 준비된 안내를 사람 행동 안내(needs_user)로 그대로 보여 준다.
+            issue = _screen_safe_user_issue(error, operation)
+        else:
+            issue = recovery.unexpected_final_issue(
+                operation=str(operation or "unknown_operation"),
+                title=message,
+                change_status="확인된 자료는 바꾸지 않았습니다.",
+                app_version=version.APP_VERSION,
+            )
+            # 옛 한 문장 응답(error)은 무엇을 못 했는지(제목)로 유지한다.
+            error_text = message
+    # 모든 실패는 교사가 할 수 있는 일로 바뀐다. 코드·횟수·식별번호는 기록에만 남는다.
+    issue = problem_guidance.apply_guidance(issue, str(operation or issue.operation))
+    _record_issue_journal(config_dir, issue, error)
+    if reporter is not None:
+        try:
+            if reporter(issue, error):
+                issue = issue.mark_reported()
+        except Exception:  # noqa: BLE001 - 보고 실패가 안내를 막으면 안 된다.
+            pass
+    reply = _issue_reply(issue, error_text=error_text)
     if isinstance(error, external_url.ExternalUrlOpenError):
         reply["error"] = str(error)
         reply["code"] = external_url.NO_EXTERNAL_BROWSER
-    elif isinstance(
-        error,
-        (ScreenSafeError, gws_env.GwsAccountStorageError, engine.AttendanceRemoteWorkBusyError),
-    ):
+    elif isinstance(error, engine.AttendanceRemoteWorkBusyError):
         reply["error"] = str(error)
     else:
         try:
@@ -189,6 +205,102 @@ def _fail(error, operation: str = ""):
     return reply
 
 
+_JOURNAL_MAX_BYTES = 512 * 1024
+_JOURNAL_KEEP_LINES = 200
+_JOURNAL_FINGERPRINT_KEYS = (
+    "operation", "state", "diagnostic_id", "title", "reason", "error_detail",
+)
+
+
+def _journal_error_chain(error) -> list:
+    """원인 사슬(from/context)을 따라가되 같은 예외를 두 번 보지 않는다."""
+
+    chain = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen and len(chain) < 8:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _journal_error_detail(error) -> str:
+    """식별번호 역추적에 필요한 안전 문구만 모은다. 원문 예외는 넣지 않는다.
+
+    세 번 처리 뒤의 FinalOperationFailure는 마지막 재시도 예외를 원인으로 달고
+    오므로, 사슬을 따라가야 어떤 확인이 어떻게 어긋났는지 남는다.
+    """
+
+    try:
+        from dashboard import central_chat
+    except ImportError:  # pragma: no cover - 배포 묶음에는 항상 들어 있다.
+        central_chat = None
+    parts = []
+    for current in _journal_error_chain(error):
+        if isinstance(current, (ScreenSafeError, gws_env.GwsAccountStorageError)):
+            parts.append(str(current))
+        elif isinstance(current, recovery.RetryableOperationError):
+            parts.append(f"{current.code}: {current.safe_reason}")
+        elif central_chat is not None and isinstance(current, central_chat.CentralChatError):
+            parts.append(central_chat._safe_central_error_detail(current))
+        extra = str(getattr(current, "diagnostic_detail", "") or "")
+        if extra:
+            parts.append(extra)
+    return " | ".join(part for part in parts if part)
+
+
+def _journal_fingerprint(entry: dict) -> tuple:
+    return tuple(entry.get(key) for key in _JOURNAL_FINGERPRINT_KEYS)
+
+
+def _record_issue_journal(config_dir, issue: recovery.UserIssue, error) -> None:
+    """화면에 보인 오류 식별번호를 로컬에서 역추적할 최소 기록.
+
+    기록 실패가 오류 안내 자체를 막으면 안 되므로 어떤 예외도 밖으로 내지 않는다.
+    같은 안내가 화면에 다시 표면화될 뿐이면 줄을 늘리지 않고, 파일은 상한을 넘으면
+    최근 기록만 남긴다.
+    """
+
+    if config_dir is None:
+        return
+    try:
+        entry = {
+            "at": datetime.now(recovery.KOREA_TIME).strftime("%Y-%m-%d %H:%M:%S"),
+            "operation": issue.operation,
+            "state": issue.state,
+            "attempt_count": issue.attempt_count,
+            "diagnostic_id": issue.diagnostic_id,
+            "title": issue.title,
+            "reason": issue.reason,
+            "error_type": type(error).__name__,
+            "error_chain": " > ".join(
+                type(item).__name__ for item in _journal_error_chain(error)
+            ),
+            "error_detail": _journal_error_detail(error),
+        }
+        journal = paths.bridge_state_dir(config_dir) / "logs" / "error-journal.jsonl"
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        previous = journal.read_text(encoding="utf-8") if journal.exists() else ""
+        lines = [line for line in previous.splitlines() if line.strip()]
+        if lines:
+            try:
+                last = json.loads(lines[-1])
+            except ValueError:
+                last = {}
+            if isinstance(last, dict) and _journal_fingerprint(last) == _journal_fingerprint(entry):
+                return
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        if len(previous.encode("utf-8")) + len(line.encode("utf-8")) > _JOURNAL_MAX_BYTES:
+            kept = lines[-_JOURNAL_KEEP_LINES:]
+            journal.write_text("".join(f"{row}\n" for row in kept) + line, encoding="utf-8")
+            return
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:  # noqa: BLE001 - 진단 기록은 최선 노력으로만 남긴다.
+        pass
+
+
 def _issue_reply(issue: recovery.UserIssue, *, error_text: str | None = None) -> dict:
     """Keep the old safe sentence while moving JS consumers to the issue record."""
 
@@ -199,10 +311,24 @@ def _issue_reply(issue: recovery.UserIssue, *, error_text: str | None = None) ->
     }
 
 
-def _screen_safe_user_issue(error: ScreenSafeError, operation: str) -> recovery.UserIssue | None:
-    """Only fixed messages that ask for a teacher action become direct actions."""
+def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
+    """화면용 고정 문장은 그대로 보여 주고, 정해진 문구에는 이동 단추를 단다."""
 
-    message = str(error)
+    message = str(error).strip()
+    if isinstance(error, AttendanceScriptChangedOutsideError):
+        # 결정적 상태라 되풀이하지 않는다. 출결 탭에는 누를 버튼이 없으므로
+        # 상태 확인과 도움 요청만 안내한다(2026-09-03).
+        return recovery.UserIssue.needs_user(
+            operation=str(operation or "attendance_script_changed_outside"),
+            title="출결 기능 확인이 필요해요.",
+            message=message,
+            change_status="기존 출결 자료와 현재 연결은 그대로입니다.",
+            actions=(recovery.IssueAction("attendance-tab", "출결 탭으로"),),
+            resume="attendance-tab",
+        ).with_guidance(steps=(
+            "출결 탭 맨 위 한 줄 안내에서 출결 기능 상태를 확인해 주세요.",
+            "출결 기능을 직접 고친 적이 없다면 아래 도움 요청을 눌러 주세요. 필요한 정보는 프로그램이 함께 보내요.",
+        ))
     if message == engine.ATTENDANCE_ACCOUNT_MESSAGE:
         return recovery.UserIssue.needs_user(
             operation=str(operation or "attendance_account"),
@@ -221,15 +347,28 @@ def _screen_safe_user_issue(error: ScreenSafeError, operation: str) -> recovery.
             actions=(recovery.IssueAction("attendance-first-setup", "출석부 설정 확인"),),
             resume="attendance-first-setup",
         )
-    return None
-
-
-def _write_support_clipboard(text: str) -> None:
-    """Use the Windows clipboard writer only after the report has been rebuilt."""
-
-    from brity_bridge import clipboard_win
-
-    clipboard_win.write_text_for_test(text)
+    if message == google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE or (
+        "@goedu.kr" in message and "로그인" in message
+    ):
+        # 학교 계정 로그인이 없거나 다른 계정이면 설정의 로그인 단계로 보낸다.
+        return recovery.UserIssue.needs_user(
+            operation=str(operation or "google_login"),
+            title="학교 Google 계정으로 로그인해 주세요.",
+            message=message,
+            change_status="확인된 자료는 바꾸지 않았습니다.",
+            actions=(recovery.IssueAction("google-login", "Google 로그인 설정 열기"),),
+            resume="google-login",
+        )
+    # 그 밖의 화면 안전 문장도 시도 0회 '예기치 않은 문제'로 바꾸지 않는다.
+    # 실제 원인과 무관한 로그인 확인 지시가 붙는 것을 막는다 (AGENTS.md 세 번 실패 절).
+    fallback = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
+    return recovery.UserIssue.needs_user(
+        operation=str(operation or "screen_safe_stop"),
+        title="확인이 필요해요.",
+        message=message or fallback,
+        change_status="확인된 자료는 바꾸지 않았습니다.",
+        actions=(),
+    )
 
 
 def _attendance_workbook_layout_is_current(
@@ -794,7 +933,12 @@ def guarded(method):
         try:
             return _ok(method(self, *args, **kwargs))
         except Exception as error:  # noqa: BLE001 - JS에는 한국어 한 문장만 보낸다
-            return _fail(error, method.__name__)
+            return _fail(
+                error,
+                method.__name__,
+                getattr(self, "_config_dir", None),
+                getattr(self, "_report_issue", None),
+            )
 
     return wrapper
 
@@ -861,8 +1005,10 @@ class BridgeDeps:
     attendance_roster_migrator: object = None
     attendance_ai_inspector: object = None
     attendance_remote_work_timeout_seconds: object = None
-    support_clipboard_writer: object = None
     support_mail_opener: object = None
+    error_report_poster: object = None        # (url, body) -> HTTP 상태 코드
+    error_report_flush_runner: object = None  # fn -> None; 기본은 데몬 스레드
+    windows_version: object = None            # () -> str
 
 
 class Api:
@@ -887,10 +1033,8 @@ class Api:
         # + 판 확인 실행)를 통째로 다시 돌리지 않는다(검토 C7). 승인된 갱신을 설치하면
         # 실행 파일이 바뀔 수 있어 install_gws_update 성공 시 비운다.
         self._attendance_gws_cache = None
-        self._support_clipboard_writer = (
-            self._deps.support_clipboard_writer or _write_support_clipboard
-        )
         self._support_mail_opener = self._deps.support_mail_opener
+        self._error_report_flush_lock = threading.Lock()
 
     def _open_external_url(self, url) -> dict:
         return external_url.open_external_url(
@@ -1005,6 +1149,8 @@ class Api:
     @guarded
     def get_app_info(self):
         state = self._load_state()
+        # 켤 때 못 보낸 오류 보고가 남아 있으면 이 기회에 다시 보낸다(화면을 막지 않음).
+        self._start_error_report_flush()
         return {
             "version": version.APP_VERSION,
             "branding": dict(version.BRANDING),
@@ -1982,18 +2128,42 @@ class Api:
             payload.get(key) == record.get(key)
             for key in ("spreadsheet_id", "script_id", "deployment_id")
         )
-        if not (
+        if (
             payload.get("state") == "current"
             and payload.get("verified") is True
             and same_ids
             and payload.get("current_bundle_sha256") == expected_sha256
             and payload.get("target_bundle_sha256") == expected_sha256
         ):
-            raise ScreenSafeError(
+            return
+        # 어떤 조건이 어긋났는지는 화면이 아니라 오류 기록으로만 남긴다.
+        mismatch = (
+            f"state={payload.get('state') or '없음'}"
+            f" verified={payload.get('verified') is True}"
+            f" ids_match={same_ids}"
+            f" current_sha_match={payload.get('current_bundle_sha256') == expected_sha256}"
+            f" target_sha_match={payload.get('target_bundle_sha256') == expected_sha256}"
+        )
+        if str(payload.get("state") or "") == "hold":
+            # 읽기가 일시적으로 모호했을 뿐이다. 사람 행동을 요구하지 말고
+            # 같은 묶음(계정~방 목록) 세 번 안에서 다시 확인한다 (AGENTS.md 127줄).
+            error: ScreenSafeError = AttendanceScriptRecheckError(
+                str(payload.get("detail") or "") or "출결 기능 상태를 다시 확인하고 있어요."
+            )
+        elif str(payload.get("state") or "") == "customized":
+            # 프로그램 밖에서 바뀐 결정적 상태다. 세 번 되풀이하지 않고 한 번에 멈춘다.
+            error = AttendanceScriptChangedOutsideError(
+                "출결 기능이 프로그램 밖에서 바뀌어 있어 학급 단톡방 작업을 시작하지 않았어요."
+            )
+            mismatch = f"{payload.get('detail') or ''} | {mismatch}".strip(" |")
+        else:
+            error = ScreenSafeError(
                 "현재 Google의 출결 기능을 안전하게 다시 확인하지 못해 "
                 "Chat 작업을 시작하지 않았어요. "
                 "출결 탭 위쪽의 한 줄 안내에 보이는 버튼을 눌러 주세요."
             )
+        error.diagnostic_detail = mismatch
+        raise error
 
     def _run_attendance_chat_action(self, action):
         """긴 작업은 별도 잠금으로 직렬화하고 설치 기록 잠금은 짧게만 쓴다."""
@@ -2032,9 +2202,17 @@ class Api:
                     )
                 run, gws = resolved
                 self._require_current_attendance_script(record_snapshot.record)
-                self._require_current_remote_attendance_script(
-                    record_snapshot, (run, gws)
-                )
+                try:
+                    self._require_current_remote_attendance_script(
+                        record_snapshot, (run, gws)
+                    )
+                except AttendanceScriptRecheckError as error:
+                    # 일시적으로 모호한 원격 확인(hold)은 사람이 고칠 일이 아니다.
+                    # 네 가지 Chat 동작 모두 같은 세 번 묶음에서 다시 확인한다.
+                    raise recovery.RetryableOperationError(
+                        "ATTENDANCE_SCRIPT_RECHECK",
+                        str(error) or "출결 기능 상태를 다시 확인하고 있어요.",
+                    ) from error
             else:
                 run, gws = self._attendance_remote_run(), None
 
@@ -2141,13 +2319,40 @@ class Api:
     @guarded
     def attendance_chat_connect(self):
         from dashboard import central_chat
-        auth_url = self._run_attendance_chat_action(
-            lambda run, gws, record: central_chat.start_auth(
-                self._config_dir,
-                run,
-                gws_executable=gws,
-                attendance_record=record,
-            )
+
+        def start_connect():
+            # 연결 시작 전 준비 확인(계정·출결 기능·원격 스크립트)과 중앙 서버의
+            # 일시 실패도 방 목록과 같은 세 번 묶음 안에서 처리한다. 사람이 고칠
+            # 일(ScreenSafeError·계정 저장소)만 그대로 올린다.
+            try:
+                return self._run_attendance_chat_action(
+                    lambda run, gws, record: central_chat.start_auth(
+                        self._config_dir,
+                        run,
+                        gws_executable=gws,
+                        attendance_record=record,
+                    )
+                )
+            except (recovery.UserActionRequired, recovery.RetryableOperationError):
+                raise
+            except (ScreenSafeError, gws_env.GwsAccountStorageError):
+                raise
+            except central_chat.CentralChatError as error:
+                raise recovery.RetryableOperationError(
+                    "CHAT_CONNECT_START",
+                    central_chat._safe_central_error_detail(error),
+                ) from error
+            except Exception as error:  # noqa: BLE001 - 연결 시작 전 준비 과정도 같은 세 번 안에 둔다.
+                raise recovery.RetryableOperationError(
+                    "CHAT_CONNECT_PREFLIGHT_READ",
+                    "학급 단톡방 연결을 위한 Google 확인을 다시 진행하고 있어요.",
+                ) from error
+
+        auth_url = self._attendance_operation(
+            "attendance_chat_connect",
+            "학급 단톡방 연결을 시작하지 못했어요.",
+            start_connect,
+            retry_states=frozenset(),
         )
         return self._open_external_url(auth_url)
 
@@ -2165,6 +2370,10 @@ class Api:
                         attendance_record=record,
                     )
                 )
+            except (recovery.UserActionRequired, recovery.RetryableOperationError):
+                # 원격 출결 기능 확인의 일시 모호함(hold)은 이미 재시도 분류가 끝났다.
+                # 일반 예외 갈래에서 원인 문구를 잃지 않도록 그대로 올린다.
+                raise
             except (ScreenSafeError, gws_env.GwsAccountStorageError):
                 # 로그인·계정·현재 출결 연결처럼 선생님이 바로잡아야 하는 일은
                 # 같은 읽기를 세 번 되풀이하지 않고 원래 안내를 그대로 보낸다.
@@ -2730,9 +2939,24 @@ class Api:
             raise ScreenSafeError("Google 연결 도구가 아직 없어요. 설정에서 준비해 주세요.")
         return run, gws
 
+    @staticmethod
+    def _goedu_session_or_screen_stop(run, gws) -> str:
+        """로그인·계정 문제는 사람만 고칠 수 있다.
+
+        engine은 고정 한국어 문장의 RuntimeError를 던지는데, 그대로 두면 세 번
+        재시도 뒤 '작업 실패'로 뭉개진다. 준비된 문장 그대로 행동 안내로 멈춘다.
+        """
+
+        try:
+            return engine.require_goedu_gws_session(run, gws)
+        except ScreenSafeError:
+            raise
+        except RuntimeError as error:
+            raise ScreenSafeError(str(error)) from error
+
     def _resolve_goedu_gws_or_fail(self):
         run, gws = self._resolve_gws_or_fail()
-        engine.require_goedu_gws_session(run, gws)
+        self._goedu_session_or_screen_stop(run, gws)
         return run, gws
 
     def _resolve_attendance_goedu_gws_context_or_fail(self):
@@ -2743,7 +2967,7 @@ class Api:
         gws = engine.resolve_gws(run)
         if not gws:
             raise ScreenSafeError("Google 연결 도구가 아직 없어요. 설정에서 준비해 주세요.")
-        current = engine.require_goedu_gws_session(run, gws)
+        current = self._goedu_session_or_screen_stop(run, gws)
         saved = engine._read_setup_status(self._config_dir)
         owner = str(saved.get("account", "") or "").strip()
         if owner and owner.casefold() != current.casefold():
@@ -2772,7 +2996,7 @@ class Api:
     def ensure_calendar_named(self, name):
         name = str(name or "").strip()
         if not name:
-            raise ValueError("캘린더 이름을 적어 주세요")
+            raise ScreenSafeError("캘린더 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
         account = engine.gws_auth_status(run, gws).get("user", "")
         made_id = engine.ensure_calendar_verified(
@@ -2786,7 +3010,7 @@ class Api:
     def ensure_tasklist_named(self, name):
         name = str(name or "").strip()
         if not name:
-            raise ValueError("할일 목록 이름을 적어 주세요")
+            raise ScreenSafeError("할일 목록 이름을 적어 주세요")
         run, gws = self._resolve_gws_or_fail()
         account = engine.gws_auth_status(run, gws).get("user", "")
         made_id = engine.ensure_tasklist_verified(
@@ -2849,6 +3073,7 @@ class Api:
             "hotkey": saved.hotkey,
             "autostart": autostart,
             "brity_download_dir": saved.brity_download_dir,
+            "error_reports_enabled": saved.error_reports_enabled,
         }
 
     @guarded
@@ -2884,6 +3109,89 @@ class Api:
             exists=self._deps.helper_window_exists,
             app_version=version.APP_VERSION,
         )
+
+    def _journal_error_code(self, error) -> str:
+        for item in _journal_error_chain(error):
+            if isinstance(item, recovery.RetryableOperationError):
+                return item.code
+        return type(error).__name__
+
+    def _report_issue(self, issue: recovery.UserIssue, error) -> bool:
+        """실패 화면이 뜰 때 개발자 보고를 대기열에 넣는다. 넣었으면 True.
+
+        동의 화면 없이 자동으로 보내되(2026-09-02 사용자 결정), 설정의 스위치가
+        꺼져 있으면 적지도 보내지도 않는다. 보고는 최선 노력이라 어떤 예외도
+        화면 안내를 막지 않는다.
+        """
+
+        try:
+            if not load_settings(paths.settings_path(self._config_dir)).error_reports_enabled:
+                return False
+            saved = engine._read_setup_status(self._config_dir)
+            profile = engine.read_profile_values(self._config_dir)
+            windows = self._deps.windows_version or platform.version
+            report = error_reports.build_report(
+                issue,
+                app_version=version.APP_VERSION,
+                windows_version=str(windows() or ""),
+                account=str(saved.get("account", "") or ""),
+                teacher={
+                    "name": profile.get("선생님이름", ""),
+                    "school": profile.get("학교명", ""),
+                    "grade": profile.get("담임학년", ""),
+                    "class": profile.get("담임반", ""),
+                },
+                kind=problem_guidance.kind_for(issue.operation, issue.message),
+                code=self._journal_error_code(error),
+                error_chain=" > ".join(
+                    type(item).__name__ for item in _journal_error_chain(error)
+                ),
+                detail=_journal_error_detail(error),
+            )
+            if not report["reportId"]:
+                return False
+            if not error_reports.enqueue(self._config_dir, report):
+                return False
+            self._start_error_report_flush()
+            return True
+        except Exception:  # noqa: BLE001 - 보고는 최선 노력이다.
+            return False
+
+    def _start_error_report_flush(self) -> None:
+        """대기 중인 보고를 배경에서 보낸다. 주소가 없거나 https가 아니면 조용히 넘긴다."""
+
+        try:
+            environ = (
+                dict(os.environ) if self._deps.environ is None else dict(self._deps.environ)
+            )
+            # 동봉 release.json의 실제 서버 주소는 설치본에서만 쓴다. 소스로 실행하는
+            # 개발·자동 시험은 CENTRAL_CHAT_SENDER_URL 환경값이 있을 때만 보낸다.
+            release = (
+                bundle_paths.bundle_root() / "release.json"
+                if bundle_paths.is_frozen()
+                else None
+            )
+            base = error_reports.sender_base_url(environ, release)
+            endpoint = error_reports.endpoint_url(base)
+        except Exception:  # noqa: BLE001 - 주소가 없으면 보고를 미룬다.
+            return
+        poster = self._deps.error_report_poster or error_reports.default_poster
+
+        def work():
+            if not self._error_report_flush_lock.acquire(blocking=False):
+                return
+            try:
+                error_reports.flush(self._config_dir, endpoint, poster)
+            except Exception:  # noqa: BLE001 - 다음 기회에 다시 보낸다.
+                pass
+            finally:
+                self._error_report_flush_lock.release()
+
+        runner = self._deps.error_report_flush_runner
+        if runner is not None:
+            runner(work)
+            return
+        threading.Thread(target=work, name="tm-error-reports", daemon=True).start()
 
     def _local_read(self, operation: str, title: str, reader):
         """Run the shared three-cycle local recovery before returning a UI issue."""
@@ -2957,7 +3265,9 @@ class Api:
             if disposition == "complete":
                 return value
             detail = (
-                str(value.get("detail") or "")
+                # GWS 컴포넌트 결과는 "detail" 키, 앱 업데이트 확인·시작 결과는
+                # "reason" 키에 실제 원인을 담는다. 어느 쪽이든 화면까지 전달한다.
+                str(value.get("detail") or value.get("reason") or "")
                 if isinstance(value, dict)
                 else ""
             )
@@ -3049,13 +3359,11 @@ class Api:
 
     @guarded
     def open_url(self, url):
-        return self._open_external_url(url)
-
-    @guarded
-    def copy_support_report(self, issue):
-        text = recovery.support_report_text(dict(issue or {}))
-        self._support_clipboard_writer(text)
-        return {"copied": True}
+        try:
+            return self._open_external_url(url)
+        except ValueError as error:
+            # "https 주소만 열 수 있어요" 같은 검증 문장은 화면용으로 준비된 것이다.
+            raise ScreenSafeError(str(error)) from error
 
     @guarded
     def open_support_email(self, issue):

@@ -3,15 +3,15 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 TITLE_MAX = 1000
 BODY_MAX = 30000
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TASK_PERIOD_SUFFIX_RE = re.compile(r"\s*\(\d+(?:\s*[-~]\s*\d+)?교시\)\s*$")
+_SEOUL_TIMEZONE = timezone(timedelta(hours=9))
 
 CALENDAR_TARGET_ID_FIELDS = {
     "work_calendar": "work_calendar_id",
@@ -78,6 +78,39 @@ def _parse_date(value: str, label: str, problems: list[str]) -> date | None:
         return None
 
 
+def _parse_task_reference_date(
+    value: str, label: str, today: date, problems: list[str]
+) -> date | None:
+    """AI의 할 일 기준값을 한국 날짜 하나로 정규화한다.
+
+    이 날짜는 중복 확인에만 쓰며 Google Tasks 본문에는 보내지 않는다.
+    """
+
+    if not isinstance(value, str):
+        problems.append(f"{label} 형식이 잘못됨")
+        return None
+    text = value.strip()
+    if not text:
+        return today
+    if _DATE_RE.match(text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            problems.append(f"{label} 형식이 잘못됨")
+            return None
+
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        problems.append(f"{label} 형식이 잘못됨")
+        return None
+    if parsed.tzinfo is None:
+        problems.append(f"{label} 형식이 잘못됨 (시간대 표시 필요)")
+        return None
+    return parsed.astimezone(_SEOUL_TIMEZONE).date()
+
+
 def _check_event(event: dict, index: int, profile_calendars: dict, problems: list[str]) -> CheckedAction | None:
     label = f"calendar_events[{index}]"
     target = event["target"]
@@ -133,7 +166,13 @@ def _check_event(event: dict, index: int, profile_calendars: dict, problems: lis
     )
 
 
-def _check_task(task: dict, index: int, profile: dict, problems: list[str]) -> CheckedAction | None:
+def _check_task(
+    task: dict,
+    index: int,
+    profile: dict,
+    today: date,
+    problems: list[str],
+) -> CheckedAction | None:
     label = f"tasks[{index}]"
     target = task["target"]
     id_field = TASK_TARGET_ID_FIELDS.get(target)
@@ -151,8 +190,10 @@ def _check_task(task: dict, index: int, profile: dict, problems: list[str]) -> C
     title = task_title_without_period_suffix(task["title"])
     _check_text(title, TITLE_MAX, f"{label} 제목", problems)
     _check_text(task["notes"], BODY_MAX, f"{label} 메모", problems)
-    if not _RFC3339_UTC_RE.match(task["due"]):
-        problems.append(f"{label} due 형식이 잘못됨 (RFC3339 UTC 필요)")
+    reference_date = _parse_task_reference_date(
+        task["due"], f"{label} due", today, problems
+    )
+    if reference_date is None:
         return None
     if not title:
         problems.append(f"{label} 제목이 비어 있음")
@@ -163,7 +204,7 @@ def _check_task(task: dict, index: int, profile: dict, problems: list[str]) -> C
         target=target,
         google_id=google_id,
         payload={"title": title, "notes": task["notes"]},
-        action_key=build_action_key("task", target, task["due"][:10], title),
+        action_key=build_action_key("task", target, reference_date.isoformat(), title),
     )
 
 
@@ -192,6 +233,7 @@ def check_proposal(
     problems: list[str] = []
     actions: list[CheckedAction] = []
     profile_calendars = profile.get("calendars", {})
+    reference_date = today or date.today()
 
     for index, event in enumerate(proposal.get("calendar_events", [])):
         action = _check_event(event, index, profile_calendars, problems)
@@ -199,7 +241,7 @@ def check_proposal(
             actions.append(action)
 
     for index, task in enumerate(proposal.get("tasks", [])):
-        action = _check_task(task, index, profile, problems)
+        action = _check_task(task, index, profile, reference_date, problems)
         if action is not None:
             actions.append(action)
 
@@ -207,7 +249,7 @@ def check_proposal(
         raise CheckError(problems)
 
     homeroom_enabled = bool(profile.get("homeroom", {}).get("enabled"))
-    date_text = (today or date.today()).isoformat()
+    date_text = reference_date.isoformat()
     for notice in proposal.get("student_notices") or []:
         payload = _notice_payload(notice, homeroom_enabled)
         if payload is None:

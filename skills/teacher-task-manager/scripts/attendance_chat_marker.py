@@ -12,6 +12,12 @@ from typing import Any
 
 
 CHAT_RESULT_HEADERS = (
+    "Google Chat\n발송상태",
+    "Google Chat\n발송시각",
+    "Google Chat\n결과",
+    "Google Chat\n내용기준",
+)
+LEGACY_CHAT_RESULT_HEADERS = (
     "Google Chat 발송상태",
     "Google Chat 시도시각",
     "Google Chat 결과",
@@ -143,10 +149,17 @@ def signature_v2(row: Sequence[Any]) -> str:
 
 
 def _result_columns(header: Sequence[Any]) -> dict[str, int] | None:
-    normalized = [_text(value).strip() for value in header]
+    normalized = [" ".join(_text(value).split()) for value in header]
+    accepted = [
+        {
+            " ".join(CHAT_RESULT_HEADERS[index].split()),
+            " ".join(LEGACY_CHAT_RESULT_HEADERS[index].split()),
+        }
+        for index in range(len(CHAT_RESULT_HEADERS))
+    ]
     positions = [
-        [index + 1 for index, value in enumerate(normalized) if value == name]
-        for name in CHAT_RESULT_HEADERS
+        [index + 1 for index, value in enumerate(normalized) if value in names]
+        for names in accepted
     ]
     if sum(len(found) for found in positions) == 0:
         return None

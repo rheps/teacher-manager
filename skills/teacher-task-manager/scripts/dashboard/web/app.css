@@ -271,12 +271,15 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .problem-panel h2 { margin:0 0 7px; color:#a03325; font-size:17px; }
 .problem-panel > p { margin:0; color:#5d2e2a; }
 .problem-status { margin-top:12px !important; }
-.problem-details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 18px; margin:14px 0 0; }
-.problem-details div { min-width:0; }
-.problem-details dt { color:var(--tm-sub); font-size:12px; }
-.problem-details dd { margin:2px 0 0; overflow-wrap:anywhere; }
-.problem-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:15px; }
-@media (max-width:600px) { .problem-details { grid-template-columns:1fr; } }
+.problem-reason { margin:0; color:#5d2e2a; }
+.problem-steps { margin:12px 0 0; }
+.problem-steps b { display:block; margin-bottom:4px; font-size:13px; color:var(--tm-sub); }
+.problem-steps ol { margin:0; padding-left:20px; }
+.problem-steps li { margin:3px 0; line-height:1.5; }
+.problem-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; justify-content:flex-end; }
+.problem-actions:empty { display:none; }
+.problem-footer { margin:10px 0 0 !important; font-size:12px; color:var(--tm-faint); }
+.problem-footer .text-link { font-size:12px; }
 .external-link-fallback { margin:-8px 0 18px; padding:14px 16px; border:1px solid #F0C36A;
   border-radius:12px; background:#FFF9E8; color:#6E4B11; }
 .external-link-fallback > b, .external-link-fallback > span { display:block; }
@@ -434,10 +437,18 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .svc-subrow select { font-family:inherit; font-size:13px; padding:6px 9px;
   border:1.5px solid var(--tm-line); border-radius:9px; }
 .class-space-actions { margin-top:0; margin-left:auto; }
-.chat-new-space-guide { flex:1 1 420px; margin-top:0; margin-left:auto; }
+.svc-subrow.chat-space-existing { display:grid; grid-template-columns:minmax(0,1fr) auto;
+  column-gap:10px; row-gap:6px; }
+.chat-space-controls { grid-column:2; margin-top:0; }
+.chat-new-space-guide { grid-column:2; margin-top:0; margin-left:auto; }
 .chat-new-space-guide small { color:var(--tm-faint); font-size:12px; line-height:1.45;
   text-align:right; }
-.chat-new-space-guide button { flex:none; }
+@media (max-width:700px) {
+  .svc-subrow.chat-space-existing { grid-template-columns:1fr; }
+  .chat-space-controls, .chat-new-space-guide { grid-column:1; margin-left:0; }
+  .chat-space-controls { justify-content:flex-start; flex-wrap:wrap; }
+  .chat-new-space-guide small { text-align:left; }
+}
 .service-logo { width:24px; height:24px; flex:none; object-fit:contain; }
 .attendance-service .nameblock { flex:1; min-width:0; }
 /* 출결 탭 상태 셀 — 글자 색만, 모든 줄 같은 폭, 맨 오른쪽 (2026-07-31 설계) */
@@ -472,6 +483,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog { width:min(420px,calc(100vw - 32px)); padding:22px; border:1px solid var(--tm-line); border-radius:16px; background:#fff; box-shadow:0 24px 64px rgba(15,23,42,.28); }
 .attendance-update-dialog h3 { margin:0; font-size:18px; }
 .attendance-update-dialog p { margin:10px 0 20px; color:var(--tm-sub); line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
+.attendance-update-dialog p.attendance-update-dialog-note { margin:-8px 0 20px; font-size:13px; color:var(--tm-faint); }
 .attendance-update-dialog-actions { display:flex; justify-content:flex-end; gap:8px; }
 .attendance-connection-dialog { width:min(680px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; }
 .attendance-candidate-list { display:grid; gap:10px; margin:14px 0 20px; }

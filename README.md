@@ -115,6 +115,10 @@ npx skills add rheps/teacher-manager -g --all
 `C:\Users\<사용자이름>\TeacherTaskManager` 모양이며, 안내할 때는 사용자가 확인할 수 있도록
 the exact full path를 먼저 보여 줍니다. 스킬이나 프로그램을 업데이트해도 이 폴더를 지우지 않습니다.
 
+## 오류 자동 보고
+
+프로그램이 작업을 끝내지 못해 문제 화면이 뜨면, 어느 작업에서 무엇이 잘못됐는지를 개발자에게 자동으로 보냅니다. 보내는 내용은 학교 Google 계정 주소, 내 정보의 이름·학교·학년·반, 프로그램 판 번호, Windows 판, 실패한 작업 이름, 오류 종류와 쉬운 말 원인, 발생 시각, 오류 식별번호입니다. 학생 이름, 메시지·첨부 내용, 출석부 번호, 로그인 토큰, 컴퓨터 폴더 경로는 보내지 않습니다. 설정의 `오류 자동 보고`에서 끌 수 있습니다.
+
 ## 문의와 문제 제보
 
 - 지원 페이지: https://big-silver.xyz/support/teacher-google-automation

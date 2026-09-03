@@ -486,7 +486,8 @@ def save_messenger_settings(
     if not isinstance(updates, dict):
         raise ValueError("메신저 설정 모양이 올바르지 않아요")
     allowed = {
-        "gemini_api_key", "gemini_model", "hotkey", "autostart", "brity_download_dir"
+        "gemini_api_key", "gemini_model", "hotkey", "autostart", "brity_download_dir",
+        "error_reports_enabled",
     }
     unknown = set(updates) - allowed
     if unknown:
@@ -516,6 +517,10 @@ def save_messenger_settings(
         candidate.brity_download_dir = folder["path"]
     if "autostart" in updates and not isinstance(updates["autostart"], bool):
         raise ValueError("자동 시작 선택이 올바르지 않아요")
+    if "error_reports_enabled" in updates:
+        if not isinstance(updates["error_reports_enabled"], bool):
+            raise ValueError("오류 자동 보고 선택이 올바르지 않아요")
+        candidate.error_reports_enabled = updates["error_reports_enabled"]
 
     if candidate.hotkey != previous.hotkey:
         status = probe_hotkey(

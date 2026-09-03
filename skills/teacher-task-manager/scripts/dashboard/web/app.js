@@ -162,7 +162,7 @@ function ownsIssueRequest(request) {
 function completeIssueRequest(request) {
   if (ownsIssueRequest(request)) clearProblemIssue(true);
 }
-const SUPPORT_ACTION_KEYS = new Set(["copy-error", "support-email", "support-web"]);
+// 문제 화면에 나올 수 있는 버튼은 모두 '단계로 바로 가는' 것뿐이다. 문의·복사 단추는 없다.
 const DIRECT_ISSUE_ACTIONS = {
   "google-login": "Google 로그인 설정 열기",
   "chat-permission": "Google Chat 권한 확인",
@@ -171,6 +171,9 @@ const DIRECT_ISSUE_ACTIONS = {
   "attachment-download": "첨부파일 상태 다시 확인",
   "inspect-calendar-candidates": "Google Calendar에서 직접 확인",
   "inspect-tasklist-candidates": "Google Tasks에서 직접 확인",
+  "attendance-tab": "출결 탭으로",
+  "open-download-page": "다운로드 페이지 열기",
+  "settings": "설정 열기",
 };
 const GOOGLE_TARGET_ID_FIELDS = [
   "업무캘린더ID", "학사일정캘린더ID", "업무Tasks목록ID", "담임안내Tasks목록ID",
@@ -198,29 +201,23 @@ function directIssueActionHtml(issue) {
 }
 function problemPanelHtml(issue) {
   if (!issue || !["needs_user", "failed"].includes(issue.state)) return "";
-  const needsUser = issue.state === "needs_user";
-  const details = needsUser
-    ? `<p class="problem-status">${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</p>`
-    : `<dl class="problem-details">
-        <div><dt>원인</dt><dd>${esc(issueValue(issue, "reason", "확인 중"))}</dd></div>
-        <div><dt>자료 상태</dt><dd>${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</dd></div>
-        <div><dt>시도 횟수</dt><dd>${esc(issueValue(issue, "attempt_count", 0))}회</dd></div>
-        <div><dt>마지막 시도</dt><dd>${esc(issueValue(issue, "last_failed_at", "알 수 없음"))}</dd></div>
-        <div><dt>판 번호</dt><dd>${esc(issueValue(issue, "app_version", "알 수 없음"))}</dd></div>
-        <div><dt>오류 식별번호</dt><dd>${esc(issueValue(issue, "diagnostic_id", "알 수 없음"))}</dd></div>
-      </dl>`;
-  const actions = needsUser
-    ? directIssueActionHtml(issue)
-    : (SUPPORT_ACTION_KEYS.has("copy-error") && SUPPORT_ACTION_KEYS.has("support-email") && SUPPORT_ACTION_KEYS.has("support-web")
-      ? `<button class="btn-tonal" data-action="issue-copy" data-preserve-issue="true">오류 정보 복사</button>
-         <button class="btn-tonal" data-action="issue-email" data-preserve-issue="true">메일로 문의하기</button>
-         <button class="btn-tonal" data-action="issue-web" data-preserve-issue="true">웹사이트에서 문의하기</button>`
-      : "");
+  // 교사가 지금 할 수 있는 일만 보여 준다. 진단용 값(코드·횟수·판·식별번호)은
+  // 로컬 기록과 개발자 보고에만 남는다 (2026-09-02 사용자 결정).
+  const steps = (Array.isArray(issue.steps) ? issue.steps : []).map((s) => String(s || "")).filter(Boolean);
+  const reason = issue.state === "needs_user"
+    ? issueValue(issue, "message", "")
+    : issueValue(issue, "reason", "");
+  const stepsHtml = steps.length
+    ? `<div class="problem-steps"><b>지금 할 수 있는 일</b><ol>${steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol></div>`
+    : "";
+  const reported = issue.reported === true ? "이 문제는 개발자에게 자동으로 보고됐어요." : "";
   return `<section class="problem-panel" role="alert">
     <h2>${esc(issueValue(issue, "title", "작업을 마치지 못했어요."))}</h2>
-    <p>${esc(issueValue(issue, "message", "다시 확인해 주세요."))}</p>
-    ${details}
-    <div class="problem-actions">${actions}</div>
+    <p class="problem-reason">${esc(reason || "다시 확인해 주세요.")}</p>
+    ${stepsHtml}
+    <p class="problem-status">${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</p>
+    <div class="problem-actions action-line">${directIssueActionHtml(issue)}</div>
+    <p class="problem-footer">${esc(reported)}${reported ? " · " : ""}<button type="button" class="text-link" data-action="issue-help" data-preserve-issue="true">도움 요청</button></p>
   </section>`;
 }
 function showProblemIssue(error, request) {
@@ -411,25 +408,28 @@ function linkRow(url) {
     `</span></div>`;
 }
 bindActions({
-  "issue-copy": async () => {
-    await call("copy_support_report", S.problemIssue);
-    showToast("오류 정보를 복사했어요");
-  },
-  "issue-email": async () => {
+  "issue-help": async () => {
+    // 메일 본문은 프로그램이 채운다(판 번호·식별번호·작업). 교사가 코드를 옮겨 적지 않는다.
     await call("open_support_email", S.problemIssue);
   },
-  "issue-web": async () => {
-    await call("open_url", "https://big-silver.xyz");
-  },
   "issue-direct": async (el, request) => {
-    if (await inspectGoogleTargetCandidate(S.problemIssue, el.dataset.issueAction, request)) return;
-    if (await openGoogleCandidateInspector(el.dataset.issueAction)) return;
-    const selection = await applyGoogleTargetSelection(S.problemIssue, el.dataset.issueAction, request);
+    const key = String(el.dataset.issueAction || "");
+    if (key === "open-download-page") { await call("open_url", LATEST_RELEASE_URL); return; }
+    if (key === "settings") { await actions["goto-settings"](); return; }
+    if (key === "attendance-tab") {
+      if (S.mode === "wizard") { await goStepAsync(7); } else { await openCard("connect"); }
+      S.connectTab = "attendance"; S.attendance = null; S.chatStatus = null;
+      render();
+      return;
+    }
+    if (await inspectGoogleTargetCandidate(S.problemIssue, key, request)) return;
+    if (await openGoogleCandidateInspector(key)) return;
+    const selection = await applyGoogleTargetSelection(S.problemIssue, key, request);
     if (selection) {
       if (selection === "selected") await resumeGoogleTargetSelection();
       return;
     }
-    await dispatchIssueResume(S.problemIssue, el.dataset.issueAction);
+    await dispatchIssueResume(S.problemIssue, key);
   },
   "link-open": async (el) => {
     const url = String(el.dataset.url || "");
@@ -1603,13 +1603,15 @@ function classSpaceSubrowHtml(a) {
   const placeholder = current && !S.chatSpaces.some((s) => String(s.name || "") === String(cs.class_space_id || ""))
     ? `<option value="">${esc(current)}</option>`
     : `<option value="">학급 단톡방을 골라 주세요</option>`;
-  return `<div class="svc-subrow">
+  return `<div class="svc-subrow chat-space-existing">
     <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>
-    <select name="class-space-select" data-action-change="class-space-pick"
-      data-current-space="${esc(cs.class_space_id || "")}">${placeholder}${options}</select>
-    <div class="chat-new-space-guide action-line" data-purpose="create-another-room">
-      <small>지금 목록에 없는 새 단톡방을 만들고 싶으면 Google Chat에서 만든 뒤 돌아오세요.<br>돌아오면 목록을 자동으로 다시 읽어요. 새 방은 이 드롭다운에서 고르면 됩니다.</small>
+    <div class="chat-space-controls action-line">
+      <select name="class-space-select" data-action-change="class-space-pick"
+        data-current-space="${esc(cs.class_space_id || "")}">${placeholder}${options}</select>
       <button class="btn-tonal" data-action="open-chat-new-space">${icon("external-link", "small")} Google Chat 열기</button>
+    </div>
+    <div class="chat-new-space-guide" data-purpose="create-another-room">
+      <small>지금 목록에 없는 새 단톡방을 만들고 싶으면 Google Chat에서 만든 뒤 돌아오세요.<br>돌아오면 목록을 자동으로 다시 읽어요. 새 방은 이 드롭다운에서 고르면 됩니다.</small>
     </div>
   </div>${madeNote}`;
 }
@@ -1841,9 +1843,15 @@ function attendanceScriptUpdateDialogHtml() {
   const busy = S.attendanceScriptUpdating;
   const busyDisabled = busy ? " disabled" : "";
   const actionLabel = busy ? `${action} 중…` : action;
+  // 실제 갱신은 Google 호출 40여 건으로 2분 넘게 걸린다(2026-09-03 실측 2분 7초).
+  // 걸리는 시간을 미리 말하지 않으면 '업데이트 중…'에서 멈춘 줄 안다.
+  const note = busy
+    ? "업데이트 중이에요. Google에 새 기능을 올리고 다시 확인하는 데 보통 2~3분 걸려요. 끝날 때까지 이 창을 닫지 말고 기다려 주세요."
+    : "Google에 새 기능을 올리고 다시 확인하는 데 보통 2~3분 걸려요. 시작하면 끝날 때까지 이 창을 닫지 말고 기다려 주세요.";
   return `<div class="attendance-update-dialog-overlay">
     <section class="attendance-update-dialog" role="dialog" aria-modal="true" aria-label="${title}">
       <h3>${title}</h3><p>${message}</p>
+      <p class="attendance-update-dialog-note">${note}</p>
       <div class="attendance-update-dialog-actions">
         <button class="btn-quiet" data-action="attendance-script-dialog-close"${busyDisabled}>취소</button>
         <button class="btn" data-action="attendance-script-dialog-confirm" data-busy-text="${action} 중…"${busyDisabled}>${actionLabel}</button>
@@ -2973,6 +2981,7 @@ function settingsSectionHtml(d, includeGoogle = true) {
   // 이 화면에서 확인: 제품에 포함된 Python · 문서 읽기 · Microsoft Edge WebView2
   ensureComputerStatus();
   if (d.autostart === undefined) d.autostart = true;
+  if (d.error_reports_enabled === undefined) d.error_reports_enabled = true;
   ensureHotkeyState(d);
   return `${computerSectionHtml(includeGoogle)}
     <div class="section-h">동작 설정</div>
@@ -2980,6 +2989,8 @@ function settingsSectionHtml(d, includeGoogle = true) {
       hotkeyRow(d) +
       rawRow("Windows 시작 시 자동 실행 (권장)",
         `<div class="field"><label class="check" style="margin:0"><input type="checkbox" name="autostart" ${d.autostart ? "checked" : ""}> 켜기</label></div>`) +
+      rawRow("오류 자동 보고",
+        `<div class="field"><label class="check" style="margin:0"><input type="checkbox" name="error_reports_enabled" ${d.error_reports_enabled ? "checked" : ""}> 켜기</label><span class="hint">문제 화면이 뜨면 어느 작업에서 무엇이 잘못됐는지를 개발자에게 자동으로 보내요.</span></div>`) +
       attachmentFolderRow(d)
     )}
     <p class="hint">오래된 Word·Excel·PowerPoint 파일은 Microsoft Office가 설치되어 있어야 안정적으로 읽을 수 있어요.</p>
@@ -2995,6 +3006,8 @@ function syncMessengerDraft() {
   S.draft.bridge.hotkey = S.draft.bridge.hotkey || DEFAULT_HOTKEY;
   const auto = document.querySelector('[name="autostart"]');
   if (auto) S.draft.bridge.autostart = auto.checked;
+  const report = document.querySelector('[name="error_reports_enabled"]');
+  if (report) S.draft.bridge.error_reports_enabled = report.checked;
   const folder = document.querySelector('[name="brity_download_dir"]');
   if (folder) S.draft.bridge.brity_download_dir = folder.value.trim();
 }
@@ -3796,6 +3809,7 @@ async function autoSaveSettings(afterHotkey, request) {
       const updates = {};
       if (dirtyFields.has("hotkey")) updates.hotkey = S.draft.bridge.hotkey || DEFAULT_HOTKEY;
       if (dirtyFields.has("autostart")) updates.autostart = S.draft.bridge.autostart !== false;
+      if (dirtyFields.has("error_reports_enabled")) updates.error_reports_enabled = S.draft.bridge.error_reports_enabled !== false;
       if (dirtyFields.has("brity_download_dir")) {
         updates.brity_download_dir = S.draft.bridge.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER;
       }
@@ -4004,7 +4018,8 @@ for (const eventName of ["input", "change"]) {
     if (!duplicateChange) markEditDirtyField(changedField);
     if (S.edit === "settings") {
       if (eventName === "change"
-          && (changedField === "autostart" || changedField === "brity_download_dir")) {
+          && (changedField === "autostart" || changedField === "brity_download_dir"
+              || changedField === "error_reports_enabled")) {
         // 저장 예외(레지스트리 거부 등)가 무통지로 사라지면 화면과 실제 값이 어긋난다.
         const request = beginIssueRequest(false);
         autoSaveSettings(false, request).catch((error) => handleCaughtError(error, request));
