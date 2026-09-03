@@ -25,6 +25,14 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # 2026-09-04 공개 v3.9(tag commit a297bce)의 Code.gs 5.13.0·appsscript.json을
+    # 공개 저장소 checkout에서 같은 함수로 계산해 이 저장소의 assets와 대조했다.
+    (
+        "d4a40be1852f6a1e" "a64c3f6c29fdb905"
+        "c76c9d9d9996f424" "5347013b4ab16289"
+    ): (
+        ("v3.9", "a297bced137a309d6e13" "dc49393bf9235e5db5fa"),
+    ),
     (
         "e3e50df0a1901fef" "1a9a3a3894a6ba30"
         "f51e078cdfe7face" "4531dd7eac2d810a"

@@ -892,6 +892,18 @@ def _existing_attendance_guidance(error) -> str:
     )
 
 
+_APPS_SCRIPT_API_DISABLED_MARKERS = (
+    "script.google.com/home/usersettings",
+    "has not enabled the apps script api",
+)
+ATTENDANCE_APPS_SCRIPT_API_MESSAGE = (
+    "이 Google 계정에서 Google Apps Script API가 아직 꺼져 있어요. "
+    "브라우저에서 https://script.google.com/home/usersettings 를 열고 같은 @goedu.kr 계정으로 "
+    "로그인한 뒤 [Google Apps Script API] 스위치를 켜 주세요. "
+    "몇 분 뒤 Teacher Manager로 돌아와 출결 준비를 다시 시작해 주세요."
+)
+
+
 def friendly_attendance_error(error) -> tuple[str, str]:
     """설치 실패를 (실패한 서비스, 화면에 보여줄 쉬운 문장)으로 바꾼다."""
     if isinstance(error, install_attendance_automation.ExistingAttendanceSheetError):
@@ -908,6 +920,11 @@ def friendly_attendance_error(error) -> tuple[str, str]:
         service = "docs"
     # 로그인이 풀렸거나 권한이 부족하면 어느 단계든 같은 처방 — 원인 그대로 알려준다.
     evidence = (str(getattr(error, "output", "") or "") + " " + str(error)).lower()
+    # Apps Script API 사용자 설정을 한 번도 켜지 않은 계정은 403이 나지만 로그인 문제가
+    # 아니다. 다시 로그인해도 풀리지 않으므로 Google의 설정 화면을 그대로 안내한다
+    # (2026-09-03 조사 6번).
+    if any(marker in evidence for marker in _APPS_SCRIPT_API_DISABLED_MARKERS):
+        return service, ATTENDANCE_APPS_SCRIPT_API_MESSAGE
     auth_markers = ("invalid_grant", "unauthorized", "credential", "401", "403",
                     "insufficient", "login required", "sign in", "please login")
     if any(marker in evidence for marker in auth_markers):
@@ -2082,13 +2099,25 @@ def gws_auth_status(run_command, gws: str) -> dict:
             )
         )
     )
+    # gws 0.22.5는 `auth status`마다 refresh token을 새 access token으로 바꿔 본다
+    # (auth_commands.rs handle_status). Google이 access_token 없는 JSON으로 거절하면
+    # `token_valid: false`를 적으므로 저장된 로그인은 더 쓸 수 없고 다시 로그인해야
+    # 한다. 통신 자체가 막히면 `token_valid`도 `user`도 없이 돌아오는데, 이는 확인
+    # 실패일 뿐 로그아웃이 아니라서 종전대로 `error`에 둔다(2026-09-03 실측).
+    token_rejected = bool(
+        status_document is not None and status_document.get("token_valid") is False
+    )
     logged_out_markers = (
         "not logged in", "not authenticated", "no credentials", "login required",
     )
     if logged_in:
         login_state = "logged_in"
         error_code = ""
-    elif credentials_absent or any(mark in lowered for mark in logged_out_markers):
+    elif (
+        credentials_absent
+        or token_rejected
+        or any(mark in lowered for mark in logged_out_markers)
+    ):
         login_state = "logged_out"
         error_code = ""
     else:

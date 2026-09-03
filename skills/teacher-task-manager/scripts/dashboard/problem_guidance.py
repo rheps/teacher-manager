@@ -16,10 +16,11 @@ KIND_GOOGLE_WRITE = "google-write"
 KIND_ATTENDANCE_SCRIPT = "attendance-script"
 KIND_LOGIN = "login"
 KIND_LOCAL = "local"
+KIND_SHEET_CONNECTION_VALUE = "sheet-connection-value"
 KIND_OTHER = "other"
 ALL_KINDS = (
     KIND_UPDATE, KIND_GOOGLE_READ, KIND_GOOGLE_WRITE, KIND_ATTENDANCE_SCRIPT,
-    KIND_LOGIN, KIND_LOCAL, KIND_OTHER,
+    KIND_LOGIN, KIND_LOCAL, KIND_SHEET_CONNECTION_VALUE, KIND_OTHER,
 )
 
 _REOPEN_STEP = "이 창을 닫았다가 다시 열면 프로그램이 자동으로 다시 확인해요."
@@ -96,6 +97,18 @@ _GUIDANCE = {
             _REOPEN_STEP,
         ),
         actions=(recovery.IssueAction("settings", "설정 열기"),),
+    ),
+    # 출석부 설정 탭의 Google Chat 연결값이 비어 있는 결정적 상태. 원인 설명 없이 선생님이
+    # 할 일만 보인다(2026-09-04 사용자 결정). 시트 메뉴 [연결 상태 확인]이 비어 있던 번호·
+    # 확인값을 다시 만들고, 새 확인값은 [연결하기]로 발송 서버에 다시 등록된다.
+    KIND_SHEET_CONNECTION_VALUE: Guidance(
+        reason="아래 순서대로 해 주세요.",
+        steps=(
+            "출석부를 열고 위 메뉴 [처음 한 번 설정하기] → [연결 상태 확인]을 눌러 주세요.",
+            "Teacher Manager로 돌아와 이 창을 닫았다가 다시 열어 주세요.",
+            "Google Chat 줄에 [연결하기]가 보이면 눌러 주세요.",
+        ),
+        actions=(recovery.IssueAction("open-current-attendance", "현재 출석부 열기"),),
     ),
     KIND_GOOGLE_WRITE: Guidance(
         reason="Google에 준비하거나 저장하는 일을 끝내지 못했어요.",

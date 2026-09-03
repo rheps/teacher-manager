@@ -28,6 +28,13 @@ SETTINGS_DESCRIPTIONS = {
 TIMEOUT_SECONDS = 6
 NOT_PREPARED_MESSAGE = "출결 준비가 아직 안 됐어요. 먼저 출결 준비 시작하기를 눌러 주세요."
 CONFIG_BROKEN_MESSAGE = "출결 시트의 설정 값을 읽지 못했어요. 시트가 열리는지 확인해 주세요."
+# 설정 탭은 제대로 읽었는데 필수 값(발송소 주소·시트 번호·확인값)이 비어 있는 결정적 상태.
+# 다시 읽어도 같으므로 세 번 묶음에 넣지 않고 한 번에 멈춘다(2026-09-04). 화면에 보일 수
+# 있는 문장이라 내부 값 이름을 넣지 않는다.
+CONFIG_VALUE_MISSING_MESSAGE = (
+    "출석부의 Google Chat 연결값이 비어 있어요. 출석부를 열고 [처음 한 번 설정하기] → "
+    "[연결 상태 확인]을 누른 뒤 다시 확인해 주세요."
+)
 SERVER_ERROR_MESSAGE = "발송 서버와 연결하지 못했어요. 인터넷 연결을 확인해 주세요."
 # 서버가 답을 준 경우는 인터넷 탓이 아니다. 답에 적힌 뜻을 그대로 옮긴다 —
 # "인터넷을 확인하세요"라고만 하면 몇 번을 다시 눌러도 달라질 게 없다(2026-07-30 확인).
@@ -75,6 +82,7 @@ CHAT_HANDOVER_RECOVERY_REQUIRED_MESSAGE = (
 _SAFE_CENTRAL_MESSAGES = {
     NOT_PREPARED_MESSAGE,
     CONFIG_BROKEN_MESSAGE,
+    CONFIG_VALUE_MISSING_MESSAGE,
     SERVER_ERROR_MESSAGE,
     UNKNOWN_SERVER_ANSWER_MESSAGE,
     CHAT_STATUS_FAILURE_MESSAGE,
@@ -97,6 +105,10 @@ _CHAT_HANDOVER_RECOVERY_NAME = ".central-chat-handover-recovery.protected"
 
 class CentralChatError(RuntimeError):
     pass
+
+
+class ConfigValueMissingError(CentralChatError):
+    """설정 탭을 제대로 읽었는데 필수 값이 비어 있음 — 다시 읽어도 같은 결정적 상태."""
 
 
 def _recovery_path(config_dir: Path) -> Path:
@@ -385,7 +397,8 @@ def read_central_config(
             config[mapped] = str(row[1]).strip()
     for required in ("url", "sheet_id", "sheet_secret"):
         if not config.get(required):
-            raise CentralChatError(CONFIG_BROKEN_MESSAGE)
+            # 읽기 실패(CONFIG_BROKEN_MESSAGE)와 달리 값이 비어 있는 것은 결정적 상태다.
+            raise ConfigValueMissingError(CONFIG_VALUE_MISSING_MESSAGE)
     return config
 
 

@@ -123,6 +123,13 @@ _SCREEN_FAILURES = {
 }
 
 
+# 설정·목록·상태 확인용 gws 명령 하나에 허용하는 시간. 실측(2026-09-03)으로 정상은
+# 1~7초, 네트워크가 막힌 `auth status`도 gws 자체 제한으로 약 43초 안에 끝났다.
+# 응답이 아예 오지 않는 망(인증 페이지 등)에서만 만료되며, 그때 run_captured는
+# 종료값 124를 돌려주고 engine.gws_auth_status는 이를 `error`로 분류한다.
+GWS_COMMAND_TIMEOUT_SECONDS = 90.0
+
+
 class ScreenSafeError(RuntimeError):
     """A fixed Korean sentence intentionally prepared for the screen."""
 
@@ -347,6 +354,21 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
             actions=(recovery.IssueAction("attendance-first-setup", "출석부 설정 확인"),),
             resume="attendance-first-setup",
         )
+    from dashboard import central_chat
+
+    if message == central_chat.CONFIG_VALUE_MISSING_MESSAGE:
+        # 설정 탭 값이 비어 있는 결정적 상태 — 되풀이하지 않고, 원인 문장 대신 선생님이
+        # 할 일 세 가지와 [현재 출석부 열기]만 보인다(2026-09-04 사용자 결정).
+        guidance = problem_guidance.guidance_for(
+            problem_guidance.KIND_SHEET_CONNECTION_VALUE
+        )
+        return recovery.UserIssue.needs_user(
+            operation=str(operation or "attendance_chat_status"),
+            title="학급 단톡방 상태를 확인하지 못했어요.",
+            message=guidance.reason,
+            change_status="기존 출결 자료와 현재 연결은 그대로입니다.",
+            actions=guidance.actions,
+        ).with_guidance(steps=guidance.steps)
     if message == google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE or (
         "@goedu.kr" in message and "로그인" in message
     ):
@@ -1530,7 +1552,11 @@ class Api:
         )
 
         def run(args):
-            return process_win.run_captured(args, env=environment)
+            # `gws auth status`는 매번 Google과 통신한다. 응답이 아예 오지 않는 자리에서
+            # 화면이 영원히 "확인 중"에 머물지 않게 제한 시간을 둔다(2026-09-03 조사 3번).
+            return process_win.run_captured(
+                args, env=environment, timeout=GWS_COMMAND_TIMEOUT_SECONDS
+            )
 
         return run
 
@@ -1609,22 +1635,34 @@ class Api:
     @guarded
     def home_checks(self):
         self._require_safe_gws_account_storage()
+        deps = self._deps.home_check_deps
+        if deps is None:
+            # 홈 점검의 `gws auth status`도 설정 화면과 같은 환경(같은 보관함 결정, 같은
+            # 제한 시간)으로 읽는다. 부모 환경 그대로 돌리면 공개 2.0의 file 로그인
+            # 사용자에게 홈에만 "로그인이 필요해요"가 남는다(2026-09-03 조사 4번).
+            deps = engine.HomeCheckDeps(
+                doctor_deps=engine.DoctorDeps(run_command=self._run())
+            )
         results = self._local_read(
             "home_checks", "이 컴퓨터의 점검 내용을 읽지 못했어요.",
-            lambda: engine.home_checks(self._config_dir, deps=self._deps.home_check_deps),
+            lambda: engine.home_checks(self._config_dir, deps=deps),
         )
         return [asdict(r) for r in results]
 
     @guarded
     def attendance_status(self):
         self._require_safe_gws_account_storage()
+        # 폴링 경로(attendance_prepare_status)와 같이 자식 작업까지 제한 시간이 있는
+        # 감독 실행으로 읽는다. `gws auth status`가 응답 없이 멈추면 출결 탭이 영원히
+        # "확인하는 중"이 된다(2026-09-03 조사 5번).
         status_value = engine.read_attendance_status(
             self._config_dir,
-            self._run(),
+            self._attendance_remote_run(),
         )
         if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
             return asdict(status_value)
         status = asdict(status_value)
+        layout_unreadable = False
         if status_value.state == "ready":
             from attendance_install_record import load_attendance_install_record
 
@@ -1635,18 +1673,44 @@ class Api:
                 self._deps.attendance_roster_inspector
                 or _attendance_workbook_layout_is_current
             )
+            layout_current = None
             try:
                 _run, gws, _account = (
                     self._resolve_attendance_goedu_gws_context_or_fail()
                 )
-                layout_current = layout_inspector(
-                    runner=self._attendance_script_runner(),
-                    workdir=self._config_dir,
-                    gws_executable=gws,
-                    spreadsheet_id=record["spreadsheet_id"],
-                )
             except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
-                layout_current = None
+                gws = ""
+            if gws:
+                # 시트 읽기 예닐곱 번 중 하나가 잠깐 실패한 것을 곧바로 "출결 기능을
+                # 확인해야 해요"로 바꾸지 않는다. 다른 출결 읽기와 같은 세 번 안에서
+                # 다시 읽고, 그래도 못 읽으면 지금 화면에만 알리고 저장본은 남기지 않는다.
+                def read_layout():
+                    try:
+                        return layout_inspector(
+                            runner=self._attendance_script_runner(),
+                            workdir=self._config_dir,
+                            gws_executable=gws,
+                            spreadsheet_id=record["spreadsheet_id"],
+                        )
+                    except Exception as error:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
+                        raise recovery.RetryableOperationError(
+                            "ATTENDANCE_LAYOUT_READ",
+                            "기존 출석부의 학생 선택과 메신저 상태를 다시 읽고 있어요.",
+                        ) from error
+
+                try:
+                    layout_current = recovery.run_operation(
+                        "attendance_layout_read",
+                        "출결 상태를 확인하지 못했어요.",
+                        read_layout,
+                        delays=recovery.NETWORK_DELAYS,
+                        change_status="기존 출결 자료와 현재 연결은 그대로입니다.",
+                        app_version=version.APP_VERSION,
+                        **self._network_recovery_options(),
+                    )
+                except recovery.FinalOperationFailure:
+                    layout_current = None
+            layout_unreadable = layout_current is None
             if layout_current is not True:
                 status["state"] = (
                     "script-update-required"
@@ -1658,8 +1722,10 @@ class Api:
                     if layout_current is False
                     else engine.ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
                 )
-        # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다.
-        engine.save_attendance_status_cache(self._config_dir, status)
+        # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다. 시트를 읽지 못해
+        # 알 수 없는 상태는 저장하지 않는다 — 다음 실행에서 옛 정상 저장본이 먼저 보인다.
+        if not layout_unreadable:
+            engine.save_attendance_status_cache(self._config_dir, status)
         return status
 
     @guarded
@@ -2296,17 +2362,29 @@ class Api:
             run, gws = self._resolve_attendance_goedu_gws_or_fail()
         else:
             run, gws = self._run(), None
+        # 서버 응답이 늦거나(콜드 스타트, 실측 첫 호출 약 4.7초에 한도 6초) 설정 탭
+        # 읽기가 한 번 실패한 것은 "연결 안 됨"이 아니라 "아직 모름"이다. 같은 세 번
+        # 묶음에서 다시 읽어, 이미 연결된 선생님에게 [연결하기]를 다시 보이지 않는다
+        # (2026-09-03 조사 7번).
+        transient_reasons = {
+            central_chat.CHAT_STATUS_FAILURE_MESSAGE: "CHAT_STATUS_READ",
+            central_chat.SERVER_ERROR_MESSAGE: "CHAT_STATUS_SERVER_UNREACHED",
+            central_chat.CONFIG_BROKEN_MESSAGE: "CHAT_STATUS_SETTINGS_READ",
+        }
+
         def read_status():
             value = central_chat.chat_status(
                 self._config_dir,
                 run,
                 gws_executable=gws,
             )
-            if value.get("reason") == central_chat.CHAT_STATUS_FAILURE_MESSAGE:
-                raise recovery.RetryableOperationError(
-                    "CHAT_STATUS_READ",
-                    central_chat.CHAT_STATUS_FAILURE_MESSAGE,
-                )
+            reason = str(value.get("reason") or "")
+            if reason == central_chat.CONFIG_VALUE_MISSING_MESSAGE:
+                # 설정 탭을 제대로 읽었는데 값이 비어 있는 결정적 상태는 다시 읽어도
+                # 같으므로 한 번에 멈추고 사람 행동을 안내한다(2026-09-04).
+                raise ScreenSafeError(reason)
+            if reason in transient_reasons:
+                raise recovery.RetryableOperationError(transient_reasons[reason], reason)
             return value
 
         return self._attendance_operation(

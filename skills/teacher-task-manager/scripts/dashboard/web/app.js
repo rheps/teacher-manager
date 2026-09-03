@@ -173,6 +173,7 @@ const DIRECT_ISSUE_ACTIONS = {
   "inspect-tasklist-candidates": "Google Tasks에서 직접 확인",
   "attendance-tab": "출결 탭으로",
   "open-download-page": "다운로드 페이지 열기",
+  "open-current-attendance": "현재 출석부 열기",
   "settings": "설정 열기",
 };
 const GOOGLE_TARGET_ID_FIELDS = [
@@ -422,6 +423,7 @@ bindActions({
       render();
       return;
     }
+    if (key === "open-current-attendance") { await actions["attendance-open"](); return; }
     if (await inspectGoogleTargetCandidate(S.problemIssue, key, request)) return;
     if (await openGoogleCandidateInspector(key)) return;
     const selection = await applyGoogleTargetSelection(S.problemIssue, key, request);
@@ -513,11 +515,24 @@ function clearGoogleDependentState(options) {
 }
 function startLoginWatch() {
   if (loginWatchTimer) return;
+  const LOGIN_DROPPED_MESSAGE = "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.";
   const tick = async () => {
     loginWatchTimer = setTimeout(tick, LOGIN_WATCH_INTERVAL_MS);
     if (S.login) return;  // 로그인 진행 중에는 전용 폴링이 따로 본다
     try {
       const status = await call("google_status");
+      if (googleAuthCheckFailed(status)) {
+        // 확인 자체가 안 된 것(절전 해제 직후처럼 네트워크가 잠깐 막힘)은 로그아웃이
+        // 아니다. 마지막으로 확인된 상태를 그대로 두고 다음 틱에 다시 본다. Google이
+        // 토큰을 실제로 거부하면 gws가 token_valid:false를 적어 logged_out으로 온다.
+        return;
+      }
+      if (S.login || hasCurrentSettingsStatusRequest()) {
+        // 응답을 기다리는 사이 로그인 완료 처리나 설정 점검이 시작됐으면 그쪽이 상태를
+        // 갱신하고 복귀까지 맡는다. 여기서 「로그아웃 → 로그인」을 계정 변화로 보고
+        // 복귀 정보를 지우면 로그인 뒤 연결 화면으로 돌아가지 못한다.
+        return;
+      }
       const before = S.google;
       const beforeKey = googleStatusKey(before);
       S.google = status;
@@ -525,9 +540,11 @@ function startLoginWatch() {
       if (before && before.logged_in && !status.logged_in) {
         // 끊김 감지 — 화면 곳곳이 실상을 다시 읽게 비우고 알린다
         clearGoogleDependentState();
-        setBanner("warn", "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.");
+        setBanner("warn", LOGIN_DROPPED_MESSAGE);
       } else if (changed) {
         clearGoogleDependentState();
+        // 끊겼다고 알린 뒤 로그인이 돌아오면 그 배너부터 걷는다 — 3분 뒤에도 남지 않게.
+        if (status.logged_in && S.banner && S.banner.text === LOGIN_DROPPED_MESSAGE) S.banner = null;
         if (status.logged_in && !isGoeduGoogleStatus(status)) {
           setBanner("warn", GOEDU_REQUIRED_MESSAGE);
           return;
@@ -2610,8 +2627,12 @@ async function refreshSettingsStatus(request) {
     const nextAccount = String(nextGoogle?.user || "").trim().toLowerCase();
     S.computer = computer;
     S.google = nextGoogle;
-    if (previousGoogle && previousAccount !== nextAccount) {
-      clearGoogleDependentState();
+    // 알고 있던 계정이 다른 계정으로 바뀌었거나 사라졌을(로그아웃) 때만 화면 자료를
+    // 비운다. 로그아웃으로 바뀐 것은 연결 화면의 [설정 열기]가 데려온 바로 그 상황이므로,
+    // 로그인이 끝난 뒤 돌아갈 복귀 정보는 남긴다. 로그아웃 상태에서 로그인이 끝난
+    // 경우는 pollLoginOnce가 이미 비웠다.
+    if (previousAccount && previousAccount !== nextAccount) {
+      clearGoogleDependentState({ preserveResume: !nextAccount });
     }
     const gwsUpdate = await call("gws_update_status");
     if (!ownsIssueRequest(owner)) return false;
