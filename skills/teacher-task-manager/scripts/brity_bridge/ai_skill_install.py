@@ -18,9 +18,9 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Mapping
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
-from brity_bridge import component_lock, deadline_io
+from brity_bridge import component_lock, deadline_io, tls
 from brity_bridge.process_supervision import run_supervised_command
 
 
@@ -333,7 +333,7 @@ def _download_approved_archive(
     stage_root: Path,
     approval: ApprovedSkillSource,
     *,
-    opener=urlopen,
+    opener=tls.open_https,
     timeout_seconds: float = 60.0,
 ) -> Path:
     url = approved_archive_url(approval)
@@ -501,7 +501,7 @@ def prepare_approved_source(
     stage_root: Path,
     approval: ApprovedSkillSource,
     *,
-    opener=urlopen,
+    opener=tls.open_https,
     timeout_seconds: float = 60.0,
 ) -> Path:
     """정확한 GitHub commit 압축을 받고 모든 스킬 파일 지문을 확인한다."""

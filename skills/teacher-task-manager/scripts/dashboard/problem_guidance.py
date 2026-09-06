@@ -17,10 +17,11 @@ KIND_ATTENDANCE_SCRIPT = "attendance-script"
 KIND_LOGIN = "login"
 KIND_LOCAL = "local"
 KIND_SHEET_CONNECTION_VALUE = "sheet-connection-value"
+KIND_SCRIPT_API = "script-api"
 KIND_OTHER = "other"
 ALL_KINDS = (
     KIND_UPDATE, KIND_GOOGLE_READ, KIND_GOOGLE_WRITE, KIND_ATTENDANCE_SCRIPT,
-    KIND_LOGIN, KIND_LOCAL, KIND_SHEET_CONNECTION_VALUE, KIND_OTHER,
+    KIND_LOGIN, KIND_LOCAL, KIND_SHEET_CONNECTION_VALUE, KIND_SCRIPT_API, KIND_OTHER,
 )
 
 _REOPEN_STEP = "이 창을 닫았다가 다시 열면 프로그램이 자동으로 다시 확인해요."
@@ -80,6 +81,15 @@ class Guidance:
 
 
 _GUIDANCE = {
+    KIND_SCRIPT_API: Guidance(
+        reason="Google의 자동화 사용 허용이 필요해요.",
+        steps=(
+            "아래 버튼으로 Google 자동화 사용 설정을 열고, 출결 준비에 쓰던 학교 계정을 선택해 주세요.",
+            "[Google Apps Script API] 스위치를 켜 주세요.",
+            "몇 분 뒤 Teacher Manager로 돌아와 출결 창을 닫았다가 다시 열고 준비를 이어가 주세요.",
+        ),
+        actions=(recovery.IssueAction("open-script-api-settings", "Google 자동화 사용 설정 열기"),),
+    ),
     KIND_UPDATE: Guidance(
         reason="업데이트 정보를 받아 오지 못했어요.",
         steps=(
@@ -163,6 +173,8 @@ def kind_from_message(message: str) -> str:
     """준비된 안내문만으로 정해지는 종류. 해당 없으면 빈 문자열."""
 
     text = str(message or "")
+    if "Apps Script API" in text:
+        return KIND_SCRIPT_API
     if "@goedu.kr" in text and "로그인" in text:
         return KIND_LOGIN
     if "처음 준비하던 Google 계정" in text:
@@ -196,7 +208,8 @@ def apply_guidance(issue: recovery.UserIssue, operation: str) -> recovery.UserIs
                 actions=issue.actions or guidance.actions,
             )
         return issue.with_guidance(steps=issue.steps or (_FOLLOW_MESSAGE_STEP,))
-    guidance = guidance_for(kind_for(operation or issue.operation, issue.message))
+    message = issue.reason if kind_from_message(issue.reason) == KIND_SCRIPT_API else issue.message
+    guidance = guidance_for(kind_for(operation or issue.operation, message))
     reason = issue.reason
     if not reason.strip() or reason == recovery.UNEXPECTED_MESSAGE:
         reason = guidance.reason

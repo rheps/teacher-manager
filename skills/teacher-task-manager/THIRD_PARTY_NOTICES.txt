@@ -29,3 +29,11 @@ https://aka.ms/privacy
 https://learn.microsoft.com/en-us/microsoft-edge/privacy-whitepaper#smartscreen
 
 Microsoft does not sponsor or endorse Teacher Manager.
+
+Teacher Manager includes the certifi root certificate list 2026.02.25 (the
+Mozilla CA bundle as certifi/cacert.pem) so its own downloads from GitHub verify
+on a freshly installed Windows whose root store has not yet fetched newer roots.
+
+Source: https://github.com/certifi/python-certifi
+License: MPL-2.0 (https://www.mozilla.org/MPL/2.0/).  The bundle carries no
+private keys and is used only to verify servers.

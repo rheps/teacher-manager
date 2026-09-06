@@ -89,7 +89,9 @@
 #       잘못 알리던 여덟 가지 고침(토큰 거부와 확인 실패 구분·3분 감시·90초 제한·홈 점검 환경·
 #       시트 읽기 세 번·발송 서버 재확인·Apps Script API 안내·로그인 뒤 연결 화면 복귀) ·
 #       출석부 설정 탭 연결값이 비면 다시 읽지 않고 할 일 세 가지만 안내
-APP_VERSION = "4.0"
+# v4.1: Resume explicitly rejected Google setup writes after permission repair,
+# opening the verified school account and preserving completed attendance resources.
+APP_VERSION = "4.1"
 
 BRANDING = {
     "name": "Teacher Manager",

@@ -180,16 +180,20 @@ def _identity_checks(profile: dict[str, str]) -> list[CheckResult]:
     return results
 
 
-def _connect_checks(profile: dict[str, str]) -> list[CheckResult]:
+def _connect_checks(profile: dict[str, str], statuses: dict | None = None) -> list[CheckResult]:
     results: list[CheckResult] = []
     fields = list(_CONNECT_LINK_FIELDS)
     if profile.get("담임여부", "") in _HOMEROOM_YES:
         fields.append(_HOMEROOM_TASKS_FIELD)
     for key, label, target, fix in fields:
         value = profile.get(target, "")
+        status = (statuses or {}).get(target, {})
+        state = status.get("state") if status.get("id") == value else None
+        ok = False if not value or state in {"unavailable", "check_failed"} else True if state == "ready" else None
+        detail = status.get("detail", "저장된 연결을 아직 확인하지 못했어요.") if value else "아직 고르지 않았어요"
         results.append(CheckResult(
-            key, label, bool(value), "연결됨" if value else "아직 고르지 않았어요",
-            "" if value else fix, card="connect", tab="messenger", target=target,
+            key, label, ok, detail,
+            ("" if ok is True else detail) if value else fix, card="connect", tab="messenger", target=target,
         ))
     return results
 
@@ -233,7 +237,6 @@ def run_doctor_checks(
 
     results: list[CheckResult] = []
     results.extend(_identity_checks(profile))
-    results.extend(_connect_checks(profile))
 
     bridge_settings = load_settings(paths.settings_path(config_dir))
     results.append(_gemini_check(deps, bridge_settings))
@@ -256,13 +259,22 @@ def run_doctor_checks(
         cli_fix,
         card="settings", target="gws-cli",
     ))
-    email = _extract_email(output)
-    logged_in = cli_found and code == 0 and bool(email)
+    # Share the desktop decision without making a second Google request.
+    from dashboard.engine import gws_auth_status, google_target_statuses
+    auth = gws_auth_status(lambda _args: (code, output), gws_executable, config_dir=config_dir)
+    email = auth["user"]
+    logged_in = auth["logged_in"]
+    ready = auth.get("authorization_state") == "ready"
+    targets = dict(profile)
+    if profile.get("담임여부", "") not in _HOMEROOM_YES:
+        targets.pop("담임안내Tasks목록ID", None)
+    statuses = google_target_statuses(deps.run_command, gws_executable, targets, auth=auth) if ready else {}
+    results.extend(_connect_checks(profile, statuses))
     if cli_found:
         results.append(CheckResult(
-            "settings.google-login", "Google 로그인", logged_in,
-            email if logged_in else "로그인이 필요해요",
-            "" if logged_in else GOOGLE_LOGIN_FIX,
+            "settings.google-login", "Google 로그인과 권한", ready,
+            email if ready else auth["authorization_detail"],
+            "" if ready else GOOGLE_LOGIN_FIX,
             card="settings", target="google-login",
         ))
     else:

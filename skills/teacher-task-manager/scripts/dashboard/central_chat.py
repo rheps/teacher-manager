@@ -25,7 +25,7 @@ SETTINGS_RANGE = "설정!A1:D200"
 SETTINGS_DESCRIPTIONS = {
     "GEMINI_API_KEY": "AI 출결 입력이 쓰는 Gemini API 키입니다. 티처 매니저 연결 화면에 넣은 값이 자동으로 들어옵니다.",
 }
-TIMEOUT_SECONDS = 6
+TIMEOUT_SECONDS = 20  # 느린 첫 이름 확인(약 11초)을 한 번 견딜 만큼
 NOT_PREPARED_MESSAGE = "출결 준비가 아직 안 됐어요. 먼저 출결 준비 시작하기를 눌러 주세요."
 CONFIG_BROKEN_MESSAGE = "출결 시트의 설정 값을 읽지 못했어요. 시트가 열리는지 확인해 주세요."
 # 설정 탭은 제대로 읽었는데 필수 값(발송소 주소·시트 번호·확인값)이 비어 있는 결정적 상태.

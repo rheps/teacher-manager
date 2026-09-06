@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.13.0
+ * 버전: 5.13.2
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.13.0';
+const APP_VERSION = '5.13.2';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -399,9 +399,7 @@ function setupAttendanceWorkbookCore_() {
   const cfg = getConfig_();
   const monthNames = getMonthSheetNames_(cfg);
 
-  // 견본 그대로인지는 첫 탭을 바꾸기 전에 한 번만 판단한다.
-  const moveTemplateRows = isPristineTemplateWorkbook_(ss, monthNames);
-  monthNames.forEach(name => ensureMonthSheet_(ss, name, moveTemplateRows));
+  monthNames.forEach(name => ensureMonthSheet_(ss, name));
   ensureRosterSheet_(ss);
   ensureHolidaySheet_(ss);
   ensureDropdownSheet_(ss);
@@ -486,30 +484,16 @@ function ensureConfigSheet_(ss) {
   sh.getDataRange().setWrap(true).setVerticalAlignment('middle');
 }
 
-/**
- * 월 탭 하나를 준비한다.
- *
- * 모양은 탭 하나가 아니라 시트 전체를 보고 정한다. 자료가 있는 달은 그대로 두고
- * 빈 달만 내리면 같은 파일에서 달마다 줄 위치가 달라지고, 자료가 있는 달에서
- * 맨 윗줄 학생이 말없이 빠진다. 쓰던 시트는 사본 절차로만 새 모양이 된다.
- *
- * 그 판단은 첫 탭을 바꾸는 순간 달라지므로 부르는 쪽에서 한 번만 하고
- * 그 결과를 `moveTemplateRows`로 넘긴다.
- */
-function ensureMonthSheet_(ss, name, moveTemplateRows) {
+/** Prepare every month in place; inserting the input row preserves all records. */
+function ensureMonthSheet_(ss, name) {
   let sh = ss.getSheetByName(name);
   const created = !sh;
   if (created) sh = ss.insertSheet(name);
-  const moveThisTab = moveTemplateRows === true
-    && isPristineTemplateMonthSheet_(sh);
-  if (created || moveThisTab) {
+  if (created || hasMonthlyHeaderInFirstRow_(sh)) {
     if (!created) sh.insertRowBefore(MONTHLY_ATTENDANCE_INPUT_ROW);
-    // A열은 이름표, B열은 합친 입력칸의 첫 칸이다. 나머지는 비워 둔다.
     sh.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, INPUT_HEADERS.length)
-      .setValues([[
-        MONTHLY_ATTENDANCE_AI_INPUT_LABEL,
-        ''
-      ].concat(new Array(INPUT_HEADERS.length - 2).fill(''))]);
+      .setValues([[MONTHLY_ATTENDANCE_AI_INPUT_LABEL, '']
+        .concat(new Array(INPUT_HEADERS.length - 2).fill(''))]);
     sh.getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, INPUT_HEADERS.length)
       .setValues([INPUT_HEADERS]);
   }
@@ -517,34 +501,9 @@ function ensureMonthSheet_(ss, name, moveTemplateRows) {
   return sh;
 }
 
-/**
- * 시트 전체가 설치 견본 그대로인지 본다.
- * 있는 월 탭이 하나도 빠짐없이 견본 모양이어야 참이다.
- * 한 달이라도 자료가 있으면 거짓이다 — 쓰던 시트이므로 손대지 않는다.
- */
-function isPristineTemplateWorkbook_(ss, monthNames) {
-  if (!ss || typeof ss.getSheetByName !== 'function') return false;
-  const names = (monthNames && monthNames.length)
-    ? monthNames
-    : getMonthSheetNames_(getConfig_());
-  let seen = 0;
-  for (let index = 0; index < names.length; index++) {
-    const sheet = ss.getSheetByName(names[index]);
-    if (!sheet) continue;  // 지운 지난 달은 판단에 넣지 않는다
-    if (!isPristineTemplateMonthSheet_(sheet)) return false;
-    seen++;
-  }
-  return seen > 0;
-}
-
-/**
- * 설치 견본 그대로인 월 탭인지 본다.
- * 1행이 정확한 제목 줄이고 그 아래에는 아무 자료도 없어야 참이다.
- */
-function isPristineTemplateMonthSheet_(sheet) {
+// Recognize a previous layout only to upgrade it, never to generate it again.
+function hasMonthlyHeaderInFirstRow_(sheet) {
   if (!sheet || typeof sheet.getRange !== 'function') return false;
-  if (typeof sheet.getLastRow !== 'function') return false;
-  if (sheet.getLastRow() !== MONTHLY_ATTENDANCE_INPUT_ROW) return false;
   const firstRow = sheet
     .getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, INPUT_HEADERS.length)
     .getValues()[0];
@@ -2849,7 +2808,7 @@ function buildRosterKeyMap_(rows) {
     const number = String(row[0] || '').trim();
     const name = String(row[1] || '').trim();
     const combined = combineStudentNumberAndName_(number, name);
-    // 학생 Google 이메일 — 있으면 개인 DM 대상이다.
+    // 학생 Google 이메일은 그대로 읽고, 실제 발송 직전에 학교 계정 또는 Gmail인지 확인한다.
     const email = String(row[2] || '').trim();
     const student = {
       rowNumber: index + 2,
@@ -3151,22 +3110,89 @@ function openChatLogSheet() {
 function ensureUsageSheet_(ss) {
   let sh = ss.getSheetByName('00_사용법');
   if (!sh) sh = ss.insertSheet('00_사용법');
-  if (String(sh.getRange(1,1).getValue() || '').trim()) return;
-  sh.getRange(1,1,1,6).merge().setValue('출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용')
+  const title = String(sh.getRange(1,1).getValue() || '').trim();
+  // Replace only the shipped guide; leave a teacher's own guide untouched.
+  if (title && title !== "출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용") return;
+  sh.getRange(1,1,1,6).merge().setValue("Teacher Manager 출결 사용 안내")
     .setBackground('#111827').setFontColor('#ffffff').setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center');
   const rows = [
-    ['순서','작업','설명','','',''],
-    [1,'Google Sheets로 열기','엑셀 파일을 구글 드라이브에 올린 뒤 Google Sheets로 엽니다.','','',''],
-    [2,'Apps Script 붙여넣기','확장 프로그램 → Apps Script에 Code.gs 전체를 붙여넣고 저장합니다.','','',''],
-    [3,'설정 입력','설정 시트 B열의 학교명, 학반, 담임, TEMPLATE_DOC_ID를 입력합니다.','','',''],
-    [4,'기존 템플릿 사용','이미 있는 Google Docs 템플릿 ID를 사용합니다. 새 문서 템플릿은 만들지 않습니다.','','',''],
-    [5,'학생명단 입력','학생명단 A열에 번호, B열에 이름을 적습니다. 개인 DM을 쓸 학생만 C열에 Google 이메일을 적습니다. 월별 시트에서는 번호+이름이 자동으로 합쳐집니다.','','',''],
-    [6,'드롭다운 적용','처음 설정과 학생명단 변경 때 B열 학생 드롭다운이 자동으로 갱신됩니다.','','',''],
-    [7,'신고서 생성','월별 시트에서 행을 선택하고 선택 행으로 신고서 만들기를 실행합니다.','','',''],
-    [8,'Tasks 사용','Tasks 기능은 Google Tasks API 고급 서비스를 별도로 켜야 합니다.','','','']
-  ];
-  sh.getRange(3,1,rows.length,6).setValues(rows);
-  sh.getRange(3,1,1,6).setBackground('#1F4E79').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
+  [
+    "순서",
+    "작업",
+    "설명",
+    "",
+    "",
+    ""
+  ],
+  [
+    "1",
+    "처음 설정",
+    "Teacher Manager에서 출결 준비를 마친 뒤, 출석부 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 실행합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "2",
+    "학생명단",
+    "학생명단에 번호, 이름, 학생 Google 이메일을 각각 입력합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "3",
+    "월별 출결 입력",
+    "각 월의 맨 위 AI 출결 입력칸에 문장을 적거나, 3행부터 날짜·학생·구분·종류·사유를 입력합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "4",
+    "학생 선택",
+    "월별 출결표의 학생 선택목록은 학생명단의 번호와 이름으로 만들어집니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "5",
+    "신고서",
+    "출결표에서 행을 선택하고 출결 신고서 만들기 메뉴를 사용합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "6",
+    "Google Chat",
+    "발송상태·발송시각·결과를 월별 출결표에서 확인합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "7",
+    "안내와 할 일",
+    "메신저 개인톡 내용과 메신저 단체톡 내용에서 안내를 확인하고 출결 미제출 할 일을 관리합니다.",
+    "",
+    "",
+    ""
+  ],
+  [
+    "8",
+    "휴일",
+    "휴일 탭에서 학교의 수업일과 휴무일을 확인합니다.",
+    "",
+    "",
+    ""
+  ]
+];
+  while (rows.length < 13) rows.push(new Array(6).fill(''));
+  sh.getRange(2,1,rows.length,6).setValues(rows);
+  sh.getRange(2,1,1,6).setBackground('#1F4E79').setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
+  sh.setFrozenRows(2);
   sh.setColumnWidths(1,1,60);
   sh.setColumnWidths(2,1,200);
   sh.setColumnWidths(3,4,260);
@@ -3572,11 +3598,12 @@ function requireGoeduTeacherAccount_(options) {
   return email;
 }
 
-function requireGoeduStudentAccount_(value) {
-  const email = String(value || '').trim();
-  if (!isExactGoeduEmail_(email)) {
+function requireStudentChatAccount_(value) {
+  // 발신 계정 제한과 수신 계정 허용 범위를 섞지 않는다.
+  const email = typeof value === 'string' ? value.trim() : '';
+  if (!/^[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)$/i.test(email)) {
     throw new Error(
-      '학생 개인톡은 @goedu.kr 학생 계정으로만 보낼 수 있어요. 학생 계정을 확인해 주세요.'
+      '학생 이메일은 @goedu.kr 또는 @gmail.com 주소 한 개를 입력해 주세요. 학교 계정(@goedu.kr)을 권장해요.'
     );
   }
   return email;
@@ -3593,7 +3620,7 @@ function callCentralChatSender_(path, payload) {
   if (centralChatPathNeedsTeacher_(path)) requireGoeduTeacherAccount_();
   const safePayload = Object.assign({}, payload || {});
   if (String(path || '').trim() === '/v1/send/personal') {
-    safePayload.studentEmail = requireGoeduStudentAccount_(safePayload.studentEmail);
+    safePayload.studentEmail = requireStudentChatAccount_(safePayload.studentEmail);
   }
   const central = ensureCentralChatConfig_();
   if (!central.url) {

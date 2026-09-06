@@ -19,6 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import apps_script_version
 import attendance_script_update
+import attendance_sheet_layout
 import attendance_workbook_identity
 from brity_bridge import bundle_paths, gws_env, process_win, tool_runtime
 
@@ -34,6 +35,7 @@ _PENDING_SHEET_INTENT = "pending_spreadsheet_intent"
 _PENDING_FOLDER_INTENT = "pending_folder_intent"
 _PENDING_TASK_TITLE = "pending_task_list_title"
 _PENDING_SCRIPT_TITLE = "pending_script_project_title"
+_PENDING_SCRIPT_RECOVERY_ID = "pending_script_recovery_id"
 _PENDING_SCRIPT_UPLOAD_SHA256 = "pending_script_upload_sha256"
 _PENDING_SCRIPT_VERSION_DESCRIPTION = "pending_script_version_description"
 # Apps Script 제목은 시트 승인 창(동의 화면)에 앱 이름으로 그대로 뜬다.
@@ -76,6 +78,16 @@ class DeploymentRecoveryPendingError(RuntimeError):
 
 class CreationRecoveryPendingError(RuntimeError):
     """생성 응답을 잃어 새로 만들지 않고 읽기 확인만 해야 하는 상태."""
+
+
+class BoundScriptRecoveryRequired(CreationRecoveryPendingError):
+    """A container-bound script cannot be discovered through the Drive API."""
+
+
+BOUND_SCRIPT_RECOVERY_MESSAGE = (
+    "출결 자동화 연결을 확인하지 못해 준비를 멈췄어요. "
+    "기존 출결 자료는 그대로입니다."
+)
 
 # 월 탭의 Google Chat 제목 네 개는 Code.gs가 직접 쓴다(ensureMonthlyChatResultColumns_).
 # 파이썬 쪽 사본은 attendance_chat_marker.CHAT_RESULT_HEADERS 한 벌만 둔다 —
@@ -303,6 +315,42 @@ def run_json(runner: CommandRunner, args: Sequence[str], cwd: Path) -> Any:
         return process_win.parse_first_json(output)
     except ValueError as error:
         raise CommandOutputError(args, output) from error
+
+
+def google_error_status(error) -> int:
+    try:
+        payload = process_win.parse_first_json(str(getattr(error, "output", "") or ""))
+        status = payload.get("error", {}).get("code")
+        return status if isinstance(status, int) and 400 <= status <= 599 else 0
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
+def rejected_creation_intents(args: Sequence[str]) -> tuple[str, ...]:
+    """Only the rejected request's intent may be discarded; completed IDs stay."""
+    operation = tuple(args[1:5])
+    if operation[:3] == ("drive", "files", "create"):
+        try:
+            body = json.loads(args[args.index("--json") + 1])
+        except (ValueError, IndexError, TypeError):
+            return ()
+        key = {
+            "application/vnd.google-apps.document": _PENDING_TEMPLATE_INTENT,
+            "application/vnd.google-apps.spreadsheet": _PENDING_SHEET_INTENT,
+            "application/vnd.google-apps.folder": _PENDING_FOLDER_INTENT,
+        }.get(body.get("mimeType")) if isinstance(body, dict) else None
+        return (key,) if key else ()
+    if operation[:3] == ("tasks", "tasklists", "insert"):
+        return (_PENDING_TASK_TITLE,)
+    if operation[:3] == ("script", "projects", "create"):
+        return (_PENDING_SCRIPT_TITLE,)
+    if operation[:2] == ("script", "+push"):
+        return (_PENDING_SCRIPT_UPLOAD_SHA256,)
+    if operation == ("script", "projects", "versions", "create"):
+        return (_PENDING_SCRIPT_VERSION_DESCRIPTION,)
+    if operation == ("script", "projects", "deployments", "create"):
+        return (_PENDING_DEPLOYMENT_DESCRIPTION, _PENDING_DEPLOYMENT_VERSION)
+    return ()
 
 
 def _pending_deployment_identity(created_ids: dict[str, str]) -> tuple[str, int] | None:
@@ -646,6 +694,38 @@ def _new_project_is_still_empty(files: Sequence[dict]) -> bool:
     )
 
 
+def verify_bound_script_recovery(
+    runner: CommandRunner, workdir: Path, *, script_id: str,
+    spreadsheet_id: str, expected_account: str, gws_executable: str,
+) -> str:
+    """Read the explicitly selected container project; never discover or create one."""
+    project = run_json(runner, [
+        gws_executable, "script", "projects", "get", "--params",
+        json.dumps({"scriptId": script_id}), "--format", "json",
+    ], workdir)
+    creator = project.get("creator", {}) if isinstance(project, dict) else {}
+    if not (
+        isinstance(project, dict) and project.get("scriptId") == script_id
+        and project.get("parentId") == spreadsheet_id
+        and expected_account and isinstance(creator, dict)
+        and str(creator.get("email", "")).strip().casefold() == expected_account.casefold()
+    ):
+        raise ValueError("준비하던 출석부의 자동화 화면이 아니에요. 아래 출석부에서 다시 열어 주세요.")
+    files = _script_head_files(runner, workdir, script_id, gws_executable)
+    # Opening Extensions > Apps Script can create Google's empty starter project.
+    # Only the stock no-op function is allowed, never arbitrary user code.
+    remaining = [item for item in files if item.get("name") != "Code"]
+    starters = [item for item in files if item.get("name") == "Code"]
+    empty = _new_project_is_still_empty(files) or (
+        len(starters) == 1 and _new_project_is_still_empty(remaining)
+        and starters[0].get("type") == "SERVER_JS"
+        and re.fullmatch(r"\s*function\s+myFunction\s*\(\s*\)\s*\{\s*\}\s*", str(starters[0].get("source", "")))
+    )
+    if not empty:
+        raise ValueError("이미 작성된 자동화 내용이 있어 덮어쓰지 않았어요. 도움 요청으로 확인해 주세요.")
+    return script_id
+
+
 def _recover_script_project(
     runner: CommandRunner,
     workdir: Path,
@@ -653,73 +733,15 @@ def _recover_script_project(
     title: str,
     spreadsheet_id: str,
     gws_executable: str,
+    script_id: str = "",
+    expected_account: str = "",
 ) -> str:
-    query = (
-        f"name = '{title}' and mimeType = 'application/vnd.google-apps.script' and "
-        "trashed = false and 'me' in owners"
+    if not script_id:
+        raise BoundScriptRecoveryRequired(BOUND_SCRIPT_RECOVERY_MESSAGE)
+    return verify_bound_script_recovery(
+        runner, workdir, script_id=script_id, spreadsheet_id=spreadsheet_id,
+        expected_account=expected_account, gws_executable=gws_executable,
     )
-    drive_candidates = _drive_files_all(
-        runner,
-        workdir,
-        {
-            "q": query,
-            "fields": "nextPageToken,incompleteSearch,files(id,name,mimeType,ownedByMe)",
-            "pageSize": 1000,
-        },
-        gws_executable,
-    )
-    exact: list[str] = []
-    for item in drive_candidates:
-        script_id = str(item.get("id", "") or "").strip()
-        if (
-            not script_id
-            or item.get("name") != title
-            or item.get("mimeType") != "application/vnd.google-apps.script"
-            or item.get("ownedByMe") is not True
-        ):
-            continue
-        project = run_json(
-            runner,
-            [
-                gws_executable,
-                "script",
-                "projects",
-                "get",
-                "--params",
-                json.dumps({"scriptId": script_id}, ensure_ascii=False),
-                "--format",
-                "json",
-            ],
-            workdir,
-        )
-        creator = project.get("creator") if isinstance(project, dict) else None
-        if (
-            isinstance(project, dict)
-            and project.get("scriptId") == script_id
-            and project.get("title") == title
-            and project.get("parentId") == spreadsheet_id
-            and isinstance(creator, dict)
-            and str(creator.get("email", "") or "").strip()
-        ):
-            exact.append(script_id)
-    if len(exact) > 1:
-        raise CreationRecoveryPendingError(
-            "앞선 Apps Script 프로젝트가 여러 개 보여 자동으로 고르지 않았어요. "
-            "새 프로젝트도 만들지 않았습니다."
-        )
-    if not exact:
-        raise CreationRecoveryPendingError(
-            "앞선 Apps Script 프로젝트 만들기 결과를 아직 확인하지 못했어요. "
-            "중복 프로젝트를 막기 위해 새로 만들지 않았습니다."
-        )
-    script_id = exact[0]
-    if not _new_project_is_still_empty(
-        _script_head_files(runner, workdir, script_id, gws_executable)
-    ):
-        raise CreationRecoveryPendingError(
-            "되찾은 Apps Script에 사용자가 고친 코드가 있어 자동으로 덮어쓰지 않았어요."
-        )
-    return script_id
 
 
 def _script_versions_all(
@@ -1574,6 +1596,24 @@ def install_attendance_automation(
         if progress is not None:
             progress(dict(created_ids))
 
+    original_runner = runner
+
+    def runner(args, cwd):
+        try:
+            return original_runner(args, cwd)
+        except Exception as error:
+            # A rejected request did not perform its write. A timeout, conflict,
+            # server error or malformed reply remains ambiguous and must be read
+            # back before any repeated creation.
+            if google_error_status(error) in {400, 401, 403, 404, 429}:
+                keys = rejected_creation_intents(args)
+                changed = any(key in created_ids for key in keys)
+                for key in keys:
+                    created_ids.pop(key, None)
+                if changed:
+                    report_progress()
+            raise
+
     with tempfile.TemporaryDirectory(prefix="teacher-attendance-") as temp_name:
         workdir = Path(temp_name)
         copy_assets_to_workdir(asset_root, workdir)
@@ -1745,6 +1785,15 @@ def install_attendance_automation(
             created_ids["spreadsheet_url"] = (
                 f"https://docs.google.com/spreadsheets/d/{created_ids['spreadsheet_id']}/edit"
             )
+        # The workbook must already have its current layout before any Apps Script
+        # operation can fail. File existence alone is not worksheet readiness.
+        if created_ids.get("workbook_layout_ready") != attendance_sheet_layout.LAYOUT_VERSION:
+            if not dry_run:
+                attendance_sheet_layout.ensure_layout(
+                    runner, workdir, created_ids["spreadsheet_id"], gws_executable
+                )
+            created_ids["workbook_layout_ready"] = attendance_sheet_layout.LAYOUT_VERSION
+            report_progress()
         if not created_ids.get("folder_id"):
             intent = str(created_ids.get(_PENDING_FOLDER_INTENT, "") or "")
             if intent:
@@ -1880,29 +1929,29 @@ def install_attendance_automation(
                     title=pending_title,
                     spreadsheet_id=created_ids["spreadsheet_id"],
                     gws_executable=gws_executable,
+                    script_id=created_ids.get(_PENDING_SCRIPT_RECOVERY_ID, ""),
+                    expected_account=created_ids.get("pending_script_recovery_account", ""),
                 )
             else:
                 pending_title = _SCRIPT_TITLE_PREFIX + secrets.token_hex(16) + "]"
                 created_ids[_PENDING_SCRIPT_TITLE] = pending_title
                 report_progress()
-                script = run_json(
-                    runner,
-                    [
-                        gws_executable,
-                        "script",
-                        "projects",
-                        "create",
-                        *dry,
-                        "--json",
-                        json.dumps(
-                            {"title": pending_title, "parentId": created_ids["spreadsheet_id"]},
-                            ensure_ascii=False,
-                        ),
-                        "--format",
-                        "json",
-                    ],
-                    workdir,
-                )
+                try:
+                    script = run_json(
+                        runner,
+                        [
+                            gws_executable, "script", "projects", "create", *dry, "--json",
+                            json.dumps({"title": pending_title, "parentId": created_ids["spreadsheet_id"]}, ensure_ascii=False),
+                            "--format", "json",
+                        ], workdir,
+                    )
+                except Exception as error:
+                    # A definite rejected request did not create a project. Keep
+                    # ambiguity for lost responses, timeouts, conflicts and 5xx.
+                    if google_error_status(error) in {400, 401, 403, 404, 429}:
+                        created_ids.pop(_PENDING_SCRIPT_TITLE, None)
+                        report_progress()
+                    raise
                 script = with_dry_run_fallback(
                     script,
                     {"scriptId": "dry-run-script-id"},
@@ -1994,11 +2043,22 @@ def install_attendance_automation(
                                 "앞서 올린 Apps Script가 현재 정식 코드인지 확인되지 않아 다시 올리지 않았어요."
                             )
                     else:
+                        if created_ids.get(_PENDING_SCRIPT_RECOVERY_ID):
+                            # Recheck immediately before the first upload, including
+                            # after a restart between selection and continuation.
+                            verify_bound_script_recovery(
+                                runner, workdir, script_id=created_ids["script_id"],
+                                spreadsheet_id=created_ids["spreadsheet_id"],
+                                expected_account=created_ids.get("pending_script_recovery_account", ""),
+                                gws_executable=gws_executable,
+                            )
                         # 업로드 답이 사라져도 다음 실행이 같은 쓰기를 되풀이하지
                         # 않도록, 보낼 정확한 지문을 먼저 안전하게 남긴다.
                         created_ids[_PENDING_SCRIPT_UPLOAD_SHA256] = (
                             expected_bundle_sha256
                         )
+                        created_ids.pop(_PENDING_SCRIPT_RECOVERY_ID, None)
+                        created_ids.pop("pending_script_recovery_account", None)
                         report_progress()
                         run_json(
                             runner,
@@ -2174,7 +2234,7 @@ def install_attendance_automation(
             "majorDimension": "ROWS",
             "values": config_rows,
         }
-        # xlsx 견본에 박힌 옛 설정 행이 남아 중복 키가 생기지 않게, 먼저 비우고 쓴다.
+        # 중단된 첫 설치를 이어갈 때도 이번 설정 행이 중복되지 않게 쓴다.
         run_json(
             runner,
             [
@@ -2294,35 +2354,6 @@ def install_attendance_automation(
             ],
             workdir,
         )
-
-        # 서식·드롭다운·시트 순서 정리는 Apps Script 실행으로 마무리한다(최선 노력).
-        # scripts.run이 계정 정책으로 막혀도 시트는 이미 위에서 만들어졌고,
-        # 서식은 첫 사용(발송·동기화) 때 ensure 함수들이 자동 적용한다.
-        try:
-            run_json(
-                runner,
-                [
-                    gws_executable,
-                    "script",
-                    "scripts",
-                    "run",
-                    *dry,
-                    "--params",
-                    json.dumps({"scriptId": created_ids["deployment_id"]}, ensure_ascii=False),
-                    "--json",
-                    json.dumps({"function": "apiSetupAttendanceWorkbook"}, ensure_ascii=False),
-                    "--format",
-                    "json",
-                ],
-                workdir,
-            )
-        except (subprocess.CalledProcessError, RuntimeError, json.JSONDecodeError):
-            print(
-                "서식/드롭다운 자동 적용(apiSetupAttendanceWorkbook)이 계정 정책으로 막혔습니다. "
-                "시트는 모두 만들어져 있어 바로 쓸 수 있고, 서식은 첫 사용 때 자동 적용됩니다. "
-                "지금 바로 정리하려면 Google Sheet에서 처음 한 번 설정하기 -> "
-                "처음 설정 한 번에 끝내기를 한 번 실행해 주세요."
-            )
 
         # 올리기·버전 만들기·배포 만들기의 성공 답만으로는 실제 원격 코드가
         # 이번 설치본과 같다고 증명할 수 없다. 특히 중간 실패 뒤 재개할 때는

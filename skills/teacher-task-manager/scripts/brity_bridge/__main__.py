@@ -27,6 +27,12 @@ def main(argv=None) -> int:
             return 1
         from brity_bridge import tray_win
 
+        try:
+            from brity_bridge import dns_warm, tools_cli
+
+            dns_warm.start_shared(extra_hosts=dns_warm.hosts_from_urls(tools_cli.bundled_central_chat_sender_url()))
+        except Exception:  # noqa: BLE001 - 예열 실패가 도우미를 막으면 안 된다
+            pass
         tray_win.run_tray(config_dir, launch_dashboard=args.launch_dashboard)
         return 0
     if args.command == "setup":

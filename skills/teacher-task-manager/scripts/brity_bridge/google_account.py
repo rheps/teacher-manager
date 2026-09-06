@@ -9,10 +9,6 @@ GOEDU_ACCOUNT_REQUIRED_MESSAGE = (
     "이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 "
     "클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)"
 )
-GOEDU_STUDENT_REQUIRED_MESSAGE = (
-    "학생 Google Chat 계정은 @goedu.kr 주소여야 해요. "
-    "학생의 교육디지털원패스·경기도교육용 클라우드·Google Workspace 가입을 확인해 주세요."
-)
 
 _GOEDU_EMAIL = re.compile(r"^[^@\s]+@goedu\.kr$", re.IGNORECASE)
 _ANY_EMAIL = re.compile(

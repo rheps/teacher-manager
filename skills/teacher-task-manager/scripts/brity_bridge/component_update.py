@@ -20,9 +20,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
-from . import bundle_paths, component_lock, deadline_io, process_win, tool_runtime
+from . import bundle_paths, component_lock, deadline_io, process_win, tool_runtime, tls
 
 
 GWS_APPROVAL_MANIFEST_URL = (
@@ -445,9 +444,9 @@ def check_gws_update(
     current_app_version: str,
     *,
     component_root: Path | None = None,
-    opener=urlopen,
+    opener=tls.open_https,
     today: date | None = None,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 40.0,  # 느린 첫 이름 확인(약 11초)을 한 번 견딜 만큼
 ) -> GwsUpdateCheck:
     day = (today or date.today()).isoformat()
     try:
@@ -1339,7 +1338,7 @@ def install_gws_update(
     offer: GwsUpdateOffer,
     *,
     component_root: Path | None = None,
-    opener=urlopen,
+    opener=tls.open_https,
     run_command: Callable[[Sequence[str]], tuple[int, str]] = process_win.run_captured,
     timeout_seconds: float = 60.0,
 ) -> GwsUpdateResult:

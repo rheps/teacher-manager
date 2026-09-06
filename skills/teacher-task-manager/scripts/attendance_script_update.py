@@ -25,12 +25,13 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
-    # 2026-09-04 공개 v3.9(tag commit a297bce)의 Code.gs 5.13.0·appsscript.json을
-    # 공개 저장소 checkout에서 같은 함수로 계산해 이 저장소의 assets와 대조했다.
+    # Public v3.9 and v4.0 contain this same bundle. The v4.0 files were fetched
+    # from its exact public tag commit and rehashed on 2026-09-05.
     (
         "d4a40be1852f6a1e" "a64c3f6c29fdb905"
         "c76c9d9d9996f424" "5347013b4ab16289"
     ): (
+        ("v4.0", "f5a7f9992749169c81189" "84004a2e25e6933e1f6"),
         ("v3.9", "a297bced137a309d6e13" "dc49393bf9235e5db5fa"),
     ),
     (
@@ -124,6 +125,15 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Windows 4.1 Candidate source, rehashed from the exact local main commit
+    # on 2026-09-06 before the Gmail-recipient change. Trust this exact bundle
+    # so that an existing Candidate Sheet can be updated in place.
+    (
+        "f9ca8ae796b2b0df" "5a6207d25efa34f7"
+        "d2777a42f3ea60e1" "46d0e01f1501f189"
+    ): (
+        ("4.1-candidate-5.13.1", "a689b332d6e3ad90c41a" "1815fe2f953dfa0e715b"),
+    ),
     (
         "593edd0c752548e8" "36d0828ec946bd00"
         "7edbd4a815086a0a" "de2b0ccdb19cc36c"
@@ -211,7 +221,7 @@ def _guard_remote_mutation(mutation_guard) -> None:
     try:
         allowed = callable(mutation_guard) and mutation_guard() is True
     except Exception as error:  # noqa: BLE001 - 계정·토큰·외부 오류는 버린다.
-        raise _PermissionRequired(_PERMISSION_REQUIRED_DETAIL) from error
+        raise _Hold("Google 로그인과 권한을 지금 확인하지 못했어요. 다시 점검해 주세요. 기존 자료는 그대로입니다.") from error
     if not allowed:
         raise _PermissionRequired(_PERMISSION_REQUIRED_DETAIL)
 

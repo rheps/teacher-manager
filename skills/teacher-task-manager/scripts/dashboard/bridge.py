@@ -27,6 +27,7 @@ from brity_bridge import (
     bundle_paths,
     capture_store,
     component_lock,
+    dns_warm,
     error_reports,
     google_account,
     gws_env,
@@ -43,7 +44,7 @@ from dashboard import version
 
 SETUP_STATE_NAME = "setup-state.json"
 SETUP_STATE_VERSION = 2
-SETUP_LAST_STEP = 9
+SETUP_LAST_STEP = 8
 _FRESH_STATE = {
     "version": SETUP_STATE_VERSION,
     "completed": False,
@@ -57,7 +58,7 @@ _ATTENDANCE_AUTH_BLOCKED_STATES = {
 }
 _ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
     "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. "
-    "설정에서 현재 Google 계정을 로그아웃한 뒤 같은 @goedu.kr 계정으로 다시 로그인해 주세요. "
+    "‘다시 로그인하고 승인’을 눌러 같은 @goedu.kr 계정으로 승인해 주세요. "
     "기존 출석부와 감지기는 그대로입니다."
 )
 _ATTENDANCE_AI_PROOF_MESSAGE = (
@@ -108,6 +109,7 @@ _SCREEN_FAILURES = {
     "attendance_chat_spaces": "학급 단톡방 목록을 가져오지 못했어요.",
     "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
     "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
+    "open_attendance_chat": "Google Chat을 열지 못했어요.",
     "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요.",
     "google_status": "Google 연결 상태를 확인하지 못했어요.",
     "list_calendars": "캘린더 목록을 가져오지 못했어요.",
@@ -128,6 +130,7 @@ _SCREEN_FAILURES = {
 # 응답이 아예 오지 않는 망(인증 페이지 등)에서만 만료되며, 그때 run_captured는
 # 종료값 124를 돌려주고 engine.gws_auth_status는 이를 `error`로 분류한다.
 GWS_COMMAND_TIMEOUT_SECONDS = 90.0
+DNS_WARM_WAIT_SECONDS = dns_warm.DEFAULT_WAIT_SECONDS  # 첫 이름 확인을 기다리는 최대 시간
 
 
 class ScreenSafeError(RuntimeError):
@@ -230,6 +233,23 @@ def _journal_error_chain(error) -> list:
         chain.append(current)
         current = current.__cause__ or current.__context__
     return chain
+
+
+def _with_network_note(detail: str) -> str:
+    """이름 확인이 느렸거나 아직 진행 중이면 보고의 상세에 그 시간을 덧붙인다."""
+
+    try:
+        status = dns_warm.shared_status()
+    except Exception:  # noqa: BLE001 - 보고는 최선 노력이다.
+        return detail
+    if status.get("state") not in ("slow", "warming"):
+        return detail
+    seconds = status.get("first_lookup_seconds")
+    if isinstance(seconds, (int, float)):
+        note = f"인터넷 이름 확인 첫 조회 {seconds:.1f}초"
+    else:
+        note = f"인터넷 이름 확인 진행 중 {float(status.get('elapsed_seconds') or 0):.0f}초"
+    return f"{detail} | {note}" if detail else note
 
 
 def _journal_error_detail(error) -> str:
@@ -1085,7 +1105,7 @@ class Api:
         )
 
     def _migrate_state(self, state: dict) -> tuple[dict, bool]:
-        """예전 7단계 기록을 9단계로 옮기되 작성 중인 값은 그대로 둔다."""
+        """Keep saved input while mapping old progress to the eight-step flow."""
 
         merged = self._fresh_state()
         merged.update(state)
@@ -1125,8 +1145,8 @@ class Api:
             if completed and old >= 7:
                 return SETUP_LAST_STEP
             if old >= 7:
-                # 예전 마지막 화면까지 왔지만 완료하지 않은 사람은 새로 생긴
-                # 학생 계정·학급 단체톡방 준비 안내(8단계)를 먼저 본다.
+                # Incomplete legacy setup returns to Google connection, which now
+                # includes student preparation and the first-setup completion gate.
                 return SETUP_LAST_STEP - 1
             return _V1_STEP_TO_V2.get(max(1, old), 1)
 
@@ -1552,6 +1572,9 @@ class Api:
         )
 
         def run(args):
+            # 이름 확인이 느린 컴퓨터(고정 IP 유선 설정이 남은 채 Wi-Fi 사용)에서는 배경
+            # 예열이 끝나기를 잠깐 기다려 gws가 캐시된 이름을 만나게 한다(2026-09-05).
+            dns_warm.wait_shared_ready(DNS_WARM_WAIT_SECONDS)
             # `gws auth status`는 매번 Google과 통신한다. 응답이 아예 오지 않는 자리에서
             # 화면이 영원히 "확인 중"에 머물지 않게 제한 시간을 둔다(2026-09-03 조사 3번).
             return process_win.run_captured(
@@ -1572,6 +1595,7 @@ class Api:
         )
 
         def run(args):
+            dns_warm.wait_shared_ready(DNS_WARM_WAIT_SECONDS)
             return engine.attendance_remote_command(args, environment=environment)
 
         return run
@@ -1588,6 +1612,7 @@ class Api:
         )
 
         def script_runner(args, cwd):
+            dns_warm.wait_shared_ready(DNS_WARM_WAIT_SECONDS)
             try:
                 return engine.attendance_remote_runner(
                     args, cwd, environment=environment
@@ -1868,48 +1893,96 @@ class Api:
                 }
             if not ok:
                 return {"started": False, "reason": reason}
-            att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
-                run_command=self._attendance_remote_run()
-            )
+            return self._launch_attendance_prepare()
 
-            def _prepare():
-                # 예외로 조용히 죽으면 화면은 running=False + 사유 0글자만 본다.
-                # 성공이든 실패든 결과를 남겨 attendance_prepare_status가 보여준다.
-                try:
-                    status = asdict(
-                        self._attendance_operation(
-                            "attendance_prepare_start",
-                            "출결 자료를 준비하지 못했어요.",
-                            lambda: engine.ensure_attendance(
-                                self._config_dir, deps=att_deps
-                            ),
-                        )
+    def _launch_attendance_prepare(self):
+        """Caller holds the prepare lock; resume never re-saves wizard inputs."""
+        att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
+            run_command=self._attendance_remote_run()
+        )
+
+        def _prepare():
+            # 예외로 조용히 죽으면 화면은 running=False + 사유 0글자만 본다.
+            # 성공이든 실패든 결과를 남겨 attendance_prepare_status가 보여준다.
+            try:
+                status = asdict(
+                    self._attendance_operation(
+                        "attendance_prepare_start",
+                        "출결 자료를 준비하지 못했어요.",
+                        lambda: engine.ensure_attendance(
+                            self._config_dir, deps=att_deps
+                        ),
                     )
-                    # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
-                    if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
-                        engine.save_attendance_status_cache(self._config_dir, status)
-                except Exception as error:  # noqa: BLE001 - 사람이 읽을 문장으로 바꾼다
-                    if isinstance(
-                        error,
-                        (recovery.UserActionRequired, recovery.FinalOperationFailure),
-                    ):
-                        self._attendance_prepare_issue = error
-                        return
-                    failed_service, detail = engine.friendly_attendance_error(error)
-                    status = asdict(engine.AttendanceStatus(
-                        state="failed", failed_service=failed_service,
-                        detail=detail[:engine.ATTENDANCE_DETAIL_LIMIT],
-                    ))
-                self._attendance_prepare_result = status
+                )
+                # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
+                if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
+                    engine.save_attendance_status_cache(self._config_dir, status)
+            except Exception as error:  # noqa: BLE001 - 사람이 읽을 문장으로 바꾼다
+                if isinstance(
+                    error,
+                    (recovery.UserActionRequired, recovery.FinalOperationFailure),
+                ):
+                    self._attendance_prepare_issue = error
+                    return
+                failed_service, detail = engine.friendly_attendance_error(error)
+                status = asdict(engine.AttendanceStatus(
+                    state="failed", failed_service=failed_service,
+                    detail=detail[:engine.ATTENDANCE_DETAIL_LIMIT],
+                ))
+            self._attendance_prepare_result = status
 
-            self._attendance_prepare_result = None
-            self._attendance_prepare_issue = None
-            thread = threading.Thread(
-                target=_prepare, name="attendance-prepare", daemon=True
-            )
-            self._attendance_prepare_thread = thread
-            thread.start()
-            return {"started": True, "reason": ""}
+        self._attendance_prepare_result = None
+        self._attendance_prepare_issue = None
+        thread = threading.Thread(
+            target=_prepare, name="attendance-prepare", daemon=True
+        )
+        self._attendance_prepare_thread = thread
+        thread.start()
+        return {"started": True, "reason": ""}
+
+    @guarded
+    def open_attendance_chat(self):
+        """Open Chat with the verified school account that owns this setup."""
+        from urllib.parse import urlencode
+
+        self._require_safe_gws_account_storage()
+        run = self._attendance_remote_run()
+        gws = engine.resolve_gws(run)
+        account = engine.require_goedu_gws_session(run, gws)
+        saved = engine._read_setup_status(self._config_dir)
+        owner = str(saved.get("account") or "").strip()
+        if owner and owner.casefold() != account.casefold():
+            raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+        return self._open_external_url(
+            "https://chat.google.com/?" + urlencode({"authuser": account})
+        )
+
+    @guarded
+    def open_attendance_script_settings(self):
+        """Open the app's verified account, never the browser's default account."""
+        from urllib.parse import urlencode
+
+        self._require_safe_gws_account_storage()
+        run = self._attendance_remote_run()
+        gws = engine.resolve_gws(run)
+        account = engine.require_goedu_gws_session(run, gws)
+        saved = engine._read_setup_status(self._config_dir)
+        owner = str(saved.get("account") or "").strip()
+        if owner and owner.casefold() != account.casefold():
+            raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+        return self._open_external_url(
+            "https://script.google.com/home/usersettings?" + urlencode({"authuser": account})
+        )
+
+    @guarded
+    def attendance_prepare_resume(self):
+        """Resume saved setup without overwriting the user's wizard settings."""
+        self._require_safe_gws_account_storage()
+        with self._attendance_prepare_lock:
+            thread = self._attendance_prepare_thread
+            if thread is not None and thread.is_alive():
+                return {"started": True, "reason": "이미 준비하는 중이에요"}
+            return self._launch_attendance_prepare()
 
     @guarded
     def attendance_prepare_status(self):
@@ -2127,12 +2200,12 @@ class Api:
         def guard():
             if not expected:
                 return False
-            try:
-                current = engine.require_goedu_gws_session(run, gws)
-            except Exception:  # noqa: BLE001 - 인증 원문은 호출자에게 내보내지 않는다.
-                return False
+            auth = engine.gws_auth_status(run, gws, config_dir=self._config_dir)
+            if auth.get("authorization_state") == "check_failed":
+                raise ScreenSafeError(engine.GOOGLE_PERMISSION_CHECK_MESSAGE)
             return (
-                current.casefold() == expected
+                str(auth.get("user", "")).casefold() == expected
+                and auth.get("authorization_state") == "ready"
                 and engine.has_current_gws_scope_grant(
                     self._config_dir, expected_account
                 )
@@ -2553,6 +2626,12 @@ class Api:
         return engine.computer_readiness(self._run())
 
     @guarded
+    def network_status(self):
+        """배경 이름 확인(예열)의 상태. 화면은 첫 확인이 느릴 때 기다려 달라고 알린다."""
+
+        return dns_warm.shared_status()
+
+    @guarded
     def google_status(self):
         base, config_dir, _bundled, selection = self._oauth_context()
         credential_override = bool(
@@ -2582,7 +2661,7 @@ class Api:
             gws = ""
             runtime_error = error.code
         auth = (
-            engine.gws_auth_status(run, gws)
+            engine.gws_auth_status(run, gws, config_dir=self._config_dir)
             if gws
             else {
                 "logged_in": False,
@@ -2604,6 +2683,7 @@ class Api:
             "logged_in": bool(auth["logged_in"]),
             "account_allowed": bool(auth.get("account_allowed")),
             "user": auth["user"],
+            **{key: auth.get(key, "") for key in ("authorization_state", "authorization_reason", "authorization_detail")},
         }
 
     @guarded
@@ -2682,6 +2762,14 @@ class Api:
     def list_tasklists(self):
         run, gws = self._resolve_gws_or_fail()
         return engine.list_tasklists(run, gws)
+
+    @guarded
+    def google_target_statuses(self, targets):
+        if not isinstance(targets, dict):
+            raise ValueError("저장된 연결 정보를 확인해 주세요")
+        run, gws = self._resolve_gws_or_fail()
+        auth = engine.gws_auth_status(run, gws, config_dir=self._config_dir)
+        return engine.google_target_statuses(run, gws, targets, auth=auth)
 
     @guarded
     def verify_google_target_candidate(self, kind, candidate_id, name, account):
@@ -2994,8 +3082,16 @@ class Api:
         if snapshot.get("ok") is True:
             run, gws = self._resolve_gws_or_fail()
             auth = engine.gws_auth_status(run, gws)
-            if auth.get("logged_in") and auth.get("account_allowed"):
+            if auth.get("logged_in") and auth.get("account_allowed") and auth.get("scope_state") == "verified":
                 engine.record_gws_scope_grant(self._config_dir, auth.get("user", ""))
+            elif auth.get("logged_in") and auth.get("account_allowed"):
+                snapshot = {**snapshot, "ok": False, "error_code": (
+                    "GWS_CONSENT_INCOMPLETE" if auth.get("scope_state") == "missing" else "GWS_CONSENT_CHECK_FAILED"
+                )}
+            elif auth.get("login_state") == "error":
+                snapshot = {**snapshot, "ok": False, "error_code": "GWS_CONSENT_CHECK_FAILED"}
+            elif not auth.get("logged_in"):
+                snapshot = {**snapshot, "ok": False, "error_code": "GWS_LOGIN_REVOKED"}
         return engine.annotate_login_snapshot(snapshot)
 
     @guarded
@@ -3224,7 +3320,7 @@ class Api:
                 error_chain=" > ".join(
                     type(item).__name__ for item in _journal_error_chain(error)
                 ),
-                detail=_journal_error_detail(error),
+                detail=_with_network_note(_journal_error_detail(error)),
             )
             if not report["reportId"]:
                 return False
@@ -3402,7 +3498,8 @@ class Api:
                     else getattr(value, "detail", "")
                 )
                 raise recovery.RetryableOperationError(
-                    "ATTENDANCE_OPERATION",
+                    (value.get("failure_code", "") if isinstance(value, dict)
+                     else getattr(value, "failure_code", "")) or "ATTENDANCE_OPERATION",
                     str(detail or "Google 출결 자료를 다시 확인하고 있어요."),
                 )
             return value

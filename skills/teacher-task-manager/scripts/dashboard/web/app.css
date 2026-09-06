@@ -440,6 +440,10 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .svc-subrow.chat-space-existing { display:grid; grid-template-columns:minmax(0,1fr) auto;
   column-gap:10px; row-gap:6px; }
 .chat-space-controls { grid-column:2; margin-top:0; }
+.chat-space-reload-status { display:inline-flex; align-items:center; gap:8px; flex:none; }
+.svc-subrow [data-action="class-space-reload"] { display:inline-flex; align-items:center; gap:5px;
+  padding:7px 9px; font-size:13px; flex:none; }
+.chat-space-status { color:var(--tm-blue); font-size:12.5px; font-weight:700; white-space:nowrap; flex:none; }
 .chat-new-space-guide { grid-column:2; margin-top:0; margin-left:auto; }
 .chat-new-space-guide small { color:var(--tm-faint); font-size:12px; line-height:1.45;
   text-align:right; }
@@ -467,13 +471,21 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .ready-hero b { display:block; margin-bottom:2px; font-size:14px; }
 .ready-hero span:last-child { color:var(--tm-sub); font-size:12.5px; }
 .attendance-action { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
-/* 마법사 7단계 "마지막 한 번" 카드 — 서비스 칸(.svc-group)과 같은 테두리 톤, 상태는 글자 색만 */
-.first-setup-card { margin-top:14px; padding:15px 17px; border:1px solid var(--tm-line); border-radius:15px; background:#fff; }
+/* First setup and student preparation share their parent service's border. */
+.first-setup-subrow,.student-chat-guide { display:block; }
+.student-chat-guide details { width:100%; min-width:0; }
+.student-chat-guide summary { cursor:pointer; font-size:13px; font-weight:700; color:var(--tm-ink); }
+.student-chat-guide p,.student-chat-guide li { color:var(--tm-sub); font-size:12.5px; line-height:1.7; word-break:keep-all; overflow-wrap:anywhere; }
+.student-chat-guide p { margin:8px 0; }
+.student-chat-guide ol { margin:10px 0; padding-left:20px; }
+.student-chat-guide li+li { margin-top:7px; }
+.student-chat-guide li b { color:var(--tm-ink); }
+.student-chat-guide .action-line { justify-content:flex-end; }
 .first-setup-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-.first-setup-head b { font-size:14px; color:var(--tm-ink); }
-.first-setup-card .svc-status { width:auto; }
-.first-setup-card p { margin:8px 0 12px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
-.first-setup-acts { display:flex; justify-content:flex-end; gap:8px; }
+.first-setup-head b { font-size:13px; color:var(--tm-ink); }
+.first-setup-subrow .svc-status { width:auto; }
+.first-setup-subrow p { margin:8px 0 0; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
+.first-setup-subrow .first-setup-menu { color:var(--tm-blue); font-weight:700; }
 .attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }
 .attendance-script-update span { flex:1 1 auto; min-width:0; }
 .attendance-script-update button { flex:0 0 auto; }

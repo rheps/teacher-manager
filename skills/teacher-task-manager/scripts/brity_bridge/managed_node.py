@@ -25,9 +25,9 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
-from . import component_lock, deadline_io, process_win, tool_runtime
+from . import component_lock, deadline_io, process_win, tool_runtime, tls
 from .tool_manifest import ManagedNodeSpec
 
 
@@ -558,7 +558,7 @@ def prepare_managed_node(
     *,
     manifest: ManagedNodeSpec | None = None,
     local_app_data: str | Path | None = None,
-    opener: Callable = urlopen,
+    opener: Callable = tls.open_https,
     timeout_seconds: float = 60.0,
     run_command: Callable = process_win.run_captured,
 ) -> NodePreparationResult:

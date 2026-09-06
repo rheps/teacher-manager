@@ -96,7 +96,18 @@ def _background_setup(app_info, ensure_helper, ensure_shortcut) -> None:
         pass
 
 
+def _start_dns_warming() -> None:
+    # 이름 확인이 느린 컴퓨터를 위해 필요한 이름을 배경에서 미리 찾아 둔다(2026-09-05).
+    try:
+        from brity_bridge import dns_warm, tools_cli
+
+        dns_warm.start_shared(extra_hosts=dns_warm.hosts_from_urls(tools_cli.bundled_central_chat_sender_url()))
+    except Exception:  # noqa: BLE001 - 예열 실패가 화면 실행을 막으면 안 된다
+        pass
+
+
 def _run_background(config_dir) -> None:
+    _start_dns_warming()
     try:
         from brity_bridge import paths
         from dashboard import engine

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -15,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
-from . import paths, recovery
+from . import paths, recovery, tls
 
 ENDPOINT_PATH = "/v1/error-reports"
 QUEUE_NAME = "error-reports.jsonl"
@@ -204,7 +203,7 @@ def sender_base_url(environ: Mapping[str, str], release_path: Path | None) -> st
     return str(data.get("centralChatSenderUrl", "") or "").strip()
 
 
-def default_poster(url: str, body: bytes, timeout: float = 5.0) -> int:
+def default_poster(url: str, body: bytes, timeout: float = 15.0) -> int:
     request = urllib.request.Request(
         url,
         data=body,
@@ -214,7 +213,7 @@ def default_poster(url: str, body: bytes, timeout: float = 5.0) -> int:
             "User-Agent": "TeacherManager",
         },
     )
-    context = ssl.create_default_context()
+    context = tls.https_context()
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             return int(response.status)

@@ -20,6 +20,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 import urllib.error
 from urllib.parse import unquote, urlsplit
@@ -807,6 +808,8 @@ class AttendanceStatus:
     workbook_name: str = ""  # 화면에 보여줄 출석부 이름 — 없으면 옛 고정 이름
     year_mismatch: bool = False  # 프로필 학년도와 기록 학년도가 다르면 새 출석부 단추가 풀린다
     canonical_workbook_name: str = ""  # 연결 선택·새 학년도 확인창에 보여줄 정식 이름
+    progress: dict = field(default_factory=dict)
+    failure_code: str = ""
 
 
 ATTENDANCE_ERROR_MESSAGES = {
@@ -908,6 +911,8 @@ def friendly_attendance_error(error) -> tuple[str, str]:
     """설치 실패를 (실패한 서비스, 화면에 보여줄 쉬운 문장)으로 바꾼다."""
     if isinstance(error, install_attendance_automation.ExistingAttendanceSheetError):
         return "sheet", _existing_attendance_guidance(error)
+    if isinstance(error, install_attendance_automation.BoundScriptRecoveryRequired):
+        return "setup", install_attendance_automation.BOUND_SCRIPT_RECOVERY_MESSAGE
     service = "setup"
     cmd = getattr(error, "cmd", None) or []
     tokens = [str(part) for part in cmd]
@@ -943,6 +948,60 @@ def _read_json_dict(path: Path) -> dict | None:
 
 def _read_setup_status(config_dir: Path) -> dict:
     return _read_json_dict(paths.attendance_setup_status_path(Path(config_dir))) or {}
+
+
+def _safe_setup_failure(error) -> dict:
+    """Keep the first failure's operation and HTTP code, never raw output or arguments."""
+    current = error
+    for _ in range(5):
+        if getattr(current, "cmd", None) or not getattr(current, "__cause__", None):
+            break
+        current = current.__cause__
+    args = list(getattr(current, "cmd", None) or [])
+    parts = [str(part) for part in args[1:4]]
+    operation = ".".join(parts) if (
+        len(parts) == 3 and parts[0] in {"drive", "sheets", "docs", "tasks", "script"}
+        and parts[1] in {"files", "spreadsheets", "documents", "tasklists", "projects", "scripts"}
+        and parts[2] in {"create", "get", "getContent", "list", "insert", "update", "batchUpdate", "values", "versions", "deployments", "run"}
+    ) else "unknown"
+    status = install_attendance_automation.google_error_status(current)
+    evidence = (str(getattr(current, "output", "") or "") + " " + str(current)).lower()
+    category = "unknown"
+    for name, markers in (
+        ("script-api-disabled", _APPS_SCRIPT_API_DISABLED_MARKERS),
+        ("dns", ("dns error", "failed to resolve", "name resolution", "getaddrinfo")),
+        ("tls", ("certificate verify", "certificate_verify", "unknown issuer")),
+        ("timeout", ("timed out", "timeout", "너무 오래 걸려")),
+    ):
+        if any(marker in evidence for marker in markers):
+            category = name
+            break
+    if category == "unknown" and status in {401, 403}:
+        category = "permission"
+    return {"error_type": type(current).__name__, "operation": operation,
+            "http_status": status, "category": category}
+
+
+def _pending_bound_script(setup: dict) -> bool:
+    progress = setup.get("progress") or {}
+    return isinstance(progress, dict) and bool(
+        progress.get("pending_script_project_title") and not progress.get("script_id")
+        and not progress.get("pending_script_recovery_id")
+    )
+
+
+def _bound_script_recovery_status(setup: dict, current_user: str) -> AttendanceStatus:
+    progress = dict(setup.get("progress") or {})
+    sheet_id = str(progress.get("spreadsheet_id", ""))
+    sheet_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+        if re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id) else ""
+    )
+    return AttendanceStatus(
+        state="script-recovery-required", account=current_user, current_user=current_user,
+        spreadsheet_url=sheet_url, progress=progress, failed_service="setup",
+        detail=install_attendance_automation.BOUND_SCRIPT_RECOVERY_MESSAGE,
+    )
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -1228,6 +1287,8 @@ def read_attendance_status(
     profile_error = _attendance_profile_error(config_dir)
     if profile_error:
         return AttendanceStatus(state="profile-required", current_user=current_user, detail=profile_error)
+    if _pending_bound_script(setup_status):
+        return _bound_script_recovery_status(setup_status, current_user)
     if setup_status.get("state") == "connection-choice-required":
         if account and current_user and account != current_user:
             return AttendanceStatus(
@@ -1259,10 +1320,15 @@ def read_attendance_status(
             ),
         )
     if setup_status.get("state") == "failed":
+        failure = setup_status.get("last_failure") or setup_status.get("first_failure") or {}
+        permission_required = isinstance(failure, dict) and failure.get("category") == "script-api-disabled"
         return AttendanceStatus(
-            state="failed", account=account, current_user=current_user,
+            state="script-permission-required" if permission_required else "failed",
+            account=account, current_user=current_user,
             failed_service=str(setup_status.get("failed_service", "") or ""),
             detail=str(setup_status.get("detail", "") or ""),
+            progress=dict(setup_status.get("progress") or {}),
+            failure_code="ATTENDANCE_SCRIPT_API_DISABLED" if permission_required else "",
         )
     return AttendanceStatus(state="not-ready", current_user=current_user, detail=ATTENDANCE_NOT_READY_MESSAGE)
 
@@ -1657,6 +1723,53 @@ GOOGLE_LOGIN_SCOPE_LIST = (
 GWS_LOGIN_SCOPES = ",".join(GOOGLE_LOGIN_SCOPE_LIST)
 REQUIRED_ATTENDANCE_SCOPES = frozenset(GOOGLE_LOGIN_SCOPE_LIST)
 GWS_SCOPE_GRANT_FILE = "google-scope-grant.generated.json"
+GOOGLE_REAUTHORIZE_MESSAGE = (
+    "Google 권한을 다시 승인해야 해요. ‘다시 로그인하고 승인’을 눌러 주세요. "
+    "기존 출석부와 설정은 그대로입니다."
+)
+GOOGLE_PERMISSION_CHECK_MESSAGE = (
+    "Google 로그인과 권한을 지금 확인하지 못했어요. 연결을 확인한 뒤 다시 점검해 주세요."
+)
+
+
+@lru_cache(maxsize=1)
+def gws_machine_identity() -> str:
+    """Compare computers without persisting a machine identifier in clear text."""
+    identity = platform.node()
+    if os.name == "nt":
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                            0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            identity = str(winreg.QueryValueEx(key, "MachineGuid")[0])
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def gws_app_build_identity() -> str:
+    """A rebuilt installer with the same displayed version also needs consent."""
+    if getattr(sys, "frozen", False):
+        digest = hashlib.sha256()
+        with open(bundle_paths.dashboard_executable(), "rb") as source:
+            digest.update(hashlib.file_digest(source, "sha256").digest())
+        # PyInstaller keeps the screen files beside the executable's archive.
+        web = bundle_paths.bundle_root() / "dashboard" / "web"
+        for name in ("index.html", "app.js", "app.css"):
+            path = web / name
+            if path.is_file():
+                digest.update(name.encode("utf-8"))
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+    return "source"
+
+
+def _gws_grant_context() -> dict:
+    return {
+        "app_version": version.APP_VERSION,
+        "app_build": gws_app_build_identity(),
+        "machine_sha256": gws_machine_identity(),
+        "attendance_bundle_sha256": current_attendance_script_bundle_sha256(),
+    }
 
 
 def gws_scope_grant_sha256(scopes: str = GWS_LOGIN_SCOPES) -> str:
@@ -1664,11 +1777,13 @@ def gws_scope_grant_sha256(scopes: str = GWS_LOGIN_SCOPES) -> str:
 
 
 def record_gws_scope_grant(config_dir: Path, account: str) -> Path:
+    """Record consent only after the caller verifies Google's actual scopes."""
     path = Path(config_dir) / GWS_SCOPE_GRANT_FILE
     _atomic_write_json(path, {
-        "schema_version": 1,
+        "schema_version": 2,
         "account": str(account or "").strip().casefold(),
         "scope_sha256": gws_scope_grant_sha256(GWS_LOGIN_SCOPES),
+        **_gws_grant_context(),
     })
     return path
 
@@ -1678,10 +1793,45 @@ def has_current_gws_scope_grant(config_dir: Path, account: str) -> bool:
     if not saved:
         return False
     return (
-        saved.get("schema_version") == 1
+        saved.get("schema_version") == 2
         and saved.get("account") == str(account or "").strip().casefold()
         and saved.get("scope_sha256") == gws_scope_grant_sha256(GWS_LOGIN_SCOPES)
+        and all(saved.get(key) == value for key, value in _gws_grant_context().items())
     )
+
+
+def _gws_authorization_status(auth: dict, config_dir: Path) -> dict:
+    state, reason, detail = "login_required", "", "Google 로그인이 필요해요."
+    if auth.get("login_state") == "error":
+        state, detail = "check_failed", GOOGLE_PERMISSION_CHECK_MESSAGE
+    elif auth.get("logged_in") and not auth.get("account_allowed"):
+        state, detail = "account_required", google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
+    elif auth.get("logged_in") and auth.get("account_allowed"):
+        saved = _read_json_dict(Path(config_dir) / GWS_SCOPE_GRANT_FILE) or {}
+        context = _gws_grant_context()
+        if saved.get("schema_version") != 2:
+            reason = "approval_missing"
+        elif saved.get("account") != str(auth.get("user", "")).strip().casefold():
+            reason = "account_changed"
+        elif saved.get("machine_sha256") != context["machine_sha256"]:
+            reason = "computer_changed"
+        elif any(saved.get(key) != context[key] for key in ("app_version", "app_build", "attendance_bundle_sha256")):
+            reason = "app_updated"
+        elif saved.get("scope_sha256") != gws_scope_grant_sha256(GWS_LOGIN_SCOPES):
+            reason = "permissions_changed"
+        elif auth.get("scope_state") == "missing":
+            reason = "permissions_missing"
+        if reason:
+            state, detail = "reauth_required", GOOGLE_REAUTHORIZE_MESSAGE
+            if reason == "app_updated":
+                detail = "업데이트 후 Google 권한을 다시 승인해야 해요. " + GOOGLE_REAUTHORIZE_MESSAGE.split(". ", 1)[1]
+            elif reason == "computer_changed":
+                detail = "이 컴퓨터에서 Google 권한을 다시 승인해야 해요. " + GOOGLE_REAUTHORIZE_MESSAGE.split(". ", 1)[1]
+        elif auth.get("scope_state") != "verified":
+            state, detail = "check_failed", GOOGLE_PERMISSION_CHECK_MESSAGE
+        else:
+            state, detail = "ready", "로그인과 필요한 Google 권한을 확인했어요."
+    return {"authorization_state": state, "authorization_reason": reason, "authorization_detail": detail}
 
 
 def check_version(run_command, executable: str) -> str:
@@ -2071,24 +2221,24 @@ def apply_gws_update(
     }
 
 
-def gws_auth_status(run_command, gws: str) -> dict:
+def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) -> dict:
     raw = run_command([gws, "auth", "status"])
     if isinstance(raw, tuple) and len(raw) == 2:
         code, output = raw
     else:
         code, output = 0, raw
-    email = google_account.extract_email(output)
-    logged_in = code == 0 and bool(email)
-    account_allowed = logged_in and google_account.is_goedu_email(email)
     lowered = str(output or "").lower()
     status_document = None
-    if code == 0 and not logged_in:
+    if code == 0:
         try:
             parsed = process_win.parse_first_json(output)
         except (TypeError, ValueError):
             parsed = None
         if isinstance(parsed, dict):
             status_document = parsed
+    email = google_account.extract_email(output)
+    logged_in = code == 0 and bool(email) and (status_document or {}).get("token_valid") is not False
+    account_allowed = logged_in and google_account.is_goedu_email(email)
     credentials_absent = bool(
         status_document is not None
         and (
@@ -2123,13 +2273,25 @@ def gws_auth_status(run_command, gws: str) -> dict:
     else:
         login_state = "error"
         error_code = "GWS_AUTH_STATUS_FAILED"
-    return {
+    # auth login prints requested scopes; only auth status reads Google's tokeninfo.
+    scopes = (status_document or {}).get("scopes")
+    aliases = {"https://www.googleapis.com/auth/userinfo.email": "email",
+               "https://www.googleapis.com/auth/userinfo.profile": "profile"}
+    scope_state = "unavailable"
+    if (status_document or {}).get("token_valid") is True and isinstance(scopes, list) and all(isinstance(s, str) for s in scopes):
+        granted = {aliases.get(s, s) for s in scopes}
+        scope_state = "verified" if set(GOOGLE_LOGIN_SCOPE_LIST) <= granted else "missing"
+    auth = {
         "logged_in": logged_in,
         "account_allowed": account_allowed,
         "user": email if logged_in else "",
         "login_state": login_state,
         "error_code": error_code,
+        "scope_state": scope_state,
     }
+    if config_dir is not None:
+        auth.update(_gws_authorization_status(auth, config_dir))
+    return auth
 
 
 def require_goedu_gws_session(run_command, gws: str) -> str:
@@ -2308,6 +2470,13 @@ def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
     del environ
     if snap.get("ok") is not False:
         return snap
+    consent_guides = {
+        "GWS_CONSENT_INCOMPLETE": "필요한 Google 권한이 모두 승인되지 않았어요. 다시 로그인하고 요청한 권한을 모두 승인해 주세요.",
+        "GWS_CONSENT_CHECK_FAILED": GOOGLE_PERMISSION_CHECK_MESSAGE,
+        "GWS_LOGIN_REVOKED": "Google 로그인을 다시 해야 해요. 다시 로그인하고 권한을 승인해 주세요.",
+    }
+    if snap.get("error_code") in consent_guides:
+        return {**snap, "url": "", "detail": consent_guides[snap["error_code"]]}
     if snap.get("error_code") == external_url.NO_EXTERNAL_BROWSER:
         return {
             **snap,
@@ -2321,7 +2490,7 @@ def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
 # 배포 저장소(rheps/teacher-manager)의 최신 Release에 붙은 version.json을 본다.
 UPDATE_INFO_URL = "https://github.com/rheps/teacher-manager/releases/latest/download/version.json"
 _UPDATE_INFO_MAX_BYTES = 64 * 1024
-_UPDATE_INFO_DEADLINE_SECONDS = 5.0
+_UPDATE_INFO_DEADLINE_SECONDS = 25.0  # 느린 첫 이름 확인(약 11초)을 한 번 견딜 만큼
 _UPDATE_SETUP_MAX_BYTES = 256 * 1024 * 1024
 _UPDATE_SETUP_DEADLINE_SECONDS = 300.0
 _UPDATE_READ_SIZE = 256 * 1024
@@ -2352,11 +2521,11 @@ class _UpdateInfoUnsafeRedirect(ValueError):
 
 
 def _fetch_update_json() -> dict:
-    import urllib.request
+    from brity_bridge import tls
 
     deadline = time.monotonic() + _UPDATE_INFO_DEADLINE_SECONDS
     contents = bytearray()
-    with urllib.request.urlopen(UPDATE_INFO_URL, timeout=3) as response:
+    with tls.open_https(UPDATE_INFO_URL, timeout=20) as response:
         _require_https_response(response, UPDATE_INFO_URL)
         while True:
             if time.monotonic() >= deadline:
@@ -4489,6 +4658,74 @@ def list_tasklists(run_command, gws: str) -> list[dict]:
     return [{key: value for key, value in row.items() if key != "owned"} for row in rows]
 
 
+GOOGLE_SAVED_TARGET_KINDS = {
+    "업무캘린더ID": "calendar", "학사일정캘린더ID": "calendar",
+    "업무Tasks목록ID": "tasklist", "담임안내Tasks목록ID": "tasklist",
+}
+GOOGLE_TARGET_CHECK_FAILED = "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. [연결 다시 확인]을 눌러 주세요."
+
+
+def google_target_statuses(run_command, gws: str, targets: dict, *, auth: dict | None = None) -> dict:
+    """Verify saved target access with GETs only; never erase or recreate a target.
+
+    The caller may supply its just-read authoritative auth result to avoid a
+    second auth-status request in the home doctor. Missing CalendarList entries
+    do not alone prove a calendar is gone: unsubscribed calendars can still exist.
+    """
+    selected = {field: str(targets.get(field) or "").strip()
+                for field in GOOGLE_SAVED_TARGET_KINDS if targets.get(field)}
+    results = {field: {"id": target_id, "state": "check_failed", "detail": GOOGLE_TARGET_CHECK_FAILED}
+               for field, target_id in selected.items()}
+    if not selected:
+        return results
+    try:
+        auth = auth if auth is not None else gws_auth_status(run_command, gws)
+    except Exception:
+        return results
+    if not auth.get("account_allowed") or auth.get("authorization_state") != "ready":
+        return results
+
+    def read(service: str, resource: str, params: dict) -> tuple[int, dict]:
+        try:
+            code, output = run_command([
+                gws, service, resource, "get", "--params", _json.dumps(params), "--format", "json",
+            ])
+            data = process_win.parse_first_json(output)
+            if not isinstance(data, dict):
+                return 0, {}
+            error = data.get("error")
+            if isinstance(error, dict):
+                return int(error.get("code") or 0), {}
+            return (200, data) if code == 0 else (0, {})
+        except Exception:
+            return 0, {}
+
+    checked = {}
+    for field, target_id in selected.items():
+        kind = GOOGLE_SAVED_TARGET_KINDS[field]
+        if (kind, target_id) in checked:
+            results[field] = dict(checked[kind, target_id])
+            continue
+        if kind == "calendar":
+            code, data = read("calendar", "calendarList", {"calendarId": target_id})
+            # CalendarList is the subscription list, not the set of all calendars.
+            if code == 404:
+                code, _ = read("calendar", "calendars", {"calendarId": target_id})
+                data = {}  # Calendar metadata cannot establish write permission.
+            role = data.get("accessRole") if data.get("id") and (data["id"] == target_id or target_id == "primary") else None
+            state = "ready" if role in {"owner", "writer"} else "unavailable" if role in {"reader", "freeBusyReader", "none"} or code == 404 else "check_failed"
+            unavailable = "저장된 캘린더에 일정을 등록할 수 없어요. 접근 권한을 확인하거나 다른 캘린더를 골라 주세요."
+        else:
+            code, data = read("tasks", "tasklists", {"tasklist": target_id})
+            state = "ready" if code == 200 and data.get("id") and (data["id"] == target_id or target_id == "@default") else "unavailable" if code == 404 else "check_failed"
+            unavailable = "저장된 할 일 목록을 사용할 수 없어요. 접근 권한을 확인하거나 다른 목록을 골라 주세요."
+        # 401/403, quota, policy changes and network failures stay unverified;
+        # only authoritative missing/read-only results declare unavailability.
+        results[field].update(state=state, detail="연결됨" if state == "ready" else unavailable if state == "unavailable" else GOOGLE_TARGET_CHECK_FAILED)
+        checked[kind, target_id] = results[field]
+    return results
+
+
 def ensure_calendar(run_command, gws: str, name: str) -> str:
     for item in list_calendars(run_command, gws):
         if item["name"] == name:
@@ -5246,10 +5483,33 @@ def ensure_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> A
     preflight = read_attendance_status(
         config_dir, deps.run_command, gws_executable=gws
     )
+    if preflight.state == "script-recovery-required":
+        # A lost script ID must not leave the already-created workbook in the
+        # obsolete layout. This repair uses Sheets only and preserves records.
+        with attendance_setup_lock(config_dir):
+            setup = _read_setup_status(config_dir)
+            progress = dict(setup.get("progress") or {})
+            try:
+                account = require_goedu_gws_session(deps.run_command, gws)
+                if not setup.get("account") or str(setup["account"]).casefold() != account.casefold():
+                    raise ValueError(ATTENDANCE_ACCOUNT_MESSAGE)
+                layout = install_attendance_automation.attendance_sheet_layout
+                if progress.get("workbook_layout_ready") != layout.LAYOUT_VERSION:
+                    layout.ensure_layout(deps.attendance_runner, config_dir, progress["spreadsheet_id"], gws)
+                    progress["workbook_layout_ready"] = layout.LAYOUT_VERSION
+                    setup = {**setup, "progress": progress}
+                    _write_setup_status(config_dir, setup)
+                return _bound_script_recovery_status(setup, account)
+            except Exception as error:
+                return AttendanceStatus(
+                    state="failed", current_user=preflight.current_user, progress=progress,
+                    failed_service="sheet", detail=friendly_attendance_error(error)[1],
+                )
     if preflight.state in (
         "gws-required", "login-required", "account-required", "auth-error",
         "profile-required", "ready", "script-check-required", "script-update-required",
         "connection-repair-required", "ai-action-required",
+        "script-recovery-required",
     ):
         return preflight
     with attendance_setup_lock(config_dir):
@@ -5269,6 +5529,7 @@ def _ensure_attendance_once(
         "gws-required", "login-required", "account-required", "auth-error",
         "profile-required", "ready", "script-check-required", "script-update-required",
         "connection-repair-required", "ai-action-required",
+        "script-recovery-required",
     ):
         return status
     if paths.attendance_install_record_path(config_dir).exists():
@@ -5294,12 +5555,14 @@ def _ensure_attendance_once(
         )
 
     saved_progress = dict(progress or {})
+    first_failure = setup_status.get("first_failure")
 
     def record_progress(ids: dict) -> None:
         saved_progress.clear()
         saved_progress.update(ids)
         _write_setup_status(config_dir, {
             "state": "installing", "account": current_user, "progress": dict(ids),
+            **({"first_failure": first_failure} if first_failure else {}),
         })
 
     # 미제출 할 일은 별도 목록을 만들지 않고 조종례 목록으로 통합한다.
@@ -5317,6 +5580,9 @@ def _ensure_attendance_once(
             gws_executable=gws,
         )
     except Exception as error:  # noqa: BLE001 - 설치 실패는 쉬운 문장으로 바꿔 화면에 보여준다
+        last_failure = _safe_setup_failure(error)
+        if not first_failure:
+            first_failure = last_failure
         failed_service, message = friendly_attendance_error(error)
         # 쓰던 시트를 찾았을 때의 안내는 시트 주소와 비어 있는 값 이름까지 담기므로
         # 200자에서 자르면 정작 필요한 뒷부분이 잘려 나간다.
@@ -5356,10 +5622,20 @@ def _ensure_attendance_once(
         _write_setup_status(config_dir, {
             "state": "failed", "account": current_user, "failed_service": failed_service,
             "detail": detail, "progress": saved_progress,
+            "first_failure": first_failure,
+            "last_failure": last_failure,
         })
+        if _pending_bound_script({"progress": saved_progress}):
+            return _bound_script_recovery_status({"progress": saved_progress}, current_user)
+        permission_required = last_failure.get("category") == "script-api-disabled"
         return AttendanceStatus(
-            state="failed", account=current_user, current_user=current_user,
+            state="script-permission-required" if permission_required else "failed",
+            account=current_user, current_user=current_user,
             failed_service=failed_service, detail=detail,
+            progress=saved_progress,
+            failure_code="ATTENDANCE_SCRIPT_API_DISABLED" if permission_required else (
+                "ATTENDANCE_SETUP_" + str(last_failure.get("operation", "unknown"))
+                + "_HTTP_" + str(last_failure.get("http_status", 0))),
         )
     if isinstance(result, install_attendance_automation.AttendanceInstallResult):
         result = replace(result, setup_account=current_user.strip().lower())
