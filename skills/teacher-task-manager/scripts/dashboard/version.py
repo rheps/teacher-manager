@@ -91,7 +91,9 @@
 #       출석부 설정 탭 연결값이 비면 다시 읽지 않고 할 일 세 가지만 안내
 # v4.1: Resume explicitly rejected Google setup writes after permission repair,
 # opening the verified school account and preserving completed attendance resources.
-APP_VERSION = "4.1"
+# v4.2: Match action button heights, clarify setup sections and roster readiness,
+# and name the class-space creation action consistently.
+APP_VERSION = "4.2"
 
 BRANDING = {
     "name": "Teacher Manager",

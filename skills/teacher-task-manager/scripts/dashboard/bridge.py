@@ -110,6 +110,7 @@ _SCREEN_FAILURES = {
     "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
     "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
     "open_attendance_chat": "Google Chat을 열지 못했어요.",
+    "open_attendance_roster": "학생명단 시트를 열지 못했어요.",
     "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요.",
     "google_status": "Google 연결 상태를 확인하지 못했어요.",
     "list_calendars": "캘린더 목록을 가져오지 못했어요.",
@@ -2046,6 +2047,28 @@ class Api:
             **self._network_recovery_options(),
         )
 
+    @guarded
+    def attendance_roster_status(self):
+        """Read only roster completeness; student identities never reach the UI."""
+        self._require_safe_gws_account_storage()
+        run = self._attendance_remote_run()
+        if self._attendance_gws_cache is None:
+            self._attendance_gws_cache = str(engine.resolve_gws(run))
+        return engine.read_attendance_roster_status(self._config_dir, run, self._attendance_gws_cache)
+
+    @guarded
+    def open_attendance_roster(self):
+        """Resolve the canonical workbook's configured roster tab at click time."""
+        self._require_safe_gws_account_storage()
+        run = self._attendance_remote_run()
+        if self._attendance_gws_cache is None:
+            self._attendance_gws_cache = str(engine.resolve_gws(run))
+        try:
+            url = engine.attendance_roster_url(self._config_dir, run, self._attendance_gws_cache)
+        except ValueError as error:
+            raise ScreenSafeError(str(error)) from error
+        return self._open_external_url(url)
+
     def _attendance_script_update(
         self,
         *,
@@ -3509,7 +3532,9 @@ class Api:
             title,
             once,
             delays=recovery.NETWORK_DELAYS,
-            change_status="기존 출결 자료와 현재 연결은 그대로입니다.",
+            change_status=("저장 상태를 다시 확인해 주세요. 기존 출결 기록은 그대로입니다."
+                           if operation == "attendance_chat_set_space"
+                           else "기존 출결 자료와 현재 연결은 그대로입니다."),
             app_version=version.APP_VERSION,
             **self._network_recovery_options(),
         )

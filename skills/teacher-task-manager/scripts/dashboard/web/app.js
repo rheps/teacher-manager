@@ -189,6 +189,7 @@ const DIRECT_ISSUE_ACTIONS = {
 const GOOGLE_TARGET_ID_FIELDS = [
   "업무캘린더ID", "학사일정캘린더ID", "업무Tasks목록ID", "담임안내Tasks목록ID",
 ];
+const LIVE_CONNECT_TARGETS = new Set([...GOOGLE_TARGET_ID_FIELDS, "gemini_api_key"]);
 function clearDraftGoogleTargetIds(fields = GOOGLE_TARGET_ID_FIELDS) {
   if (!S.draft?.profile) return;
   fields.forEach((field) => { S.draft.profile[field] = ""; });
@@ -275,7 +276,7 @@ function bannerHtml() {
       </div>`
     : "";
   const currentIssue = problemIssueOwner === screenKey() ? S.problemIssue : null;
-  return problemPanelHtml(currentIssue) + networkWaitNoticeHtml() + banner + fallback;
+  return (isClassSpaceIssue(currentIssue) ? "" : problemPanelHtml(currentIssue)) + networkWaitNoticeHtml() + banner + fallback;
 }
 function toastHtml() { return S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ""; }
 
@@ -317,7 +318,7 @@ function firstIssueMessage(rows) {
   return rows.length ? rows[0].message : "";
 }
 function fieldError(name) {
-  if (editingCard() === "connect" && GOOGLE_TARGET_ID_FIELDS.includes(name)) {
+  if (editingCard() === "connect" && LIVE_CONNECT_TARGETS.has(name)) {
     return connectIssues().find((row) => row.target === name)?.message || "";
   }
   const row = (S.fieldIssues || {})[name];
@@ -474,6 +475,7 @@ bindActions({
   "attendance-open": async () => {
     try {
       await call("open_current_attendance");
+      if (S.mode === "edit" && S.edit === "connect" && S.connectTab === "attendance") startChatConnectPoll(true);
     } catch (_error) {
       showToast("현재 출석부 연결을 먼저 바로잡아 주세요");
     }
@@ -662,6 +664,15 @@ function saveDraft() { return call("save_setup_state", currentState()); }
    넘어가는 모든 길이 이 판정 하나를 지난다 — 준비 스레드와 9단계 apply_all의 겹침을 막는
    유일한 방어라 느슨하게 만들면 안 된다. */
 function attendanceWizardGateOpen() {
+  const chat = S.chatStatus;
+  return Boolean(!S.classSpaceSaving && attendanceSheetSetupDone() && chat && chat.connected
+    && chat.class_space_id && S.chatStatusContext === chatReadContext() && attendanceRosterReady());
+}
+function attendanceRosterReady() {
+  return rosterContext === chatReadContext() && rosterStatus?.state === "ready"
+    && Number.isInteger(rosterStatus.count) && rosterStatus.count > 0;
+}
+function attendanceSheetSetupDone() {
   return Boolean(
     S.attendance
     && S.attendance.state === "ready"
@@ -692,6 +703,8 @@ async function refreshAttendanceWizardGate() {
     S.firstSetupDone = Boolean(
       first && first.done === true && completionCode && completionCode === currentCode
     );
+    await loadChatStatus(true);
+    await loadAttendanceRosterStatus(true);
   } catch (_error) {
     S.firstSetupDone = false;
     S.firstSetupConnectionCode = "";
@@ -702,7 +715,12 @@ function attendanceWizardGateMessage() {
   const state = S.attendance ? S.attendance.state : "";
   if (state === "connection-repair-required") return "출결 탭에서 사용할 기존 출석부를 먼저 골라 주세요.";
   if (state === "installing") return "출결 준비가 끝나야 다음으로 갈 수 있어요";
-  if (state === "ready") return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
+  if (state === "ready") {
+    if (!attendanceSheetSetupDone()) return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
+    if (!S.chatStatus?.connected) return "Google Chat의 [연결하기]에서 권한 허용을 마쳐 주세요.";
+    if (!S.chatStatus?.class_space_id || S.chatStatusContext !== chatReadContext()) return "Google Chat에서 사용할 학급 단톡방을 만든 뒤, 이 화면의 목록에서 골라 주세요.";
+    return "학생명단의 [명단 입력하기]에서 번호·이름·이메일을 입력해 주세요. 이 화면으로 돌아오면 확인한 뒤 다음으로 갈 수 있어요.";
+  }
   if (state === "failed") return "출결 준비가 실패했어요. 출결 탭에서 [다시 시도]를 눌러 주세요.";
   return "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요.";
 }
@@ -1532,25 +1550,26 @@ function chatReadContext() {
     S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || S.attendance?.connection_code || "",
     S.attendance?.account || "", S.attendance?.connection_code || ""]);
 }
-function loadChatStatus(force) {
+function loadChatStatus(force, renderResult = true) {
   if (S.chatStatusContext !== chatReadContext()) S.chatStatus = null;
   if (!force && S.chatStatus != null) return;  // 결과가 없을 때(null)만 새로 묻는다
-  S.chatStatus = "loading";
+  if (S.chatStatus == null) S.chatStatus = "loading";
   const context = S.chatStatusContext = chatReadContext();
   const version = ++chatStatusReadVersion;
   const current = () => version === chatStatusReadVersion && context === chatReadContext();
   const request = beginIssueRequest(true);
-  call("attendance_chat_status")
+  return call("attendance_chat_status")
     .then((data) => {
       if (!current()) return;
       S.chatStatus = data;
-      render();
+      if (renderResult) render();
+      return data;
     })
     .catch((error) => {
       if (!current()) return;
-      S.chatStatus = { connected: false, registered: false, account: "", class_space_name: "", class_space_id: "", reason: "" };
+      S.chatStatus = { connected: false, read_failed: true, registered: false, account: "", class_space_name: "", class_space_id: "", reason: "" };
       if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
-      render();
+      if (renderResult) render();
     });
 }
 /* 연결하기 뒤 재확인 — 출결 탭에 있는 동안 3초 간격, 최대 10분 */
@@ -1561,24 +1580,31 @@ function stopChatConnectPoll() {
   chatPollGen += 1;
   if (chatPollTimer) { clearTimeout(chatPollTimer); chatPollTimer = null; }
 }
-function startChatConnectPoll() {
+function startChatConnectPoll(waitForClassSpace = false) {
   stopChatConnectPoll();
   const gen = chatPollGen;
+  const context = chatReadContext();
   chatPollUntil = Date.now() + 10 * 60 * 1000;
   const stillOnAttendanceTab = () => S.connectTab === "attendance" &&
     ((S.mode === "edit" && S.edit === "connect") ||
       (S.mode === "wizard" && WIZARD_CARD_BY_STEP[S.step] === "connect"));
   const tick = async () => {
     chatPollTimer = null;
-    if (gen !== chatPollGen || !stillOnAttendanceTab() || Date.now() > chatPollUntil) return;
+    if (gen !== chatPollGen || context !== chatReadContext() || !stillOnAttendanceTab() || Date.now() > chatPollUntil) return;
     const request = beginIssueRequest(true);
     try {
+      const version = ++chatStatusReadVersion;
       const data = await call("attendance_chat_status");
-      if (gen !== chatPollGen || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
+      if (gen !== chatPollGen || version !== chatStatusReadVersion || context !== chatReadContext() || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
       S.chatStatus = data;
-      if (data.connected) { showToast("Google Chat 연결이 끝났어요"); return; }
+      S.chatStatusContext = context;
+      if (data.connected && (!waitForClassSpace || data.class_space_id)) {
+        render();
+        showToast("Google Chat 연결이 끝났어요");
+        return;
+      }
     } catch (error) {
-      if (gen !== chatPollGen || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
+      if (gen !== chatPollGen || context !== chatReadContext() || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
       if (showProblemIssue(error, request)) {
         stopChatConnectPoll();
         return;
@@ -1613,40 +1639,51 @@ function startAttendancePreparePoll() {
       ((S.mode === "wizard" && WIZARD_CARD_BY_STEP[S.step] === "connect") ||
        (S.mode === "edit" && S.edit === "connect"));
     if (!onTab) { attendancePreparePollOn = false; return; }
+    let context = chatReadContext();
+    const current = () => {
+      const valid = gen === attendancePrepareGen && owner === screenKey() && context === chatReadContext();
+      if (!valid && gen === attendancePrepareGen) attendancePreparePollOn = false;
+      return valid;
+    };
     const issueRequest = beginIssueRequest(true);
     const before = JSON.stringify([
-      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.chatStatus,
     ]);
     let keepPolling = false;
     try {
       let a = S.attendance;
       if (!a || a.state !== "ready") {
         const data = await call("attendance_prepare_status");
-        if (gen !== attendancePrepareGen) return;
+        if (!current()) return;
         if (data && data.status && typeof data.status === "object") {
           S.attendance = data.status;
           a = data.status;
+          context = chatReadContext();
         }
         keepPolling = Boolean(data && data.running);
       }
       if (S.mode === "wizard" && a && a.state === "ready" && !attendanceWizardGateOpen()) {
         const first = await call("attendance_first_setup_status");
-        if (gen !== attendancePrepareGen) return;
+        if (!current()) return;
         const completionCode = firstSetupCodeFromValue(first && first.value);
         const currentCode = String(a.connection_code || "").trim().toUpperCase();
         S.firstSetupConnectionCode = completionCode;
         S.firstSetupDone = Boolean(
           first && first.done === true && completionCode && completionCode === currentCode
         );
-        if (S.firstSetupDone) {
-          S.chatStatus = null;  // 처음 설정이 발송까지 켠다 — Chat 줄을 연결됨으로 다시 읽는다
-          S.banner = null;      // "처음 설정이 끝나야…" 게이트 배너는 조건이 풀리면 걷는다 (검토 C2)
-        } else {
-          keepPolling = true;
+        // Account consent and room selection can finish after the Sheet menu has returned.
+        // Read them independently, including when only the Sheet checkpoint is present.
+        await loadChatStatus(true, false);
+        if (!current()) return;
+        if (hasCurrentFinalIssue(["attendance_chat_status"])) {
+          attendancePreparePollOn = false;
+          return;
         }
+        keepPolling = !attendanceWizardGateOpen();
+        if (!keepPolling) S.banner = null;
       }
     } catch (error) {
-      if (gen !== attendancePrepareGen) return;
+      if (!current()) return;
       // 문제 화면을 그리는 동안에는 일반 상태 읽기가 끼어들어 안내를 지우지
       // 않게 폴링 소유권을 유지하고, 그린 직후에만 폴링을 끝낸다.
       if (showProblemIssue(error, issueRequest)) {
@@ -1658,7 +1695,7 @@ function startAttendancePreparePoll() {
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
     if (JSON.stringify([
-      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode,
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.chatStatus,
     ]) !== before) render();
     if (!keepPolling) { attendancePreparePollOn = false; return; }
     attendancePrepareTimer = setTimeout(tick, 3000);
@@ -1673,13 +1710,33 @@ function defaultClassSpaceName() {
   const room = pick("담임학년") && pick("담임반") ? `${pick("담임학년")}-${pick("담임반")}` : "";
   return [pick("학교명"), room].filter(Boolean).join(" ");
 }
+function isClassSpaceIssue(issue) {
+  return issue && ["attendance_chat_create_space", "attendance_chat_set_space", "attendance_chat_spaces"].includes(issue.operation)
+    && (issue.actions || []).every(action => action.key === "chat-space-list");
+}
 function classSpaceSubrowHtml(a) {
-  const cs = S.chatStatus;
-  if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return "";
   if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
-  if (hasCurrentAttendanceFinalIssue([
-    "attendance_chat_create_space", "attendance_chat_set_space", "attendance_chat_spaces",
-  ])) return "";
+  const content = classSpaceContentHtml(a);
+  const cs = S.chatStatus;
+  const canRead = a.state === "ready" && cs && cs !== "loading" && cs.connected;
+  const reading = canRead && S.chatSpaces === null;
+  const connected = canRead && !S.chatSpacesError && Array.isArray(S.chatSpaces)
+    && cs.class_space_id && S.chatSpaces.some(row => row.name === cs.class_space_id);
+  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : S.chatSpacesError ? "확인 필요" : reading ? "확인 중…" : "방 선택 필요";
+  const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
+  return `<section class="svc-subrow class-space-section">
+    <div class="first-setup-head"><b>학급 단톡방</b></div>
+    ${studentChatGuideHtml()}${content}
+    <div class="class-space-actions action-line">
+      <button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} 단톡방(스페이스) 만들기</button>
+      <span class="chat-space-reload-status"><button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…"${!canRead || reading || S.classSpaceSaving ? " disabled" : ""}>${icon("refresh", "small")} 다시 불러오기</button>
+      <span class="chat-space-status ${reading || S.classSpaceSaving ? "muted" : connected ? "connected" : "warn"}">${label}</span></span>
+    </div>${localIssue}</section>`;
+}
+function classSpaceContentHtml(a) {
+  const cs = S.chatStatus;
+  if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>`;
+  if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
   if (S.chatSpacesContext !== chatReadContext()) {
     S.chatSpaces = undefined;
     S.chatSpaceName = undefined;
@@ -1713,19 +1770,17 @@ function classSpaceSubrowHtml(a) {
       }).finally(() => clearTimeout(timeout));
   }
   const current = S.chatSpaceName !== undefined ? S.chatSpaceName : (cs.class_space_name || "");
-  const reload = `<button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…">${icon("refresh", "small")} 다시 불러오기</button>`;
 
   // ㄷ. 학교가 막아 두었다 — 손으로 만드는 순서를 보여준다.
   if (S.spaceCreate === "blocked") {
     return `<div class="svc-subrow">
-      <span class="nameblock"><b>학급 단톡방</b><small>이 학교 계정으로는 프로그램이 방을 만들 수 없어요.
+      <span class="nameblock"><small>이 학교 계정으로는 프로그램이 방을 만들 수 없어요.
         Google Chat에서 직접 만들어 주세요.<br>
         1. Google Chat을 엽니다<br>
         2. [새 채팅] → [한 명 이상을 추가하세요]에 학생 이메일을 한꺼번에 붙여 넣습니다<br>
         3. 메시지를 한 번 보낸 뒤 위쪽 대화 이름 → [이 채팅을 스페이스로 전환]을 누릅니다<br>
         4. 방 이름을 "${esc(S.spaceDraftName || defaultClassSpaceName())}"처럼 짧게 정합니다<br>
         5. 이 화면으로 돌아오면 방 목록을 자동으로 다시 읽습니다</small></span>
-      <div class="class-space-actions action-line">${reload}</div>
     </div>`;
   }
 
@@ -1739,25 +1794,23 @@ function classSpaceSubrowHtml(a) {
 
   if (S.chatSpaces === null) {
     return `<div class="svc-subrow">
-      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오는 중이에요…</small></span></div>${madeNote}`;
+      <span class="nameblock"><small>방 목록을 가져오는 중이에요…</small></span></div>${madeNote}`;
   }
 
   // 목록을 못 읽었다 — "방이 없다"와 다르다. 못 읽은 것을 없는 것으로 보고 만들기를 권하면,
   // 이미 있는 방을 두고 같은 이름으로 또 만들려다 SPACE_NAME_TAKEN을 만난다.
   if (S.chatSpacesError) {
     return `<div class="svc-subrow">
-      <span class="nameblock"><b>학급 단톡방</b><small>방 목록을 가져오지 못했어요.
+      <span class="nameblock"><small>방 목록을 가져오지 못했어요.
         인터넷 연결을 확인한 뒤 다시 불러와 주세요</small></span>
-      <button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…">다시 불러오기</button>
     </div>`;
   }
 
   // 방은 Google Chat에서 만들고 학생을 초대한 뒤 이곳에서 선택한다.
   if (!S.chatSpaces.length) {
     return `<div class="svc-subrow">
-      <span class="nameblock"><b>학급 단톡방</b><small>아직 만든 방이 없어요.
-        위의 [Google Chat 열기]에서 방을 만든 뒤 돌아와 주세요.</small></span>
-      <div class="class-space-actions action-line">${reload}</div>
+      <span class="nameblock"><small>아직 만든 방이 없어요.
+        아래 [단톡방(스페이스) 만들기]에서 방을 만든 뒤 돌아와 주세요.</small></span>
     </div>${madeNote}`;
   }
 
@@ -1769,14 +1822,11 @@ function classSpaceSubrowHtml(a) {
   const placeholder = current && !S.chatSpaces.some((s) => String(s.name || "") === String(cs.class_space_id || ""))
     ? `<option value="">${esc(current)}</option>`
     : `<option value="">학급 단톡방을 골라 주세요</option>`;
-  const roomConnected = cs.class_space_id && S.chatSpaces.some((s) => String(s.name || "") === String(cs.class_space_id));
   return `<div class="svc-subrow chat-space-existing">
-    <span class="nameblock"><b>학급 단톡방</b><small>단체 문자를 보낼 방이에요</small></span>
+    <span class="nameblock"><small>단체 문자를 보낼 방이에요</small></span>
     <div class="chat-space-controls action-line">
       <select name="class-space-select" data-action-change="class-space-pick"
-        data-current-space="${esc(cs.class_space_id || "")}">${placeholder}${options}</select>
-      <span class="chat-space-reload-status">${reload}
-        ${roomConnected ? `<span class="chat-space-status">연결됨</span>` : ""}</span>
+        data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}>${placeholder}${options}</select>
     </div>
     <div class="chat-new-space-guide" data-purpose="create-another-room">
       <small>지금 목록에 없는 새 단톡방을 만들고 싶으면 Google Chat에서 만든 뒤 돌아오세요.<br>돌아오면 목록을 자동으로 다시 읽어요. 새 방은 이 드롭다운에서 고르면 됩니다.</small>
@@ -1794,9 +1844,6 @@ function serviceOpenButtonHtml(entry, a) {
   ].includes(a.state);
   if (!resourcesAvailable) return "";
   if (entry.service === "sheet") {
-    const open = ["ready", "script-check-required", "script-update-required", "ai-action-required"].includes(a.state)
-      ? `<button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} 시트 열기</button>`
-      : "";
     // 평상시에는 선택한 정본 번호만 쓴다. 여러 파일을 합치려고 새 Sheet를 만드는
     // 옛 정리 단추는 두지 않고, 새 생성은 사용자가 누른 새 학년도 시작만 허용한다.
     const transitionDisabled = S.attendanceTransitioning ? "disabled" : "";
@@ -1807,7 +1854,7 @@ function serviceOpenButtonHtml(entry, a) {
     const reconnect = S.mode === "edit"
       ? `<button class="btn-tonal" data-action="attendance-connection-choose" ${S.attendanceConnectionBusy || transitionDisabled ? "disabled" : ""}>연결 확인/바꾸기</button>`
       : "";
-    return make + reconnect + open;
+    return make + reconnect;
   }
   if (entry.service === "docs" && a.template_doc_url) {
     return `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.template_doc_url)}">${icon("external-link", "small")} 서식 열기</button>`;
@@ -1818,9 +1865,11 @@ function serviceOpenButtonHtml(entry, a) {
    서비스 줄 단추로 옮겼다(설계 2026-07-31 — serviceOpenButtonHtml 참고). */
 function serviceSubrowsHtml(entry, a) {
   if (entry.service === "chat") {
-    return studentChatGuideHtml() + classSpaceSubrowHtml(a);
+    return classSpaceSubrowHtml(a);
   }
-  if (entry.service === "sheet" && S.mode === "wizard" && a.state === "ready") return firstSetupCardHtml(a);
+  if (entry.service === "sheet" && a.state === "ready") {
+    return firstSetupCardHtml(a) + studentRosterSubrowHtml(a);
+  }
   return "";
 }
 /* 서비스 줄 맨 오른쪽 상태 칸 — 글자 색만, 모든 줄 같은 폭(.svc-status, 설계 2026-07-31).
@@ -1831,6 +1880,7 @@ function attendanceTransitionNeedsAttention(state) {
   ].includes(state);
 }
 function serviceStatusHtml(entry, a) {
+  if (a.state === "checking") return `<span class="svc-status muted">확인 중…</span>`;
   const scriptCheck = a.state === "script-check-required";
   const scriptUpdate = a.state === "script-update-required";
   const scriptAttention = scriptCheck || scriptUpdate;
@@ -1861,8 +1911,11 @@ function serviceStatusHtml(entry, a) {
   }
   if (entry.service === "chat") {
     const cs = S.chatStatus;
+    if (a.state === "ready" && (cs?.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]))) {
+      return `<span class="svc-status warn">확인 필요</span>`;
+    }
     if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
-      return `<span class="svc-status ok">계정 연결됨</span>`;
+      return `<span class="svc-status ok">연결됨</span>`;
     }
     if (a.state === "ready" && (!cs || cs === "loading")) {
       return `<span class="svc-status muted">확인 중…</span>`;
@@ -1876,7 +1929,7 @@ function serviceStatusHtml(entry, a) {
     return `<span class="svc-status muted">준비 전</span>`;
   }
   if (entry.service === "sheet") {
-    if (a.state === "ready" && S.mode === "wizard" && !attendanceWizardGateOpen()) return `<span class="svc-status warn">처음 설정 필요</span>`;
+    if (a.state === "ready" && S.mode === "wizard" && !attendanceSheetSetupDone()) return `<span class="svc-status warn">처음 설정 필요</span>`;
     if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
@@ -1887,17 +1940,45 @@ function serviceStatusHtml(entry, a) {
   if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
   return `<span class="svc-status muted">준비 전</span>`;
 }
+function attendanceChatOpenBlockReason() {
+  if (!S.google) return "Google 로그인을 확인하고 있어요.";
+  if (!isGoogleReady(S.google)) return "설정에서 Google 로그인과 권한 승인을 먼저 마쳐 주세요.";
+  if (S.attendance?.account && S.attendance.account.toLowerCase() !== String(S.google.user || "").toLowerCase()) {
+    return "출결 자료를 만든 Google 계정으로 로그인해 주세요.";
+  }
+  return "";
+}
+function attendanceChatConnectBlockReason(a = S.attendance) {
+  const loginReason = attendanceChatOpenBlockReason();
+  if (loginReason) return loginReason;
+  if (S.chatConnectOpening) return "Google 권한 승인 창을 열고 있어요.";
+  if (!a || a.state === "checking") return "출결 자료의 준비 상태를 확인하고 있어요.";
+  if (a.state === "installing" || S.attendanceSaving) return "출결 자료를 만들고 있어요. 준비가 끝나면 연결할 수 있어요.";
+  if (S.attendanceScriptUpdating || S.attendanceTransitioning) return "출결 자료를 변경하고 있어요. 끝나면 연결할 수 있어요.";
+  if (["script-check-required", "script-update-required"].includes(a.state)) return "위의 출결 기능 확인·업데이트를 먼저 마쳐 주세요.";
+  if (a.state !== "ready") return "출결 자료 준비를 먼저 마쳐 주세요.";
+  const cs = S.chatStatus;
+  if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return "Google Chat 연결 상태를 확인하고 있어요.";
+  if (cs.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]) || typeof cs.connected !== "boolean") return "Google Chat 연결 상태를 확인하지 못했어요.";
+  if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
+  if (cs.connected) {
+    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [단톡방(스페이스) 만들기]에서 학생을 초대하고 방을 골라 주세요.";
+    if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Chat 준비가 끝났어요. 아래 출결 DB 관리에서 시트의 처음 설정을 마쳐 주세요.";
+    return "자동발송 계정이 연결됐어요. 다시 연결할 필요가 없어요.";
+  }
+  // First-time Sheet setup, student invitations and a selected room are not
+  // prerequisites for starting Chat authorization.
+  return "";
+}
 function attendanceServiceRow(entry, a) {
   let chatActs = "";
+  let chatHint = "";
   if (entry.service === "chat") {
-    const cs = S.chatStatus;
-    const statusFailed = hasCurrentFinalIssue(["attendance_chat_status"]);
-    const needsConnect = a.state === "ready" && cs && cs !== "loading"
-      && !cs.connected && !cs.moved && !statusFailed;
-    const connect = needsConnect
-      ? `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…">연결하기</button>` : "";
-    const openChat = `<button class="btn-tonal" data-action="open-chat-new-space">${icon("external-link", "small")} Google Chat 열기</button>`;
-    chatActs = connect + openChat;
+    const reason = attendanceChatConnectBlockReason(a);
+    const connect = `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…"${reason ? ' disabled aria-describedby="attendance-chat-action-hint"' : ""}>연결하기</button>`;
+    chatActs = connect;
+    const hint = reason || "[연결하기]를 눌러 Google Chat 자동발송을 허용해 주세요.";
+    chatHint = `<p class="hint attendance-chat-action-hint" id="attendance-chat-action-hint">${esc(hint)}</p>`;
   }
   const note = (a.state === "failed" && a.failed_service === entry.service)
     ? `<span class="field-error">${esc(a.detail || "")}</span>`
@@ -1912,7 +1993,7 @@ function attendanceServiceRow(entry, a) {
       <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(
         entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${connectionCode}${note}</span>
       <span class="svc-acts">${serviceOpenButtonHtml(entry, a)}${chatActs}</span>
-      ${serviceStatusHtml(entry, a)}</div>
+      ${serviceStatusHtml(entry, a)}</div>${chatHint}
     ${serviceSubrowsHtml(entry, a)}</div>`;
 }
 let attendanceStatusReadVersion = 0;
@@ -2105,18 +2186,107 @@ function attendanceConnectionDialogHtml() {
 /* 마법사 7단계 "마지막 한 번" 카드 — 준비가 끝난 뒤, 시트에서 처음 설정을 끝내라는 안내.
    기존 서비스 칸(.svc-group)과 같은 톤이고 상태는 글자 색만(.svc-status). */
 function firstSetupCardHtml(a) {
-  const complete = attendanceWizardGateOpen();
+  if (S.mode === "edit") loadFirstSetupStatusForEdit();
+  const complete = attendanceSheetSetupDone();
   const chatReady = S.chatStatus && S.chatStatus.connected && S.chatStatus.class_space_id;
-  const status = complete ? "완료 확인됨" : chatReady ? "시트에서 실행해 주세요" : "Chat 준비 후 진행";
   const detail = complete
-    ? `<p>이 출석부의 처음 설정이 완료된 것을 확인했어요. [다음]을 눌러 계속해 주세요.</p>`
-    : `<p>위의 [시트 열기]를 누른 뒤, 시트 상단 메뉴에서 실행해 주세요.</p>
-       <p class="first-setup-menu">처음 한 번 설정하기 → 처음 설정 한 번에 끝내기</p>
-       <p>처음에는 Google 계정 선택과 권한 허용이 필요할 수 있어요.</p>`;
+    ? `<p>시트 설정은 끝났어요. ${chatReady ? "아래에서 학생명단 입력도 확인해 주세요." : "위의 Google Chat 연결과 학급 단톡방 선택을 마쳐 주세요. 시트 메뉴는 다시 누르지 않아도 돼요."}</p>`
+    : `<p>[설정하러 가기]를 누른 뒤, 시트 상단의 파란 원 표시 메뉴에서 실행해 주세요.</p>
+       <p class="first-setup-menu">● 처음 한 번 설정하기 → 처음 설정 한 번에 끝내기</p>
+       <p>처음에는 Google 계정 선택과 권한 허용이 필요할 수 있어요. Chat과 단톡방은 이 화면으로 돌아와서 마쳐도 돼요.</p>`;
   return `<div class="svc-subrow first-setup-subrow">
-    <div class="first-setup-head"><b>처음 한 번 설정하기</b><span class="svc-status ${complete ? "ok" : "muted"}">${status}</span></div>
+    <div class="first-setup-head"><b>처음 한 번 설정하기</b><span class="chat-space-reload-status">
+      <button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} ${complete ? "시트 열기" : "설정하러 가기"}</button>
+      <span class="svc-status ${complete ? "ok" : "warn"}">${complete ? "완료 확인됨" : "실행 필요"}</span></span></div>
     ${detail}</div>`;
 }
+let firstSetupEditContext = "";
+let firstSetupEditReadVersion = 0;
+async function loadFirstSetupStatusForEdit(force = false) {
+  if (S.mode !== "edit" || S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
+  const context = chatReadContext();
+  if (!force && firstSetupEditContext === context) return;
+  firstSetupEditContext = context;
+  const version = ++firstSetupEditReadVersion;
+  const current = () => version === firstSetupEditReadVersion && context === chatReadContext();
+  try {
+    const first = await call("attendance_first_setup_status");
+    if (!current()) return;
+    S.firstSetupConnectionCode = firstSetupCodeFromValue(first?.value);
+    S.firstSetupDone = first?.done === true && S.firstSetupConnectionCode === String(S.attendance.connection_code || "").trim().toUpperCase();
+  } catch (_) {
+    if (!current()) return;
+    S.firstSetupDone = false;
+    S.firstSetupConnectionCode = "";
+  }
+  if (current()) render();
+}
+let rosterReadVersion = 0;
+let rosterContext = "";
+let rosterStatus = null;
+async function loadAttendanceRosterStatus(force = false) {
+  if (S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
+  const context = chatReadContext();
+  if (rosterContext === context && (rosterStatus?.state === "checking" || (!force && rosterStatus))) return;
+  rosterContext = context;
+  rosterStatus = {state:"checking"};
+  const version = ++rosterReadVersion;
+  const sheet = S.attendance.spreadsheet_id
+    || String(S.attendance.spreadsheet_url || "").match(/\/spreadsheets\/d\/([^/]+)/)?.[1] || "";
+  const current = () => version === rosterReadVersion && context === chatReadContext();
+  if (force) render();
+  let timeout;
+  try {
+    const result = await Promise.race([call("attendance_roster_status"), new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("Roster read timed out")), 120000);
+    })]);
+    if (!current()) return;
+    const validCount = Number.isInteger(result?.count) && (result.state === "empty" ? result.count === 0 : result.count > 0);
+    rosterStatus = result && sheet && result.spreadsheet_id === sheet && validCount && ["empty","incomplete","ready"].includes(result.state)
+      ? result : {state:"unavailable"};
+  } catch (_) {
+    if (!current()) return;
+    rosterStatus = {state:"unavailable"};
+  } finally {
+    clearTimeout(timeout);
+    if (current()) render();
+  }
+}
+function studentRosterSubrowHtml(a) {
+  if (rosterContext !== chatReadContext() || !rosterStatus) {
+    loadAttendanceRosterStatus();
+  }
+  const status = rosterContext === chatReadContext() ? rosterStatus : null;
+  const state = status?.state || "checking";
+  const complete = state === "ready";
+  const label = complete ? "입력됨" : state === "empty" ? "입력 필요"
+    : state === "incomplete" ? "수정 필요" : state === "unavailable" ? "확인 필요" : "확인 중…";
+  let detail = "[명단 입력하기]를 눌러 번호·이름·학생 이메일을 입력해 주세요. 이 화면으로 돌아오면 자동으로 확인해요.";
+  if (complete) detail = `${Number(status.count)}명의 명단을 확인했어요. 우리 반 학생이 모두 들어 있는지도 확인해 주세요.`;
+  if (state === "unavailable") detail = "학생명단을 읽지 못했어요. 인터넷 연결을 확인한 뒤 [명단 입력하기]에서 명단을 열고 돌아와 주세요.";
+  if (state === "incomplete") {
+    const missing = Object.entries(status.missing || {}).filter(([, count]) => count > 0).map(([field, count]) => `${field} ${count}명 누락`);
+    if (status.invalid_rows?.length) missing.push(`${status.invalid_rows.join(", ")}행의 번호·이메일 형식 또는 중복 확인`);
+    detail = `${missing.join(" · ")}. [학생명단]에서 고쳐 주세요.`;
+  }
+  return `<div class="svc-subrow student-roster-subrow">
+    <div class="first-setup-head"><b>학생명단 입력</b><span class="chat-space-reload-status">
+      <button class="btn-tonal" data-action="attendance-roster-open">${icon("external-link", "small")} 명단 입력하기</button>
+      <span class="svc-status ${complete ? "ok" : state === "checking" ? "muted" : "warn"}">${esc(label)}</span></span></div>
+    <p>${esc(detail)}</p></div>`;
+}
+bindActions({"attendance-roster-open": async () => {
+  rosterReadVersion += 1;
+  rosterStatus = null;
+  render();
+  await call("open_attendance_roster");
+}});
+window.addEventListener("focus", () => {
+  if (S.connectTab === "attendance" && ((S.mode === "wizard" && S.step === 7) || (S.mode === "edit" && S.edit === "connect"))) {
+    loadAttendanceRosterStatus(true);
+    loadFirstSetupStatusForEdit(true);
+  }
+});
 function attendanceComingSoonHtml() {
   return `<div class="attendance-head"><div>
     <h2>출결</h2>
@@ -2128,8 +2298,7 @@ function attendanceTabHtml() {
   // 느린 attendance_status 응답이 폴링이 방금 놓은 새 상태를 옛 값으로 덮는 것을 막는다.
   if (!attendancePreparePollOn) loadAttendanceStatus();
   if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
-  const a = S.attendance;
-  if (!a || typeof a !== "object") return `<p class="sub">출결 준비 상태를 확인하는 중이에요…</p>`;
+  const a = S.attendance && typeof S.attendance === "object" ? S.attendance : { state: "checking" };
   const account = a.account || a.current_user || "";
   let statusArea = "";
   if (a.state === "account-required") {
@@ -2163,7 +2332,7 @@ function attendanceTabHtml() {
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
   const transitionAttentionRequired = attendanceTransitionNeedsAttention(a.state);
-  const pendingGuide = S.mode === "wizard"
+  const pendingGuide = a.state === "checking" ? "출결 준비 상태를 확인하는 중이에요…" : S.mode === "wizard"
     ? a.state === "installing"
       ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"
       : ["failed", "script-permission-required"].includes(a.state)
@@ -2191,7 +2360,7 @@ function attendanceTabHtml() {
       : ""}
     ${ready
       ? ""
-      : scriptAttentionRequired || transitionAttentionRequired || ["script-recovery-required", "script-permission-required"].includes(a.state) || S.mode === "wizard" ? ""
+      : scriptAttentionRequired || transitionAttentionRequired || ["checking", "script-recovery-required", "script-permission-required"].includes(a.state) || S.mode === "wizard" ? ""
       : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
     ${attendanceScriptUpdateDialogHtml()}
     ${attendanceConnectionDialogHtml()}`;
@@ -2573,11 +2742,24 @@ bindActions({
     }
   },
   "chat-connect": async () => {
-    await call("attendance_chat_connect");
-    showToast("브라우저에서 구글 허용을 마쳐 주세요");
-    startChatConnectPoll();
+    if (attendanceChatConnectBlockReason()) return;
+    const context = chatReadContext();
+    const owner = screenKey();
+    S.chatConnectOpening = true;
+    render();
+    try {
+      await call("attendance_chat_connect");
+      if (context !== chatReadContext() || owner !== screenKey()) return;
+      showToast("브라우저에서 구글 허용을 마쳐 주세요");
+      if (S.mode === "wizard") startAttendancePreparePoll();
+      else startChatConnectPoll();
+    } finally {
+      S.chatConnectOpening = false;
+      if (context === chatReadContext() && owner === screenKey()) render();
+    }
   },
   "open-chat-new-space": async () => {
+    if (attendanceChatOpenBlockReason()) return;
     S.chatNewSpaceBrowserOpen = true;
     S.chatNewSpaceBrowserBlurred = false;
     await call("open_attendance_chat");
@@ -2586,8 +2768,10 @@ bindActions({
     const box = document.querySelector('input[name="class-space-name"]');
     const name = (box ? box.value : "").trim() || defaultClassSpaceName();
     S.spaceDraftName = name;
+    chatStatusReadVersion += 1;
     const data = await call("attendance_chat_create_space", name);
     if (data.state === "ok") {
+      chatStatusReadVersion += 1;
       S.spaceCreate = "ok";
       S.chatSpaceName = data.display_name;
       S.chatSpaces = undefined;   // 방금 만든 방이 목록에 잡히게 다시 읽는다
@@ -2663,6 +2847,7 @@ document.addEventListener("change", (event) => {
   }
   if (event.target.matches("[data-link-select]")) { syncConnectFields(); render(); return; }
   if (event.target.matches('[data-action-change="class-space-pick"]')) {
+    if (S.classSpaceSaving) return;
     const select = event.target;
     const spaceName = select.value;
     select.closest(".chat-space-controls")?.querySelector(".chat-space-status")?.remove();
@@ -2670,9 +2855,14 @@ document.addEventListener("change", (event) => {
     const label = select.options[select.selectedIndex].textContent;
     const expected = String(select.dataset.currentSpace || "");
     const request = beginIssueRequest(false);
+    const context = chatReadContext();
+    S.classSpaceSaving = true;
+    render();
+    chatStatusReadVersion += 1;
     call("attendance_chat_set_space", spaceName, label, expected)
       .then(() => {
-        if (!ownsIssueRequest(request)) return;
+        if (!ownsIssueRequest(request) || context !== chatReadContext()) return;
+        chatStatusReadVersion += 1;
         S.chatSpaceName = label;
         if (S.chatStatus && typeof S.chatStatus === "object") {
           S.chatStatus.class_space_id = spaceName;
@@ -2681,7 +2871,8 @@ document.addEventListener("change", (event) => {
         showToast("학급 단톡방을 골랐어요");
         render();
       })
-      .catch((error) => handleCaughtError(error, request));
+      .catch((error) => { if (context === chatReadContext()) handleCaughtError(error, request); })
+      .finally(() => { S.classSpaceSaving = false; if (context === chatReadContext()) render(); });
   }
 });
 window.addEventListener("blur", () => {
@@ -2698,26 +2889,30 @@ window.addEventListener("focus", () => {
   render();
 });
 function stepConnect() {
+  // Keep the Chat actions visible while first-install login is being checked,
+  // without starting any attendance or Chat requests before verification.
+  const pendingChat = () => S.connectTab === "attendance" && attendanceUiEnabled()
+    ? attendanceServiceRow(ATTENDANCE_SERVICES.find(entry => entry.service === "chat"), {state:"checking"}) : "";
   if (!S.google) {
     const request = beginIssueRequest(false);
     call("google_status")
       .then((data) => { if (ownsIssueRequest(request)) { adoptGoogleStatus(data); render(); } })
       .catch((error) => handleCaughtError(error, request));
-    return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>`;
+    return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>${pendingChat()}`;
   }
   if (googleAuthCheckFailed(S.google)) {
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
-      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
+      <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>${pendingChat()}`;
   }
   if (isGoeduGoogleStatus(S.google) && !isGoogleReady(S.google)) {
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(googleAuthorizationMessage(S.google))}</span>
-      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>`;
+      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>${pendingChat()}`;
   }
   if (!isGoeduGoogleStatus(S.google)) {
     const message = S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(message)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
-      <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 @goedu.kr 계정을 확인한 뒤에만 시작해요.</p>`;
+      <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 @goedu.kr 계정을 확인한 뒤에만 시작해요.</p>${pendingChat()}`;
   }
   if (S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
@@ -3336,7 +3531,7 @@ function studentChatGuideHtml() {
           <strong>① 교육디지털원패스 가입·ID 확인</strong>: 담임 선생님은 <strong>[회원 정보 → 학생 회원 가입]</strong>의 <strong>학생 회원 가입 현황</strong>에서 학생 ID를 확인할 수 있어요. 여기서 확인하는 것은 원패스 ID예요.<br>
           <strong>② 교육용 클라우드 가입</strong>: 학생이 원패스 ID로 경기도교육청 교육용 클라우드 지원시스템에 추가로 가입해 주세요.<br>
           <strong>③ Google Workspace 가입</strong>: 교육용 클라우드 안에서 Google Workspace 사용 신청까지 별도로 마쳐야 학교 Google 계정이 생겨요. 학교 이메일은 보통 <strong>원패스 ID@goedu.kr</strong>입니다.</li>
-        <li><b>학생 계정 초대</b> — 위의 <strong>[Google Chat 열기]</strong>로 선생님 학교 계정에 들어가 <strong>[새 채팅]</strong>을 누르세요. <strong>[한 명 이상을 추가하세요]</strong> 칸에 학생 이메일을 한꺼번에 붙여 넣으세요.<br>
+        <li><b>학생 계정 초대</b> — 아래 <strong>[단톡방(스페이스) 만들기]</strong>로 선생님 학교 계정에 들어가 <strong>[새 채팅]</strong>을 누르세요. <strong>[한 명 이상을 추가하세요]</strong> 칸에 학생 이메일을 한꺼번에 붙여 넣으세요.<br>
           이메일은 <strong>한 줄에 하나씩</strong> 또는 <strong>쉼표와 띄어쓰기</strong>로 구분해 주세요. 띄어쓰기만으로 구분하면 인식되지 않아요.<br>
           예: student1@goedu.kr, student2@goedu.kr</li>
         <li><b>학생 단체 톡방 만들기</b> — 메시지를 한 번 보낸 뒤, <strong>위쪽 대화 이름 → [이 채팅을 스페이스로 전환]</strong>을 누르세요. 이름은 '2학년 7반'처럼 짧게 정해 주세요.</li>
@@ -3387,6 +3582,13 @@ bindActions({
       return;
     }
     // 모두 저장 화면엔 격자 입력이 없다 — draft에 저장된 최신 값을 그대로 쓴다.
+    if (attendanceUiEnabled() && !(await refreshAttendanceWizardGate())) {
+      const message = attendanceWizardGateMessage();
+      S.connectTab = "attendance";
+      await goStepAsync(7);
+      setBanner("warn", message);
+      return;
+    }
     await ensureGridLoaded();
     const results = await call("apply_all", S.draft.profile, S.draft.grid, S.draft.bridge);
     const failed = results.filter((r) => r.status === "failed");
@@ -3516,7 +3718,7 @@ function effectiveChecks() {
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
-  const fieldRows = Object.values(S.fieldIssues || {}).filter((row) => editing !== "connect" || !GOOGLE_TARGET_ID_FIELDS.includes(row.target));
+  const fieldRows = Object.values(S.fieldIssues || {}).filter((row) => editing !== "connect" || !LIVE_CONNECT_TARGETS.has(row.target));
   if (editing === "connect") {
     // Programmatic changes need the same current validation as keyboard changes.
     const current = connectIssues();
@@ -4624,12 +4826,18 @@ registerResumeHandler("google-login", async () => {
   await openGoogleLoginSettings();
 });
 registerResumeHandler("chat-space-list", async ({ ownsRequest }) => {
+  const context = chatReadContext();
+  chatStatusReadVersion += 1;
+  chatSpacesReadVersion += 1;
   const status = await call("attendance_chat_status");
-  if (!ownsRequest()) return;
+  if (!ownsRequest() || context !== chatReadContext()) return;
   const spaces = await call("attendance_chat_spaces");
-  if (!ownsRequest()) return;
+  if (!ownsRequest() || context !== chatReadContext()) return;
+  if (!Array.isArray(spaces)) throw new Error("방 목록 응답을 확인하지 못했어요.");
   S.chatStatus = status;
+  S.chatStatusContext = context;
   S.chatSpaces = spaces;
+  S.chatSpacesContext = context;
   S.chatSpaceName = String(status?.class_space_name || "");
   S.chatSpacesError = false;
   S.spaceCreate = null;
@@ -4649,6 +4857,11 @@ async function dispatchIssueResume(issue, actionKey) {
 }
 let lastScreenKey = "";
 function render() {
+  if (rosterContext && rosterContext !== chatReadContext()) {
+    rosterReadVersion += 1;
+    rosterContext = "";
+    rosterStatus = null;
+  }
   if (S.problemIssue && problemIssueOwner !== screenKey()) clearProblemIssue();
   const onLoginScreen = (S.mode === "wizard" && S.step === 2) || (S.mode === "edit" && S.edit === "settings");
   if (S.login && !onLoginScreen) {

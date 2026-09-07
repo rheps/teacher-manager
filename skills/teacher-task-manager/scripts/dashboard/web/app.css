@@ -146,7 +146,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .chat-boundary b { color:var(--tm-ink); }
 .student-links { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:18px; }
 /* 색은 달라도 세 버튼(가입 안내·Chat 열기·나중에 설정)의 크기는 같게 */
-.student-links > button { padding:12px 24px; font-size:15px; border-radius:11px; }
+.student-links > button { padding:0 24px; border-radius:11px; }
 
 /* 내 정보 — 담임 학년·반 고정 행 */
 .homeroom-cell { align-items:center; }
@@ -169,7 +169,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 /* 새 버전 안내 — 홈 맨 위 */
 .update-banner { display:flex; align-items:center; gap:12px; background:var(--tm-blue-soft); border:1px solid #B6D5FB; border-radius:13px; padding:12px 16px; font-size:13.5px; margin-bottom:16px; }
 .update-banner b { color:var(--tm-blue); }
-.update-banner .btn { margin-left:auto; flex:none; padding:9px 16px; font-size:13px; }
+.update-banner .btn { margin-left:auto; flex:none; padding:0 16px; }
 
 /* 패널(회색 목록 카드) */
 .panel { background:var(--tm-surface); border:1px solid var(--tm-line); border-radius:16px; padding:4px 18px; }
@@ -199,6 +199,12 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .btn-quiet:disabled { opacity:.55; cursor:default; }
 /* 마법사 [이전] 버튼 전용 — 카드 창에는 이 자리에 [< 홈]이 없다 (2026-07-31). */
 .btn-prev { background:none; border:none; color:var(--tm-faint); font-size:17px; font-weight:600; font-family:inherit; cursor:pointer; padding:8px 4px; display:inline-flex; align-items:center; gap:5px; }
+/* Action buttons share the reload button's height; labels only change their width. */
+.btn,.btn-tonal,.btn-quiet,.btn-prev {
+  display:inline-flex; align-items:center; justify-content:center; gap:5px;
+  height:30px; min-height:30px; max-height:30px; padding-top:0; padding-bottom:0;
+  font-size:13px; line-height:16px; white-space:nowrap; flex-shrink:0;
+}
 .save-state { font-size:13.5px; color:var(--tm-faint); }
 /* 가려진 칸의 눈 단추 — 칸 안 오른쪽 끝에 겹쳐 놓는다 */
 .field-with-eye { position:relative; display:block; }
@@ -210,7 +216,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .foot { display:flex; align-items:center; margin-top:28px; }
 .foot .btn, .foot .btn-quiet { margin-left:auto; }
 /* 8단계: 건너뛰기(조용한 버튼)도 본문 두 버튼과 같은 크기로 */
-.foot .btn-quiet { padding:12px 24px; font-size:15px; }
+.foot .btn-quiet { padding:0 24px; }
 
 /* 입력 */
 .field { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
@@ -440,10 +446,17 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .svc-subrow.chat-space-existing { display:grid; grid-template-columns:minmax(0,1fr) auto;
   column-gap:10px; row-gap:6px; }
 .chat-space-controls { grid-column:2; margin-top:0; }
-.chat-space-reload-status { display:inline-flex; align-items:center; gap:8px; flex:none; }
-.svc-subrow [data-action="class-space-reload"] { display:inline-flex; align-items:center; gap:5px;
-  padding:7px 9px; font-size:13px; flex:none; }
-.chat-space-status { color:var(--tm-blue); font-size:12.5px; font-weight:700; white-space:nowrap; flex:none; }
+.chat-space-reload-status { display:inline-flex; align-items:center; gap:11px; flex:none; }
+.svc-subrow [data-action="class-space-reload"] { padding:0 9px; flex:none; }
+.chat-space-status { color:var(--tm-green); font-size:12.5px; font-weight:700; white-space:nowrap; flex:none; }
+.chat-space-status.warn { color:var(--tm-amber); }
+.chat-space-status.muted { color:var(--tm-faint); }
+.class-space-section { display:block; }
+.class-space-section > .svc-subrow { padding:8px 0; border:0; }
+.class-space-section .problem-panel { margin:12px 0 0; }
+.class-space-section .chat-space-status { width:64px; text-align:right; }
+.class-space-section .class-space-actions { justify-content:flex-end; flex-wrap:wrap; }
+.class-space-section select { max-width:100%; }
 .chat-new-space-guide { grid-column:2; margin-top:0; margin-left:auto; }
 .chat-new-space-guide small { color:var(--tm-faint); font-size:12px; line-height:1.45;
   text-align:right; }
@@ -465,6 +478,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 /* 기능 단추 묶음 — 상태 셀의 왼쪽 모서리에 붙어 오른쪽 정렬 */
 .svc-acts { display:flex; gap:6px; flex:none; align-items:center; margin-left:auto; justify-content:flex-end; }
 .svc-acts .btn-tonal:disabled { opacity:.42; cursor:default; }
+.attendance-chat-action-hint { margin:0; padding:0 17px 12px 52px; }
 /* AI 에이전트 탭의 연결 성공 배너가 쓴다 — 출결 탭은 더 이상 안 쓴다 */
 .ready-hero { display:flex; align-items:center; gap:13px; margin:12px 0 13px; padding:15px 17px; border:1px solid var(--tm-green-soft); border-radius:15px; color:var(--tm-green); background:var(--tm-green-soft); }
 .ready-hero .check { width:32px; height:32px; display:flex; align-items:center; justify-content:center; flex:none; border-radius:10px; color:#fff; background:var(--tm-green); font-weight:900; }
@@ -472,7 +486,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .ready-hero span:last-child { color:var(--tm-sub); font-size:12.5px; }
 .attendance-action { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
 /* First setup and student preparation share their parent service's border. */
-.first-setup-subrow,.student-chat-guide { display:block; }
+.first-setup-subrow,.student-roster-subrow,.student-chat-guide { display:block; }
+.first-setup-subrow,.student-roster-subrow { background:#fff; }
 .student-chat-guide details { width:100%; min-width:0; }
 .student-chat-guide summary { cursor:pointer; font-size:13px; font-weight:700; color:var(--tm-ink); }
 .student-chat-guide p,.student-chat-guide li { color:var(--tm-sub); font-size:12.5px; line-height:1.7; word-break:keep-all; overflow-wrap:anywhere; }
@@ -483,8 +498,9 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .student-chat-guide .action-line { justify-content:flex-end; }
 .first-setup-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .first-setup-head b { font-size:13px; color:var(--tm-ink); }
-.first-setup-subrow .svc-status { width:auto; }
-.first-setup-subrow p { margin:8px 0 0; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
+.first-setup-subrow .svc-status { width:64px; white-space:nowrap; }
+.student-roster-subrow .svc-status { width:64px; white-space:nowrap; }
+.first-setup-subrow p,.student-roster-subrow p { margin:8px 0 0; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
 .first-setup-subrow .first-setup-menu { color:var(--tm-blue); font-weight:700; }
 .attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }
 .attendance-script-update span { flex:1 1 auto; min-width:0; }

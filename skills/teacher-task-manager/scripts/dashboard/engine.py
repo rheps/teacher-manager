@@ -404,11 +404,11 @@ def push_gemini_key_to_attendance_sheet(
 def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: str) -> dict:
     """시트의 [처음 설정 한 번에 끝내기] 완료 표시를 읽는다. 못 읽으면 미완료로 본다.
 
-    시트 안 Apps Script가 네 단계를 모두 마치면 `설정` 탭에
-    FIRST_TIME_SETUP_DONE과 ATTENDANCE_CONNECTION_CODE 줄을 적는다(Code.gs).
+    시트 설정과 AI 감지기 준비를 끝내면 FIRST_TIME_SETUP_SHEET_DONE을 적는다.
+    옛 네 단계 전체 완료 표시 FIRST_TIME_SETUP_DONE도 호환해서 읽는다.
+    Chat 계정 연결과 방 선택은 화면에서 실제 상태를 별도로 확인한다.
     현재 정식 출석부의 전체 Google 번호에서 계산한 확인번호와 처음 연결한 학교
-    계정이 모두 정확히 같을 때만 완료로 인정한다 — 네트워크·권한 실패는 오류가
-    아니라 '아직'이다.
+    계정이 모두 정확히 같을 때만 완료로 인정한다. 읽기 실패는 공통 재확인으로 넘긴다.
     """
     from dashboard import central_chat
 
@@ -450,7 +450,7 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
             continue
         key = str(row[0]).strip()
         value = str(row[1]).strip() if len(row) > 1 else ""
-        if key == "FIRST_TIME_SETUP_DONE":
+        if key in {"FIRST_TIME_SETUP_DONE", "FIRST_TIME_SETUP_SHEET_DONE"}:
             done_values.append(value)
         elif key == "ATTENDANCE_CONNECTION_CODE":
             connection_codes.append(value)
@@ -467,6 +467,102 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
             value = item
             break
     return {"done": bool(value), "value": value}
+
+
+def summarize_attendance_roster(rows: list) -> dict:
+    """Return counts and sheet row numbers only, never student identities."""
+    if (not isinstance(rows, list) or not rows or not isinstance(rows[0], list)
+            or rows[0][:2] != ["번호", "이름"] or len(rows[0]) < 3
+            or "이메일" not in str(rows[0][2])):
+        return {"state": "unavailable"}
+    missing = {"번호": 0, "이름": 0, "이메일": 0}
+    invalid_rows, numbers, emails = [], set(), set()
+    count = 0
+    for row_number, row in enumerate(rows[1:], 2):
+        if not isinstance(row, list):
+            return {"state": "unavailable"}
+        values = [str(v if v is not None else "").strip() for v in (row + ["", "", ""])[:3]]
+        if not any(values):
+            continue
+        count += 1
+        number, name, email = values
+        for label, value in zip(missing, values):
+            if not value:
+                missing[label] += 1
+        normalized_number = str(int(number)) if re.fullmatch(r"[0-9]+", number) else ""
+        email = email.casefold()
+        invalid = (bool(number) and (not normalized_number or normalized_number == "0" or normalized_number in numbers))
+        invalid = invalid or (bool(email) and (not re.fullmatch(r'[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)', email) or email in emails))
+        if invalid:
+            invalid_rows.append(row_number)
+        if normalized_number:
+            numbers.add(normalized_number)
+        if email:
+            emails.add(email)
+    state = "empty" if not count else "incomplete" if any(missing.values()) or invalid_rows else "ready"
+    return {"state": state, "count": count, "missing": missing, "invalid_rows": invalid_rows[:20]}
+
+
+def _verified_attendance_roster_name(record, config_dir, run_command, gws_executable):
+    from dashboard import central_chat
+
+    spreadsheet_id = str(record.get("spreadsheet_id", "") or "").strip()
+    owner = str(record.get(SETUP_ACCOUNT_FIELD, "") or _read_setup_status(config_dir).get("account", "") or "").strip()
+    if not spreadsheet_id or not owner:
+        raise ValueError("현재 출석부 연결을 먼저 확인해 주세요.")
+    _require_google_target_account(run_command, gws_executable, owner)
+    settings = central_chat._read_settings_rows(spreadsheet_id, run_command, gws_executable)
+    codes = [str(row[1]).strip() for row in settings if isinstance(row, list) and len(row) > 1 and row[0] == "ATTENDANCE_CONNECTION_CODE"]
+    if codes != [attendance_workbook_identity.attendance_connection_code(spreadsheet_id)]:
+        raise ValueError("현재 출석부 연결을 먼저 확인해 주세요.")
+    names = [str(row[1]).strip() for row in settings if isinstance(row, list) and len(row) > 1 and row[0] == "ROSTER_SHEET_NAME" and row[1]]
+    if len(set(names)) > 1:
+        raise ValueError("학생명단 시트 이름을 확인하지 못했어요.")
+    return names[0] if names else "학생명단"
+
+
+def attendance_roster_url(config_dir: Path, run_command, gws_executable: str) -> str:
+    """Resolve the actual roster tab, including custom names; no Google writes."""
+    from dashboard import central_chat
+
+    record = read_verified_canonical_record(paths.attendance_install_record_path(Path(config_dir)))
+    title = _verified_attendance_roster_name(record, config_dir, run_command, gws_executable)
+    output = central_chat._command_output(run_command, [
+        gws_executable, "sheets", "spreadsheets", "get", "--params",
+        _json.dumps({"spreadsheetId": record["spreadsheet_id"], "fields": "sheets.properties(sheetId,title)"}),
+        "--format", "json",
+    ])
+    response = process_win.parse_first_json(output)
+    matches = [sheet.get("properties", {}) for sheet in response.get("sheets", [])
+               if isinstance(sheet, dict) and sheet.get("properties", {}).get("title") == title]
+    if len(matches) != 1 or type(matches[0].get("sheetId")) is not int or matches[0]["sheetId"] < 0:
+        raise ValueError("학생명단 시트를 찾지 못했어요. 출석부의 처음 설정을 마친 뒤 다시 열어 주세요.")
+    current = read_verified_canonical_record(paths.attendance_install_record_path(Path(config_dir)))
+    if current.get("spreadsheet_id") != record["spreadsheet_id"]:
+        raise ValueError("연결된 출석부가 바뀌었어요. 명단 입력하기를 다시 눌러 주세요.")
+    return f'https://docs.google.com/spreadsheets/d/{record["spreadsheet_id"]}/edit#gid={matches[0]["sheetId"]}&range=A2'
+
+
+def read_attendance_roster_status(config_dir: Path, run_command, gws_executable: str) -> dict:
+    """Read the canonical workbook's roster without changing any Google data."""
+    import json
+    from dashboard import central_chat
+
+    spreadsheet_id = ""
+    try:
+        record = read_verified_canonical_record(paths.attendance_install_record_path(Path(config_dir)))
+        spreadsheet_id = str(record.get("spreadsheet_id", "") or "").strip()
+        title = _verified_attendance_roster_name(record, config_dir, run_command, gws_executable).replace("'", "''")
+        output = central_chat._command_output(run_command, [
+            gws_executable, "sheets", "spreadsheets", "values", "get", "--params",
+            json.dumps({"spreadsheetId": spreadsheet_id, "range": f"'{title}'!A:C", "valueRenderOption": "FORMATTED_VALUE"}, ensure_ascii=False),
+            "--format", "json",
+        ])
+        response = process_win.parse_first_json(output)
+        result = summarize_attendance_roster(response.get("values") if isinstance(response, dict) else None)
+        return {**result, "spreadsheet_id": spreadsheet_id}
+    except Exception:  # A failed read is unknown, never an empty or completed roster.
+        return {"state": "unavailable", "spreadsheet_id": spreadsheet_id}
 
 
 def save_messenger_settings(

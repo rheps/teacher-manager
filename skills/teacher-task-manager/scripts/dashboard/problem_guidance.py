@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from brity_bridge import recovery
 
@@ -208,6 +208,12 @@ def apply_guidance(issue: recovery.UserIssue, operation: str) -> recovery.UserIs
                 actions=issue.actions or guidance.actions,
             )
         return issue.with_guidance(steps=issue.steps or (_FOLLOW_MESSAGE_STEP,))
+    if operation in {"attendance_chat_set_space", "attendance_chat_spaces", "attendance_chat_create_space"} and not kind_from_message(issue.reason) and not kind_from_message(issue.message):
+        return replace(issue.with_guidance(
+            steps=("아래에서 방 목록과 저장 상태를 다시 확인해 주세요.",
+                   "연결됨으로 표시되지 않으면 사용할 학급 단톡방을 다시 골라 주세요."),
+            actions=(recovery.IssueAction("chat-space-list", "학급 단톡방 다시 확인"),),
+        ), resume="chat-space-list")
     message = issue.reason if kind_from_message(issue.reason) == KIND_SCRIPT_API else issue.message
     guidance = guidance_for(kind_for(operation or issue.operation, message))
     reason = issue.reason

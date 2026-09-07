@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.13.2
+ * 버전: 5.13.5
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.13.2';
+const APP_VERSION = '5.13.5';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -135,8 +135,8 @@ function onOpen() {
   // 메뉴는 '사전 세팅'과 '교사가 직접 실행하는 일'로 가른다.
   // Chat 연결은 출결뿐 아니라 교육청 메신저 발송의 사전 세팅이기도 해서 어느 한쪽 실행
   // 메뉴 밑에 둘 수 없다. 그래서 최상위에 따로 세우고, 사전 세팅은 항목 하나로 합친다.
-  ui.createMenu('처음 한 번 설정하기')
-    .addItem('처음 설정 한 번에 끝내기', 'runFirstTimeSetup')
+  ui.createMenu('🔵 처음 한 번 설정하기')
+    .addItem('▶ 처음 설정 한 번에 끝내기', 'runFirstTimeSetup')
     .addItem('연결 상태 확인', 'checkCentralChatStatus')
     .addToUi();
 
@@ -194,8 +194,51 @@ function attendanceConnectionCodeForSpreadsheetId_(spreadsheetId) {
  * 나머지는 계속 진행한 뒤 실패한 것만 결과 화면에 적는다.
  */
 function runFirstTimeSetup() {
+  requireGoeduTeacherAccount_();
+  SpreadsheetApp.getUi().showModalDialog(
+    HtmlService.createHtmlOutput(firstTimeSetupProgressHtml_()).setWidth(520).setHeight(480),
+    '처음 한 번 설정하기'
+  );
+}
+
+/** Open the wait notice before making any slow calls. The worker runs in the same Sheet. */
+function firstTimeSetupProgressHtml_() {
+  return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><style>
+    body{font:14px/1.7 sans-serif;color:#24364b;margin:24px}
+    h2{font-size:19px;color:#2265b5;margin:0 0 14px}
+    #message{white-space:pre-wrap;overflow-wrap:anywhere}
+    #spinner{width:24px;height:24px;border:3px solid #dbeafe;border-top-color:#2563eb;border-radius:50%;animation:spin 1s linear infinite;margin-bottom:16px}
+    button{background:#e8f2ff;color:#1760b5;border:0;border-radius:8px;padding:10px 18px;margin-top:16px;cursor:pointer}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style></head><body>
+    <div id="spinner" aria-hidden="true"></div>
+    <h2 id="title">처음 설정을 진행하고 있어요</h2>
+    <div id="message" role="status" aria-live="polite">완료 안내가 나올 때까지 이 창과 출결 시트를 닫지 말고 기다려 주세요.
+준비에 시간이 걸릴 수 있습니다. 권한 허용이나 방 선택 안내가 나타나면 따라 주세요.</div>
+    <button id="close" hidden onclick="google.script.host.close()">확인</button>
+    <script>
+      function finish(title, message) {
+        document.getElementById('spinner').hidden = true;
+        document.getElementById('title').textContent = title;
+        document.getElementById('message').textContent = message;
+        document.getElementById('close').hidden = false;
+      }
+      google.script.run.withSuccessHandler(function(result) {
+        // A pending authorization opens its own dialog. Never cover or close it.
+        if (result && result.pending) return;
+        if (!result || typeof result.message !== 'string') {
+          finish('설정 결과를 확인해 주세요', 'Teacher Manager로 돌아가 설정 상태를 확인해 주세요. 완료되지 않았다면 시트의 처음 설정 메뉴를 다시 눌러 주세요.');
+          return;
+        }
+        finish(result.complete ? '처음 설정이 끝났어요' : '남은 설정을 확인해 주세요', result.message);
+      }).withFailureHandler(function() {
+        finish('처음 설정을 마치지 못했어요', '인터넷 연결과 Google 권한 허용을 확인한 뒤, 시트의 처음 설정 메뉴를 다시 눌러 주세요. 이미 끝난 단계는 건너뜁니다.');
+      }).runFirstTimeSetupWork();
+    </script></body></html>`;
+}
+
+function runFirstTimeSetupWork() {
   const setupAccount = String(requireGoeduTeacherAccount_() || '').trim();
-  const ui = SpreadsheetApp.getUi();
   const steps = [
     { title: '기본 시트/설정 점검', run: firstTimeSetupWorkbookStep_ },
     { title: 'AI 출결 입력 켜기', run: firstTimeSetupAiStep_ },
@@ -204,11 +247,12 @@ function runFirstTimeSetup() {
   ];
 
   // 뒤 단계가 앞 단계의 결과를 알아야 하는 곳이 있다 — 연결이 끝나야 단톡방 목록을 받는다.
-  const context = { chatReady: false };
+  const context = { chatReady: false, sheetReady: false, chatPending: false };
   const lines = [];
   const leftovers = [];
+  let connectionCode = '';
 
-  steps.forEach(function (step) {
+  steps.forEach(function (step, index) {
     let result;
     try {
       result = step.run(context);
@@ -220,23 +264,30 @@ function runFirstTimeSetup() {
     const mark = result.ok === true ? (result.skipped === true ? '[이미]' : '[됨]') : '[못 함]';
     lines.push(mark + ' ' + step.title + (result.message ? ' — ' + firstTimeSetupOneLine_(result.message) : ''));
     if (result.ok !== true) leftovers.push(step.title + '\n' + String(result.message || ''));
+    if (result.pending === true) context.chatPending = true;
+
+    // Save Sheet prerequisites before consent; Chat and room selection can continue in TM.
+    // Keep the legacy all-four marker separate so older apps cannot mistake partial setup for completion.
+    if (index === 1 && leftovers.length === 0) {
+      try {
+        const spreadsheetId = String(SpreadsheetApp.getActiveSpreadsheet().getId() || '').trim();
+        connectionCode = attendanceConnectionCodeForSpreadsheetId_(spreadsheetId);
+        if (!connectionCode) throw new Error('지금 열린 출석부의 연결 확인번호를 읽지 못했습니다.');
+        setConfigValue_(ATTENDANCE_CONNECTION_CODE_SETTING, connectionCode);
+        setConfigValue_('FIRST_TIME_SETUP_SHEET_DONE',
+          (connectionCode + ' ' + setupAccount + ' ' + new Date().toISOString()).trim());
+        SpreadsheetApp.flush();
+        context.sheetReady = true;
+      } catch (err) {
+        const connectionError = errorMessage_(err);
+        lines.push('[못 함] 시트 설정 완료 기록 — ' + connectionError);
+        leftovers.push('시트 설정 완료 기록\n' + connectionError);
+      }
+    }
   });
 
-  // 네 단계가 모두 끝났을 때 실제 Sheet 번호에서 만든 확인번호를 먼저 적는다.
-  // 전체 번호는 화면에 드러내지 않고, 프로그램과 시트가 같은 파일인지 사람이 대조한다.
-  let connectionCode = '';
-  if (leftovers.length === 0) {
-    try {
-      const spreadsheetId = String(SpreadsheetApp.getActiveSpreadsheet().getId() || '').trim();
-      connectionCode = attendanceConnectionCodeForSpreadsheetId_(spreadsheetId);
-      if (!connectionCode) throw new Error('지금 열린 출석부의 연결 확인번호를 읽지 못했습니다.');
-      setConfigValue_(ATTENDANCE_CONNECTION_CODE_SETTING, connectionCode);
-    } catch (err) {
-      const connectionError = errorMessage_(err);
-      lines.push('[못 함] 연결 확인번호 기록 — ' + connectionError);
-      leftovers.push('연결 확인번호 기록\n' + connectionError);
-    }
-  }
+  // The authorization dialog is asynchronous; a summary alert would cover it before consent.
+  if (context.sheetReady && context.chatPending) return { pending: true };
 
   // 확인번호까지 준비됐을 때만 완료 표시를 적는다 — 설치 프로그램이 이 값을 읽어
   // 마법사의 [다음]을 켠다. 일부 실패면 적지 않는다(거짓 완료 방지).
@@ -249,6 +300,7 @@ function runFirstTimeSetup() {
         'FIRST_TIME_SETUP_DONE',
         (connectionCode + ' ' + setupAccount + ' ' + new Date().toISOString()).trim()
       );
+      SpreadsheetApp.flush();
     } catch (err) {
       // 네 단계가 끝났어도 표시가 없으면 프로그램의 [다음]이 계속 잠긴다.
       // 다시 눌렀을 때 이미 끝난 네 단계는 건너뛰고 이 표시만 다시 적게 안내한다.
@@ -258,7 +310,12 @@ function runFirstTimeSetup() {
     }
   }
 
-  const closing = leftovers.length
+  const chatOnlyPending = context.sheetReady && leftovers.length > 0
+    && leftovers.every(item => item.indexOf('Google Chat ') === 0);
+  const closing = chatOnlyPending
+    ? '시트 설정은 끝났습니다. Teacher Manager로 돌아가 Google Chat 연결과 학급 단톡방 선택을 마쳐 주세요.\n' +
+      '이 메뉴는 다시 누르지 않아도 됩니다.\n\n아직 남은 것\n\n' + leftovers.join('\n\n')
+    : leftovers.length
     ? '아직 남은 것\n\n' + leftovers.join('\n\n') + '\n\n' +
       '위 안내대로 마친 뒤 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 다시 누르면 됩니다.\n' +
       '이미 끝난 것은 건너뛰니 여러 번 눌러도 안전합니다.'
@@ -266,7 +323,50 @@ function runFirstTimeSetup() {
       '연결 확인번호: ' + connectionCode + '\n' +
       'Teacher Manager에 보이는 번호와 같은지 확인해 주세요.';
 
-  ui.alert('처음 한 번 설정하기', lines.join('\n') + '\n\n' + closing, ui.ButtonSet.OK);
+  // Report roster readiness with the other results, without changing saved setup checkpoints.
+  const roster = firstTimeSetupRosterStep_();
+  const rosterMark = roster.ok ? '[됨]' : roster.unavailable ? '[확인 필요]' : '[안 됨]';
+  lines.push(rosterMark + ' 학생명단 입력 — ' + roster.message);
+  return {
+    title: '처음 한 번 설정하기',
+    message: lines.join('\n') + '\n\n' + closing,
+    complete: leftovers.length === 0 && roster.ok,
+    sheetReady: context.sheetReady
+  };
+}
+
+function firstTimeSetupRosterStep_() {
+  try {
+    const name = String(readConfigValueReadOnly_('ROSTER_SHEET_NAME') || '학생명단').trim();
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+    if (!sheet || sheet.getLastRow() < 1) throw new Error('Roster unavailable');
+    const rows = sheet.getRange(1, 1, sheet.getLastRow(), 3).getDisplayValues();
+    const header = rows.shift();
+    if (header[0] !== '번호' || header[1] !== '이름' || String(header[2]).indexOf('이메일') < 0) {
+      throw new Error('Roster layout unavailable');
+    }
+    const students = rows.map(row => row.map(value => String(value || '').trim()))
+      .filter(row => row.some(Boolean));
+    const numbers = new Set();
+    const emails = new Set();
+    const complete = students.length > 0 && students.every(function (row) {
+      const number = /^[0-9]+$/.test(row[0]) ? row[0].replace(/^0+/, '') : '';
+      const email = row[2].toLowerCase();
+      if (!number || !row[1] || !/^[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)$/.test(email)
+          || numbers.has(number) || emails.has(email)) return false;
+      numbers.add(number);
+      emails.add(email);
+      return true;
+    });
+    return {
+      ok: complete,
+      message: complete
+        ? students.length + '명의 번호·이름·학생 이메일을 확인했습니다. 우리 반 학생이 모두 있는지도 확인해 주세요.'
+        : '[학생명단] 탭에 번호·이름·학생 이메일을 빠짐없이 입력하고, 중복이나 잘못된 값이 없는지 확인해 주세요.'
+    };
+  } catch (_) {
+    return { ok: false, unavailable: true, message: '학생명단을 읽지 못했습니다. Teacher Manager의 [학생명단 입력]에서 확인해 주세요.' };
+  }
 }
 
 /** 결과 목록 한 줄에는 첫 문장만 싣는다 — 자세한 안내는 아래 '아직 남은 것'에 그대로 나온다. */
@@ -319,7 +419,8 @@ function firstTimeSetupChatStep_(context) {
       message: '이미 연결되어 있습니다' + (status.account ? ': ' + status.account : '.')
     };
   }
-  return startCentralChatConnection({ quiet: true }) || { ok: false, message: '결과를 확인하지 못했습니다.' };
+  return startCentralChatConnection({ quiet: true, sheetSetupReady: !!(context && context.sheetReady) })
+    || { ok: false, message: '결과를 확인하지 못했습니다.' };
 }
 
 /** 4단계 — 학급 단톡방 고르기. 목록에서 고르는 화면은 사람이 눌러야 끝난다. */
@@ -388,6 +489,7 @@ function apiMigrateRosterLayoutAfterUpdate() {
   ensureRosterSheet_(ss);
   syncStudentDropdownValues_(ss, cfg);
   applyStudentDropdowns_(ss, cfg);
+  if (ss.getSheetByName('00_사용법')) ensureUsageSheet_(ss);
   return 'ok';
 }
 
@@ -2663,6 +2765,7 @@ function ensureRosterSheet_(ss) {
   const name = cfg.ROSTER_SHEET_NAME || '학생명단';
   let sh = ss.getSheetByName(name);
   if (!sh) sh = ss.insertSheet(name);
+  sh.setTabColor('#3B82F6');
 
   if (sh.getMaxColumns() < ROSTER_HEADERS.length) {
     sh.insertColumnsAfter(sh.getMaxColumns(), ROSTER_HEADERS.length - sh.getMaxColumns());
@@ -3111,10 +3214,26 @@ function ensureUsageSheet_(ss) {
   let sh = ss.getSheetByName('00_사용법');
   if (!sh) sh = ss.insertSheet('00_사용법');
   const title = String(sh.getRange(1,1).getValue() || '').trim();
+  const currentTitle = 'Teacher Manager 출결 사용 안내';
   // Replace only the shipped guide; leave a teacher's own guide untouched.
-  if (title && title !== "출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용") return;
-  sh.getRange(1,1,1,6).merge().setValue("Teacher Manager 출결 사용 안내")
-    .setBackground('#111827').setFontColor('#ffffff').setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center');
+  if (title && title !== currentTitle && title !== "출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용") return;
+  const heading = sh.getRange(1,1,1,3);
+  if (heading.getValues()[0].slice(1).some(value => value !== '' && value !== null)
+      || heading.getFormulas()[0].slice(1).some(Boolean) || heading.getNotes()[0].slice(1).some(Boolean)) return;
+  const merges = heading.getMergedRanges();
+  if (merges.some(range => range.getRow() !== 1 || range.getColumn() !== 1 || range.getNumRows() !== 1
+      || ![3, 6].includes(range.getNumColumns()))) return;
+  if (!merges.some(range => range.getNumColumns() === 3)) {
+    merges.forEach(range => range.breakApart());
+    heading.merge();
+  }
+  if (title !== currentTitle) heading.setValue(currentTitle);
+  heading.setBackground('#1F4E79').setFontColor('#ffffff').setFontWeight('bold').setFontSize(14)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle').setWrap(true);
+  sh.setRowHeight(1, 36);
+  // The desktop preparer already writes this title. Repair its heading only;
+  // retain all existing instructions and any notes the teacher added below it.
+  if (title === currentTitle) return;
   const rows = [
   [
     "순서",
@@ -4719,13 +4838,19 @@ function startCentralChatConnection(options) {
       ? String(info.getAuthorizationUrl() || '').trim()
       : '';
     if (authorizationUrl) {
-      showLinkDialog_('Google 권한 연결', authorizationUrl, '권한 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.');
-      return { ok: false, message: '권한 허용 화면을 열었습니다. 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.' };
+      const message = options && options.sheetSetupReady
+        ? '시트 설정은 끝났습니다. 권한 허용을 마친 뒤 Teacher Manager로 돌아가 Google Chat의 [연결하기]를 눌러 주세요. 이 시트 메뉴는 다시 누르지 않아도 됩니다.'
+        : '권한 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.';
+      showLinkDialog_('Google 권한 연결', authorizationUrl, message);
+      return { ok: false, pending: true, message: message };
     }
     const result = callCentralChatSender_('/v1/auth/start', {});
-    showLinkDialog_('Google Chat 최초 발송 연결하기', result.authUrl, '연결을 마친 뒤 시트로 돌아오세요.');
+    const message = options && options.sheetSetupReady
+      ? '시트 설정은 끝났습니다. 아래 연결 화면에서 Google 권한을 허용한 뒤 Teacher Manager로 돌아가 학급 단톡방을 골라 주세요. 이 시트 메뉴는 다시 누르지 않아도 됩니다.'
+      : '연결을 마친 뒤 시트로 돌아오세요.';
+    showLinkDialog_('Google Chat 최초 발송 연결하기', result.authUrl, message);
     // 브라우저에서 연결을 마쳐야 끝나므로 이 자리에서는 아직 됐다고 하지 않는다.
-    return { ok: false, message: '연결 화면을 열었습니다. 브라우저에서 연결을 마친 뒤 이 메뉴를 다시 눌러 주세요.' };
+    return { ok: false, pending: true, message: '연결 화면을 열었습니다. 브라우저에서 연결을 마친 뒤 Teacher Manager로 돌아가 주세요.' };
   } catch (err) {
     const message = 'Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + centralChatErrorMessage_(err);
     if (!quiet) ui.alert(message);

@@ -25,6 +25,14 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Exact public v4.1 tag c0c8ee6, checked against GitHub and independently
+    # rehashed with .NET on 2026-09-07 before changing the bundled setup flow.
+    (
+        "bc9b7cf0ebdf4aec" "9e8a2744e9d1d440"
+        "0e4b76bc35d11ee1" "088bc3d6dffdca0c"
+    ): (
+        ("v4.1", "c0c8ee607c6db6b1a79b" "146246de0eb46fbf5cf6"),
+    ),
     # Public v3.9 and v4.0 contain this same bundle. The v4.0 files were fetched
     # from its exact public tag commit and rehashed on 2026-09-05.
     (
@@ -125,6 +133,21 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Exact source of the delivered 4.1 roster-status Candidate, before 5.13.5.
+    (
+        "82447ff9f8cb4e4c" "6a61beb70a81e565"
+        "473b8503c71105c6" "d59f31d452986389"
+    ): (
+        ("4.1-candidate-5.13.4", "70c106499b9cffe0ce3d" "f93fe0eed7eee5e21de5"),
+    ),
+    # Delivered 4.1 Candidate. Its exact commit and clean Candidate inputs were
+    # compared and rehashed on 2026-09-07 before the guide/roster UI changes.
+    (
+        "4a81bb875b359845" "9ec9e23840a68e98"
+        "04badfb340e4cb05" "fb49115f3c82b87b"
+    ): (
+        ("4.1-candidate-5.13.3", "3f66932de011e0e2c0ab" "c85a0027e4634bcbe48d"),
+    ),
     # Windows 4.1 Candidate source, rehashed from the exact local main commit
     # on 2026-09-06 before the Gmail-recipient change. Trust this exact bundle
     # so that an existing Candidate Sheet can be updated in place.

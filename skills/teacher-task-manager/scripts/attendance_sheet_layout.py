@@ -138,6 +138,47 @@ def _tail_header_repairs(sheet, old_header):
     return requests
 
 
+def _usage_title_repairs(guide):
+    """Format only a recognized title; merging must never discard teacher content."""
+    if not guide or _values(guide, 0)[0] not in (USAGE_TITLE, PREVIOUS_USAGE_TITLE):
+        return None
+    if any(cell.get('userEnteredValue', {}) not in ({}, {'stringValue': ''}) or cell.get('note') for cell in _cells(guide, 0)[1:3]):
+        return None
+    sid = guide['properties']['sheetId']
+    target = _range(sid, 0, 1, 0, 3)
+    previous = _range(sid, 0, 1, 0, 6)
+    overlaps = [m for m in guide.get('merges', [])
+                if m.get('startRowIndex', 0) == 0 and m.get('startColumnIndex', 0) < 3]
+    def matches(merge, area):
+        return all(merge.get(key, 0) == value for key, value in area.items())
+    if any(not matches(m, target) and not matches(m, previous) for m in overlaps):
+        return None
+    requests = []
+    if not any(matches(m, target) for m in overlaps):
+        for merge in overlaps:
+            requests.append({'unmergeCells': {'range': merge}})
+        requests.append({'mergeCells': {'range': target, 'mergeType': 'MERGE_ALL'}})
+    cell = _cells(guide, 0)[0]
+    fmt = cell.get('userEnteredFormat', {})
+    text = fmt.get('textFormat', {})
+    def rgb(value):
+        return tuple(round(value.get(key, 0) * 255) for key in ('red', 'green', 'blue'))
+    styled = (fmt.get('horizontalAlignment') == 'CENTER' and fmt.get('verticalAlignment') == 'MIDDLE'
+              and fmt.get('wrapStrategy') == 'WRAP' and text.get('bold') is True and text.get('fontSize') == 14
+              and rgb(fmt.get('backgroundColorStyle', {}).get('rgbColor', fmt.get('backgroundColor', {}))) == (31, 78, 121)
+              and rgb(text.get('foregroundColorStyle', {}).get('rgbColor', text.get('foregroundColor', {}))) == (255, 255, 255))
+    if requests or not styled:
+        title_format = {'backgroundColor': _color('1F4E79'), 'backgroundColorStyle': {'rgbColor': _color('1F4E79')},
+                        'horizontalAlignment': 'CENTER', 'verticalAlignment': 'MIDDLE', 'wrapStrategy': 'WRAP',
+                        'textFormat': {'bold': True, 'fontSize': 14, 'foregroundColor': _color('FFFFFF'),
+                                       'foregroundColorStyle': {'rgbColor': _color('FFFFFF')}}}
+        requests.append({'repeatCell': {'range': target, 'cell': {'userEnteredFormat': title_format},
+                                       'fields': ','.join('userEnteredFormat.' + key for key in title_format)}})
+        requests.append({'updateDimensionProperties': {'range': {'sheetId': sid, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 1},
+                                                       'properties': {'pixelSize': 36}, 'fields': 'pixelSize'}})
+    return requests
+
+
 def plan_layout(snapshot):
     sheets = {s.get('properties',{}).get('title'):s for s in snapshot.get('sheets',[])}
     if any(name not in sheets for name in (*MONTHS, '드롭다운', '학생명단')):
@@ -167,12 +208,14 @@ def plan_layout(snapshot):
         requests.append({'updateDimensionProperties':{'range':{'sheetId':dropdown,'dimension':'COLUMNS','startIndex':9,'endIndex':10},
             'properties':{'hiddenByUser':True},'fields':'hiddenByUser'}})
     guide = sheets.get('00_사용법')
-    if guide and _values(guide, 0)[0] == PREVIOUS_USAGE_TITLE:
+    guide_title_requests = _usage_title_repairs(guide)
+    if guide_title_requests is not None and _values(guide, 0)[0] == PREVIOUS_USAGE_TITLE:
         guide_id = guide['properties']['sheetId']
         values = [[USAGE_TITLE] + [''] * 5] + USAGE_ROWS + [[''] * 6 for _ in range(4)]
         requests.append({'updateCells': {'start': {'sheetId': guide_id, 'rowIndex': 0, 'columnIndex': 0},
             'rows': [{'values': [{'userEnteredValue': {'stringValue': value}} for value in row]} for row in values],
             'fields': 'userEnteredValue'}})
+    requests.extend(guide_title_requests or [])
     for name in todo:
         sheet = sheets[name]; props = sheet['properties']; sid = props['sheetId']
         rows = max(int(props.get('gridProperties',{}).get('rowCount',250)),250)
@@ -241,7 +284,7 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws):
         if guide_present:
             guide_reply = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',
                 json.dumps({'spreadsheetId':spreadsheet_id,'ranges':["'00_사용법'!A1:F14"],
-                            'fields':'sheets(properties,data(startRow,startColumn,rowData(values(userEnteredValue))))'},ensure_ascii=False),
+                            'fields':'sheets(properties,merges,data(startRow,startColumn,rowData(values(userEnteredValue,note,userEnteredFormat))))'},ensure_ascii=False),
                 '--format','json'],workdir))
             reply['sheets'] = [item for item in reply['sheets'] if item['properties']['title'] != '00_사용법']
             reply['sheets'].extend((guide_reply or {}).get('sheets', []))
