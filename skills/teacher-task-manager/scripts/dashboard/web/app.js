@@ -435,7 +435,13 @@ function linkRow(url) {
 bindActions({
   "issue-help": async () => {
     // 메일 본문은 프로그램이 채운다(판 번호·식별번호·작업). 교사가 코드를 옮겨 적지 않는다.
-    await call("open_support_email", S.problemIssue);
+    const issue = S.problemIssue || (S.attendanceScriptUpdate?.state === "customized" ? {
+      operation: "attendance_script_update_status",
+      title: "출결 기능 확인이 필요해요.",
+      message: attendanceScriptProtectedMessage(S.attendanceScriptUpdate),
+      change_status: "기존 출결 자료와 현재 연결은 그대로입니다.",
+    } : null);
+    await call("open_support_email", issue);
   },
   "issue-direct": async (el, request) => {
     const key = String(el.dataset.issueAction || "");
@@ -1517,7 +1523,7 @@ function messengerTabHtml() {
   if (S.google && S.google.logged_in && locked) {
     return `<div class="banner warn"><span>${esc(GOEDU_REQUIRED_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
-      <p class="sub" style="margin-top:14px">개인 Gmail 계정으로는 Google 연결을 만들거나 고를 수 없어요.</p>`;
+      <p class="sub" style="margin-top:14px">설정에서 Google 계정과 권한 승인을 확인해 주세요.</p>`;
   }
   if (locked) {
     return `<div class="banner warn"><span>${esc(FIELD_MESSAGES["google-login"])}</span>
@@ -1977,7 +1983,7 @@ function attendanceServiceRow(entry, a) {
     const reason = attendanceChatConnectBlockReason(a);
     const connect = `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…"${reason ? ' disabled aria-describedby="attendance-chat-action-hint"' : ""}>연결하기</button>`;
     chatActs = connect;
-    const hint = reason || "[연결하기]를 눌러 Google Chat 자동발송을 허용해 주세요.";
+    const hint = reason || S.chatStatus?.reason || "[연결하기]를 눌러 Google Chat 자동발송을 허용해 주세요.";
     chatHint = `<p class="hint attendance-chat-action-hint" id="attendance-chat-action-hint">${esc(hint)}</p>`;
   }
   const note = (a.state === "failed" && a.failed_service === entry.service)
@@ -2081,7 +2087,8 @@ function attendanceScriptUpdateHtml(a) {
       <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>`;
   }
   if (update?.state === "customized") {
-    return `<div class="attendance-script-update warn"><span>직접 수정된 기능이라 자동으로 바꾸지 않아요.</span></div>`;
+    return `<div class="attendance-script-update warn"><span>${esc(attendanceScriptProtectedMessage(update))}</span>
+      <button class="btn-quiet" data-action="issue-help" data-preserve-issue="true">도움 요청</button></div>`;
   }
   if (update?.state === "hold") {
     const detail = String(update.detail || "").trim()
@@ -2091,6 +2098,16 @@ function attendanceScriptUpdateHtml(a) {
   }
   return `<div class="attendance-script-update warn"><span>출결 기능을 최신판으로 바꿔야 해요.</span>
     <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 업데이트</button></div>`;
+}
+function attendanceScriptProtectedMessage(update) {
+  // 알려진 안전한 이유만 화면에 옮긴다. 원격 상세 정보는 그대로 표시하지 않는다.
+  const reasons = {
+    "현재 편집본과 실제 배포 중인 버전이 달라요.": "저장된 출결 기능과 실제 실행되는 기능이 달라 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.",
+    "추가한 스크립트 파일이 있어 자동으로 덮어쓰지 않아요.": "출결 기능에 추가된 파일이 있어 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.",
+  };
+  return Object.prototype.hasOwnProperty.call(reasons, update?.detail)
+    ? reasons[update.detail]
+    : "출결 기능이 확인된 정식 버전과 달라 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.";
 }
 function attendanceScriptAccountKey() {
   const attendanceAccount = S.attendance?.account || S.attendance?.current_user || "";

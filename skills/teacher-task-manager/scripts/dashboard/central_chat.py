@@ -56,6 +56,11 @@ SPACE_CREATE_FAILED_MESSAGE = "방을 만들지 못했어요. 잠시 뒤 다시 
 SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌었어요. 현재 상태를 다시 확인해 주세요."
 CLASS_SPACE_SELECTION_CHANGED_CODE = "CHAT_SPACE_SELECTION_CHANGED"
 GOEDU_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
+CHAT_AUTH_UNKNOWN_MESSAGE = "Google Chat 발송 권한을 확인하지 못했어요. 기존 연결은 그대로입니다."
+CHAT_AUTH_PERMISSION_MESSAGE = "Google Chat 발송 권한이 부족해요. [연결하기]를 눌러 같은 Google 계정으로 필요한 권한을 허용해 주세요."
+CHAT_AUTH_REFRESH_MESSAGE = "자동발송을 계속할 수 있도록 승인이 필요해요. [연결하기]를 눌러 같은 Google 계정으로 승인해 주세요."
+CHAT_AUTH_ACCOUNT_MESSAGE = "출석부를 만든 계정과 Google Chat 발송 계정이 달라요. [연결하기]를 눌러 출석부를 만든 Google 계정을 선택해 주세요. 기존 연결은 그대로입니다."
+CHAT_SHEET_ACCESS_MESSAGE = "Google Chat 발송 계정으로 현재 출석부를 열 수 없어요. 출석부 접근 권한을 확인한 뒤 [연결하기]를 눌러 주세요. 기존 연결은 그대로입니다."
 SERVER_ANSWER_MESSAGES = {
     "SHEET_MOVED": SHEET_MOVED_MESSAGE,
     "SHEET_AUTH_REQUIRED": SHEET_AUTH_REQUIRED_MESSAGE,
@@ -65,6 +70,12 @@ SERVER_ANSWER_MESSAGES = {
     "SPACE_CREATE_FAILED": SPACE_CREATE_FAILED_MESSAGE,
     "SPACE_CREATE_STALE": SPACE_CREATE_STALE_MESSAGE,
     "GOEDU_ACCOUNT_REQUIRED": GOEDU_ACCOUNT_REQUIRED_MESSAGE,
+    "AUTH_GRANTS_UNKNOWN": CHAT_AUTH_UNKNOWN_MESSAGE,
+    "AUTH_CHECK_FAILED": CHAT_AUTH_UNKNOWN_MESSAGE,
+    "AUTH_PERMISSION_REQUIRED": CHAT_AUTH_PERMISSION_MESSAGE,
+    "AUTH_REFRESH_REQUIRED": CHAT_AUTH_REFRESH_MESSAGE,
+    "AUTH_ACCOUNT_MISMATCH": CHAT_AUTH_ACCOUNT_MESSAGE,
+    "SPREADSHEET_ACCESS_DENIED": CHAT_SHEET_ACCESS_MESSAGE,
 }
 UNKNOWN_SERVER_ANSWER_MESSAGE = (
     "발송 서버가 요청을 처리하지 못했어요. 잠시 뒤 다시 시도해 주세요."
@@ -1322,15 +1333,22 @@ def start_auth(
 ) -> str:
     # 출결 기록이 없으면 그 안내를 먼저 보여 준다. GWS 선택은 기록을 읽은 뒤
     # read_central_config 안에서 하므로 불필요한 실행 파일 확인도 일어나지 않는다.
+    record = _chosen_record(config_dir, attendance_record)
+    intended_account = record.get("setup_account", "")
+    if intended_account and not google_account.is_goedu_email(intended_account):
+        raise CentralChatError(CONFIG_BROKEN_MESSAGE)
     config = read_central_config(
         config_dir,
         run_command,
         gws_executable=gws_executable,
-        attendance_record=attendance_record,
+        attendance_record=record,
     )
-    response = http_post(config["url"], "/v1/auth/start", {
+    payload = {
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
-    })
+    }
+    if intended_account:
+        payload["intendedEmail"] = intended_account.strip()
+    response = http_post(config["url"], "/v1/auth/start", payload)
     auth_url = str(response.get("authUrl", "") or "")
     if not auth_url.startswith("https://"):
         raise CentralChatError(SERVER_ERROR_MESSAGE)
@@ -1345,10 +1363,12 @@ def chat_status(
     gws_executable: str | None = None,
 ) -> dict:
     try:
+        record = _chosen_record(config_dir, _ATTENDANCE_RECORD_NOT_SUPPLIED)
         config = read_central_config(
             config_dir,
             run_command,
             gws_executable=gws_executable,
+            attendance_record=record,
         )
         response = http_post(config["url"], "/v1/status", {
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
@@ -1368,8 +1388,21 @@ def chat_status(
         reason = supplied if supplied in _SAFE_CENTRAL_MESSAGES else (
             CHAT_STATUS_FAILURE_MESSAGE if supplied or reason_code else ""
         )
+    connected = response.get("connected")
+    read_failed = reason_code in {"AUTH_GRANTS_UNKNOWN", "AUTH_CHECK_FAILED"} or not isinstance(connected, bool)
+    if read_failed:
+        connected = None
+        reason = reason or CHAT_AUTH_UNKNOWN_MESSAGE
+    expected_account = str(record.get("setup_account") or "").strip().lower()
+    actual_account = str(response.get("account") or "").strip().lower()
+    if expected_account and actual_account and expected_account != actual_account:
+        connected, read_failed = False, False
+        reason_code, reason = "AUTH_ACCOUNT_MISMATCH", CHAT_AUTH_ACCOUNT_MESSAGE
     return {
-        "connected": bool(response.get("connected")),
+        "connected": connected,
+        "read_failed": read_failed,
+        "reason_code": reason_code,
+        "has_stored_connection": response.get("hasStoredConnection") is True,
         "registered": bool(response.get("registered")),
         "account": str(response.get("account", "") or ""),
         # 서버에 예전 선택이 남아 있어도 현재 출결 시트에 방 ID가 없으면

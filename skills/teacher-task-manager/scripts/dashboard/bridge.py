@@ -355,7 +355,7 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
             resume="attendance-tab",
         ).with_guidance(steps=(
             "출결 탭 맨 위 한 줄 안내에서 출결 기능 상태를 확인해 주세요.",
-            "출결 기능을 직접 고친 적이 없다면 아래 도움 요청을 눌러 주세요. 필요한 정보는 프로그램이 함께 보내요.",
+            "아래 도움 요청을 눌러 주세요. 필요한 정보는 프로그램이 함께 채워요.",
         ))
     if message == engine.ATTENDANCE_ACCOUNT_MESSAGE:
         return recovery.UserIssue.needs_user(
@@ -2313,9 +2313,9 @@ class Api:
                 str(payload.get("detail") or "") or "출결 기능 상태를 다시 확인하고 있어요."
             )
         elif str(payload.get("state") or "") == "customized":
-            # 프로그램 밖에서 바뀐 결정적 상태다. 세 번 되풀이하지 않고 한 번에 멈춘다.
+            # 신뢰 여부를 확정하지 못한 상태를 보호한다. 누가 바꿨는지는 단정하지 않는다.
             error = AttendanceScriptChangedOutsideError(
-                "출결 기능이 프로그램 밖에서 바뀌어 있어 학급 단톡방 작업을 시작하지 않았어요."
+                "출결 기능이 확인된 정식 버전과 달라 학급 단톡방 작업을 시작하지 않았어요."
             )
             mismatch = f"{payload.get('detail') or ''} | {mismatch}".strip(" |")
         else:
@@ -2466,6 +2466,7 @@ class Api:
             central_chat.CHAT_STATUS_FAILURE_MESSAGE: "CHAT_STATUS_READ",
             central_chat.SERVER_ERROR_MESSAGE: "CHAT_STATUS_SERVER_UNREACHED",
             central_chat.CONFIG_BROKEN_MESSAGE: "CHAT_STATUS_SETTINGS_READ",
+            central_chat.CHAT_AUTH_UNKNOWN_MESSAGE: "CHAT_STATUS_GRANTS_CHECK",
         }
 
         def read_status():

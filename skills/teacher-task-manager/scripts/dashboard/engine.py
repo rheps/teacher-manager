@@ -1230,6 +1230,12 @@ def read_attendance_status(
             account=account,
             detail=ATTENDANCE_AUTH_STATUS_MESSAGE,
         )
+    if auth.get("login_state") == "account_invalid":
+        return AttendanceStatus(
+            state="account-required",
+            account=account,
+            detail=ATTENDANCE_ACCOUNT_REQUIRED_MESSAGE,
+        )
     if not auth.get("logged_in"):
         return AttendanceStatus(state="login-required", account=account, detail=ATTENDANCE_LOGIN_MESSAGE)
     if not auth.get("account_allowed"):
@@ -2353,12 +2359,23 @@ def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) ->
     token_rejected = bool(
         status_document is not None and status_document.get("token_valid") is False
     )
+    identity_invalid = bool(
+        code == 0
+        and (
+            (status_document is not None and "user" in status_document)
+            or re.search(r"(?im)^\s*(?:user\s*:|logged in as\s*:|signed in as\s*:)", str(output or ""))
+        )
+        and not email
+    )
     logged_out_markers = (
         "not logged in", "not authenticated", "no credentials", "login required",
     )
     if logged_in:
         login_state = "logged_in"
         error_code = ""
+    elif identity_invalid:
+        login_state = "account_invalid"
+        error_code = "GOOGLE_ACCOUNT_INVALID"
     elif (
         credentials_absent
         or token_rejected

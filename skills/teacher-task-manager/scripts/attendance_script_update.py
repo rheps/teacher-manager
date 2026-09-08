@@ -25,6 +25,8 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
+    '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
     # Exact public v4.1 tag c0c8ee6, checked against GitHub and independently
     # rehashed with .NET on 2026-09-07 before changing the bundled setup flow.
     (
@@ -133,6 +135,10 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
+    'd1b41c62807847f8fca8417b37a3bac52940509ab165cedc23fe8f85478c8161': (('4.2-google-accounts-candidate', '0dc4d72d3776c646f12bed8554bc9f3e256ff738'),),
+    # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
+    '8ab8e3c8eb2bf3e7467ad45cf10652d8a4fe697c599beb22a241c1361d93d045': (('4.2-gmail-candidate', 'f33896f602483c0dcf4bebc30ed58309a80435a6'),),
     # Exact source of the delivered 4.1 roster-status Candidate, before 5.13.5.
     (
         "82447ff9f8cb4e4c" "6a61beb70a81e565"
@@ -177,6 +183,15 @@ TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
 TRUSTED_PRERELEASE_BUNDLE_SHA256 = frozenset(
     TRUSTED_PRERELEASE_BUNDLE_PROVENANCE
 )
+
+
+# Delivery order only for the three independently proven 4.2 bundles. Unknown
+# content is never assigned an order or trusted from version labels.
+_DELIVERED_42_ORDER = {
+    "5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8": 1,
+    "8ab8e3c8eb2bf3e7467ad45cf10652d8a4fe697c599beb22a241c1361d93d045": 2,
+    "d1b41c62807847f8fca8417b37a3bac52940509ab165cedc23fe8f85478c8161": 3,
+}
 
 
 def _is_trusted_teacher_manager_bundle(bundle_sha256: str) -> bool:
@@ -612,12 +627,27 @@ def inspect_attendance_script_update(
             _content(runner, gws, script, deployed_version), script
         )
 
+        target_order = _DELIVERED_42_ORDER.get(target_sha)
+        if target_order is not None and any(
+            _DELIVERED_42_ORDER.get(bundle.sha256, 0) > target_order
+            for bundle in (head, fixed)
+        ):
+            return _result(
+                "hold", sheet=sheet, script=script, deployment=deployment,
+                current_sha=current_sha, target_sha=target_sha,
+                deployed_version=deployed_version,
+                detail="출결 기능이 이 프로그램보다 새로워요. 프로그램을 업데이트한 뒤 다시 확인해 주세요.",
+            )
+
         if head.sha256 != fixed.sha256 or head.has_extra_files != fixed.has_extra_files:
             head_is_official = (
                 head.sha256 == target_sha
                 or _is_trusted_teacher_manager_bundle(head.sha256)
             )
-            fixed_is_official = _is_trusted_teacher_manager_bundle(fixed.sha256)
+            fixed_is_official = (
+                fixed.sha256 == target_sha
+                or _is_trusted_teacher_manager_bundle(fixed.sha256)
+            )
             if not (
                 head_is_official
                 and fixed_is_official
@@ -945,6 +975,11 @@ def _finish_existing_verified_version(
             "description": update_description,
         }
     }
+    # A verified immutable version does not prove HEAD stayed unchanged.
+    try:
+        _require_bundle(_content(runner, gws, script), script, inspected.target_bundle_sha256)
+    except Exception as exc:
+        return _stopped_result(inspected, exc)
     error: Exception | None = None
     try:
         live_version, _live_description = _check_deployment_base(
@@ -981,6 +1016,10 @@ def _finish_existing_verified_version(
         sleeper,
     )
     if confirmation == "updated":
+        try:
+            _require_bundle(_content(runner, gws, script), script, inspected.target_bundle_sha256)
+        except Exception as exc:
+            return _stopped_result(inspected, exc)
         return _updated_result(inspected, updated_version)
     if confirmation == "previous":
         # Google가 아직 옛 연결을 보여 주면 쓰기를 되풀이하지 않는다. 다음 실행은

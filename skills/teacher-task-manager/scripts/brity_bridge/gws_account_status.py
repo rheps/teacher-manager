@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-
-EMAIL_PATTERN = re.compile(
-    r"(?<![\w.+-])[\w.!#$%&'*+/=?^`{|}~-]+@"
-    r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
-    r"[.][A-Za-z]{2,}(?![\w.-])"
-)
+from brity_bridge.google_account import extract_email, is_goedu_email
 
 RunCommand = Callable[[Sequence[str]], tuple[int, str]]
 
@@ -82,11 +76,7 @@ def _strict_email(value: Any, label: str) -> str:
     _need(isinstance(value, str), f"{label}이 글자가 아닙니다.")
     clean = value.strip()
     _need(clean == value, f"{label} 앞뒤에 공백이 있습니다.")
-    matches = list(EMAIL_PATTERN.finditer(clean))
-    _need(
-        len(matches) == 1 and matches[0].group(0) == clean,
-        f"{label}의 이메일 모양이 올바르지 않습니다.",
-    )
+    _need(is_goedu_email(value), f"{label}의 이메일 모양이 올바르지 않습니다.")
     return clean
 
 
@@ -111,15 +101,15 @@ def _legacy_output_confirms_login(output: str, account: str) -> bool:
     account_key = account.casefold()
 
     def line_parts(line: str) -> tuple[str, str] | None:
-        matches = list(EMAIL_PATTERN.finditer(line))
-        if len(matches) != 1:
+        account = extract_email(line)
+        if not account:
             return None
-        match = matches[0]
-        if line[match.end():].strip():
+        position = line.find(account)
+        if position < 0 or line[position + len(account):].strip():
             return None
         return (
-            line[:match.start()].strip().casefold().rstrip(":").strip(),
-            match.group(0).casefold(),
+            line[:position].strip().casefold().rstrip(":").strip(),
+            account.casefold(),
         )
 
     for line in lines:
@@ -152,13 +142,7 @@ def current_gws_account(run_command: RunCommand, gws_executable: str) -> str:
         "현재 Google 계정 확인 요청이 성공하지 않았습니다.",
     )
     _need(isinstance(output, str), "현재 Google 계정 확인 결과가 글자가 아닙니다.")
-
-    found: dict[str, str] = {}
-    for match in EMAIL_PATTERN.finditer(output):
-        email = match.group(0)
-        found.setdefault(email.casefold(), email)
-    _need(len(found) == 1, "현재 Google 계정을 하나로 분명하게 확인하지 못했습니다.")
-    raw_account = next(iter(found.values()))
+    exact_identity = extract_email(output)
 
     status_objects: list[Mapping[str, Any]] = []
     for value in _json_values_in_text(output):
@@ -168,6 +152,8 @@ def current_gws_account(run_command: RunCommand, gws_executable: str) -> str:
         "현재 Google 로그인 상태를 나타내는 JSON 객체가 여러 개입니다.",
     )
     if not status_objects:
+        raw_account = exact_identity
+        _need(raw_account, "현재 Google 계정을 하나로 분명하게 확인하지 못했습니다.")
         _need(
             _legacy_output_confirms_login(output, raw_account),
             "현재 Google 로그인 완료를 확인하는 문구가 없습니다.",
@@ -200,10 +186,10 @@ def current_gws_account(run_command: RunCommand, gws_executable: str) -> str:
 
     status_account = _strict_email(status["user"], "현재 Google 로그인 상태의 계정")
     _need(
-        status_account.casefold() == raw_account.casefold(),
-        "현재 Google 로그인 상태의 계정과 출력 속 계정이 다릅니다.",
+        exact_identity and exact_identity.casefold() == status_account.casefold(),
+        "현재 Google 로그인 상태의 계정을 하나로 분명하게 확인하지 못했습니다.",
     )
-    return raw_account
+    return status_account
 
 
 __all__ = ["current_gws_account"]

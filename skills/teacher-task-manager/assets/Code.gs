@@ -352,7 +352,7 @@ function firstTimeSetupRosterStep_() {
     const complete = students.length > 0 && students.every(function (row) {
       const number = /^[0-9]+$/.test(row[0]) ? row[0].replace(/^0+/, '') : '';
       const email = row[2].toLowerCase();
-      if (!number || !row[1] || !/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/.test(email)
+      if (!number || !row[1] || !isExactGoeduEmail_(email)
           || numbers.has(number) || emails.has(email)) return false;
       numbers.add(number);
       emails.add(email);
@@ -2555,8 +2555,9 @@ function ensureAttendanceAiEditTrigger_(spreadsheetId, spreadsheet) {
 
 /** 실행 계정이 화면에서 넘긴 교사 계정과 정확히 같은지만 돌려준다. */
 function attendanceAiExpectedAccountMatches_(expectedAccount) {
-  const expected = String(expectedAccount || '').trim().toLowerCase();
-  if (!/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/.test(expected)) return false;
+  const expectedValue = typeof expectedAccount === 'string' ? expectedAccount : '';
+  if (!isExactGoeduEmail_(expectedValue)) return false;
+  const expected = expectedValue.trim().toLowerCase();
   let actual = '';
   try { actual = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase(); } catch (err) {}
   if (!actual) {
@@ -3652,7 +3653,15 @@ function isChatAppConfigurationError_(err) {
 
 function isExactGoeduEmail_(value) {
   // 기존 이름은 호환용이다. Google 세션에서 받은 주소의 형식만 확인하며 도메인은 제한하지 않는다.
-  return /^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/i.test(String(value || '').trim());
+  if (typeof value !== 'string' || /[\u0000-\u001F\u007F-\u009F]/.test(value)) return false;
+  const email = value.trim();
+  if ((email.match(/@/g) || []).length !== 1) return false;
+  const parts = email.split('@');
+  const local = parts[0];
+  const labels = parts[1].split('.');
+  if (!/^[\p{L}\p{N}!#$%&'*+\-/=?^_`{|}~]+(?:\.[\p{L}\p{N}!#$%&'*+\-/=?^_`{|}~]+)*$/u.test(local)) return false;
+  if (labels.length < 2) return false;
+  return labels.every(label => /^[\p{L}\p{N}](?:[\p{L}\p{N}-]*[\p{L}\p{N}])?$/u.test(label));
 }
 
 function readSessionEmail_(event, allowEffectiveUser) {
@@ -3719,7 +3728,7 @@ function requireGoeduTeacherAccount_(options) {
 function requireStudentChatAccount_(value) {
   // 발신 계정 제한과 수신 계정 허용 범위를 섞지 않는다.
   const email = typeof value === 'string' ? value.trim() : '';
-  if (!/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/i.test(email)) {
+  if (!isExactGoeduEmail_(value)) {
     throw new Error(
       '학생의 Google 계정 이메일 주소 한 개를 입력해 주세요.'
     );
