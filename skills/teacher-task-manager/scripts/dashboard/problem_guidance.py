@@ -84,7 +84,7 @@ _GUIDANCE = {
     KIND_SCRIPT_API: Guidance(
         reason="Google의 자동화 사용 허용이 필요해요.",
         steps=(
-            "아래 버튼으로 Google 자동화 사용 설정을 열고, 출결 준비에 쓰던 학교 계정을 선택해 주세요.",
+            "아래 버튼으로 Google 자동화 사용 설정을 열고, 출결 준비에 쓰던 Google 계정을 선택해 주세요.",
             "[Google Apps Script API] 스위치를 켜 주세요.",
             "몇 분 뒤 Teacher Manager로 돌아와 출결 창을 닫았다가 다시 열고 준비를 이어가 주세요.",
         ),
@@ -138,9 +138,9 @@ _GUIDANCE = {
         actions=(recovery.IssueAction("attendance-tab", "출결 탭으로"),),
     ),
     KIND_LOGIN: Guidance(
-        reason="학교 Google 계정 로그인이 필요해요.",
+        reason="Google 계정 로그인이 필요해요.",
         steps=(
-            "설정에서 학교(@goedu.kr) 계정으로 로그인해 주세요.",
+            "설정에서 Google 계정으로 로그인해 주세요.",
             "로그인이 끝나면 프로그램이 자동으로 이어서 진행해요.",
         ),
         actions=(recovery.IssueAction("google-login", "Google 로그인 설정 열기"),),
@@ -175,7 +175,7 @@ def kind_from_message(message: str) -> str:
     text = str(message or "")
     if "Apps Script API" in text:
         return KIND_SCRIPT_API
-    if "@goedu.kr" in text and "로그인" in text:
+    if ("@goedu.kr" in text or "Google 계정" in text) and "로그인" in text:
         return KIND_LOGIN
     if "처음 준비하던 Google 계정" in text:
         return KIND_LOGIN

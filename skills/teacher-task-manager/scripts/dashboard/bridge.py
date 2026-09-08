@@ -58,7 +58,7 @@ _ATTENDANCE_AUTH_BLOCKED_STATES = {
 }
 _ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
     "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. "
-    "‘다시 로그인하고 승인’을 눌러 같은 @goedu.kr 계정으로 승인해 주세요. "
+    "‘다시 로그인하고 승인’을 눌러 같은 Google 계정으로 승인해 주세요. "
     "기존 출석부와 감지기는 그대로입니다."
 )
 _ATTENDANCE_AI_PROOF_MESSAGE = (
@@ -69,8 +69,8 @@ _ATTENDANCE_AI_PROOF_MESSAGE = (
 _ATTENDANCE_ROSTER_MIGRATION_MESSAGE = (
     "새 출결 기능은 올라갔지만 기존 출석부의 학생명단·월별 학생 선택·메신저 상태 정리를 "
     "끝내지 못했어요. 기존 학생 자료는 그대로입니다. Teacher Manager에서 [설정]을 열고 "
-    "[경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)] 줄에서 로그아웃한 뒤, "
-    "본인의 @goedu.kr 계정으로 로그인하고 Google Sheets 권한을 허용해 주세요."
+    "[Google 로그인] 줄에서 로그아웃한 뒤, "
+    "출석부를 연결한 Google 계정으로 로그인하고 Google Sheets 권한을 허용해 주세요."
 )
 _ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE = (
     "기존 출석부의 학생 선택목록과 메신저 상태를 현재 방식으로 정리해야 해요. "
@@ -391,12 +391,12 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
             actions=guidance.actions,
         ).with_guidance(steps=guidance.steps)
     if message == google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE or (
-        "@goedu.kr" in message and "로그인" in message
+        ("@goedu.kr" in message or "Google 계정" in message) and "로그인" in message
     ):
-        # 학교 계정 로그인이 없거나 다른 계정이면 설정의 로그인 단계로 보낸다.
+        # Google 계정 로그인이 없거나 다른 계정이면 설정의 로그인 단계로 보낸다.
         return recovery.UserIssue.needs_user(
             operation=str(operation or "google_login"),
-            title="학교 Google 계정으로 로그인해 주세요.",
+            title="Google 계정으로 로그인해 주세요.",
             message=message,
             change_status="확인된 자료는 바꾸지 않았습니다.",
             actions=(recovery.IssueAction("google-login", "Google 로그인 설정 열기"),),
@@ -1889,7 +1889,7 @@ class Api:
                     "started": False,
                     "reason": (
                         "이 컴퓨터 설정을 저장하지 못했어요. 현재 Windows 계정의 "
-                        "@goedu.kr Google 로그인을 확인한 뒤 다시 시도해 주세요."
+                        "Google 로그인을 확인한 뒤 다시 시도해 주세요."
                     ),
                 }
             if not ok:
@@ -3157,7 +3157,7 @@ class Api:
         return run, gws
 
     def _resolve_attendance_goedu_gws_context_or_fail(self):
-        """출결 자료는 처음 준비한 학교 계정으로만 읽거나 바꾼다."""
+        """출결 자료는 처음 준비한 Google 계정으로만 읽거나 바꾼다."""
 
         self._require_safe_gws_account_storage()
         run = self._attendance_remote_run()

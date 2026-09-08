@@ -22,7 +22,7 @@ GEMINI_KEY_INVALID_FIX = "Gemini API key가 맞지 않아요. AI Studio에서 �
 GEMINI_NETWORK_FIX = "인터넷 연결을 확인한 뒤 Gemini API key를 다시 확인해 주세요."
 GEMINI_RATE_LIMIT_DETAIL = "현재 사용 한도에 도달했어요. 잠시 뒤 다시 확인해 주세요."
 HOTKEY_FIX = "설정에서 메신저 단축키를 다시 눌러 주세요."
-GOOGLE_LOGIN_FIX = "설정에서 학교 Google 계정으로 로그인해 주세요."
+GOOGLE_LOGIN_FIX = "설정에서 Google 계정으로 로그인해 주세요."
 GWS_CLI_FIX = "설정에서 Google Workspace CLI를 준비해 주세요."
 HELPER_FIX = "설정에서 저장하기를 눌러 도우미를 다시 시작해 주세요."
 
@@ -285,7 +285,7 @@ def run_doctor_checks(
         ))
     if logged_in and not is_goedu_email(email):
         results.append(CheckResult(
-            "settings.goedu-account", "교육청 계정(@goedu.kr)", False,
+            "settings.goedu-account", "Google 계정", False,
             f"{email} — {GOEDU_ACCOUNT_REQUIRED_MESSAGE}",
             GOEDU_ACCOUNT_REQUIRED_MESSAGE,
             card="settings", target="google-login",

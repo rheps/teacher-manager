@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping
 
 import attendance_workbook_identity
 import install_attendance_automation
+from brity_bridge.google_account import is_goedu_email
 
 
 @dataclass
@@ -425,7 +426,7 @@ def _chat_move_verified(source_status: Mapping, target_status: Mapping,
         and str(target_status.get("movedFrom", "") or "") == source["sheet_id"]
         and str(target_status.get("account", "") or "").lower()
         == str(source_status.get("account", "") or "").lower()
-        and str(target_status.get("account", "") or "").lower().endswith("@goedu.kr")
+        and is_goedu_email(target_status.get("account", ""))
         and str(source_status.get("classSpaceResource", "") or "")
         == str(source.get("class_space_id", "") or "")
         and str(target_status.get("classSpaceResource", "") or "")
@@ -484,7 +485,7 @@ def _handover_chat_for_candidate(
             return
     connected = bool(source_status.get("connected"))
     source_account = str(source_status.get("account", "") or "").lower()
-    if not connected or not source_account.endswith("@goedu.kr"):
+    if not connected or not is_goedu_email(source_account):
         if existing.get("state") in {"prepared", "move-requested"}:
             raise TransitionUserError("Chat 연결 이동 상태가 서로 달라 자동으로 바꾸지 않았어요.")
         transition_state["chat_handover"] = _chat_ledger(

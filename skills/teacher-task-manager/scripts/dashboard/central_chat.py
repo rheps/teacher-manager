@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from brity_bridge import component_lock, gws_env, paths, process_win, tool_runtime
+from brity_bridge import component_lock, google_account, gws_env, paths, process_win, tool_runtime
 
 SETTINGS_RANGE = "설정!A1:D200"
 
@@ -46,7 +46,7 @@ SHEET_AUTH_REQUIRED_MESSAGE = (
     "이 출석부는 아직 발송 서버에 등록되지 않았어요. 출결 준비를 먼저 마쳐 주세요."
 )
 SPACE_BLOCKED_MESSAGE = (
-    "이 학교 계정으로는 프로그램이 방을 만들 수 없어요. Google Chat에서 직접 만들어 주세요."
+    "이 Google 계정으로는 프로그램이 방을 만들 수 없어요. Google Chat에서 직접 만들어 주세요."
 )
 SPACE_NAME_TAKEN_MESSAGE = "같은 이름의 방이 이미 있어요. 이름을 조금 바꿔서 다시 만들어 주세요."
 SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
@@ -55,10 +55,7 @@ SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
 SPACE_CREATE_FAILED_MESSAGE = "방을 만들지 못했어요. 잠시 뒤 다시 눌러 주세요."
 SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌었어요. 현재 상태를 다시 확인해 주세요."
 CLASS_SPACE_SELECTION_CHANGED_CODE = "CHAT_SPACE_SELECTION_CHANGED"
-GOEDU_ACCOUNT_REQUIRED_MESSAGE = (
-    "이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 "
-    "클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 다시 로그인해 주세요."
-)
+GOEDU_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
 SERVER_ANSWER_MESSAGES = {
     "SHEET_MOVED": SHEET_MOVED_MESSAGE,
     "SHEET_AUTH_REQUIRED": SHEET_AUTH_REQUIRED_MESSAGE,
@@ -739,7 +736,7 @@ def move_sheet_connection(
             if not (
                 target_status.get("registered") is True
                 and target_status.get("connected") is True
-                and account.endswith("@goedu.kr")
+                and google_account.is_goedu_email(account)
             ):
                 raise CentralChatError(UNKNOWN_SERVER_ANSWER_MESSAGE)
             return {
@@ -757,7 +754,7 @@ def move_sheet_connection(
             }
         return {"outcome": "not_registered", "moved": False}
     account = str(source_status.get("account", "") or "").strip().casefold()
-    if not account.endswith("@goedu.kr"):
+    if not google_account.is_goedu_email(account):
         raise CentralChatError(GOEDU_ACCOUNT_REQUIRED_MESSAGE)
 
     gws = _resolved_gws_executable(gws_executable)
@@ -920,7 +917,7 @@ def rollback_sheet_connection(
         or not target_spreadsheet_id
         or not secret
         or not url.startswith("https://")
-        or not account.endswith("@goedu.kr")
+        or not google_account.is_goedu_email(account)
         or set(previous) != set(_CHAT_HANDOVER_KEYS)
         or not all(isinstance(previous[key], str) for key in _CHAT_HANDOVER_KEYS)
         or set(handover) != set(_CHAT_HANDOVER_KEYS)

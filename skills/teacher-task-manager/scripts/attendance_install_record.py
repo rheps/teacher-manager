@@ -200,10 +200,12 @@ def validate_attendance_install_record(record: dict) -> dict:
         setup_account = record[SETUP_ACCOUNT_FIELD]
         if (
             not isinstance(setup_account, str)
-            or re.fullmatch(r"[^@\s]+@goedu\.kr", setup_account.strip(), re.IGNORECASE)
-            is None
+            or re.fullmatch(
+                r'[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+',
+                setup_account.strip(), re.IGNORECASE,
+            ) is None
         ):
-            raise _error("setup_account는 확인된 @goedu.kr 계정이어야 해요.")
+            raise _error("setup_account는 확인된 Google 계정이어야 해요.")
     if SCRIPT_ATTESTATION_FIELD in record:
         attestation = record[SCRIPT_ATTESTATION_FIELD]
         if (

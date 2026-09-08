@@ -352,7 +352,7 @@ function firstTimeSetupRosterStep_() {
     const complete = students.length > 0 && students.every(function (row) {
       const number = /^[0-9]+$/.test(row[0]) ? row[0].replace(/^0+/, '') : '';
       const email = row[2].toLowerCase();
-      if (!number || !row[1] || !/^[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)$/.test(email)
+      if (!number || !row[1] || !/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/.test(email)
           || numbers.has(number) || emails.has(email)) return false;
       numbers.add(number);
       emails.add(email);
@@ -1879,8 +1879,8 @@ function attendanceAiSkipLog_(reason) {
 }
 
 function handleAttendanceAiEdit(e, testPorts) {
-  // 설치형 감지기는 실제 편집자 주소가 숨겨질 수 있다. 주소가 보이면 Gmail 편집을
-  // 막고, 주소가 안 보여도 감지기를 만든 계정은 반드시 @goedu.kr인지 따로 확인한다.
+  // 설치형 감지기는 실제 편집자 주소가 숨겨질 수 있다. 주소가 보이면 허용 계정인지
+  // 확인하고, 주소가 안 보여도 감지기를 만든 계정은 허용 계정인지 따로 확인한다.
   requireGoeduTeacherAccount_({ event: e, requireEffectiveUser: true });
   if (
     !e
@@ -2553,10 +2553,10 @@ function ensureAttendanceAiEditTrigger_(spreadsheetId, spreadsheet) {
   return { created: true, removed: 0, count: 1 };
 }
 
-/** 실행 계정이 화면에서 넘긴 학교 계정과 정확히 같은지만 돌려준다. */
+/** 실행 계정이 화면에서 넘긴 교사 계정과 정확히 같은지만 돌려준다. */
 function attendanceAiExpectedAccountMatches_(expectedAccount) {
   const expected = String(expectedAccount || '').trim().toLowerCase();
-  if (!/^[^@\s]+@goedu\.kr$/.test(expected)) return false;
+  if (!/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/.test(expected)) return false;
   let actual = '';
   try { actual = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase(); } catch (err) {}
   if (!actual) {
@@ -2911,7 +2911,7 @@ function buildRosterKeyMap_(rows) {
     const number = String(row[0] || '').trim();
     const name = String(row[1] || '').trim();
     const combined = combineStudentNumberAndName_(number, name);
-    // 학생 Google 이메일은 그대로 읽고, 실제 발송 직전에 학교 계정 또는 Gmail인지 확인한다.
+    // 학생 Google 이메일은 그대로 읽고, 실제 발송 직전에 주소 한 개의 형식을 확인한다.
     const email = String(row[2] || '').trim();
     const student = {
       rowNumber: index + 2,
@@ -3651,7 +3651,8 @@ function isChatAppConfigurationError_(err) {
 }
 
 function isExactGoeduEmail_(value) {
-  return /^[^@\s]+@goedu\.kr$/i.test(String(value || '').trim());
+  // 기존 이름은 호환용이다. Google 세션에서 받은 주소의 형식만 확인하며 도메인은 제한하지 않는다.
+  return /^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/i.test(String(value || '').trim());
 }
 
 function readSessionEmail_(event, allowEffectiveUser) {
@@ -3669,8 +3670,8 @@ function readSessionEmail_(event, allowEffectiveUser) {
   try {
     activeEmail = String(Session.getActiveUser().getEmail() || '').trim();
   } catch (ignored) {}
-  // 현재 사용자가 보이면 그 계정을 그대로 판단한다. Gmail 사용자가 시트를 열었는데
-  // 소유자의 @goedu.kr 계정으로 바꿔 판단하면 안 된다.
+  // 현재 사용자가 보이면 그 계정을 그대로 판단한다.
+  // 소유자의 허용 계정으로 바꿔 판단하면 안 된다.
   if (activeEmail) return activeEmail;
   // 설치형 자동 감지기는 실제 편집 계정을 모를 때 소유자 계정으로 대신 판단하지 않는다.
   // 누가 고쳤는지 확인할 수 없는 편집은 조용히 멈추는 것이 학생 자료를 잘못 다루는 것보다 안전하다.
@@ -3685,7 +3686,7 @@ function readSessionEmail_(event, allowEffectiveUser) {
 function mayRunLocalSheetTrigger_(event) {
   // 단순 onEdit/onSelectionChange에서는 Google이 사용자 주소를 주지 않을 수 있다.
   // 이 두 함수는 현재 시트의 표시·서식만 고치므로, 주소가 정말 안 보일 때는 계속
-  // 동작하게 한다. 다만 주소가 보인다면 정확한 @goedu.kr만 허용한다.
+  // 동작하게 한다. 다만 주소가 보인다면 허용 교사 계정인지 확인한다.
   const email = readSessionEmail_(event, false);
   return !email || isExactGoeduEmail_(email);
 }
@@ -3695,8 +3696,7 @@ function requireGoeduTeacherAccount_(options) {
   const email = readSessionEmail_(opts.event, opts.allowEffectiveUser !== false);
   if (!isExactGoeduEmail_(email)) {
     throw new Error(
-      '이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 ' +
-      '클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 다시 로그인해 주세요.'
+      '이 계정으로는 진행할 수 없어요. Google 계정으로 다시 로그인해 주세요.'
     );
   }
   if (opts.requireEffectiveUser === true) {
@@ -3708,8 +3708,7 @@ function requireGoeduTeacherAccount_(options) {
     }
     if (!isExactGoeduEmail_(effectiveEmail)) {
       throw new Error(
-        '이 감지기를 만든 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 ' +
-        '클라우드 지원시스템에서 준비한 @goedu.kr 계정으로 AI 출결 입력을 다시 켜 주세요.'
+        '이 감지기를 만든 계정으로는 진행할 수 없어요. Google 계정으로 AI 출결 입력을 다시 켜 주세요.'
       );
     }
     return effectiveEmail;
@@ -3720,9 +3719,9 @@ function requireGoeduTeacherAccount_(options) {
 function requireStudentChatAccount_(value) {
   // 발신 계정 제한과 수신 계정 허용 범위를 섞지 않는다.
   const email = typeof value === 'string' ? value.trim() : '';
-  if (!/^[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)$/i.test(email)) {
+  if (!/^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$/i.test(email)) {
     throw new Error(
-      '학생 이메일은 @goedu.kr 또는 @gmail.com 주소 한 개를 입력해 주세요. 학교 계정(@goedu.kr)을 권장해요.'
+      '학생의 Google 계정 이메일 주소 한 개를 입력해 주세요.'
     );
   }
   return email;
@@ -3730,7 +3729,7 @@ function requireStudentChatAccount_(value) {
 
 function centralChatPathNeedsTeacher_(path) {
   // 연결을 끊거나 서버 기록을 지우는 길만 예외다. 새 작업 주소가 나중에 생겨도
-  // 목록에 깜빡하고 더하지 않았다는 이유로 개인 계정에서 열리지 않게 기본은 차단한다.
+  // 목록에 깜빡하고 더하지 않았다는 이유로 계정 확인 없이 열리지 않게 기본은 차단한다.
   return ['/v1/disconnect', '/v1/account/delete']
     .indexOf(String(path || '').trim()) === -1;
 }
@@ -3866,7 +3865,7 @@ function centralChatErrorMessage_(err) {
   const code = String(err && err.centralCode || '').trim();
   if (code === CENTRAL_SHEET_MOVED_CODE) return CENTRAL_SHEET_MOVED_MESSAGE;
   if (code === 'GOEDU_ACCOUNT_REQUIRED') {
-    return '이 계정으로는 진행할 수 없어요. @goedu.kr 계정으로 다시 로그인해 주세요.';
+    return '이 계정으로는 진행할 수 없어요. Google 계정으로 다시 로그인해 주세요.';
   }
   return errorMessage_(err);
 }

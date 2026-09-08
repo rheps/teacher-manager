@@ -1,4 +1,4 @@
-"""Teacher Manager가 허용하는 경기도교육청 Google 계정 규칙."""
+"""Teacher Manager Google 계정 주소 형식 검사. 계정 인증은 Google 로그인으로 확인한다."""
 
 from __future__ import annotations
 
@@ -6,11 +6,13 @@ import re
 
 
 GOEDU_ACCOUNT_REQUIRED_MESSAGE = (
-    "이 계정으로는 진행할 수 없어요. 교육디지털원패스 및 경기도교육청 "
-    "클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)"
+    "이 계정으로는 진행할 수 없어요. Google "
+    "계정으로 다시 로그인해 주세요."
 )
 
-_GOEDU_EMAIL = re.compile(r"^[^@\s]+@goedu\.kr$", re.IGNORECASE)
+_GOOGLE_EMAIL = re.compile(
+    r'^[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+$', re.IGNORECASE
+)
 _ANY_EMAIL = re.compile(
     r"([^@\s\"'<>,;:()\[\]{}]+@[^@\s\"'<>,;:()\[\]{}]+)",
     re.IGNORECASE,
@@ -18,9 +20,9 @@ _ANY_EMAIL = re.compile(
 
 
 def is_goedu_email(value: object) -> bool:
-    """공백이나 위장 주소 없이 정확한 ``이름@goedu.kr``인지 확인한다."""
+    """주소 한 개의 형식만 확인한다. Google 계정 여부는 로그인 결과로 확인하며 기존 이름은 호환용이다."""
 
-    return bool(_GOEDU_EMAIL.fullmatch(str(value or "").strip()))
+    return bool(_GOOGLE_EMAIL.fullmatch(str(value or "").strip()))
 
 
 def extract_email(text: object) -> str:

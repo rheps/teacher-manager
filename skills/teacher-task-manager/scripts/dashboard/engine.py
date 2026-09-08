@@ -492,7 +492,7 @@ def summarize_attendance_roster(rows: list) -> dict:
         normalized_number = str(int(number)) if re.fullmatch(r"[0-9]+", number) else ""
         email = email.casefold()
         invalid = (bool(number) and (not normalized_number or normalized_number == "0" or normalized_number in numbers))
-        invalid = invalid or (bool(email) and (not re.fullmatch(r'[^@\s<>,;:"()[\]{}\\/]+@(?:goedu\.kr|gmail\.com)', email) or email in emails))
+        invalid = invalid or (bool(email) and (not re.fullmatch(r'[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+', email) or email in emails))
         if invalid:
             invalid_rows.append(row_number)
         if normalized_number:
@@ -915,7 +915,7 @@ ATTENDANCE_ERROR_MESSAGES = {
     "setup": "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
 }
 ATTENDANCE_GWS_MESSAGE = "Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
-ATTENDANCE_LOGIN_MESSAGE = "설정에서 학교 Google 계정으로 로그인해 주세요."
+ATTENDANCE_LOGIN_MESSAGE = "설정에서 Google 계정으로 로그인해 주세요."
 ATTENDANCE_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
 ATTENDANCE_AUTH_STATUS_MESSAGE = (
     "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검하고 "
@@ -997,7 +997,7 @@ _APPS_SCRIPT_API_DISABLED_MARKERS = (
 )
 ATTENDANCE_APPS_SCRIPT_API_MESSAGE = (
     "이 Google 계정에서 Google Apps Script API가 아직 꺼져 있어요. "
-    "브라우저에서 https://script.google.com/home/usersettings 를 열고 같은 @goedu.kr 계정으로 "
+    "브라우저에서 https://script.google.com/home/usersettings 를 열고 같은 Google 계정으로 "
     "로그인한 뒤 [Google Apps Script API] 스위치를 켜 주세요. "
     "몇 분 뒤 Teacher Manager로 돌아와 출결 준비를 다시 시작해 주세요."
 )
@@ -2391,7 +2391,7 @@ def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) ->
 
 
 def require_goedu_gws_session(run_command, gws: str) -> str:
-    """실제 Google 자료를 읽거나 쓰기 직전에 학교 계정을 다시 확인한다."""
+    """실제 Google 자료를 읽거나 쓰기 직전에 Google 로그인 계정을 다시 확인한다."""
 
     if not gws:
         raise RuntimeError("Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요.")
@@ -2401,7 +2401,7 @@ def require_goedu_gws_session(run_command, gws: str) -> str:
             raise RuntimeError(
                 "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검해 주세요."
             )
-        raise RuntimeError("Google Workspace에 @goedu.kr 계정으로 먼저 로그인해 주세요.")
+        raise RuntimeError("Google 계정으로 먼저 로그인해 주세요.")
     return google_account.require_goedu_email(auth.get("user", ""))
 
 
@@ -4461,17 +4461,17 @@ def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> l
 
 def _google_login_issue(*, personal: bool = False) -> recovery.UserActionRequired:
     message = (
-        "현재 개인 Google 계정으로 로그인되어 있어요. 학교 @goedu.kr 계정으로 바꿔 주세요."
+        google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
         if personal
-        else "학교 @goedu.kr Google 계정으로 로그인해 주세요."
+        else "Google 계정으로 로그인해 주세요."
     )
     return recovery.UserActionRequired(
         recovery.UserIssue.needs_user(
             operation="google_login",
-            title="학교 Google 로그인이 필요해요.",
+            title="Google 로그인이 필요해요.",
             message=message,
             change_status=GOOGLE_UNCHANGED,
-            actions=(recovery.IssueAction("google-login", "학교 계정으로 로그인"),),
+            actions=(recovery.IssueAction("google-login", "Google 계정으로 로그인"),),
             resume="google-login",
         )
     )
@@ -5208,7 +5208,7 @@ def attendance_connection_candidates(
             return AttendanceConnectionCandidates(
                 state=state,
                 expected_name=expected_name,
-                detail="설정에서 같은 학교 Google 계정으로 로그인해 주세요.",
+                detail="설정에서 출결 자료를 만든 Google 계정으로 로그인해 주세요.",
             )
         del account  # 계정 일치는 위에서 확인했고 후보는 ownedByMe 표식까지 다시 본다.
         found = install_attendance_automation.find_canonical_attendance_sheets(
@@ -5366,7 +5366,7 @@ def select_attendance_connection(
             if state != "ready":
                 return AttendanceConnectionSelection(
                     state=state,
-                    detail="설정에서 같은 학교 Google 계정으로 로그인해 주세요.",
+                    detail="설정에서 출결 자료를 만든 Google 계정으로 로그인해 주세요.",
                 )
             fresh = install_attendance_automation.find_canonical_attendance_sheets(
                 deps.attendance_runner,

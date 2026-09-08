@@ -79,7 +79,7 @@ const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
   "이 컴퓨터 설정", "Google 연결", "모두 저장",
 ];
-const GOEDU_REQUIRED_MESSAGE = "교육디지털원패스 및 경기도교육청 클라우드 지원시스템 계정으로 다시 로그인해 주세요. (@goedu.kr)";
+const GOEDU_REQUIRED_MESSAGE = "Google 계정으로 다시 로그인해 주세요.";
 function isGoeduGoogleStatus(status) {
   return Boolean(status && status.logged_in && status.account_allowed === true);
 }
@@ -293,7 +293,7 @@ const FIELD_MESSAGES = {
   "업무Tasks목록ID": "개인 업무를 등록할 Tasks 목록을 골라 주세요.",
   "담임안내Tasks목록ID": "조종례 전달사항을 등록할 Tasks 목록을 골라 주세요.",
   "gemini_api_key": "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
-  "google-login": "Google 로그인이 필요해요. 설정에서 경기도교육청 클라우드 계정(@goedu.kr)으로 로그인해 주세요.",
+  "google-login": "Google 로그인이 필요해요. 설정에서 Google 계정으로 로그인해 주세요.",
 };
 // 사용자가 직접 고치는 입력칸의 name — 편집 중엔 저장된 점검 대신 현재 입력을 본다.
 const EDITABLE_TARGETS = new Set([
@@ -827,8 +827,8 @@ stepBodies[1] = function stepStart() {
     </div>`;
   return `
     <p class="start-eyebrow">처음 설치하는 선생님</p>
-    <h1>설치 전에 세 가지만 준비해 주세요</h1>
-    <p class="sub start-lede">Teacher Manager는 경기도교육청 교직원용입니다. 아래 가입을 먼저 마치면 앱 설치 뒤 바로 Google Workspace와 Brity 메신저를 연결할 수 있어요.</p>
+    <h1>Google 계정을 준비해 주세요</h1>
+    <p class="sub start-lede">학교 계정이나 개인 Gmail 등 Google에 로그인할 수 있는 계정으로 시작할 수 있어요. 이미 Google 계정이 있으면 아래 가입 없이 다음 단계로 진행하세요. 경기도교육청 학교 계정을 새로 만들려면 아래 순서를 따라 주세요.</p>
     <div class="prep-list">
       ${prepRow(1, "교육디지털원패스 교직원 회원가입", "https://edupass.neisplus.kr/에서 교직원 계정을 준비합니다.", linkButton("https://edupass.neisplus.kr/", "교육디지털원패스 열기"))}
       ${prepRow(2, "경기도교육청 교육용 클라우드 지원시스템 가입", "https://www.goedu.kr/에서 디지털원패스 계정을 통해 교직원 가입을 마칩니다.", linkButton("https://www.goedu.kr/", "공식 사이트 열기"))}
@@ -865,7 +865,7 @@ async function pollLoginOnce(request) {
     await refreshSettingsStatus(request);
     if (!ownsIssueRequest(request)) return false;
     if (isGoogleReady(S.google)) {
-      if (!(await resumeInterruptedGoogleScreen(request))) showToast("@goedu.kr 계정으로 로그인했어요");
+      if (!(await resumeInterruptedGoogleScreen(request))) showToast("Google 계정으로 로그인했어요");
       refreshChecks().catch(() => {});
     } else setBanner("warn", googleAuthorizationMessage(S.google));
     return false;
@@ -1774,7 +1774,7 @@ function classSpaceContentHtml(a) {
   // ㄷ. 학교가 막아 두었다 — 손으로 만드는 순서를 보여준다.
   if (S.spaceCreate === "blocked") {
     return `<div class="svc-subrow">
-      <span class="nameblock"><small>이 학교 계정으로는 프로그램이 방을 만들 수 없어요.
+      <span class="nameblock"><small>이 Google 계정으로는 프로그램이 방을 만들 수 없어요.
         Google Chat에서 직접 만들어 주세요.<br>
         1. Google Chat을 엽니다<br>
         2. [새 채팅] → [한 명 이상을 추가하세요]에 학생 이메일을 한꺼번에 붙여 넣습니다<br>
@@ -1787,7 +1787,7 @@ function classSpaceContentHtml(a) {
   // 방금 만들었다 — 학생 초대 안내를 그 자리에 이어 붙인다.
   const madeNote = S.spaceCreate === "ok"
     ? `<div class="svc-subrow">
-        <span class="nameblock"><small>학생의 학교 계정(@goedu.kr) 또는 Gmail(@gmail.com)로 직접 초대해 주세요. 학교 계정을 권장해요.<br>
+        <span class="nameblock"><small>학생이 사용하는 Google 계정 이메일로 직접 초대해 주세요.<br>
           (Teacher Manager에서 단체 톡방 인원 초대는 불가능합니다. 직접 진행해 주세요.)</small></span>
         </div>`
     : "";
@@ -2076,7 +2076,7 @@ function attendanceScriptUpdateHtml(a) {
   }
   if (update?.state === "permission-required") {
     const detail = String(update.detail || "").trim()
-      || "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. ‘다시 로그인하고 승인’을 눌러 같은 @goedu.kr 계정으로 승인해 주세요. 기존 출석부와 감지기는 그대로입니다.";
+      || "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. ‘다시 로그인하고 승인’을 눌러 같은 Google 계정으로 승인해 주세요. 기존 출석부와 감지기는 그대로입니다.";
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>`;
   }
@@ -2319,7 +2319,7 @@ function attendanceTabHtml() {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || "내 정보와 하루 일과를 먼저 입력해 주세요.")}</span>
       <button class="btn-quiet" data-action="goto-identity">내 정보 열기</button></div>`;
   } else if (a.state === "script-permission-required") {
-    statusArea = `<div class="banner warn"><span>학교 계정에서 Google 자동화 사용을 한 번 허용해야 해요. 설정에서 [Google Apps Script API]를 켠 뒤 돌아와 계속해 주세요. 기존 출결 자료는 그대로입니다.</span>
+    statusArea = `<div class="banner warn"><span>로그인한 Google 계정에서 자동화 사용을 한 번 허용해야 해요. 설정에서 [Google Apps Script API]를 켠 뒤 돌아와 계속해 주세요. 기존 출결 자료는 그대로입니다.</span>
       <button class="btn-quiet" data-action="attendance-script-settings">Google 자동화 사용 설정 열기</button>
       <button class="btn-tonal" data-action="attendance-prepare-retry" data-busy-text="확인 중…">허용 후 계속</button></div>`;
   } else if (a.state === "script-recovery-required") {
@@ -2912,7 +2912,7 @@ function stepConnect() {
     const message = S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(message)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
-      <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 @goedu.kr 계정을 확인한 뒤에만 시작해요.</p>${pendingChat()}`;
+      <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 Google 계정과 필요한 권한을 확인한 뒤 시작해요.</p>${pendingChat()}`;
   }
   if (S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
@@ -3206,7 +3206,7 @@ function googleLoginRowsHtml() {
   const g = S.google;
   if (!g) return `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
-    <div class="row"><span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span><span class="st">확인 중이에요…</span></div>`;
+    <div class="row"><span class="nameblock"><b>Google 로그인</b></span><span class="st">확인 중이에요…</span></div>`;
   const loginError = fieldError("google-login");
   const updateUnavailable = Boolean(S.gwsUpdate && S.gwsUpdate.unavailable);
   const update = updateUnavailable ? null : S.gwsUpdate;
@@ -3251,7 +3251,7 @@ function googleLoginRowsHtml() {
       ? `<span class="st ok">준비됐어요</span>`
       : `<span class="st warn">로그인 준비 파일이 없어요</span>`;
   const oauthRow = `<div class="row">${oauthBlock}<span class="row-actions">${oauthRight}</span></div>`;
-  const loginBlock = `<span class="nameblock"><b>경기도교육청 클라우드 아이디로 Google 로그인(@goedu.kr)</b></span>`;
+  const loginBlock = `<span class="nameblock"><b>Google 로그인</b></span>`;
   const authCheckFailed = googleAuthCheckFailed(g);
   const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem);
   const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button>`;
@@ -3319,14 +3319,14 @@ function googleAccountDecisionHtml() {
   </div>`;
   if (!allowed) {
     return `${account}<div class="decision-banner error">
-      <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>@goedu.kr 계정으로만 진행할 수 있습니다.</p>
+      <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>Google 계정으로 진행할 수 있습니다.</p>
     </div>${lockedGoogleServicesHtml()}`;
   }
   if (!ready) return `${account}<div class="banner warn">${esc(googleAuthorizationMessage(g))}</div>`;
   return account;
 }
 function googleAccountSectionHtml(includeRefresh) {
-  return `<div class="section-h section-head"><span>Google Workspace 준비</span>${includeRefresh ? settingsRefreshButtonHtml() : ""}</div>
+  return `<div class="section-h section-head"><span>Google 계정 준비</span>${includeRefresh ? settingsRefreshButtonHtml() : ""}</div>
     <div class="panel">${googleLoginRowsHtml()}</div>
     ${googleAccountDecisionHtml()}
     ${loginWaitHtml()}`;
@@ -3376,11 +3376,11 @@ function stepGoogleLogin() {
     : isGoeduGoogleStatus(g) && !isGoogleReady(g)
       ? "Google 권한을 다시 확인해 주세요"
     : isGoogleReady(g)
-      ? "경기도교육청 계정으로 확인됐어요"
-      : "Google Workspace에 로그인해 주세요";
+      ? "Google 계정으로 확인됐어요"
+      : "Google 계정으로 로그인해 주세요";
   const lead = g && g.logged_in && !isGoeduGoogleStatus(g)
-    ? "Teacher Manager 앱은 @goedu.kr 계정 전용입니다."
-    : "일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 경기도교육청 계정으로 로그인해 주세요.";
+    ? "Teacher Manager 앱은 Google 계정으로 사용할 수 있습니다."
+    : "일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 Google 계정으로 로그인해 주세요.";
   return `<h1>${title}</h1><p class="sub">${lead}</p>${googleAccountSectionHtml(true)}`;
 }
 async function validateGoogleLogin() {
@@ -3523,15 +3523,15 @@ bindActions({
 /* Student preparation belongs before room selection, inside Google Chat. */
 function studentChatGuideHtml() {
   return `<div class="svc-subrow student-chat-guide">
-    <p><strong>학생 학교 계정(@goedu.kr)을 권장해요.</strong><br>학생은 일반 Gmail(@gmail.com)로도 Google Chat 안내를 받을 수 있어요.</p>
+    <p><strong>학생이 사용하는 Google 계정을 준비해 주세요.</strong><br>학교별 계정이나 개인 Gmail 등 주소의 도메인에 관계없이 입력할 수 있어요.</p>
     <details ${S.studentChatGuideOpen ? "open" : ""} data-student-chat-guide>
       <summary>학생 계정 준비와 초대 방법</summary>
       <ol>
-        <li><b>학생 계정 준비</b> — 학교 계정은 아래 세 단계를 모두 마쳐야 사용할 수 있어요.<br>
+        <li><b>학생 계정 준비</b> — 이미 Google 계정이 있으면 그대로 사용하세요. 경기도교육청 학교 계정을 새로 만들 때는 아래 세 단계를 마쳐 주세요.<br>
           <strong>① 교육디지털원패스 가입·ID 확인</strong>: 담임 선생님은 <strong>[회원 정보 → 학생 회원 가입]</strong>의 <strong>학생 회원 가입 현황</strong>에서 학생 ID를 확인할 수 있어요. 여기서 확인하는 것은 원패스 ID예요.<br>
           <strong>② 교육용 클라우드 가입</strong>: 학생이 원패스 ID로 경기도교육청 교육용 클라우드 지원시스템에 추가로 가입해 주세요.<br>
           <strong>③ Google Workspace 가입</strong>: 교육용 클라우드 안에서 Google Workspace 사용 신청까지 별도로 마쳐야 학교 Google 계정이 생겨요. 학교 이메일은 보통 <strong>원패스 ID@goedu.kr</strong>입니다.</li>
-        <li><b>학생 계정 초대</b> — 아래 <strong>[단톡방(스페이스) 만들기]</strong>로 선생님 학교 계정에 들어가 <strong>[새 채팅]</strong>을 누르세요. <strong>[한 명 이상을 추가하세요]</strong> 칸에 학생 이메일을 한꺼번에 붙여 넣으세요.<br>
+        <li><b>학생 계정 초대</b> — 아래 <strong>[단톡방(스페이스) 만들기]</strong>로 선생님 Google 계정에 들어가 <strong>[새 채팅]</strong>을 누르세요. <strong>[한 명 이상을 추가하세요]</strong> 칸에 학생 이메일을 한꺼번에 붙여 넣으세요.<br>
           이메일은 <strong>한 줄에 하나씩</strong> 또는 <strong>쉼표와 띄어쓰기</strong>로 구분해 주세요. 띄어쓰기만으로 구분하면 인식되지 않아요.<br>
           예: student1@goedu.kr, student2@goedu.kr</li>
         <li><b>학생 단체 톡방 만들기</b> — 메시지를 한 번 보낸 뒤, <strong>위쪽 대화 이름 → [이 채팅을 스페이스로 전환]</strong>을 누르세요. 이름은 '2학년 7반'처럼 짧게 정해 주세요.</li>
