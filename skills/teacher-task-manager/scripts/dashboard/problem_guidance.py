@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from brity_bridge import recovery
 
@@ -24,8 +24,7 @@ ALL_KINDS = (
     KIND_LOGIN, KIND_LOCAL, KIND_SHEET_CONNECTION_VALUE, KIND_SCRIPT_API, KIND_OTHER,
 )
 
-_REOPEN_STEP = "이 창을 닫았다가 다시 열면 프로그램이 자동으로 다시 확인해요."
-_HELP_STEP = "그래도 같으면 아래 도움 요청을 눌러 주세요. 필요한 정보는 프로그램이 함께 보내요."
+_PRESERVE_STEP = "현재 자료와 입력한 값을 그대로 보관해 주세요."
 
 _OPERATION_KINDS = {
     "get_update_info": KIND_UPDATE,
@@ -84,48 +83,44 @@ _GUIDANCE = {
     KIND_SCRIPT_API: Guidance(
         reason="Google의 자동화 사용 허용이 필요해요.",
         steps=(
-            "아래 버튼으로 Google 자동화 사용 설정을 열고, 출결 준비에 쓰던 Google 계정을 선택해 주세요.",
+            "[Apps Script API 사용]을 눌러 출결 준비에 쓰던 Google 계정의 설정을 열어 주세요.",
             "[Google Apps Script API] 스위치를 켜 주세요.",
-            "몇 분 뒤 Teacher Manager로 돌아와 출결 창을 닫았다가 다시 열고 준비를 이어가 주세요.",
+            "Teacher Manager 출결 탭으로 돌아와 이어지는 안내를 확인해 주세요.",
         ),
-        actions=(recovery.IssueAction("open-script-api-settings", "Google 자동화 사용 설정 열기"),),
+        actions=(recovery.IssueAction("open-script-api-settings", "Apps Script API 사용"),),
     ),
     KIND_UPDATE: Guidance(
         reason="업데이트 정보를 받아 오지 못했어요.",
         steps=(
-            "인터넷 연결을 확인해 주세요. 학교 망이면 잠시 뒤에 다시 열어 주세요.",
-            _REOPEN_STEP,
-            "급하면 아래 버튼으로 최신 설치 파일을 직접 내려받아 실행하면 돼요.",
+            "설치 파일을 내려받지 못했다면 인터넷 연결을 확인해 주세요.",
+            "아래 [다운로드 페이지 열기]에서 최신 Teacher Manager 설치 파일을 직접 받을 수 있어요.",
+            _PRESERVE_STEP,
         ),
         actions=(recovery.IssueAction("open-download-page", "다운로드 페이지 열기"),),
     ),
     KIND_GOOGLE_READ: Guidance(
         reason="Google 자료를 읽어 오지 못했어요.",
         steps=(
-            "인터넷 연결을 확인해 주세요.",
-            "설정에서 Google 로그인 상태가 정상인지 확인해 주세요.",
-            _REOPEN_STEP,
+            "설정에서 Google 로그인 상태를 확인하고, 읽으려던 Google 자료가 현재 어떻게 보이는지 확인해 주세요.",
+            _PRESERVE_STEP,
         ),
         actions=(recovery.IssueAction("settings", "설정 열기"),),
     ),
-    # 출석부 설정 탭의 Google Chat 연결값이 비어 있는 결정적 상태. 원인 설명 없이 선생님이
-    # 할 일만 보인다(2026-09-04 사용자 결정). 시트 메뉴 [연결 상태 확인]이 비어 있던 번호·
-    # 확인값을 다시 만들고, 새 확인값은 [연결하기]로 발송 서버에 다시 등록된다.
+    # 출석부 설정 탭의 Google Chat 연결 상태를 읽지 못한 결정적 상태. 메뉴는 현재 상태를
+    # 확인할 뿐 값을 새로 만들지 않으므로, 확인된 상태만 안내한다.
     KIND_SHEET_CONNECTION_VALUE: Guidance(
         reason="아래 순서대로 해 주세요.",
         steps=(
-            "출석부를 열고 위 메뉴 [처음 한 번 설정하기] → [연결 상태 확인]을 눌러 주세요.",
-            "Teacher Manager로 돌아와 이 창을 닫았다가 다시 열어 주세요.",
-            "Google Chat 줄에 [연결하기]가 보이면 눌러 주세요.",
+            "출석부를 열고 위 메뉴 [🔵 처음 한 번 설정하기 → 연결 상태 확인]을 눌러 주세요.",
+            "준비가 끝났다는 안내가 보이지 않으면 Teacher Manager의 현재 출결 상태를 확인해 주세요.",
         ),
         actions=(recovery.IssueAction("open-current-attendance", "현재 출석부 열기"),),
     ),
     KIND_GOOGLE_WRITE: Guidance(
         reason="Google에 준비하거나 저장하는 일을 끝내지 못했어요.",
         steps=(
-            "인터넷 연결을 확인해 주세요.",
-            "이 창을 닫았다가 다시 열고 같은 버튼을 한 번 더 눌러 주세요. 이미 만든 것은 프로그램이 찾아서 이어 써요.",
-            _HELP_STEP,
+            "저장 결과를 확인하지 못했어요. 같은 작업을 다시 하기 전에 현재 Google 자료를 확인해 주세요.",
+            _PRESERVE_STEP,
         ),
         actions=(recovery.IssueAction("settings", "설정 열기"),),
     ),
@@ -133,7 +128,7 @@ _GUIDANCE = {
         reason="현재 Google의 출결 기능이 이 프로그램과 맞는지 확인하지 못했어요.",
         steps=(
             "출결 탭 맨 위 안내에서 출결 기능 상태를 확인해 주세요.",
-            "[출결 기능 업데이트]가 보이면 눌러 주세요. 자동 업데이트를 멈췄다는 안내가 보이면 [도움 요청]을 눌러 주세요.",
+            "기존 출석부 복구 안내가 보이면 현재 연결 상태를 확인해 주세요.",
         ),
         actions=(recovery.IssueAction("attendance-tab", "출결 탭으로"),),
     ),
@@ -148,25 +143,43 @@ _GUIDANCE = {
     KIND_LOCAL: Guidance(
         reason="이 컴퓨터에서 처리하는 일을 끝내지 못했어요.",
         steps=(
-            "Teacher Manager를 닫았다가 다시 열어 주세요.",
-            "그래도 같으면 컴퓨터를 다시 시작한 뒤 열어 주세요.",
-            _HELP_STEP,
+            "입력한 값을 그대로 보관해 주세요.",
+            _PRESERVE_STEP,
         ),
         actions=(),
     ),
     KIND_OTHER: Guidance(
         reason=recovery.UNEXPECTED_MESSAGE,
         steps=(
-            "Teacher Manager를 닫았다가 다시 열어 주세요.",
-            "그래도 같으면 컴퓨터를 다시 시작한 뒤 열어 주세요.",
-            _HELP_STEP,
+            "작업 결과를 확인하지 못했어요. 같은 작업을 다시 하기 전에 현재 자료를 확인해 주세요.",
+            _PRESERVE_STEP,
         ),
         actions=(),
     ),
 }
 
 
-_FOLLOW_MESSAGE_STEP = "위 안내대로 진행한 뒤 이 창을 닫았다가 다시 열어 주세요."
+_FINAL_GUIDANCE = {
+    KIND_ATTENDANCE_SCRIPT: Guidance(
+        reason="현재 Google의 출결 기능이 이 프로그램과 맞는지 확인하지 못했어요.",
+        steps=(
+            "출결 탭 맨 위에서 현재 출결 기능 상태를 확인해 주세요.",
+            _PRESERVE_STEP,
+        ),
+        actions=(recovery.IssueAction("attendance-tab", "출결 탭으로"),),
+    ),
+    KIND_LOGIN: Guidance(
+        reason="Google 로그인을 끝내지 못했어요.",
+        steps=(
+            "설정에서 현재 Google 로그인 상태를 확인해 주세요.",
+            _PRESERVE_STEP,
+        ),
+        actions=(recovery.IssueAction("google-login", "Google 로그인 설정 열기"),),
+    ),
+}
+
+
+_FOLLOW_MESSAGE_STEP = "위 안내에 적힌 화면과 버튼을 사용해 주세요."
 
 
 def kind_from_message(message: str) -> str:
@@ -208,14 +221,9 @@ def apply_guidance(issue: recovery.UserIssue, operation: str) -> recovery.UserIs
                 actions=issue.actions or guidance.actions,
             )
         return issue.with_guidance(steps=issue.steps or (_FOLLOW_MESSAGE_STEP,))
-    if operation in {"attendance_chat_set_space", "attendance_chat_spaces", "attendance_chat_create_space"} and not kind_from_message(issue.reason) and not kind_from_message(issue.message):
-        return replace(issue.with_guidance(
-            steps=("아래에서 방 목록과 저장 상태를 다시 확인해 주세요.",
-                   "연결됨으로 표시되지 않으면 사용할 학급 단톡방을 다시 골라 주세요."),
-            actions=(recovery.IssueAction("chat-space-list", "학급 단톡방 다시 확인"),),
-        ), resume="chat-space-list")
-    message = issue.reason if kind_from_message(issue.reason) == KIND_SCRIPT_API else issue.message
-    guidance = guidance_for(kind_for(operation or issue.operation, message))
+    message_kind = kind_from_message(issue.reason) or kind_from_message(issue.message)
+    kind = message_kind or kind_for(operation or issue.operation, issue.message)
+    guidance = _FINAL_GUIDANCE.get(kind, guidance_for(kind))
     reason = issue.reason
     if not reason.strip() or reason == recovery.UNEXPECTED_MESSAGE:
         reason = guidance.reason

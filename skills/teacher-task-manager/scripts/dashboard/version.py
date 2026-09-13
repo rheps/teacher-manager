@@ -93,7 +93,7 @@
 # opening the verified school account and preserving completed attendance resources.
 # v4.2: Match action button heights, clarify setup sections and roster readiness,
 # and name the class-space creation action consistently.
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 
 BRANDING = {
     "name": "Teacher Manager",

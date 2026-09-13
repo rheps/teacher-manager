@@ -158,7 +158,7 @@ def validate_approved_skill(value: object) -> ApprovedSkillSource:
     except (KeyError, TypeError, ValueError) as error:
         raise AiSkillInstallError(
             "AI_SKILLS_APPROVAL_INVALID",
-            "검토한 AI 공개판의 파일 목록을 안전하게 확인하지 못했습니다. AI 연결은 시작하지 않았습니다.",
+            "AI 연결 파일을 확인하지 못해 설치를 시작하지 않았어요. 기존 AI 프로그램 설정은 바꾸지 않았습니다.",
         ) from error
 
 
@@ -181,7 +181,7 @@ def load_approved_skill(path: Path) -> ApprovedSkillSource:
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
         raise AiSkillInstallError(
             "AI_SKILLS_APPROVAL_INVALID",
-            "검토한 AI 공개판의 파일 목록을 안전하게 확인하지 못했습니다. AI 연결은 시작하지 않았습니다.",
+            "AI 연결 파일을 확인하지 못해 설치를 시작하지 않았어요. 기존 AI 프로그램 설정은 바꾸지 않았습니다.",
         ) from error
     return validate_approved_skill(payload)
 
@@ -263,7 +263,7 @@ def resolve_managed_npx(runtime_root: Path, npx_cmd: Path) -> Path:
     except OSError as error:
         raise AiSkillInstallError(
             "AI_NODE_NOT_READY",
-            "Teacher Manager 전용 npx 파일을 안전하게 확인하지 못했습니다.",
+            "AI 연결에 필요한 실행 파일을 확인하지 못해 설치를 시작하지 않았어요. 기존 AI 프로그램 설정은 바꾸지 않았습니다.",
         ) from error
 
 

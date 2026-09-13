@@ -30,6 +30,8 @@ import attendance_connection_handover
 import attendance_script_update
 import attendance_workbook_identity
 import attendance_workbook_transition
+from attendance_context import AttendanceScope, AttendanceScopeError
+from attendance_binding import AttendanceBindingClient, AttendanceBindingError
 import parse_settings
 from attendance_install_record import (
     AttendanceInstallRecordError,
@@ -46,6 +48,7 @@ from attendance_install_record import (
     replace_attendance_install_record,
     validate_verified_canonical_record,
     write_attendance_install_record,
+    _spreadsheet_id_from_url,
 )
 from brity_bridge import (
     atomic_io,
@@ -81,6 +84,8 @@ class HomeCheckDeps:
     doctor_deps: DoctorDeps = field(default_factory=DoctorDeps)
     document_probe: object = None
     attendance_ui_probe: object = None
+    binding_client: object = None
+    attendance_status_probe: object = None
 
 
 def _timetable_check(config_dir: Path) -> CheckResult:
@@ -182,7 +187,8 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
         else attendance_ui_enabled()
     )
     if attendance_ui_visible:
-        attendance = read_attendance_status(config_dir, doctor_deps.run_command)
+        attendance = (deps.attendance_status_probe() if callable(deps.attendance_status_probe)
+                      else read_attendance_status(config_dir, doctor_deps.run_command, binding_client=deps.binding_client))
         # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
         # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
         attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
@@ -401,7 +407,7 @@ def push_gemini_key_to_attendance_sheet(
     return {"state": "ok", "detail": "출석부의 설정 화면에도 반영했어요."}
 
 
-def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: str) -> dict:
+def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: str, *, include_reason: bool = False) -> dict:
     """시트의 [처음 설정 한 번에 끝내기] 완료 표시를 읽는다. 못 읽으면 미완료로 본다.
 
     시트 설정과 AI 감지기 준비를 끝내면 FIRST_TIME_SETUP_SHEET_DONE을 적는다.
@@ -412,13 +418,19 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
     """
     from dashboard import central_chat
 
+    def not_done(reason):
+        result = {"done": False, "value": ""}
+        if include_reason:
+            result["reason"] = reason
+        return result
+
     record_path = paths.attendance_install_record_path(Path(config_dir))
     if not record_path.exists():
-        return {"done": False, "value": ""}
+        return not_done("connection_invalid")
     try:
         record = read_verified_canonical_record(record_path)
     except (OSError, AttendanceInstallRecordError):
-        return {"done": False, "value": ""}
+        return not_done("connection_invalid")
     spreadsheet_id = str(record.get("spreadsheet_id", "") or "").strip()
     expected_connection_code = attendance_workbook_identity.attendance_connection_code(
         spreadsheet_id
@@ -432,10 +444,10 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
         and status_account
         and record_account.casefold() != status_account.casefold()
     ):
-        return {"done": False, "value": ""}
+        return not_done("account_mismatch")
     expected_account = record_account or status_account
     if not spreadsheet_id or not expected_connection_code or not expected_account:
-        return {"done": False, "value": ""}
+        return not_done("account_missing")
     try:
         rows = central_chat._read_settings_rows(spreadsheet_id, run_command, gws_executable)
     except Exception as error:  # noqa: BLE001 - 외부 원문은 숨기고 공통 세 차례 확인으로 넘긴다
@@ -455,10 +467,18 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
         elif key == "ATTENDANCE_CONNECTION_CODE":
             connection_codes.append(value)
     if connection_codes != [expected_connection_code]:
-        return {"done": False, "value": ""}
+        return not_done("connection_mismatch")
     value = ""
+    reason = "setup_required"
     for item in done_values:
         parts = item.split()
+        if len(parts) >= 3:
+            if parts[0] != expected_connection_code:
+                reason = "connection_mismatch"
+            elif parts[1].casefold() != expected_account.casefold():
+                reason = "account_mismatch"
+        elif item:
+            reason = "marker_invalid"
         if (
             len(parts) >= 3
             and parts[0] == expected_connection_code
@@ -466,7 +486,7 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
         ):
             value = item
             break
-    return {"done": bool(value), "value": value}
+    return {"done": True, "value": value} if value else not_done(reason)
 
 
 def summarize_attendance_roster(rows: list) -> dict:
@@ -538,9 +558,13 @@ def attendance_roster_url(config_dir: Path, run_command, gws_executable: str) ->
     if len(matches) != 1 or type(matches[0].get("sheetId")) is not int or matches[0]["sheetId"] < 0:
         raise ValueError("학생명단 시트를 찾지 못했어요. 출석부의 처음 설정을 마친 뒤 다시 열어 주세요.")
     current = read_verified_canonical_record(paths.attendance_install_record_path(Path(config_dir)))
-    if current.get("spreadsheet_id") != record["spreadsheet_id"]:
+    if any(current.get(key) != record.get(key) for key in ("spreadsheet_id", SETUP_ACCOUNT_FIELD)):
         raise ValueError("연결된 출석부가 바뀌었어요. 명단 입력하기를 다시 눌러 주세요.")
-    return f'https://docs.google.com/spreadsheets/d/{record["spreadsheet_id"]}/edit#gid={matches[0]["sheetId"]}&range=A2'
+    account = str(record.get(SETUP_ACCOUNT_FIELD) or _read_setup_status(config_dir).get("account") or "").strip()
+    return external_url.with_google_account(
+        f'https://docs.google.com/spreadsheets/d/{record["spreadsheet_id"]}/edit#gid={matches[0]["sheetId"]}&range=A2',
+        account,
+    )
 
 
 def read_attendance_roster_status(config_dir: Path, run_command, gws_executable: str) -> dict:
@@ -900,19 +924,42 @@ class AttendanceStatus:
     detail: str = ""
     failed_service: str = ""  # sheet | docs | tasks | setup | 빈 문자열
     created: bool = False  # 이번 호출에서 새로 만들었는지
-    school_year: str = ""  # 기록에 새긴 학년도 — 도장이 없으면 지금 학년도로 본다
+    school_year: str = ""  # Immutable recorded workbook year; unknown stays unknown.
     workbook_name: str = ""  # 화면에 보여줄 출석부 이름 — 없으면 옛 고정 이름
     year_mismatch: bool = False  # 프로필 학년도와 기록 학년도가 다르면 새 출석부 단추가 풀린다
     canonical_workbook_name: str = ""  # 연결 선택·새 학년도 확인창에 보여줄 정식 이름
     progress: dict = field(default_factory=dict)
     failure_code: str = ""
+    recovery_action: str = ""
+    attendance_scope: dict = field(default_factory=dict)
+    current_school_year: str = ""
+    year_verified: bool = False
+    creation_allowed: bool = False
+    replacement_allowed: bool = False
+    replacement_previous_spreadsheet_id: str = ""
+    replacement_request_key: str = ""
+    replacement_operation_id: str = ""
+    creation_reason: str = ""
+    binding_state: str = "UNVERIFIED"
+    verification_state: str = "UNVERIFIED"
+    automation_state: str = "UNVERIFIED"
+    account_authorization_required: bool = False
+    initial_setup_required: bool = False
+    roster_input_required: bool = False
+    can_edit: bool | None = None
+    write_allowed: bool = False
+    initial_preparation_allowed: bool = False
+    attendance_action: dict = field(default_factory=dict)
+    failure_domain: str = ""
+    failure_stage: str = ""
+    http_status: int = 0
 
 
 ATTENDANCE_ERROR_MESSAGES = {
-    "sheet": "Google Sheet를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
-    "docs": "Google Docs 양식을 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
-    "tasks": "Google Tasks 목록을 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
-    "setup": "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.",
+    "sheet": "출석부를 준비하지 못했어요.",
+    "docs": "결석 신고서 양식을 준비하지 못했어요.",
+    "tasks": "출결서류 안내를 담을 할 일 목록을 준비하지 못했어요.",
+    "setup": "출결 자료를 준비하지 못했어요.",
 }
 ATTENDANCE_GWS_MESSAGE = "Google 연결 기능이 아직 준비되지 않았어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
 ATTENDANCE_LOGIN_MESSAGE = "설정에서 Google 계정으로 로그인해 주세요."
@@ -922,8 +969,8 @@ ATTENDANCE_AUTH_STATUS_MESSAGE = (
     "인터넷 연결이나 학교 보안 정책을 확인해 주세요."
 )
 ATTENDANCE_PROFILE_MESSAGE = "내 정보와 하루 일과를 먼저 입력해 주세요."
-ATTENDANCE_ACCOUNT_MESSAGE = "처음 준비하던 Google 계정으로 다시 로그인해 주세요."
-ATTENDANCE_RECORD_BROKEN_MESSAGE = "출결 설치 기록을 읽지 못했어요. 이전에 만든 출결 시트를 확인해 주세요."
+ATTENDANCE_ACCOUNT_MESSAGE = "현재 출석부를 만든 Google 계정으로 로그인해 주세요. [Google 연결]에 표시된 계정과 브라우저에서 출석부를 열 때의 계정을 비교해 주세요."
+ATTENDANCE_RECORD_BROKEN_MESSAGE = "이 컴퓨터에 저장된 출석부 연결 정보를 읽지 못했어요. 기존 자료와 원본 기록은 보존했습니다. 현재 계정의 연결을 확인한 뒤 복구합니다."
 ATTENDANCE_NOT_READY_MESSAGE = "출결 준비 시작하기를 누르면 로그인한 계정에 자동으로 준비해요."
 ATTENDANCE_SCRIPT_UPDATE_REQUIRED_MESSAGE = (
     "예전에 설치한 공식 출결 자료를 찾았어요. 출결 기능을 최신판으로 올린 뒤 사용할 수 있어요."
@@ -932,7 +979,7 @@ ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE = (
     "기존 출결 자료는 그대로 두고, 현재 출결 기능이 안전한 최신판인지 먼저 확인해 주세요."
 )
 ATTENDANCE_CONNECTION_REPAIR_MESSAGE = (
-    "현재 연결이 옛 출석부를 가리키고 있어요. 사용할 정식 출석부를 한 번 골라 주세요."
+    "현재 출석부 연결을 확인해야 해요. [사용할 출석부 고르기]에서 이어 쓸 파일을 골라 주세요."
 )
 ATTENDANCE_DETAIL_LIMIT = 800  # 화면에 보여줄 실패 안내 길이 상한
 
@@ -957,37 +1004,36 @@ def _existing_attendance_guidance(error) -> str:
         if len(error.candidates) > 1:
             shown = ", ".join(names) if names else "이름을 읽지 못한 출석부"
             return (
-                "정식 출석부가 여러 개라 자동으로 고르지 않았어요. "
-                f"파일 이름: {shown}. 화면의 [사용할 출석부 고르기]에서 "
-                "연결 확인번호를 비교한 뒤 하나를 골라 주세요."
+                "기존 출석부가 여러 개라 자동으로 고르지 않았어요. "
+                f"파일 이름: {shown}. 기존 자료를 보관하고 현재 계정의 "
+                "출석부 연결을 확인해야 합니다."
             )
         shown = names[0] if names else "예전에 쓰던 출석부"
         return (
-            f"정식 출석부를 찾았어요: {shown}. 기존 자료는 바꾸지 않았습니다. "
-            "화면의 [사용할 출석부 고르기]에서 연결 확인번호를 비교한 뒤 골라 주세요."
+            f"기존 출석부 ‘{shown}’을 찾았어요. 이어 쓸 수 있는지 확인이 필요합니다. "
+            "기존 자료를 보관하고 현재 계정의 출석부 연결을 확인해 주세요."
         )
 
     raw = str(error or "")
     labels = []
     for marker, label in (
-        ("SCRIPT_ID", "자동 기능 연결"),
-        ("DEPLOYMENT_ID", "자동 기능 배포 연결"),
+        ("SCRIPT_ID", "출석부 자동 처리 기능"),
+        ("DEPLOYMENT_ID", "출석부 자동 처리 기능"),
         ("TEMPLATE_DOC_ID", "결석 신고서 양식"),
-        ("FOLDER_ID", "출결 파일 보관 폴더"),
+        ("FOLDER_ID", "결석 신고서 저장 폴더"),
         ("TASK_LIST_ID", "할 일 목록"),
     ):
         if marker in raw and label not in labels:
             labels.append(label)
     if "여러 개" in raw:
         return (
-            "같은 이름의 기존 출석부가 여러 개라 자동으로 고르지 않았어요. "
-            "Google Drive에서 파일 이름으로 열어 확인한 뒤 사용할 파일 하나만 남겨 주세요."
+            "기존 출석부로 확인되는 파일이 여러 개여서 연결을 바꾸지 않았어요. "
+            "기존 자료를 보관하고 현재 계정의 출석부 연결을 확인해야 합니다."
         )
-    checks = ", ".join(labels) if labels else "비어 있는 연결 항목"
+    checks = ", ".join(labels) if labels else "출석부의 자동 처리 기능"
     return (
-        "쓰시던 출석부를 찾았지만 연결 준비가 비어 있어 이어서 사용하지 않았어요. "
-        "기존 출석부는 바꾸지 않았습니다. 출석부의 설정 화면에서 확인할 항목: "
-        f"{checks}. 확인한 뒤 다시 시도해 주세요."
+        f"기존 출석부에서 {checks}을 확인하지 못해 연결하지 않았어요. "
+        "기존 파일은 바꾸지 않았습니다. 기존 출석부의 현재 연결 상태를 확인해 주세요. 설정 탭에 연결 정보를 직접 입력할 필요는 없습니다."
     )
 
 
@@ -999,7 +1045,8 @@ ATTENDANCE_APPS_SCRIPT_API_MESSAGE = (
     "이 Google 계정에서 Google Apps Script API가 아직 꺼져 있어요. "
     "브라우저에서 https://script.google.com/home/usersettings 를 열고 같은 Google 계정으로 "
     "로그인한 뒤 [Google Apps Script API] 스위치를 켜 주세요. "
-    "몇 분 뒤 Teacher Manager로 돌아와 출결 준비를 다시 시작해 주세요."
+    "Teacher Manager 출결 탭으로 돌아와 이어지는 안내를 확인해 주세요. "
+    "사용 허용이 반영되기까지 잠시 걸릴 수 있어요."
 )
 
 
@@ -1026,11 +1073,13 @@ def friendly_attendance_error(error) -> tuple[str, str]:
     # (2026-09-03 조사 6번).
     if any(marker in evidence for marker in _APPS_SCRIPT_API_DISABLED_MARKERS):
         return service, ATTENDANCE_APPS_SCRIPT_API_MESSAGE
-    auth_markers = ("invalid_grant", "unauthorized", "credential", "401", "403",
-                    "insufficient", "login required", "sign in", "please login")
-    if any(marker in evidence for marker in auth_markers):
-        return service, ("Google 로그인이 풀렸거나 권한이 부족해요. "
-                         "설정에서 로그아웃 후 다시 로그인하고 다시 시도해 주세요.")
+    auth_markers = ("invalid_grant", "unauthorized", "login required", "please login")
+    if any(marker in evidence for marker in auth_markers) or re.search(r"\b401\b", evidence):
+        return service, "Google 로그인이 만료됐거나 취소됐어요. [Google 로그인]에서 다시 로그인해 주세요."
+    if "insufficientpermissions" in evidence or "insufficient authentication scopes" in evidence:
+        return service, "출결 작업에 필요한 Google 권한이 부족해요. [Google 로그인]에서 다시 로그인하고 요청한 권한을 승인해 주세요."
+    if re.search(r"\b403\b", evidence) or "permission_denied" in evidence:
+        return service, "Google에서 이 출결 작업을 허용하지 않았어요. 파일을 열 수 있는 계정인지 확인해 주세요."
     return service, ATTENDANCE_ERROR_MESSAGES[service]
 
 
@@ -1048,6 +1097,19 @@ def _read_setup_status(config_dir: Path) -> dict:
 
 def _safe_setup_failure(error) -> dict:
     """Keep the first failure's operation and HTTP code, never raw output or arguments."""
+    current = error
+    for _ in range(6):
+        if isinstance(current, AttendanceBindingError):
+            from attendance_binding import FAILURE_DOMAINS, FAILURE_STAGES, OPERATION_NAMES, RECOVERY_ACTIONS
+            status = current.status if type(current.status) is int and 100 <= current.status <= 599 else 0
+            return {"error_type": "AttendanceBindingError", "operation": current.operation if current.operation in OPERATION_NAMES else "unknown",
+                    "http_status": status, "category": "permission" if status in (401, 403) else "unknown",
+                    "failure_code": current.diagnostic_code,
+                    "failure_domain": current.failure_domain if current.failure_domain in FAILURE_DOMAINS else "",
+                    "failure_stage": current.failure_stage if current.failure_stage in FAILURE_STAGES else "",
+                    "recovery_action": current.recovery_action if current.recovery_action in RECOVERY_ACTIONS else ""}
+        if not getattr(current, '__cause__', None): break
+        current = current.__cause__
     current = error
     for _ in range(5):
         if getattr(current, "cmd", None) or not getattr(current, "__cause__", None):
@@ -1130,6 +1192,23 @@ def _write_setup_status(config_dir: Path, data: dict) -> None:
     _atomic_write_json(paths.attendance_setup_status_path(Path(config_dir)), data)
 
 
+def _remember_setup_failure(config_dir: Path, error: Exception, account: str) -> None:
+    """Retain sanitized diagnostics without replacing unreadable write evidence."""
+    path = paths.attendance_setup_status_path(Path(config_dir))
+    try:
+        saved = attendance_workbook_transition._read_dict(path) if path.exists() else {}
+        owner = str(saved.get("account") or "").strip().casefold()
+        if owner and owner != str(account).casefold():
+            return
+        failure = _safe_setup_failure(error)
+        saved.setdefault("first_failure", failure)
+        saved.update(last_failure=failure, state="verification-unavailable", account=account)
+        _write_setup_status(config_dir, saved)
+    except (OSError, ValueError, AttendanceInstallRecordError):
+        # The original bytes are more valuable than a secondary diagnostic.
+        pass
+
+
 def _attendance_profile_error(config_dir: Path) -> str:
     """출결 준비에 필요한 개인 설정이 채워졌는지 파일을 만들지 않고 확인한다."""
     try:
@@ -1152,7 +1231,11 @@ def save_attendance_status_cache(config_dir: Path, status: dict) -> None:
     저장이 실패해도 확인 자체를 막지 않는다.
     """
     try:
-        _atomic_write_json(Path(config_dir) / ATTENDANCE_STATUS_CACHE_NAME, dict(status))
+        cached = dict(status)
+        cached.pop('attendance_action', None)
+        cached.pop('replacement_request_key', None)
+        cached['initial_preparation_allowed'] = False
+        _atomic_write_json(Path(config_dir) / ATTENDANCE_STATUS_CACHE_NAME, cached)
     except OSError:
         pass
 
@@ -1165,6 +1248,9 @@ def load_attendance_status_cache(config_dir: Path) -> dict | None:
         return None
     if not isinstance(saved, dict) or not saved.get("state"):
         return None
+    saved.pop('attendance_action', None)
+    saved.pop('replacement_request_key', None)
+    saved['initial_preparation_allowed'] = False
     if saved.get("state") in {
         "ready",
         "script-check-required",
@@ -1203,18 +1289,16 @@ def load_attendance_status_cache(config_dir: Path) -> dict | None:
 
 
 def _profile_school_year(config_dir: Path) -> str:
-    """profile.generated.json의 school.year — 없거나 빈 값이면 지금 학년도로 본다."""
-    profile = _read_json_dict(paths.profile_path(Path(config_dir))) or {}
-    school = profile.get("school")
-    year = str((school or {}).get("year", "") or "").strip() if isinstance(school, dict) else ""
-    return year or install_attendance_automation.current_school_year()
+    """Local Seoul display estimate. Never an authorization or workbook stamp."""
+    return install_attendance_automation.current_school_year()
 
 
-def read_attendance_status(
+def _read_local_attendance_status(
     config_dir: Path,
     run_command=_default_run_command,
     *,
     gws_executable: str | None = None,
+    auth_result: dict | None = None,
 ) -> AttendanceStatus:
     config_dir = Path(config_dir)
     setup_status = _read_setup_status(config_dir)
@@ -1222,7 +1306,7 @@ def read_attendance_status(
     gws = str(gws_executable or resolve_gws(run_command))
     if not gws:
         return AttendanceStatus(state="gws-required", account=account, detail=ATTENDANCE_GWS_MESSAGE)
-    auth = gws_auth_status(run_command, gws)
+    auth = auth_result if auth_result is not None else gws_auth_status(run_command, gws)
     current_user = str(auth.get("user", "") or "")
     if auth.get("login_state") == "error":
         return AttendanceStatus(
@@ -1294,8 +1378,8 @@ def read_attendance_status(
                 account=current_user,
                 current_user=current_user,
                 detail=(
-                    "이전 설치의 Google 계정 확인 기록이 없어 사용할 출석부를 "
-                    "한 번 다시 골라 주세요. 새 파일은 만들지 않습니다."
+                    "현재 출석부를 만든 Google 계정을 확인하지 못했어요. "
+                    "[사용할 출석부 고르기]에서 기존 파일을 확인해 주세요. 새 파일은 만들지 않습니다."
                 ),
                 school_year=str(record.get("school_year", "") or ""),
                 workbook_name=str(record.get("workbook_name", "") or ""),
@@ -1318,32 +1402,15 @@ def read_attendance_status(
         valid_sheet_url = spreadsheet_url.startswith(
             "https://docs.google.com/spreadsheets/d/"
         )
-        # 학년도 판정 — 기록에 도장이 없으면(옛 기록) 지금 학년도로 본다. bridge가 그 도장을
-        # 한 번 채워 적지만, 여기서는 파일을 고치지 않고 비교값만 판정한다.
-        profile_year = _profile_school_year(config_dir)
-        record_year = (
-            str(record.get("school_year", "") or "")
-            or install_attendance_automation.current_school_year()
-        )
+        record_year = str(record.get("school_year", "") or "")
         workbook_name = (
             str(record.get("workbook_name", "") or "")
             or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
         )
-        year_mismatch = profile_year != record_year
+        year_mismatch = False  # Server scope alone decides current-year mismatch.
         record_grade = str(record.get("homeroom_grade", "") or "").strip()
         record_class = str(record.get("homeroom_class", "") or "").strip()
-        recorded_workbook_name = (
-            attendance_workbook_identity.attendance_workbook_name(
-                {
-                    "school": {"year": record_year},
-                    "homeroom": {
-                        "enabled": bool(record_grade and record_class),
-                        "grade": record_grade,
-                        "class": record_class,
-                    },
-                }
-            )
-        )
+        recorded_workbook_name = attendance_workbook_identity.attendance_workbook_name_from_record(record)
         # 평상시 상태 확인은 다른 파일을 이름으로 찾지 않는다. 사용자가 한 번 고른
         # 검증 정본 번호만 열기·업데이트의 기준으로 쓴다.
         if valid_sheet_url:
@@ -1409,8 +1476,8 @@ def read_attendance_status(
                 setup_status.get("spreadsheet_url", "") or ""
             ),
             detail=(
-                "현재 출석부 연결을 고르기 전에는 새 출석부를 만들지 않습니다. "
-                + str(setup_status.get("detail", "") or "")
+                "이전에 사용한 출석부가 있어 새 출석부는 만들지 않았어요. "
+                "[사용할 출석부 고르기]에서 파일을 열어 확인한 뒤 이어 쓸 출석부를 골라 주세요."
             )[:ATTENDANCE_DETAIL_LIMIT],
             school_year=_profile_school_year(config_dir),
             workbook_name=str(
@@ -1435,41 +1502,153 @@ def read_attendance_status(
     return AttendanceStatus(state="not-ready", current_user=current_user, detail=ATTENDANCE_NOT_READY_MESSAGE)
 
 
-def backfill_attendance_record_stamp(config_dir: Path) -> bool:
-    """옛 출결 기록에 학년도 도장이 없으면 한 번만 채워 적는다.
+def _restore_registry_record(config_dir: Path, scope: AttendanceScope) -> None:
+    """Restore only complete independently verified identity, preserving old bytes."""
+    value = scope.payload
+    manifest = value.get("resourceManifest")
+    if value["bindingState"] != "ACTIVE" or value["verificationState"] != "VERIFIED" or not isinstance(manifest, dict):
+        return
+    record = dict(manifest)
+    record.update({
+        "spreadsheet_id": value["spreadsheetId"],
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/" + value["spreadsheetId"] + "/edit",
+        "school_year": str(value["workbookSchoolYear"]),
+        "workbook_name": str(value.get("displayName") or "출석부"),
+        "workbook_role": attendance_workbook_identity.ATTENDANCE_ROLE_VALUE,
+        "setup_account": value.get("email"), "subject_key": value["subjectKey"],
+        "binding_generation": value["generation"], "binding_protocol_version": value["protocolVersion"],
+    })
+    for key in CONNECTION_FIELDS:
+        if not isinstance(record.get(key), str):
+            return  # Incomplete remote evidence never fabricates an install record.
+    record = validate_verified_canonical_record(record)
+    from attendance_install_record import restore_verified_registry_record
+    from attendance_sheet_layout import validate_month_sheet_ids
+    if manifest.get("monthlySheetIds") is not None:
+        record["monthly_sheet_ids"] = validate_month_sheet_ids(manifest["monthlySheetIds"])
+    record.pop("monthlySheetIds", None)
+    restore_verified_registry_record(paths.attendance_install_record_path(config_dir), record)
 
-    read_attendance_status는 판정만 하고 파일을 고치지 않는다 — 기록을 실제로
-    고치는 자리는 여기 하나뿐이다(bridge.attendance_status가 부른다).
-    이미 school_year가 있으면 아무것도 하지 않는다(덮어쓰지 않는다).
-    """
-    config_dir = Path(config_dir)
-    record_path = paths.attendance_install_record_path(config_dir)
-    if not record_path.exists():
-        return False
+
+def read_attendance_status(config_dir: Path, run_command=_default_run_command, *, gws_executable=None, binding_client=None) -> AttendanceStatus:
+    """Combine local evidence with a fresh authenticated account-year authority."""
+    local = _read_local_attendance_status(config_dir, run_command, gws_executable=gws_executable)
+    if local.state in ("gws-required", "login-required", "account-required", "auth-error"):
+        return local
     try:
-        snapshot = read_attendance_install_snapshot(record_path)
-    except AttendanceInstallRecordError:
-        return False  # 깨진 기록은 여기서 고치지 않는다 — read_attendance_status가 이미 failed로 알린다
-    record = dict(snapshot.record)
-    if str(record.get("school_year", "") or "").strip():
-        return False
-    profile = _read_json_dict(paths.profile_path(config_dir)) or {}
-    homeroom = profile.get("homeroom")
-    homeroom = homeroom if isinstance(homeroom, dict) else {}
-    record["school_year"] = install_attendance_automation.current_school_year()
-    record["homeroom_grade"] = str(homeroom.get("grade", "") or "")
-    record["homeroom_class"] = str(homeroom.get("class", "") or "")
-    try:
-        replace_attendance_install_record(record_path, record, snapshot)
-    except AttendanceInstallRecordError:
-        # 다른 창이 확인 증명이나 새 출결 연결을 방금 썼다면 그 기록이 우선이다.
-        return False
-    return True
+        if binding_client is None:
+            raise AttendanceBindingError("ATTENDANCE_AUTH_REQUIRED")
+        if isinstance(binding_client, AttendanceBindingClient):
+            binding_client.restore(local.current_user)
+        if binding_client.email and binding_client.email.casefold() != local.current_user.casefold():
+            binding_client.clear()
+            raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+        scope = binding_client.current()
+        if scope.payload["bindingState"] == "MIGRATION_UNKNOWN":
+            path = paths.attendance_install_record_path(config_dir)
+            if path.exists():
+                # A broken local object is not an empty inventory.
+                saved = load_attendance_install_record(path)
+                exact_id = saved.get("spreadsheet_id")
+                if exact_id:
+                    try:
+                        adopted = binding_client.adopt(exact_id)
+                        scope = binding_client.current()
+                        scope.require_same(adopted)
+                    except AttendanceBindingError as error:
+                        if error.code == "ATTENDANCE_FILE_TRASHED":
+                            scope = binding_client.replacement_check(scope, exact_id)
+                        elif error.code != "ATTENDANCE_ROLE_MANIFEST_REQUIRED":
+                            raise
+                        else:
+                            candidate = binding_client.adoption_candidate(exact_id)
+                            return replace(local, state="recovery-required", recovery_action="repair-existing",
+                                           detail="기존 출석부를 확인했어요. 자료를 보존하면서 연결 정보를 복구할 수 있어요.",
+                                           attendance_scope=candidate.payload, current_school_year=str(candidate.year), year_verified=True,
+                                           creation_allowed=False, account_authorization_required=False,
+                                           binding_state="MIGRATION_UNKNOWN", verification_state="UNVERIFIED", automation_state="BLOCKED")
+            else:
+                scope = binding_client.discover()
+        _restore_registry_record(config_dir, scope)
+    except (AttendanceScopeError, AttendanceInstallRecordError, OSError) as error:
+        code = str(getattr(error, "code", "ATTENDANCE_AUTHORITY_UNAVAILABLE"))
+        auth_required = code == "ATTENDANCE_AUTH_REQUIRED"
+        return replace(local, state="account-authorization-required" if auth_required else "verification-unavailable",
+                       detail=str(error) if isinstance(error, AttendanceScopeError) else ATTENDANCE_RECORD_BROKEN_MESSAGE,
+                       failure_code=code, account_authorization_required=auth_required,
+                       creation_allowed=False, replacement_allowed=False, replacement_previous_spreadsheet_id="",
+                       year_verified=False, verification_state="UNVERIFIED", automation_state="BLOCKED", write_allowed=False, can_edit=None,
+                       failure_domain=getattr(error, 'failure_domain', ''), failure_stage=getattr(error, 'failure_stage', ''),
+                       recovery_action=getattr(error, 'recovery_action', ''), http_status=getattr(error, 'status', 0), initial_preparation_allowed=False)
+    value = scope.payload
+    state, detail = local.state, local.detail
+    failure_code = value["verificationState"] if value["verificationState"].startswith("ATTENDANCE_") else ""
+    controlled = AttendanceBindingError(failure_code, failure_domain=value.get('failure_domain'),
+        failure_stage=value.get('failure_stage'), recovery_action=value.get('recovery_action'))
+    can_edit = value.get("canEdit") if type(value.get("canEdit")) is bool else None
+    write_allowed = value["verificationState"] == "VERIFIED" and value.get("writeAllowed") is True and can_edit is True
+    if value["bindingState"] == "ACTIVE":
+        local = _read_local_attendance_status(config_dir, run_command, gws_executable=gws_executable,
+                    auth_result={"logged_in": True, "account_allowed": True, "user": local.current_user})
+        state, detail = local.state, local.detail
+        linked_id = _spreadsheet_id_from_url(local.spreadsheet_url)
+        if linked_id != value["spreadsheetId"] or local.school_year != str(value["workbookSchoolYear"]):
+            state, detail = "connection-repair-required", "현재 출석부의 연결 정보를 복구하고 있어요. 기존 자료는 그대로입니다."
+        elif value["verificationState"] != "VERIFIED":
+            state, detail = "verification-unavailable", str(AttendanceBindingError(value["verificationState"]))
+        elif not write_allowed:
+            failure_code = "ATTENDANCE_FILE_NOT_EDITABLE" if can_edit is False else "ATTENDANCE_EDITABILITY_UNVERIFIED"
+            state, detail = "verification-unavailable", str(AttendanceBindingError(failure_code))
+        elif value["automationState"] == "UPGRADE_REQUIRED":
+            state, detail = "script-update-required", "기존 출석부의 연결 정보를 현재 기능에 맞게 확인해야 해요."
+        elif value["automationState"] not in ("AUTHORIZED", "READY"):
+            state, detail = "verification-unavailable", "현재 출석부의 자동 처리 권한을 확인하지 못했어요. 연결 상태를 다시 확인해 주세요."
+    elif value["bindingState"] == "UNBOUND_CONFIRMED":
+        state, detail = "not-ready", "현재 학년도의 출석부 설정이 필요해요."
+    elif value["bindingState"] in ("PREPARING", "CREATE_RESULT_UNKNOWN"):
+        state, detail = "recovery-required", "이전에 시작한 출석부 준비 기록이 있어요. 같은 작업의 결과를 확인하고 이어서 준비할 수 있어요."
+        if value.get('preparationRunning') is True and not failure_code:
+            state, detail = 'preparing', '출석부를 만드는 중이에요.'
+        elif not failure_code:
+            controlled.recovery_action = 'resume-attendance-preparation'
+    else:
+        state, detail = "connection-repair-required", "기존 출석부 연결을 확인해야 해요. 새로 만들지 않고 기존 자료를 보존합니다."
+    if scope.replacement_allowed:
+        state, detail = "verification-unavailable", ("기존 출석부를 확인할 수 없어요. 기존 파일을 변경하지 않고 새 출석부를 만들 수 있어요."
+            if value["replacement"]["reason"] == "replace-unavailable" else "기존 출석부가 휴지통에 있어요. 기존 자료를 보관하고 새 출석부를 만들 수 있어요.")
+    if failure_code:
+        state, detail = 'verification-unavailable', str(controlled)
+    if value['bindingState'] == 'UNBOUND_CONFIRMED' and 'initialPreparationAllowed' not in value:
+        controlled = AttendanceBindingError('ATTENDANCE_INITIAL_PREPARATION_UNSUPPORTED',
+            failure_domain='central-attendance', recovery_action='update-attendance-service')
+        failure_code = controlled.diagnostic_code
+        state, detail = 'verification-unavailable', str(controlled)
+    if state == "ready" and value.get("initialSetupRequired") is True:
+        state, detail = "initial-setup-required", "출석부에서 처음 설정을 한 번 마쳐 주세요."
+    return replace(local, state=state, detail=detail, attendance_scope=value,
+                   current_school_year=str(scope.year), year_verified=True,
+                   creation_allowed=scope.create_allowed,
+                   replacement_allowed=scope.replacement_allowed,
+                   replacement_previous_spreadsheet_id=value["replacement"]["previousSpreadsheetId"] if scope.replacement_allowed else "",
+                   creation_reason=value["replacement"]["reason"] if scope.replacement_allowed else ("new-school-year" if local.school_year and local.school_year != str(scope.year) else "first-setup"),
+                   year_mismatch=bool(local.school_year and local.school_year != str(scope.year)),
+                   failure_code=failure_code, can_edit=can_edit, write_allowed=write_allowed,
+                   failure_domain=controlled.failure_domain, failure_stage=controlled.failure_stage,
+                   recovery_action=controlled.recovery_action, initial_preparation_allowed=scope.initial_preparation_allowed,
+                   binding_state=value["bindingState"], verification_state=value["verificationState"],
+                   automation_state=value["automationState"], account_authorization_required=False,
+                   initial_setup_required=value.get("initialSetupRequired") is True,
+                   roster_input_required=value.get("rosterInputRequired") is True)
+
+
+def backfill_attendance_record_stamp(config_dir: Path) -> bool:
+    """Compatibility entry point: unknown identity cannot be stamped from today."""
+    return False
 
 
 # 파서가 읽는 기존 항목명이 정본 — 대시보드가 새 이름을 만들지 않는다.
 PROFILE_FIELD_ORDER = [
-    "선생님이름", "학년도", "학교명", "학교급", "담임여부", "담임학년", "담임반",
+    "선생님이름", "학교명", "학교급", "담임여부", "담임학년", "담임반",
     "출근시간", "퇴근시간", "조회시작", "1교시시작", "점심종료시간",
     "월요일마지막교시", "화요일마지막교시", "수요일마지막교시", "목요일마지막교시", "금요일마지막교시",
     "업무캘린더ID", "업무캘린더이름", "학사일정캘린더ID", "학사일정캘린더이름",
@@ -1478,7 +1657,7 @@ PROFILE_FIELD_ORDER = [
 ]
 
 IDENTITY_FIELDS = frozenset({
-    "선생님이름", "학년도", "학교명", "학교급", "담임여부", "담임학년", "담임반",
+    "선생님이름", "학교명", "학교급", "담임여부", "담임학년", "담임반",
     "출근시간", "퇴근시간", "조회시작", "1교시시작", "점심종료시간",
     "월요일마지막교시", "화요일마지막교시", "수요일마지막교시", "목요일마지막교시", "금요일마지막교시",
 })
@@ -1508,7 +1687,8 @@ def read_profile_values(config_dir: Path, *, strict: bool = False) -> dict[str, 
 def write_profile_values(config_dir: Path, updates: dict[str, str]) -> Path:
     config_dir = Path(config_dir)
     merged = read_profile_values(config_dir)
-    merged.update({key: (value or "").strip() for key, value in updates.items()})
+    merged.update({key: (value or "").strip() for key, value in updates.items() if key != "학년도"})
+    merged.pop("학년도", None)
     ordered = [key for key in PROFILE_FIELD_ORDER if key in merged]
     ordered += [key for key in merged if key not in PROFILE_FIELD_ORDER]
     path = config_dir / "teacher-profile.csv"
@@ -1909,27 +2089,13 @@ def _gws_authorization_status(auth: dict, config_dir: Path) -> dict:
     elif auth.get("logged_in") and not auth.get("account_allowed"):
         state, detail = "account_required", google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
     elif auth.get("logged_in") and auth.get("account_allowed"):
-        saved = _read_json_dict(Path(config_dir) / GWS_SCOPE_GRANT_FILE) or {}
-        context = _gws_grant_context()
-        if saved.get("schema_version") != 2:
-            reason = "approval_missing"
-        elif saved.get("account") != str(auth.get("user", "")).strip().casefold():
-            reason = "account_changed"
-        elif saved.get("machine_sha256") != context["machine_sha256"]:
-            reason = "computer_changed"
-        elif any(saved.get(key) != context[key] for key in ("app_version", "app_build", "attendance_bundle_sha256")):
-            reason = "app_updated"
-        elif saved.get("scope_sha256") != gws_scope_grant_sha256(GWS_LOGIN_SCOPES):
-            reason = "permissions_changed"
-        elif auth.get("scope_state") == "missing":
+        if auth.get("scope_state") == "missing":
             reason = "permissions_missing"
+        elif auth.get("offline_state") == "missing":
+            reason = "offline_access_missing"
         if reason:
             state, detail = "reauth_required", GOOGLE_REAUTHORIZE_MESSAGE
-            if reason == "app_updated":
-                detail = "업데이트 후 Google 권한을 다시 승인해야 해요. " + GOOGLE_REAUTHORIZE_MESSAGE.split(". ", 1)[1]
-            elif reason == "computer_changed":
-                detail = "이 컴퓨터에서 Google 권한을 다시 승인해야 해요. " + GOOGLE_REAUTHORIZE_MESSAGE.split(". ", 1)[1]
-        elif auth.get("scope_state") != "verified":
+        elif auth.get("scope_state") != "verified" or auth.get("offline_state") != "verified":
             state, detail = "check_failed", GOOGLE_PERMISSION_CHECK_MESSAGE
         else:
             state, detail = "ready", "로그인과 필요한 Google 권한을 확인했어요."
@@ -2241,7 +2407,7 @@ def read_gws_update_status(
     ):
         exact_offer = None
         status_code = "UP_TO_DATE"
-        status_detail = "현재 사용 중인 Google 도구가 승인 목록과 같거나 더 최신입니다."
+        status_detail = "지금 설치할 Google 연결 기능 업데이트가 없습니다."
     elif (
         exact_offer is not None
         and component_update.gws_version_permanently_rejected(
@@ -2254,7 +2420,7 @@ def read_gws_update_status(
         exact_offer = None
         status_success = False
         status_code = "COMPONENT_VERSION_REJECTED"
-        status_detail = "앞서 안전 확인에 실패한 같은 Google 도구 판은 다시 받지 않고 현재 기본판을 사용합니다."
+        status_detail = "이 업데이트는 공식 파일인지 확인하지 못해 설치하지 않았어요. 현재 설치된 Google 연결 기능의 상태를 확인해 주세요."
     payload = {
         "success": status_success,
         "code": status_code,
@@ -2305,14 +2471,14 @@ def apply_gws_update(
     if not selected_new_version:
         if runtime["runtime_ready"]:
             fallback = (
-                "현재 기본판으로 계속 쓸 수 있어요."
+                "현재 설치된 Google 연결 기능을 계속 사용할 수 있어요."
                 if runtime["current_source"] == "bundled"
                 else "현재 사용 중인 Google 도구로 계속 쓸 수 있어요."
             )
             if fallback not in detail:
                 detail = f"{detail} {fallback}".strip()
         else:
-            repair = "설치 파일이 손상됐어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
+            repair = "현재 Google 연결 기능을 실행할 수 있는지 확인하지 못했어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
             if "설치 파일을 다시 실행" not in detail:
                 detail = f"{detail} {repair}".strip()
     return {
@@ -2394,6 +2560,14 @@ def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) ->
     if (status_document or {}).get("token_valid") is True and isinstance(scopes, list) and all(isinstance(s, str) for s in scopes):
         granted = {aliases.get(s, s) for s in scopes}
         scope_state = "verified" if set(GOOGLE_LOGIN_SCOPE_LIST) <= granted else "missing"
+    # A successful `auth status` refresh proves continued access even when an older
+    # gws response omits `has_refresh_token`. An explicit false value is different:
+    # this desktop app cannot continue background Google work after the access token.
+    offline_state = "unavailable"
+    if (status_document or {}).get("token_valid") is True:
+        offline_state = (
+            "missing" if status_document.get("has_refresh_token") is False else "verified"
+        )
     auth = {
         "logged_in": logged_in,
         "account_allowed": account_allowed,
@@ -2401,6 +2575,7 @@ def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) ->
         "login_state": login_state,
         "error_code": error_code,
         "scope_state": scope_state,
+        "offline_state": offline_state,
     }
     if config_dir is not None:
         auth.update(_gws_authorization_status(auth, config_dir))
@@ -2457,6 +2632,21 @@ def _gws_auth_url_from_line(line: str) -> str:
     return candidate
 
 
+def _login_failure_category(line: str) -> str:
+    """Keep an allowlisted category, never process output, paths or OAuth values."""
+    text = str(line or "")[:4096].casefold()
+    for code, markers in (
+        ("GWS_LOGIN_CONFIG_MISSING", ("no oauth client configured", "client_secrets.json not found")),
+        ("GWS_LOGIN_CONFIG_INVALID", ("invalid_client", "unauthorized_client", "redirect_uri_mismatch")),
+        ("GWS_CONSENT_INCOMPLETE", ("access_denied", "consent_required")),
+        ("GWS_LOGIN_CANCELLED", ("login cancelled", "login canceled", "authentication cancelled")),
+        ("GWS_LOGIN_CONNECTION_FAILED", ("connection timed out", "connection refused", "dns error", "failed to connect", "error sending request")),
+    ):
+        if any(marker in text for marker in markers):
+            return code
+    return ""
+
+
 class LoginSession:
     """gws auth login을 돌리며 검증한 주소를 진행 중에만 메모리로 내놓는다."""
 
@@ -2500,10 +2690,12 @@ class LoginSession:
 
     def _read(self, proc) -> None:
         code = 1
+        failure_category = ""
         try:
             for line in proc.stdout:
                 auth_url = _gws_auth_url_from_line(line)
                 if not auth_url:
+                    failure_category = _login_failure_category(line) or failure_category
                     continue
                 with self._lock:
                     if proc is not self._proc or self._auth_url_attempted:
@@ -2534,6 +2726,8 @@ class LoginSession:
             if proc is not self._proc:
                 return
             self._auth_url = ""
+            if code != 0 and not self._error_code:
+                self._error_code = failure_category
             if self._error_code:
                 final_ok = False
             else:
@@ -2568,13 +2762,15 @@ class LoginSession:
             proc = self._proc
         if proc is None or proc.poll() is not None:
             return False
+        with self._lock:
+            self._error_code = "GWS_LOGIN_CANCELLED"
         proc.kill()
         return True
 
 
-_LOGIN_SETUP_GUIDE = "Google 로그인 준비 파일을 확인한 뒤 다시 시도해 주세요."
+_LOGIN_SETUP_GUIDE = "Google 로그인을 끝내지 못했어요. 실패 원인은 아직 확인하지 못했습니다."
 _LOGIN_BROWSER_GUIDE = (
-    "웹 브라우저를 열지 못했어요. 기본 브라우저 또는 Microsoft Edge를 준비한 뒤 다시 눌러 주세요."
+    "Google 로그인 페이지를 열지 못했어요. Windows [설정] → [앱] → [기본 앱]에서 웹 브라우저를 지정해 주세요."
 )
 
 
@@ -2584,6 +2780,10 @@ def annotate_login_snapshot(snap: dict, environ=os.environ) -> dict:
     if snap.get("ok") is not False:
         return snap
     consent_guides = {
+        "GWS_LOGIN_CONFIG_MISSING": "프로그램의 Google 로그인에 필요한 파일이 없습니다. Teacher Manager 설치 파일을 다시 실행해 주세요.",
+        "GWS_LOGIN_CONFIG_INVALID": "Google에서 프로그램의 로그인 설정을 받아들이지 않았어요.",
+        "GWS_LOGIN_CANCELLED": "Google 로그인을 취소했어요. 사용하려면 [로그인]을 눌러 주세요.",
+        "GWS_LOGIN_CONNECTION_FAILED": "Google과 통신하지 못해 로그인을 마치지 못했어요. 브라우저에서 Google이 열리는지 확인해 주세요.",
         "GWS_CONSENT_INCOMPLETE": "필요한 Google 권한이 모두 승인되지 않았어요. 다시 로그인하고 요청한 권한을 모두 승인해 주세요.",
         "GWS_CONSENT_CHECK_FAILED": GOOGLE_PERMISSION_CHECK_MESSAGE,
         "GWS_LOGIN_REVOKED": "Google 로그인을 다시 해야 해요. 다시 로그인하고 권한을 승인해 주세요.",
@@ -2742,7 +2942,7 @@ def _require_https_response(response, requested_url: str) -> None:
 # 갈래로 나눠 실제 이유를 그대로 알린다.
 _UPDATE_CHECK_RETRY = "잠시 뒤 '업데이트 다시 확인'을 눌러 주세요."
 _UPDATE_CHECK_OFFLINE = (
-    "인터넷에 연결되지 않아 업데이트를 확인하지 못했어요. "
+    "배포 사이트에 연결하지 못해 업데이트를 확인하지 못했어요. "
     "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요."
 )
 
@@ -2774,7 +2974,7 @@ def _update_check_failure_reason(error: BaseException) -> str:
         return _UPDATE_CHECK_OFFLINE
     return (
         "업데이트 확인을 하지 못했어요. "
-        "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요."
+        "실패 원인은 아직 확인하지 못했습니다."
     )
 
 
@@ -2995,7 +3195,13 @@ def _download_file(url: str, dest_dir, expected_sha256: str, opener=None):
     digest = hashlib.sha256()
     total = 0
     try:
-        with opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS)) as source:
+        try:
+            response = opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS))
+        except (ssl.SSLError, urllib.error.URLError):
+            raise
+        except OSError as error:
+            raise urllib.error.URLError(error) from error
+        with response as source:
             _require_https_response(source, url)
             with partial.open("xb") as sink:
                 partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
@@ -3003,7 +3209,11 @@ def _download_file(url: str, dest_dir, expected_sha256: str, opener=None):
                     if time.monotonic() >= deadline:
                         raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
                     remaining = _UPDATE_SETUP_MAX_BYTES - total
-                    chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
+                    try:
+                        chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
+                    except OSError as error:
+                        # A socket read failure is not a local folder permission problem.
+                        raise urllib.error.URLError(error) from error
                     if time.monotonic() >= deadline:
                         raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
                     if not chunk:
@@ -3758,7 +3968,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "code": "UPDATE_SETUP_LAUNCHED",
                     "stage": "setup_opened",
                     "latest": target_latest,
-                    "reason": "업데이트가 이미 진행 중이며 Setup 창을 열었습니다. 같은 창에서 계속해 주세요.",
+                    "reason": "앞서 Teacher Manager 설치 창을 열었어요. 작업표시줄에서 설치 창을 찾아 계속해 주세요. 설치 완료 여부는 아직 확인하지 않았습니다.",
                 }
 
         path = None
@@ -3781,7 +3991,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "started": False,
                     "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
                     "latest": target_latest,
-                    "reason": "Setup 창을 앞서 열었는지 확실히 확인할 수 없어 다시 열지 않았어요.",
+                    "reason": "설치 창이 열렸는지 확인하지 못해 새 창을 열지 않았어요. 작업표시줄에서 Teacher Manager 설치 창을 확인해 주세요.",
                 }
             try:
                 opened = setup_is_open(path)
@@ -3806,13 +4016,13 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "code": "UPDATE_SETUP_LAUNCHED",
                     "stage": "setup_opened",
                     "latest": target_latest,
-                    "reason": "업데이트가 이미 진행 중이며 Setup 창을 열었습니다. 같은 창에서 계속해 주세요.",
+                    "reason": "앞서 Teacher Manager 설치 창을 열었어요. 작업표시줄에서 설치 창을 찾아 계속해 주세요. 설치 완료 여부는 아직 확인하지 않았습니다.",
                 }
             return {
                 "started": False,
                 "code": "UPDATE_SETUP_LAUNCH_UNCERTAIN",
                 "latest": target_latest,
-                "reason": "Setup 창을 앞서 열었는지 확실히 확인할 수 없어 다시 열지 않았어요.",
+                "reason": "설치 창이 열렸는지 확인하지 못해 새 창을 열지 않았어요. 작업표시줄에서 Teacher Manager 설치 창을 확인해 주세요.",
             }
 
         if path is None:
@@ -3828,7 +4038,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "started": False,
                     "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
                     "latest": target_latest,
-                    "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
+                    "reason": "받은 설치 파일이 공식 파일과 달라 실행하지 않았어요.",
                 }
             except _UpdateDownloadTooLarge:
                 return {
@@ -3851,12 +4061,42 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "latest": target_latest,
                     "reason": "업데이트를 저장할 폴더와 파일을 안전하게 확인하지 못했어요.",
                 }
-            except Exception:  # noqa: BLE001 - 통신 실패를 사람 말로
+            except ssl.SSLError:
+                return {
+                    "started": False, "code": "UPDATE_DOWNLOAD_TLS_UNSAFE", "latest": target_latest,
+                    "reason": "배포 사이트의 보안 인증서를 확인하지 못해 설치 파일을 받지 않았어요. 컴퓨터의 날짜·시간을 확인해 주세요.",
+                }
+            except urllib.error.HTTPError:
+                return {
+                    "started": False, "code": "UPDATE_DOWNLOAD_SERVER_FAILED", "latest": target_latest,
+                    "reason": "배포 사이트에서 설치 파일을 받지 못했어요.",
+                }
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                if isinstance(getattr(error, "reason", None), ssl.SSLError):
+                    return {
+                        "started": False, "code": "UPDATE_DOWNLOAD_TLS_UNSAFE", "latest": target_latest,
+                        "reason": "배포 사이트의 보안 인증서를 확인하지 못해 설치 파일을 받지 않았어요. 컴퓨터의 날짜·시간을 확인해 주세요.",
+                    }
                 return {
                     "started": False,
                     "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
                     "latest": target_latest,
                     "reason": "새 버전 다운로드에 실패했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
+                }
+            except OSError:
+                return {
+                    "started": False, "code": "UPDATE_DOWNLOAD_SAVE_FAILED", "latest": target_latest,
+                    "reason": f"설치 파일을 이 폴더에 저장하지 못했어요: {dest_dir or Path(tempfile.gettempdir()) / 'TeacherManager-Update'}. 저장 공간과 폴더의 쓰기 권한을 확인해 주세요.",
+                }
+            except ValueError:
+                return {
+                    "started": False, "code": "UPDATE_DOWNLOAD_UNSAFE", "latest": target_latest,
+                    "reason": "설치 파일을 공식 보안 주소에서 받았는지 확인하지 못해 실행하지 않았어요.",
+                }
+            except Exception:
+                return {
+                    "started": False, "code": "UPDATE_DOWNLOAD_FAILED", "latest": target_latest,
+                    "reason": "설치 파일을 준비하지 못했어요. 실패 원인은 아직 확인하지 못했습니다.",
                 }
             try:
                 actual_sha256 = _file_sha256(path)
@@ -3866,7 +4106,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "started": False,
                     "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
                     "latest": target_latest,
-                    "reason": "받은 업데이트 파일을 안전하게 확인하지 못했어요. 다시 시도해 주세요.",
+                    "reason": "받은 설치 파일을 읽지 못해 실행하지 않았어요.",
                 }
             if actual_sha256 != target_sha256:
                 _remove_download(path)
@@ -3874,7 +4114,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "started": False,
                     "code": "UPDATE_DOWNLOAD_HASH_MISMATCH",
                     "latest": target_latest,
-                    "reason": "받은 업데이트 파일이 배포 정보와 일치하지 않아요. 잠시 뒤 다시 시도해 주세요.",
+                    "reason": "받은 설치 파일이 공식 파일과 달라 실행하지 않았어요.",
                 }
 
         if config_dir is not None:
@@ -4194,7 +4434,7 @@ def ai_node_prepare(
         return {
             "success": False,
             "code": "AI_SKILLS_DISABLED",
-            "detail": "AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요.",
+            "detail": "다른 AI 프로그램과 연결하는 기능은 준비 중이에요. 이 단계는 건너뛰어도 됩니다.",
             "version": "",
         }
     kwargs = {
@@ -4351,7 +4591,7 @@ def ai_skills_install(
         return {
             "success": False,
             "code": "AI_SKILLS_DISABLED",
-            "detail": "AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요.",
+            "detail": "다른 AI 프로그램과 연결하는 기능은 준비 중이에요. 이 단계는 건너뛰어도 됩니다.",
             "version": "",
         }
     selected = {str(key) for key in (keys or [])}
@@ -4442,13 +4682,35 @@ def _run_gws_json(run_command, args: list[str], failure_message: str) -> dict:
     return parsed
 
 
+class _MalformedGwsJsonResponse(ValueError):
+    """A successful command returned data that cannot be a Google list result."""
+
+
 def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> list[dict]:
     code, output = run_command(args)
     if code != 0:
+        try:
+            failed = process_win.parse_first_json(output)
+        except (TypeError, ValueError):
+            failed = None
+        error = failed.get("error") if isinstance(failed, dict) else None
+        if isinstance(error, dict):
+            error_code = error.get("code")
+            error_status = str(error.get("status") or "").strip().upper()
+            if error_code == 401 or error_status == "UNAUTHENTICATED":
+                raise _google_login_issue()
+            if error_code == 403 or error_status == "PERMISSION_DENIED":
+                raise _google_list_permission_issue()
+            if (
+                isinstance(error_code, int)
+                and 400 <= error_code < 500
+                and error_code not in {408, 429}
+            ):
+                raise _MalformedGwsJsonResponse(failure_message)
         raise RuntimeError(failure_message)
     text = str(output or "").strip()
     if not text:
-        raise RuntimeError(failure_message)
+        raise _MalformedGwsJsonResponse(failure_message)
     decoder = _json.JSONDecoder()
     pages: list[dict] = []
     offset = 0
@@ -4464,15 +4726,20 @@ def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> l
         try:
             page, end = decoder.raw_decode(text, offset)
         except (ValueError, TypeError) as error:
-            raise RuntimeError(failure_message) from error
+            raise _MalformedGwsJsonResponse(failure_message) from error
         if not isinstance(page, dict):
-            raise RuntimeError(failure_message)
+            raise _MalformedGwsJsonResponse(failure_message)
+        if "error" in page:
+            raise _MalformedGwsJsonResponse(failure_message)
+        items = page.get("items", [])
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise _MalformedGwsJsonResponse(failure_message)
         pages.append(page)
         offset = end
         while offset < len(text) and text[offset].isspace():
             offset += 1
     if not pages:
-        raise RuntimeError(failure_message)
+        raise _MalformedGwsJsonResponse(failure_message)
     return pages
 
 
@@ -4501,8 +4768,14 @@ def _require_google_target_account(run_command, gws: str, expected_account: str 
         )
     auth = gws_auth_status(run_command, gws)
     if auth.get("login_state") == "error":
-        raise recovery.RetryableOperationError(
-            "GOOGLE_AUTH_STATUS", "Google 로그인 상태를 확인하지 못했습니다."
+        raise recovery.UserActionRequired(
+            recovery.UserIssue.needs_user(
+                operation="google_auth_status",
+                title="Google 로그인 상태를 확인하지 못했어요.",
+                message="설정에서 Google 로그인 상태를 다시 점검해 주세요.",
+                change_status=GOOGLE_UNCHANGED,
+                actions=(recovery.IssueAction("settings", "설정 열기"),),
+            )
         )
     if not auth.get("logged_in"):
         raise _google_login_issue()
@@ -4519,6 +4792,10 @@ def _google_targets_once(
     run_command, gws: str, kind: str, *, expected_account: str = ""
 ) -> list[dict]:
     _require_google_target_account(run_command, gws, expected_account)
+    return _google_target_rows_once(run_command, gws, kind)
+
+
+def _google_target_rows_once(run_command, gws: str, kind: str) -> list[dict]:
     if kind == "calendar":
         args = [
             gws, "calendar", "calendarList", "list", "--params",
@@ -4565,18 +4842,29 @@ def _google_targets_once(
 
 
 def list_google_targets_with_recovery(
-    run_command, gws: str, kind: str, *, sleeper=time.sleep
+    run_command, gws: str, kind: str, *, sleeper=None
 ) -> list[dict]:
     """Read Calendar or Tasks targets over three network cycles."""
+
+    account_context = {"account": ""}
+
+    def read_once() -> list[dict]:
+        account = _require_google_target_account(run_command, gws)
+        expected = account_context["account"]
+        if expected and account.casefold() != expected.casefold():
+            raise _google_login_issue()
+        if not expected:
+            account_context["account"] = account
+        return _google_target_rows_once(run_command, gws, kind)
 
     rows = recovery.run_operation(
         "google_lists",
         GOOGLE_LISTS_FINAL_FAILURE,
-        lambda: _google_targets_once(run_command, gws, kind),
+        read_once,
         delays=recovery.NETWORK_DELAYS,
         change_status=GOOGLE_UNCHANGED,
         app_version=version.APP_VERSION,
-        sleeper=sleeper,
+        sleeper=time.sleep if sleeper is None else sleeper,
     )
     return [
         {key: value for key, value in row.items() if key != "owned"}
@@ -4761,14 +5049,28 @@ def ensure_tasklist_verified(
     )
 
 
-def list_calendars(run_command, gws: str) -> list[dict]:
-    rows = _google_targets_once(run_command, gws, "calendar")
-    return [{key: value for key, value in row.items() if key != "owned"} for row in rows]
+def list_calendars(run_command, gws: str, *, sleeper=None) -> list[dict]:
+    return list_google_targets_with_recovery(
+        run_command, gws, "calendar", sleeper=sleeper
+    )
 
 
-def list_tasklists(run_command, gws: str) -> list[dict]:
-    rows = _google_targets_once(run_command, gws, "tasklist")
-    return [{key: value for key, value in row.items() if key != "owned"} for row in rows]
+def _google_list_permission_issue() -> recovery.UserActionRequired:
+    return recovery.UserActionRequired(
+        recovery.UserIssue.needs_user(
+            operation="google_list_permission",
+            title="Google 목록 읽기 권한을 확인해 주세요.",
+            message="현재 Google 계정에서 Calendar 또는 Tasks 목록을 읽을 수 있는지 설정에서 확인해 주세요.",
+            change_status=GOOGLE_UNCHANGED,
+            actions=(recovery.IssueAction("settings", "설정 열기"),),
+        )
+    )
+
+
+def list_tasklists(run_command, gws: str, *, sleeper=None) -> list[dict]:
+    return list_google_targets_with_recovery(
+        run_command, gws, "tasklist", sleeper=sleeper
+    )
 
 
 GOOGLE_SAVED_TARGET_KINDS = {
@@ -4879,10 +5181,10 @@ _ATTENDANCE_REMOTE_TIMEOUT_MESSAGE = (
 )
 _ATTENDANCE_REMOTE_TREE_MESSAGE = (
     "Google 출결 작업을 안전하게 끝내지 못했어요. "
-    "Teacher Manager를 껐다 켠 뒤 다시 눌러 주세요."
+    "진행 결과가 불확실하므로 같은 작업을 다시 누르기 전에 현재 결과를 확인해 주세요."
 )
 _ATTENDANCE_REMOTE_BUSY_MESSAGE = (
-    "다른 창에서 출결 원격 작업을 진행하고 있어요. "
+    "다른 Teacher Manager 창에서 출석부를 준비하거나 연결을 바꾸고 있어요. "
     "그 작업이 끝난 뒤 다시 눌러 주세요."
 )
 
@@ -4957,6 +5259,7 @@ class AttendanceDeps:
     chat_connection_rollback: object = central_chat.rollback_sheet_connection
     chat_connection_complete: object = central_chat.complete_sheet_connection
     gws_resolver: object = tool_runtime.resolve_gws_executable
+    binding_client: object = None
 
 
 @dataclass(frozen=True)
@@ -4966,6 +5269,9 @@ class AttendanceConnectionCandidate:
     name: str
     modified_time: str
     attendance_rows: int
+    spreadsheet_url: str = ""
+    selectable: bool = True
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -5148,7 +5454,7 @@ def _verified_attendance_candidate(
     properties = item.get("appProperties")
     spreadsheet_id = str(item.get("id", "") or "").strip()
     if not (
-        spreadsheet_id
+        re.fullmatch(r"[A-Za-z0-9_-]+", spreadsheet_id)
         and item.get("name") == expected_name
         and item.get("mimeType")
         == install_attendance_automation.SPREADSHEET_MIME
@@ -5204,371 +5510,17 @@ def _attendance_connection_identity(config_dir: Path):
     return snapshot, school_year, grade, klass, expected_name
 
 
-def attendance_connection_candidates(
-    config_dir: Path,
-    deps: AttendanceDeps | None = None,
-    *,
-    include_row_counts: bool = True,
-) -> AttendanceConnectionCandidates:
-    """명시적인 연결 화면에서만 정식 후보를 읽어 개인정보 없는 요약을 만든다."""
-
-    deps = deps or AttendanceDeps()
-    config_dir = Path(config_dir)
-    record_path = paths.attendance_install_record_path(config_dir)
-    try:
-        _snapshot, school_year, _grade, _klass, expected_name = (
-            _attendance_connection_identity(config_dir)
-        )
-        gws = str(deps.gws_resolver())
-        state, account = _attendance_repair_account(config_dir, deps, gws)
-        if state != "ready":
-            return AttendanceConnectionCandidates(
-                state=state,
-                expected_name=expected_name,
-                detail="설정에서 출결 자료를 만든 Google 계정으로 로그인해 주세요.",
-            )
-        del account  # 계정 일치는 위에서 확인했고 후보는 ownedByMe 표식까지 다시 본다.
-        found = install_attendance_automation.find_canonical_attendance_sheets(
-            deps.attendance_runner,
-            config_dir,
-            False,
-            school_year,
-            gws,
-        )
-        candidates: list[AttendanceConnectionCandidate] = []
-        for item in found:
-            checked = _verified_attendance_candidate(
-                item, expected_name=expected_name, school_year=school_year
-            )
-            if checked is None:
-                continue
-            spreadsheet_id = str(checked["id"])
-            attendance_rows = 0
-            if include_row_counts:
-                try:
-                    attendance_rows = _attendance_candidate_row_count(
-                        deps.attendance_runner,
-                        config_dir,
-                        gws,
-                        spreadsheet_id,
-                    )
-                except Exception:  # noqa: BLE001 - 한 후보의 줄 수는 선택 보조 정보일 뿐이다.
-                    attendance_rows = 0
-            candidates.append(
-                AttendanceConnectionCandidate(
-                    spreadsheet_id=spreadsheet_id,
-                    connection_code=(
-                        attendance_workbook_identity.attendance_connection_code(
-                            spreadsheet_id
-                        )
-                    ),
-                    name=expected_name,
-                    modified_time=str(checked.get("modifiedTime", "") or ""),
-                    attendance_rows=attendance_rows,
-                )
-            )
-        candidates.sort(
-            key=lambda value: (value.modified_time, value.spreadsheet_id),
-            reverse=True,
-        )
-        if not candidates:
-            return AttendanceConnectionCandidates(
-                state="not-found",
-                expected_name=expected_name,
-                detail=(
-                    "정식 표식이 있는 기존 출석부를 찾지 못했어요. "
-                    "새 파일은 만들지 않았습니다."
-                ),
-            )
-        return AttendanceConnectionCandidates(
-            state="ready" if len(candidates) == 1 else "choose",
-            expected_name=expected_name,
-            candidates=tuple(candidates),
-        )
-    except Exception:  # noqa: BLE001 - 외부 원문과 Google 번호를 화면 문장에 섞지 않는다.
-        return AttendanceConnectionCandidates(
-            state="failed",
-            detail=(
-                "기존 출석부 목록을 끝까지 확인하지 못했어요. "
-                "현재 연결과 Google 파일은 그대로입니다."
-            ),
-        )
+def attendance_connection_candidates(config_dir: Path, deps: AttendanceDeps | None = None, *, include_row_counts: bool = True) -> AttendanceConnectionCandidates:
+    """Compatibility endpoint: an account-year binding has no workbook picker."""
+    return AttendanceConnectionCandidates(state="recovery-required", detail=ATTENDANCE_CONNECTION_REPAIR_MESSAGE)
 
 
-def select_attendance_connection_by_code(
-    config_dir: Path,
-    connection_code: str,
-    deps: AttendanceDeps | None = None,
-) -> AttendanceConnectionSelection:
-    """사람이 붙여 넣은 확인번호와 정식 후보 하나를 대조한 뒤 전체 ID로 연결한다.
-
-    ``TM-…`` 확인번호는 Sheet를 여는 실제 키가 아니다. 같은 계정·학년도·정식
-    이름·Drive 표식을 모두 통과한 후보 중 정확히 하나와 일치할 때만, 아래의 기존
-    선택 함수에 잘리지 않은 ``spreadsheet_id`` 전체를 넘겨 다시 확인한다.
-    """
-
-    deps = deps or AttendanceDeps()
-    config_dir = Path(config_dir)
-    checked_code = str(connection_code or "").strip().upper()
-    if re.fullmatch(r"TM-[0-9A-F]{6}-[0-9A-F]{6}", checked_code) is None:
-        return AttendanceConnectionSelection(
-            state="failed",
-            detail="연결 확인번호는 TM-XXXXXX-XXXXXX 모양으로 붙여 넣어 주세요.",
-        )
-    listed = attendance_connection_candidates(
-        config_dir, deps=deps, include_row_counts=False
-    )
-    if listed.state not in {"ready", "choose"}:
-        return AttendanceConnectionSelection(
-            state=listed.state if listed.state in {
-                "login-required", "account-required", "auth-error"
-            } else "failed",
-            detail=(
-                listed.detail
-                or "확인번호와 대조할 정식 출석부를 찾지 못했어요. 현재 연결은 그대로입니다."
-            ),
-        )
-    matched = [
-        candidate
-        for candidate in listed.candidates
-        if candidate.connection_code == checked_code
-    ]
-    if len(matched) != 1:
-        detail = (
-            "같은 연결 확인번호의 정식 출석부가 둘 이상이라 연결하지 않았어요. "
-            "파일을 직접 확인해 주세요."
-            if len(matched) > 1
-            else (
-                "그 연결 확인번호와 같은 정식 출석부를 찾지 못했어요. "
-                "시트의 연결 상태 확인 창에 나온 번호를 다시 확인해 주세요."
-            )
-        )
-        return AttendanceConnectionSelection(
-            state="choose" if len(matched) > 1 else "not-found",
-            detail=detail,
-        )
-    return select_attendance_connection(
-        config_dir, matched[0].spreadsheet_id, deps=deps
-    )
+def select_attendance_connection_by_code(config_dir: Path, connection_code: str, deps: AttendanceDeps | None = None) -> AttendanceConnectionSelection:
+    return AttendanceConnectionSelection(state="recovery-required", detail=ATTENDANCE_CONNECTION_REPAIR_MESSAGE)
 
 
-def select_attendance_connection(
-    config_dir: Path,
-    spreadsheet_id: str,
-    deps: AttendanceDeps | None = None,
-) -> AttendanceConnectionSelection:
-    """고른 정식 Sheet로 업무 자료와 Chat 연결을 인계한 뒤 로컬 연결을 교체한다."""
-
-    deps = deps or AttendanceDeps()
-    config_dir = Path(config_dir)
-    candidate_id = str(spreadsheet_id or "").strip()
-    record_path = paths.attendance_install_record_path(config_dir)
-    google_handover_started = False
-    chat_rollback_failed = False
-    try:
-        with attendance_remote_work_lock(config_dir):
-            (
-                snapshot,
-                school_year,
-                homeroom_grade,
-                homeroom_class,
-                expected_name,
-            ) = _attendance_connection_identity(config_dir)
-            if not candidate_id:
-                raise AttendanceInstallRecordError(
-                    "고를 정식 출석부 확인값이 비어 있어요."
-                )
-            gws = str(deps.gws_resolver())
-            state, selected_account = _attendance_repair_account(config_dir, deps, gws)
-            if state != "ready":
-                return AttendanceConnectionSelection(
-                    state=state,
-                    detail="설정에서 출결 자료를 만든 Google 계정으로 로그인해 주세요.",
-                )
-            fresh = install_attendance_automation.find_canonical_attendance_sheets(
-                deps.attendance_runner,
-                config_dir,
-                False,
-                school_year,
-                gws,
-            )
-            chosen = next(
-                (
-                    checked
-                    for item in fresh
-                    if (
-                        checked := _verified_attendance_candidate(
-                            item,
-                            expected_name=expected_name,
-                            school_year=school_year,
-                        )
-                    )
-                    is not None
-                    and checked.get("id") == candidate_id
-                ),
-                None,
-            )
-            if chosen is None:
-                return AttendanceConnectionSelection(
-                    state="failed",
-                    detail=(
-                        "고른 출석부를 정식 파일로 다시 확인하지 못했어요. "
-                        "현재 연결은 그대로입니다."
-                    ),
-                )
-            recovered = install_attendance_automation.reuse_existing_attendance_sheet(
-                deps.attendance_runner,
-                config_dir,
-                chosen,
-                expected_name,
-                gws,
-            )
-            wanted = dict(snapshot.record) if snapshot is not None else {}
-            for key in CONNECTION_FIELDS:
-                wanted[key] = str(getattr(recovered, key))
-            wanted["school_year"] = school_year
-            wanted["homeroom_grade"] = homeroom_grade
-            wanted["homeroom_class"] = homeroom_class
-            wanted["workbook_name"] = expected_name
-            wanted["workbook_role"] = (
-                attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
-            )
-            wanted[SETUP_ACCOUNT_FIELD] = selected_account.strip().lower()
-            wanted.pop(SCRIPT_ATTESTATION_FIELD, None)
-            wanted.pop(SCRIPT_UPDATE_REQUIRED_FIELD, None)
-            if recovered.script_update_required:
-                wanted[SCRIPT_UPDATE_REQUIRED_FIELD] = True
-            bundle_sha256 = str(recovered.script_bundle_sha256 or "").strip()
-            if bundle_sha256:
-                wanted[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
-                    wanted, bundle_sha256
-                )
-            # 활성 기록을 바꾸기 전에 후보 ID와 열기 주소까지 완성된 새 기록을
-            # 먼저 검증한다. 교체한 뒤 처음 오류를 발견하면 화면은 실패인데 실제
-            # 연결은 이미 바뀐 반쪽 상태가 된다.
-            verified_wanted = validate_verified_canonical_record(wanted)
-            if verified_wanted["spreadsheet_id"] != candidate_id:
-                raise AttendanceInstallRecordError(
-                    "고른 정식 출석부 번호와 복구할 연결번호가 달라요."
-                )
-            if snapshot is not None and snapshot.record == verified_wanted:
-                return AttendanceConnectionSelection(
-                    state="selected",
-                    spreadsheet_url=str(verified_wanted["spreadsheet_url"]),
-                )
-            chat_move_result = None
-            source_id = (
-                str(snapshot.record.get("spreadsheet_id", "") or "").strip()
-                if snapshot is not None
-                else ""
-            )
-            if source_id and source_id != candidate_id:
-                google_handover_started = True
-                handed_over = deps.connection_record_handover(
-                    config_dir=config_dir,
-                    source_spreadsheet_id=source_id,
-                    target_spreadsheet_id=candidate_id,
-                    runner=deps.attendance_runner,
-                    gws_executable=gws,
-                )
-                if getattr(handed_over, "state", "") != "complete":
-                    raise AttendanceInstallRecordError(
-                        "기존 출석부 자료를 새 연결로 옮긴 결과를 확인하지 못했어요."
-                    )
-                chat_move_result = deps.chat_connection_mover(
-                    config_dir,
-                    candidate_id,
-                    deps.run_command,
-                    gws_executable=gws,
-                    attendance_record=dict(snapshot.record),
-                )
-                if (
-                    not isinstance(chat_move_result, dict)
-                    or chat_move_result.get("outcome")
-                    not in {"moved", "not_registered", "same"}
-                ):
-                    raise AttendanceInstallRecordError(
-                        "Google Chat 연결을 새 출석부로 옮긴 결과를 확인하지 못했어요."
-                    )
-            if snapshot is None:
-                # 후보를 확인하는 동안 다른 창이 연결 기록을 만들었다면 그 결과를
-                # 덮지 않는다. 아직 없을 때만 검증된 로컬 연결 기록 하나를 만든다.
-                if record_path.exists():
-                    raise AttendanceInstallRecordError(
-                        "다른 창에서 출석부 연결 기록을 먼저 만들었어요."
-                    )
-                written = write_attendance_install_record(record_path, wanted)
-                verified = validate_verified_canonical_record(written)
-            else:
-                try:
-                    backup_path = config_dir / (
-                        "attendance-install.before-connection-repair."
-                        + snapshot.sha256[:12]
-                        + ".json"
-                    )
-                    ensure_create_only_install_backup(backup_path, snapshot)
-                    final = replace_attendance_install_record(
-                        record_path, wanted, snapshot
-                    )
-                except Exception:
-                    if (
-                        isinstance(chat_move_result, dict)
-                        and chat_move_result.get("moved") is True
-                    ):
-                        try:
-                            rolled_back = deps.chat_connection_rollback(
-                                config_dir,
-                                chat_move_result,
-                                deps.run_command,
-                                gws_executable=gws,
-                            )
-                            if rolled_back is not True:
-                                chat_rollback_failed = True
-                        except Exception:  # noqa: BLE001 - 복구 불명확 상태를 별도로 알린다.
-                            chat_rollback_failed = True
-                    raise
-                # replace 함수가 교체 뒤 바이트를 다시 읽어 돌려주므로 같은 파일을 한 번
-                # 더 열지 않는다. 두 번째 읽기만 실패해 선택 실패로 보이는 일을 막는다.
-                verified = validate_verified_canonical_record(final.record)
-                if final.record != verified:
-                    raise AttendanceInstallRecordError(
-                        "교체한 정식 출석부 기록이 다시 읽은 값과 달라요."
-                    )
-                if (
-                    isinstance(chat_move_result, dict)
-                    and chat_move_result.get("moved") is True
-                ):
-                    try:
-                        deps.chat_connection_complete(config_dir, chat_move_result)
-                    except Exception:
-                        pass  # 보호 기록을 못 지워도 이미 확인한 연결 교체는 되돌리지 않는다.
-            if verified["spreadsheet_id"] != candidate_id:
-                raise AttendanceInstallRecordError("교체한 정식 출석부 번호가 달라요.")
-            return AttendanceConnectionSelection(
-                state="selected",
-                spreadsheet_url=str(verified["spreadsheet_url"]),
-            )
-    except Exception:  # noqa: BLE001 - 내부값과 외부 원문은 화면에 섞지 않는다.
-        if chat_rollback_failed:
-            detail = (
-                "컴퓨터의 출석부 연결은 바꾸지 않았지만 Google Chat 연결을 "
-                "원래대로 되돌렸는지 확인하지 못했어요. 다시 누르지 말고 설정의 "
-                "출결 문제 해결에서 연결 상태를 확인해 주세요."
-            )
-        elif google_handover_started:
-            detail = (
-                "컴퓨터의 출석부 연결은 바꾸지 않았어요. 대상 출석부에 이미 확인된 "
-                "자료는 그대로 두었으며, 다시 고르면 중복 없이 이어서 확인합니다."
-            )
-        else:
-            detail = (
-                "고른 출석부 연결을 끝까지 확인하지 못했어요. "
-                "현재 연결과 Google 파일은 그대로입니다."
-            )
-        return AttendanceConnectionSelection(
-            state="failed",
-            detail=detail,
-        )
+def select_attendance_connection(config_dir: Path, spreadsheet_id: str, deps: AttendanceDeps | None = None) -> AttendanceConnectionSelection:
+    return AttendanceConnectionSelection(state="recovery-required", detail=ATTENDANCE_CONNECTION_REPAIR_MESSAGE)
 
 
 @contextmanager
@@ -5585,271 +5537,660 @@ def attendance_setup_lock(
         yield
 
 
-def ensure_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
-    """저장 버튼 한 번으로 출결 자료를 처음 한 번만 준비한다. 반복 호출해도 중복 생성하지 않는다."""
+def _preserve_historical_publication(config_dir: Path, receipt) -> None:
+    """Keep immutable noncurrent receipt and original setup bytes before refresh."""
+    from attendance_context import HistoricalPublicationReceipt
+    if not isinstance(receipt, HistoricalPublicationReceipt):
+        raise AttendanceBindingError("ATTENDANCE_HISTORICAL_RECEIPT_INVALID")
+    operation_id = receipt.payload["operationId"]
+    history = Path(config_dir) / "attendance-operation-history" / hashlib.sha256(operation_id.encode()).hexdigest()
+    history.mkdir(parents=True, exist_ok=True)
+
+    def preserve(kind, raw):
+        target = history / (kind + "-" + hashlib.sha256(raw).hexdigest() + ".json")
+        try:
+            with target.open("xb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except FileExistsError:
+            if target.read_bytes() != raw:
+                raise AttendanceBindingError("ATTENDANCE_RECOVERY_RECORD_CONFLICT")
+
+    preserve("publication", (_json.dumps(receipt.payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    journal = paths.attendance_setup_status_path(config_dir)
+    if journal.exists():
+        preserve("setup", journal.read_bytes())
+
+
+def _attendance_failure_fields(error) -> dict:
+    if isinstance(error, AttendanceScopeError) and not isinstance(error, AttendanceBindingError):
+        error = AttendanceBindingError(error.code)
+    if not isinstance(error, AttendanceBindingError):
+        return {}
+    return dict(failure_code=error.diagnostic_code, failure_domain=error.failure_domain,
+                failure_stage=error.failure_stage, recovery_action=error.recovery_action,
+                http_status=error.status if type(error.status) is int and 100 <= error.status <= 599 else 0)
+
+
+def _protected_attendance_setup(config_dir: Path, account: str) -> dict:
+    path = paths.attendance_setup_status_path(config_dir)
+    saved = attendance_workbook_transition._read_dict(path) if path.exists() else {}
+    if saved.get('account') and str(saved['account']).casefold() != account.casefold():
+        raise AttendanceBindingError('ATTENDANCE_ACCOUNT_CHANGED')
+    return saved
+
+
+def _same_attendance_action(left: dict, right: dict) -> bool:
+    fields = ('schemaVersion', 'provenance', 'origin', 'reason', 'subjectKey', 'expectedSchoolYear',
+              'expectedGeneration', 'previousSpreadsheetId', 'previousOperationId', 'idempotencyKey')
+    return all(left.get(key) == right.get(key) for key in fields) and (
+        not left.get('operationId') or not right.get('operationId') or left['operationId'] == right['operationId'])
+
+
+def _reconcile_attendance_publication(config_dir, client, scope, saved, action):
+    """Recognize a committed response loss from server proof, using no cloud writes."""
+    if action['phase'] == 'published' or scope.payload['bindingState'] != 'ACTIVE': return action
+    if scope.payload['generation'] == action['expectedGeneration']: return action
+    if (scope.payload['verificationState'] != 'VERIFIED' or scope.payload['subjectKey'] != action['subjectKey']
+            or scope.year != action['expectedSchoolYear'] or scope.payload['generation'] != action['expectedGeneration'] + 1
+            or scope.payload.get('operationId') != action.get('operationId')):
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    operation = client.operation(action['operationId'])
+    action = attendance_workbook_transition.correlate_attendance_operation(action, operation)
+    resource = (operation.get('resources') or {}).get('spreadsheet') or {}
+    candidate = resource.get('resourceId')
+    if (operation.get('state') != 'ACTIVE' or operation.get('publishedGeneration') != scope.payload['generation']
+            or resource.get('phase') != 'CONFIRMED_RESULT' or resource.get('verificationState') != 'VERIFIED_METADATA'
+            or candidate != scope.payload['spreadsheetId']):
+        raise AttendanceBindingError('ATTENDANCE_RESULT_UNKNOWN')
+    if action['provenance'] == 'legacy-existing-operation':
+        proof = action['evidence']
+        digest = attendance_workbook_transition.attendance_action_digest
+        if (candidate != proof.get('candidateSpreadsheetId')
+                or digest(operation.get('resources')) != proof.get('resourceDigest')
+                or digest(operation.get('progress')) != proof.get('checkpointDigest')):
+            raise AttendanceBindingError('ATTENDANCE_RECOVERY_REQUIRED')
+    action = {**action, 'phase': 'published', 'publishedSpreadsheetId': candidate,
+              'publishedGeneration': scope.payload['generation']}
+    _restore_registry_record(config_dir, scope)
+    saved.update(state='created', attendance_action=action)
+    _write_setup_status(config_dir, saved)
+    return action
+
+
+def _action_status(status: AttendanceStatus, action: dict, saved: dict | None = None) -> AttendanceStatus:
+    return replace(status, attendance_action=dict(action), progress=dict((saved or {}).get('progress') or {}),
+                   creation_allowed=False, replacement_allowed=False, initial_preparation_allowed=False,
+                   replacement_request_key=action.get('idempotencyKey', '') if action.get('reason') in ('replace-trashed', 'replace-unavailable') else '',
+                   replacement_operation_id=action.get('operationId', '') if action.get('reason') in ('replace-trashed', 'replace-unavailable') else '')
+
+
+def prepare_attendance_action(config_dir: Path, deps: AttendanceDeps | None = None, *,
+                              origin='explicit-create', intent=None, expected_action=None) -> AttendanceStatus:
+    """Record one intent before dispatch. This function does not provision resources."""
     deps = deps or AttendanceDeps()
     config_dir = Path(config_dir)
-    # 계정 확인은 폴더·잠금 파일을 만들기 전에 한다. 개인 Gmail에서 눌렀다는
-    # 이유만으로 사용자 폴더에 흔적을 남기지 않는다. 실제 준비 직전에는 잠금 안에서
-    # 다시 읽어 다른 창이 먼저 끝낸 결과도 그대로 사용한다.
-    gws = str(deps.gws_resolver())
-    preflight = read_attendance_status(
-        config_dir, deps.run_command, gws_executable=gws
-    )
-    if preflight.state == "script-recovery-required":
-        # A lost script ID must not leave the already-created workbook in the
-        # obsolete layout. This repair uses Sheets only and preserves records.
-        with attendance_setup_lock(config_dir):
-            setup = _read_setup_status(config_dir)
-            progress = dict(setup.get("progress") or {})
-            try:
-                account = require_goedu_gws_session(deps.run_command, gws)
-                if not setup.get("account") or str(setup["account"]).casefold() != account.casefold():
-                    raise ValueError(ATTENDANCE_ACCOUNT_MESSAGE)
-                layout = install_attendance_automation.attendance_sheet_layout
-                if progress.get("workbook_layout_ready") != layout.LAYOUT_VERSION:
-                    layout.ensure_layout(deps.attendance_runner, config_dir, progress["spreadsheet_id"], gws)
-                    progress["workbook_layout_ready"] = layout.LAYOUT_VERSION
-                    setup = {**setup, "progress": progress}
-                    _write_setup_status(config_dir, setup)
-                return _bound_script_recovery_status(setup, account)
-            except Exception as error:
-                return AttendanceStatus(
-                    state="failed", current_user=preflight.current_user, progress=progress,
-                    failed_service="sheet", detail=friendly_attendance_error(error)[1],
-                )
-    if preflight.state in (
-        "gws-required", "login-required", "account-required", "auth-error",
-        "profile-required", "ready", "script-check-required", "script-update-required",
-        "connection-repair-required", "ai-action-required",
-        "script-recovery-required",
-    ):
-        return preflight
+    status = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()),
+                                    binding_client=deps.binding_client)
+    if not status.attendance_scope: return status
     with attendance_setup_lock(config_dir):
-        return _ensure_attendance_once(config_dir, deps, gws)
+        try:
+            scope = deps.binding_client.current()
+            if scope.payload['subjectKey'] != status.attendance_scope.get('subjectKey'):
+                raise AttendanceBindingError('ATTENDANCE_ACCOUNT_CHANGED')
+            status = replace(status, attendance_scope=scope.payload)
+            saved = _protected_attendance_setup(config_dir, status.current_user)
+            action = saved.get('attendance_action')
+            if (intent and action and scope.payload['bindingState'] == 'ACTIVE'
+                    and scope.payload['verificationState'] == 'VERIFIED'
+                    and scope.payload['generation'] == action.get('expectedGeneration', -2) + 1):
+                action = attendance_workbook_transition.validate_attendance_action(action)
+                if expected_action and not _same_attendance_action(action, expected_action):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                if any(action.get(key) != value for key, value in intent.items()):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                action = _reconcile_attendance_publication(config_dir, deps.binding_client, scope, saved, action)
+                if action['phase'] != 'published':
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                attendance_workbook_transition.require_action_context(action, scope, published=True)
+                return _action_status(status, action, saved)
+            if intent:
+                _require_replacement_intent(scope, intent)
+            pending_replacement = bool(intent and intent.get('previousOperationId')
+                and scope.payload['bindingState'] in ('PREPARING', 'CREATE_RESULT_UNKNOWN')
+                and scope.replacement_allowed and scope.payload.get('operationId') == intent['previousOperationId'])
+            same_replacement_request = bool(action and intent and all(action.get(key) == value for key, value in intent.items() if key != 'idempotencyKey'))
+            if pending_replacement and not same_replacement_request:
+                # The explicit request names the exact abandoned operation and trashed candidate.
+                # Preserve its journal before starting with entirely empty local progress.
+                scope = deps.binding_client.replacement_check(scope, intent['previousSpreadsheetId'], intent['previousOperationId'])
+                _require_replacement_intent(scope, intent)
+                if not scope.replacement_allowed:
+                    raise AttendanceBindingError('ATTENDANCE_REPLACEMENT_UNVERIFIED')
+                if expected_action:
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                if action:
+                    old_action = attendance_workbook_transition.validate_attendance_action(action)
+                    attendance_workbook_transition.correlate_attendance_operation(old_action,
+                        deps.binding_client.operation(intent['previousOperationId']))
+                if saved.get('operation_id') not in (None, '', intent['previousOperationId']):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                if saved.get('progress', {}).get('spreadsheet_id') not in (None, '', intent['previousSpreadsheetId']):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                if saved:
+                    attendance_workbook_transition.archive_attendance_setup(config_dir)
+                action, saved = None, {}
+            if action:
+                action = attendance_workbook_transition.validate_attendance_action(action)
+                if expected_action and not _same_attendance_action(action, expected_action):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                action = _reconcile_attendance_publication(config_dir, deps.binding_client, scope, saved, action)
+                if action['phase'] == 'published':
+                    if intent and scope.replacement_allowed:
+                        attendance_workbook_transition.archive_attendance_setup(config_dir)
+                        action, saved = None, {}
+                    else:
+                        try:
+                            attendance_workbook_transition.require_action_context(action, scope, published=True)
+                            return _action_status(status, action, saved)
+                        except AttendanceScopeError:
+                            # A new year's explicit action archives, never repurposes, its predecessor.
+                            if scope.year <= action['expectedSchoolYear']: raise
+                            attendance_workbook_transition.archive_attendance_setup(config_dir)
+                            action = None
+                            saved = {}
+                else:
+                    if intent and not all(action.get(key) == value for key, value in intent.items() if key != 'idempotencyKey'):
+                        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                    attendance_workbook_transition.require_action_context(action, scope)
+                    if (scope.payload.get('operationId') and action.get('operationId')
+                            and scope.payload['operationId'] != action['operationId']):
+                        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                    return _action_status(replace(status, state='preparing'), action, saved)
+            if not pending_replacement and scope.payload.get('operationId') and scope.payload['bindingState'] in ('PREPARING', 'CREATE_RESULT_UNKNOWN'):
+                # Missing original keys are not silently adopted by a start/status request.
+                legacy_intent = saved.get('replacement_intent') or intent
+                if legacy_intent and scope.payload.get('operationReason') in ('replace-trashed', 'replace-unavailable'):
+                    _require_replacement_intent(scope, legacy_intent)
+                    action = attendance_workbook_transition.new_attendance_action(scope, legacy_intent['reason'], intent=legacy_intent)
+                    operation = deps.binding_client.operation(scope.payload['operationId'])
+                    action = attendance_workbook_transition.correlate_attendance_operation(action, operation)
+                else:
+                    return replace(status, state='preparing', creation_allowed=False, initial_preparation_allowed=False,
+                                   replacement_allowed=False, recovery_action='resume-attendance-preparation')
+            else:
+                if saved.get('progress') and saved.get('state') != 'created':
+                    raise AttendanceBindingError('ATTENDANCE_RESULT_UNKNOWN')
+                if scope.payload['bindingState'] == 'ACTIVE' and not intent:
+                    return status
+                if origin == 'initial-auto':
+                    if 'initialPreparationAllowed' not in scope.payload:
+                        raise AttendanceBindingError('ATTENDANCE_INITIAL_PREPARATION_UNSUPPORTED',
+                            failure_domain='central-attendance', recovery_action='update-attendance-service')
+                    if not scope.initial_preparation_allowed: return status
+                    reason = 'first-setup'
+                else:
+                    reason = intent['reason'] if intent else status.creation_reason
+                if intent:
+                    _require_replacement_intent(scope, intent)
+                    if not scope.replacement_allowed:
+                        raise AttendanceBindingError('ATTENDANCE_REPLACEMENT_UNVERIFIED')
+                elif not scope.create_allowed:
+                    return status
+                if _attendance_profile_error(config_dir):
+                    return replace(status, state='profile-required', detail=ATTENDANCE_PROFILE_MESSAGE)
+                if saved.get('state') == 'created':
+                    attendance_workbook_transition.archive_attendance_setup(config_dir)
+                    saved = {}
+                action = attendance_workbook_transition.new_attendance_action(scope, reason, origin=origin, intent=intent)
+            saved.update(account=status.current_user, state='requested', attendance_action=action)
+            if intent: saved['replacement_intent'] = dict(intent)
+            _write_setup_status(config_dir, saved)
+            return _action_status(replace(status, state='preparing', detail='출석부 준비 요청을 확인하고 있어요.'), action, saved)
+        except (AttendanceScopeError, AttendanceInstallRecordError, OSError, ValueError) as error:
+            return replace(status, state='verification-unavailable', creation_allowed=False,
+                replacement_allowed=False, initial_preparation_allowed=False,
+                detail=str(error) if isinstance(error, AttendanceScopeError) else ATTENDANCE_RECORD_BROKEN_MESSAGE,
+                **_attendance_failure_fields(error))
+
+
+def execute_attendance_action(config_dir: Path, deps: AttendanceDeps | None = None, *, expected_action=None) -> AttendanceStatus:
+    deps = deps or AttendanceDeps()
+    config_dir = Path(config_dir)
+    status = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()),
+                                    binding_client=deps.binding_client)
+    if not status.attendance_scope: return status
+    with attendance_setup_lock(config_dir):
+        saved = _protected_attendance_setup(config_dir, status.current_user)
+        action = attendance_workbook_transition.validate_attendance_action(saved.get('attendance_action'))
+        if expected_action and not _same_attendance_action(action, expected_action):
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        action = _reconcile_attendance_publication(config_dir, deps.binding_client, deps.binding_client.current(), saved, action)
+        if action['phase'] == 'published':
+            attendance_workbook_transition.require_action_context(action, deps.binding_client.current(), published=True)
+            return _action_status(status, action, saved)
+        if action['provenance'] == 'legacy-existing-operation':
+            return _execute_legacy_publication(config_dir, deps, status, saved, action)
+        return _ensure_attendance_once(config_dir, deps, admission_status=status, action=action)
+
+
+def _legacy_attendance_proof(saved: dict, operation: dict, scope: AttendanceScope, account: str) -> dict:
+    """Match the retained journal to server evidence without elevating its evidence tiers."""
+    from attendance_context import parse_instant
+    from attendance_sheet_layout import validate_month_sheet_ids
+    fail = lambda: AttendanceBindingError('ATTENDANCE_RECOVERY_REQUIRED')
+    if (saved.get('operation_id') != scope.payload.get('operationId') or saved.get('operation_id') != operation.get('operationId')
+            or str(saved.get('account') or '').casefold() != account.casefold()
+            or operation.get('subjectKey') != scope.payload['subjectKey'] or operation.get('schoolYear') != scope.year
+            or operation.get('generation') != scope.payload['generation'] or operation.get('reason') != 'first-setup'
+            or scope.payload['bindingState'] not in ('PREPARING', 'CREATE_RESULT_UNKNOWN')
+            or operation.get('state') != 'CANDIDATE_IDENTIFIED'):
+        raise fail()
+    if operation.get('leaseExpiresAt'):
+        if parse_instant(operation['leaseExpiresAt']) > parse_instant(scope.payload['serverNow']):
+            raise AttendanceBindingError('ATTENDANCE_OPERATION_IN_PROGRESS')
+    resources, remote = operation.get('resources'), operation.get('progress')
+    local = saved.get('progress')
+    if not isinstance(resources, dict) or not resources or not isinstance(local, dict) or not isinstance(remote, dict): raise fail()
+    if any(not isinstance(resource, dict) or resource.get('phase') != 'CONFIRMED_RESULT' for resource in resources.values()): raise fail()
+    for kind, field in (('spreadsheet', 'spreadsheet_id'), ('template', 'template_doc_id'), ('folder', 'folder_id'),
+                        ('script', 'script_id'), ('deployment', 'deployment_id')):
+        resource = resources.get(kind) or {}
+        value = resource.get('resourceId')
+        if not value or local.get(field) != value or remote.get(field) != value: raise fail()
+        if kind in ('spreadsheet', 'template', 'folder') and resource.get('verificationState') != 'VERIFIED_METADATA': raise fail()
+    if not local.get('task_list_id') or local.get('task_list_id') != remote.get('task_list_id'): raise fail()
+    if local.get('workbook_layout_ready') != 'monthly-ai-chat-1' or local.get('workbook_layout_ready') != remote.get('workbook_layout_ready'): raise fail()
+    try:
+        local_months = validate_month_sheet_ids(_json.loads(local.get('monthly_sheet_ids', 'null')))
+        remote_months = validate_month_sheet_ids(_json.loads(remote.get('monthly_sheet_ids', 'null')))
+    except (ValueError, TypeError): raise fail() from None
+    if local_months != remote_months or any(remote.get(key) != value for key, value in local.items()): raise fail()
+    digest = attendance_workbook_transition.attendance_action_digest
+    return dict(candidateSpreadsheetId=resources['spreadsheet']['resourceId'], resourceDigest=digest(resources),
+                checkpointDigest=digest(remote), monthlySheetIds=local_months)
+
+
+def prepare_attendance_resume(config_dir: Path, deps: AttendanceDeps | None = None, *, expected_action=None) -> AttendanceStatus:
+    deps = deps or AttendanceDeps()
+    config_dir = Path(config_dir)
+    status = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()), binding_client=deps.binding_client)
+    if not status.attendance_scope: return status
+    with attendance_setup_lock(config_dir):
+        try:
+            scope = deps.binding_client.current()
+            saved = _protected_attendance_setup(config_dir, status.current_user)
+            action = saved.get('attendance_action')
+            if action:
+                action = attendance_workbook_transition.validate_attendance_action(action)
+                if expected_action and not _same_attendance_action(action, expected_action):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                action = _reconcile_attendance_publication(config_dir, deps.binding_client, scope, saved, action)
+                attendance_workbook_transition.require_action_context(action, scope, published=action['phase'] == 'published')
+                if action['phase'] != 'published':
+                    operation = deps.binding_client.operation(scope.payload.get('operationId') or action.get('operationId'))
+                    action = attendance_workbook_transition.correlate_attendance_operation(action, operation)
+                    if action['provenance'] == 'legacy-existing-operation':
+                        proof = _legacy_attendance_proof(saved, operation, scope, status.current_user)
+                        if proof != {key: action['evidence'].get(key) for key in proof}:
+                            raise AttendanceBindingError('ATTENDANCE_RECOVERY_REQUIRED')
+                return _action_status(status, action, saved)
+            if not expected_action or expected_action.get('provenance') != 'legacy-existing-operation' or expected_action.get('explicitResume') is not True:
+                return replace(status, creation_allowed=False, replacement_allowed=False, recovery_action='resume-attendance-preparation')
+            for key, value in {'subjectKey': scope.payload['subjectKey'], 'expectedSchoolYear': scope.year,
+                    'expectedGeneration': scope.payload['generation'], 'operationId': scope.payload.get('operationId')}.items():
+                if expected_action.get(key) != value or value is None:
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+            operation = deps.binding_client.operation(scope.payload['operationId'])
+            proof = _legacy_attendance_proof(saved, operation, scope, status.current_user)
+            source_hash = attendance_workbook_transition.archive_attendance_setup(config_dir)
+            action = attendance_workbook_transition.validate_attendance_action(dict(schemaVersion=1,
+                provenance='legacy-existing-operation', explicitResume=True, idempotencyKey=None,
+                originalRequestOwnership='unproven', reason=operation['reason'], subjectKey=scope.payload['subjectKey'],
+                expectedSchoolYear=scope.year, expectedGeneration=scope.payload['generation'], previousSpreadsheetId=None,
+                operationId=operation['operationId'], phase='admitted', publishedSpreadsheetId=None, publishedGeneration=None,
+                evidence={**proof, 'sourceJournalSha256': source_hash}))
+            saved['attendance_action'] = action
+            _write_setup_status(config_dir, saved)
+            return _action_status(replace(status, state='preparing', attendance_scope=scope.payload), action, saved)
+        except (AttendanceScopeError, AttendanceInstallRecordError, OSError, ValueError) as error:
+            return replace(status, state='verification-unavailable', creation_allowed=False, replacement_allowed=False,
+                initial_preparation_allowed=False, detail=str(error) if isinstance(error, AttendanceScopeError) else ATTENDANCE_RECORD_BROKEN_MESSAGE,
+                **_attendance_failure_fields(error))
+
+
+def _execute_legacy_publication(config_dir, deps, status, saved, action):
+    """An existing candidate needs publication, never another installer/configuration pass."""
+    from attendance_binding import RegistryCreationOperation
+    try:
+        scope = deps.binding_client.current()
+        attendance_workbook_transition.require_action_context(action, scope)
+        operation_data = deps.binding_client.operation(action['operationId'])
+        proof = _legacy_attendance_proof(saved, operation_data, scope, status.current_user)
+        if proof != {key: action['evidence'].get(key) for key in proof}:
+            raise AttendanceBindingError('ATTENDANCE_RECOVERY_REQUIRED')
+        operation = RegistryCreationOperation(deps.binding_client, scope, operation_data)
+        operation.authorize_write()
+        committed = operation.publish()  # Service re-verifies this exact candidate before atomic publication.
+        action = {**action, 'phase': 'published', 'publishedSpreadsheetId': proof['candidateSpreadsheetId'],
+                  'publishedGeneration': action['expectedGeneration'] + 1}
+        attendance_workbook_transition.require_action_context(action, committed, published=True)
+        fresh = deps.binding_client.current()
+        attendance_workbook_transition.require_action_context(action, fresh, published=True)
+        if fresh.payload['bindingState'] != 'ACTIVE' or fresh.payload['verificationState'] != 'VERIFIED':
+            raise AttendanceBindingError('ATTENDANCE_RESULT_UNKNOWN')
+        _restore_registry_record(config_dir, fresh)
+        saved.update(state='created', attendance_action=action)
+        _write_setup_status(config_dir, saved)
+        refreshed = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()), binding_client=deps.binding_client)
+        return _action_status(replace(refreshed, created=False), action, saved)
+    except (AttendanceScopeError, AttendanceInstallRecordError, OSError, ValueError) as error:
+        _remember_setup_failure(config_dir, error, status.current_user)
+        return _failed_attendance_action(config_dir, deps, status, action, error)
+
+
+def attendance_action_status(config_dir: Path, deps: AttendanceDeps | None = None, *, expected_action: dict) -> AttendanceStatus:
+    """Observe a captured action with fresh authority; never start, claim or migrate."""
+    with attendance_setup_lock(config_dir):
+        return _attendance_action_status_locked(config_dir, deps, expected_action=expected_action)
+
+
+def _attendance_action_status_locked(config_dir: Path, deps: AttendanceDeps | None = None, *, expected_action: dict) -> AttendanceStatus:
+    deps = deps or AttendanceDeps()
+    status = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()), binding_client=deps.binding_client)
+    saved = _protected_attendance_setup(Path(config_dir), status.current_user)
+    action = attendance_workbook_transition.validate_attendance_action(saved.get('attendance_action'))
+    if not _same_attendance_action(action, expected_action): raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    if not status.attendance_scope: return status
+    scope = AttendanceScope.parse(status.attendance_scope)
+    action = _reconcile_attendance_publication(config_dir, deps.binding_client, scope, saved, action)
+    attendance_workbook_transition.require_action_context(action, scope, published=action['phase'] == 'published')
+    if action['phase'] != 'published' and scope.payload.get('operationId'):
+        action = attendance_workbook_transition.correlate_attendance_operation(action, deps.binding_client.operation(scope.payload['operationId']))
+    fields = saved.get('last_failure') or {}
+    if action['phase'] == 'blocked':
+        error = AttendanceBindingError(fields.get('failure_code', 'ATTENDANCE_RESULT_UNKNOWN'), status=fields.get('http_status', 0),
+            failure_domain=fields.get('failure_domain', ''), failure_stage=fields.get('failure_stage', ''),
+            recovery_action=fields.get('recovery_action', ''))
+        status = replace(status, state='verification-unavailable', detail=str(error), **_attendance_failure_fields(error))
+    return _action_status(status, action, saved)
+
+
+def open_attendance_action(config_dir: Path, deps: AttendanceDeps | None = None, *, expected_context=None,
+                           automatic=False, opener) -> dict:
+    """Open a freshly verified exact binding; consume automatic attempts before dispatch."""
+    deps = deps or AttendanceDeps()
+    if type(automatic) is not bool:
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    status = read_attendance_status(config_dir, deps.run_command, gws_executable=str(deps.gws_resolver()),
+                                    binding_client=deps.binding_client)
+    if not status.current_user or deps.binding_client is None:
+        raise AttendanceBindingError('ATTENDANCE_AUTH_REQUIRED')
+    with attendance_setup_lock(config_dir):
+        fresh = deps.binding_client.current()
+        keys = ('subjectKey', 'currentSchoolYear', 'generation', 'operationId', 'spreadsheetId')
+        if (fresh.payload['bindingState'] != 'ACTIVE' or fresh.payload['verificationState'] != 'VERIFIED'
+                or fresh.payload.get('workbookSchoolYear') != fresh.year
+                or deps.binding_client.email.casefold() != status.current_user.casefold()):
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        if expected_context is not None and (not isinstance(expected_context, dict)
+                or any(type(expected_context.get(key)) is not type(fresh.payload.get(key))
+                       or expected_context.get(key) != fresh.payload.get(key) for key in keys)):
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        record = read_verified_canonical_record(paths.attendance_install_record_path(config_dir))
+        if (record.get('spreadsheet_id') != fresh.payload['spreadsheetId']
+                or record.get('subject_key') != fresh.payload['subjectKey']
+                or record.get('binding_generation') != fresh.payload['generation']):
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        if automatic:
+            if expected_context is None: raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+            saved = _protected_attendance_setup(Path(config_dir), status.current_user)
+            action = attendance_workbook_transition.validate_attendance_action(saved.get('attendance_action'))
+            if (action['provenance'] != 'saved-request' or action.get('origin') != 'explicit-create'
+                    or action['phase'] != 'published'):
+                raise AttendanceBindingError('ATTENDANCE_CREATION_NOT_ALLOWED')
+            attendance_workbook_transition.require_action_context(action, fresh, published=True)
+            attendance_workbook_transition.correlate_attendance_operation(action, deps.binding_client.operation(action['operationId']))
+            attempt = action.get('openAttempt')
+            if attempt is not None and (not isinstance(attempt, dict) or attempt.get('operationId') != action['operationId']
+                    or attempt.get('spreadsheetId') != action['publishedSpreadsheetId'] or attempt.get('state') not in ('attempted', 'opened', 'failed')):
+                raise AttendanceBindingError('ATTENDANCE_PROGRESS_INVALID')
+            if attempt:
+                return {'opened': False, 'already_attempted': True}
+            action['openAttempt'] = dict(operationId=action['operationId'], spreadsheetId=action['publishedSpreadsheetId'], state='attempted')
+            saved['attendance_action'] = action
+            _write_setup_status(Path(config_dir), saved)
+        # The bridge's opener checks the captured desktop account again immediately before navigation.
+        return opener(f"https://docs.google.com/spreadsheets/d/{fresh.payload['spreadsheetId']}/edit", status.current_user)
+
+
+def ensure_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
+    """Every entry point shares the authenticated registry creation gate."""
+    prepared = prepare_attendance_action(config_dir, deps, origin='initial-auto')
+    if not prepared.attendance_action or prepared.attendance_action['phase'] == 'published':
+        return prepared
+    return execute_attendance_action(config_dir, deps, expected_action=prepared.attendance_action)
 
 
 def _ensure_attendance_once(
     config_dir: Path,
     deps: AttendanceDeps,
     gws_executable: str | None = None,
+    admission_status: AttendanceStatus | None = None,
+    replacement_intent: dict | None = None,
+    action: dict | None = None,
 ) -> AttendanceStatus:
+    """Execute only one server-admitted creation; local records are caches."""
+    from attendance_binding import RegistryCreationOperation
     gws = str(gws_executable or deps.gws_resolver())
-    status = read_attendance_status(
-        config_dir, deps.run_command, gws_executable=gws
-    )
-    if status.state in (
-        "gws-required", "login-required", "account-required", "auth-error",
-        "profile-required", "ready", "script-check-required", "script-update-required",
-        "connection-repair-required", "ai-action-required",
-        "script-recovery-required",
-    ):
+    status = admission_status or read_attendance_status(config_dir, deps.run_command, gws_executable=gws,
+                                    binding_client=deps.binding_client)
+    if not status.attendance_scope:
         return status
-    if paths.attendance_install_record_path(config_dir).exists():
-        return status  # 깨진 설치 기록 — 자동으로 새 자료를 만들지 않는다
-
+    scope = AttendanceScope.parse(status.attendance_scope)
+    if action is None:
+        return replace(status, creation_allowed=False, replacement_allowed=False)
+    attendance_workbook_transition.require_action_context(action, scope)
+    if action['reason'] in ('replace-trashed', 'replace-unavailable'):
+        replacement_intent = {key: action[key] for key in ('reason', 'subjectKey', 'expectedSchoolYear',
+            'expectedGeneration', 'previousSpreadsheetId', 'idempotencyKey')}
+        if action['reason'] == 'replace-unavailable':
+            replacement_intent.update({key: action[key] for key in ('explicitConfirmation', 'failureCode', 'failureStage')})
+        if action.get('previousOperationId'):
+            replacement_intent['previousOperationId'] = action['previousOperationId']
+    operation_id = scope.payload.get("operationId")
+    replacing = replacement_intent is not None or scope.payload.get("operationReason") in ("replace-trashed", "replace-unavailable")
+    if scope.payload["bindingState"] == "ACTIVE" and not replacement_intent:
+        return status
+    if replacement_intent and (scope.payload["bindingState"] == "ACTIVE"
+            or operation_id == replacement_intent.get("previousOperationId")):
+        operation_id = None  # A prior completed creation is not this new intent.
+    if not scope.create_allowed and not operation_id and not replacement_intent:
+        return status
+    action_correlation = {}
     try:
+        # Preserve a malformed journal; never pretend its writes did not occur.
+        setup_path = paths.attendance_setup_status_path(config_dir)
+        setup_evidence = attendance_workbook_transition._read_dict(setup_path) if setup_path.exists() else {}
+        saved_account = str(setup_evidence.get("account") or "").strip().casefold()
+        if setup_evidence.get("progress") and saved_account != status.current_user.casefold():
+            raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+        if replacing and setup_evidence.get("progress") and not setup_evidence.get("replacement_intent") and setup_evidence.get("state") != "created":
+            if setup_evidence.get("operation_id") != operation_id:
+                raise AttendanceBindingError("ATTENDANCE_RESULT_UNKNOWN")
+        if replacing:
+            attendance_workbook_transition.preserve_replacement_record(config_dir)
+        if replacement_intent is not None:
+            saved_intent = setup_evidence.get("replacement_intent")
+            if saved_intent and setup_evidence.get("state") != "created":
+                _require_replacement_intent(scope, saved_intent)
+                replacement_intent = saved_intent
+            _require_replacement_intent(scope, replacement_intent)
+            if not operation_id and not scope.replacement_allowed:
+                raise AttendanceBindingError("ATTENDANCE_REPLACEMENT_SOURCE_CHANGED")
+            setup_evidence.update(state="replacement-intent", account=status.current_user,
+                                  replacement_intent=dict(replacement_intent), attendance_action=action)
+            _write_setup_status(config_dir, setup_evidence)
+        profile_error = _attendance_profile_error(config_dir)
+        if profile_error:
+            return replace(status, state="profile-required", detail=profile_error, creation_allowed=False)
+        if replacing:
+            from dashboard import roster
+            roster.preserve_for_replacement(config_dir, status.current_user, {
+                "subjectKey": scope.payload["subjectKey"], "currentSchoolYear": scope.year,
+                "generation": scope.payload["generation"],
+                "previousSpreadsheetId": (replacement_intent or {}).get("previousSpreadsheetId") or scope.payload.get("previousSpreadsheetId"),
+            })
         profile_json = parse_settings.parse_config_dir(config_dir, require_links=False)
-    except ValueError:
-        return AttendanceStatus(
-            state="profile-required", current_user=status.current_user, detail=ATTENDANCE_PROFILE_MESSAGE
-        )
-
-    setup_status = _read_setup_status(config_dir)
-    progress = setup_status.get("progress")
-    progress = dict(progress) if isinstance(progress, dict) and progress else None
-    account = str(setup_status.get("account", "") or "")
-    current_user = status.current_user
-    if progress and account and current_user and account != current_user:
-        return AttendanceStatus(
-            state="failed", account=account, current_user=current_user,
-            failed_service="setup", detail=ATTENDANCE_ACCOUNT_MESSAGE,
-            school_year=_profile_school_year(config_dir),
-        )
-
-    saved_progress = dict(progress or {})
-    first_failure = setup_status.get("first_failure")
-
-    def record_progress(ids: dict) -> None:
-        saved_progress.clear()
-        saved_progress.update(ids)
-        _write_setup_status(config_dir, {
-            "state": "installing", "account": current_user, "progress": dict(ids),
-            **({"first_failure": first_failure} if first_failure else {}),
-        })
-
-    # 미제출 할 일은 별도 목록을 만들지 않고 조종례 목록으로 통합한다.
-    try:
-        profile_data = _json.loads(Path(profile_json).read_text(encoding="utf-8"))
-    except ValueError:
-        profile_data = {}
-    homeroom_tasks_id = str((profile_data.get("calendars") or {}).get("homeroom_tasks_id", "") or "")
-    try:
+        profile = install_attendance_automation.load_profile(profile_json)
+        if operation_id:
+            operation_data = deps.binding_client.operation(operation_id)
+        else:
+            operation_data = deps.binding_client.start(scope, action['idempotencyKey'], action['reason'],
+                previous_spreadsheet_id=action.get('previousSpreadsheetId') or '',
+                **({'previous_operation_id': action['previousOperationId']} if action.get('previousOperationId') else {}),
+                trigger='initial-auto' if action.get('origin') == 'initial-auto' else '',
+                **({'explicit_confirmation': action['explicitConfirmation'], 'failure_code': action['failureCode'], 'failure_stage': action['failureStage']} if action['reason'] == 'replace-unavailable' else {}))
+        action = attendance_workbook_transition.correlate_attendance_operation(action, operation_data)
+        action['phase'] = 'admitted'
+        setup_evidence.update(account=status.current_user, operation_id=action['operationId'], attendance_action=action)
+        _write_setup_status(config_dir, setup_evidence)
+        if replacing:
+            previous_id = (replacement_intent or {}).get("previousSpreadsheetId") or scope.payload.get("previousSpreadsheetId")
+            if operation_data.get("reason") != action['reason'] or operation_data.get("previousSpreadsheetId") != previous_id:
+                raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+        operation = RegistryCreationOperation(deps.binding_client, scope, operation_data)
+        if replacement_intent:
+            action_correlation = {"replacement_request_key": replacement_intent["idempotencyKey"],
+                                  "replacement_operation_id": operation.operation_id}
+        operation.claim()
+        progress = dict(operation.operation.get("progress") or {})
+        record_path = paths.attendance_install_record_path(config_dir)
+        if record_path.exists() and not replacing:
+            previous = read_verified_canonical_record(record_path)
+            if str(previous.get("school_year")) == str(scope.year):
+                raise AttendanceBindingError("ATTENDANCE_CREATION_NOT_ALLOWED")
+            for key in ("template_doc_id", "template_doc_url", "folder_id", "task_list_id"):
+                if previous.get(key):
+                    progress.setdefault(key, previous[key])
+        def remember(values):
+            action['phase'] = 'running'
+            setup_evidence.update(state="installing", account=status.current_user,
+                                  operation_id=operation.operation_id, progress=dict(values), attendance_action=dict(action))
+            _write_setup_status(config_dir, setup_evidence)
+        task_id = str(progress.get("task_list_id") or ("" if replacing else (profile.get("calendars") or {}).get("homeroom_tasks_id")) or "")
         result = deps.attendance_installer(
-            profile_json, runner=deps.attendance_runner, resume=progress, progress=record_progress,
-            attendance_task_list_id=homeroom_tasks_id,
-            attendance_task_list_title="조종례시 담임학급 안내사항",
+            profile_json, runner=deps.attendance_runner, resume=progress, progress=remember,
+            attendance_task_list_id=task_id, attendance_task_list_title="조종례시 담임학급 안내사항",
             gemini_api_key=install_attendance_automation.local_gemini_api_key(config_dir),
-            gws_executable=gws,
+            gws_executable=gws, creation_reason=action['reason'],
+            write_record_on_success=False, registry_operation=operation,
         )
-    except Exception as error:  # noqa: BLE001 - 설치 실패는 쉬운 문장으로 바꿔 화면에 보여준다
-        last_failure = _safe_setup_failure(error)
-        if not first_failure:
-            first_failure = last_failure
-        failed_service, message = friendly_attendance_error(error)
-        # 쓰던 시트를 찾았을 때의 안내는 시트 주소와 비어 있는 값 이름까지 담기므로
-        # 200자에서 자르면 정작 필요한 뒷부분이 잘려 나간다.
-        detail = message[:ATTENDANCE_DETAIL_LIMIT]
-        if isinstance(
-            error,
-            install_attendance_automation.AttendanceConnectionChoiceRequired,
-        ):
-            candidates = list(error.candidates)
-            workbook_name = str(
-                (candidates[0] if len(candidates) == 1 else {}).get("name", "")
-                or install_attendance_automation.ATTENDANCE_LEGACY_SHEET_NAME
-            )
-            profile = _read_json_dict(Path(profile_json)) or {}
-            detail = (
-                "현재 출석부 연결을 고르기 전에는 새 출석부를 만들지 않습니다. "
-                + detail
-            )[:ATTENDANCE_DETAIL_LIMIT]
-            saved = {
-                "state": "connection-choice-required",
-                "account": current_user,
-                "detail": detail,
-                "workbook_name": workbook_name,
-            }
-            _write_setup_status(config_dir, saved)
-            return AttendanceStatus(
-                state="connection-repair-required",
-                account=current_user,
-                current_user=current_user,
-                detail=detail,
-                school_year=_profile_school_year(config_dir),
-                workbook_name=workbook_name,
-                canonical_workbook_name=(
-                    attendance_workbook_identity.attendance_workbook_name(profile)
-                ),
-            )
-        _write_setup_status(config_dir, {
-            "state": "failed", "account": current_user, "failed_service": failed_service,
-            "detail": detail, "progress": saved_progress,
-            "first_failure": first_failure,
-            "last_failure": last_failure,
-        })
-        if _pending_bound_script({"progress": saved_progress}):
-            return _bound_script_recovery_status({"progress": saved_progress}, current_user)
-        permission_required = last_failure.get("category") == "script-api-disabled"
-        return AttendanceStatus(
-            state="script-permission-required" if permission_required else "failed",
-            account=current_user, current_user=current_user,
-            failed_service=failed_service, detail=detail,
-            progress=saved_progress,
-            failure_code="ATTENDANCE_SCRIPT_API_DISABLED" if permission_required else (
-                "ATTENDANCE_SETUP_" + str(last_failure.get("operation", "unknown"))
-                + "_HTTP_" + str(last_failure.get("http_status", 0))),
-        )
-    if isinstance(result, install_attendance_automation.AttendanceInstallResult):
-        result = replace(result, setup_account=current_user.strip().lower())
-    deps.write_record(profile_json, result)
-    script_update_required = bool(
-        getattr(result, "script_update_required", False)
-    )
-    result_bundle_sha256 = str(
-        getattr(result, "script_bundle_sha256", "") or ""
-    )
-    if script_update_required:
-        result_state = "script-update-required"
-        result_detail = ATTENDANCE_SCRIPT_UPDATE_REQUIRED_MESSAGE
-    elif result_bundle_sha256 == current_attendance_script_bundle_sha256():
-        result_state = "ready"
-        result_detail = ""
-    else:
-        result_state = "script-check-required"
-        result_detail = ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
-    _write_setup_status(
-        config_dir, {"state": result_state, "account": current_user}
-    )
-    return AttendanceStatus(
-        state=result_state, account=current_user, current_user=current_user,
-        spreadsheet_url=result.spreadsheet_url, template_doc_url=result.template_doc_url,
-        connection_code=(
-            attendance_workbook_identity.attendance_connection_code(
-                getattr(result, "spreadsheet_id", "")
-            )
-        ),
-        detail=result_detail,
-        created=True,
-        school_year=_profile_school_year(config_dir),
-        workbook_name=getattr(result, "workbook_name", "") or "",
-        year_mismatch=False,
-    )
+        if not isinstance(result, install_attendance_automation.AttendanceInstallResult):
+            raise AttendanceBindingError("ATTENDANCE_RESULT_UNKNOWN")
+        committed = operation.publish()
+        from attendance_context import HistoricalPublicationReceipt
+        if isinstance(committed, HistoricalPublicationReceipt):
+            if committed.payload["spreadsheetId"] != result.spreadsheet_id:
+                raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+            _preserve_historical_publication(config_dir, committed)
+            # The old candidate is never installed as the current workbook.
+            # A new school-year action requires a separate explicit user action.
+            return read_attendance_status(config_dir, deps.run_command, gws_executable=gws,
+                                          binding_client=deps.binding_client)
+        if committed.payload.get("spreadsheetId") != result.spreadsheet_id:
+            raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+        if committed.payload.get('operationId') != operation.operation_id or committed.payload['generation'] != action['expectedGeneration'] + 1:
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        fresh_publication = deps.binding_client.current()
+        fresh_publication.require_same(committed)
+        if fresh_publication.payload.get('operationId') != operation.operation_id:
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        if fresh_publication.payload['verificationState'] != 'VERIFIED':
+            raise AttendanceBindingError('ATTENDANCE_RESULT_UNKNOWN')
+        committed = fresh_publication
+        if replacing:
+            if (result.spreadsheet_id == previous_id
+                    or committed.payload["generation"] != scope.payload["generation"] + 1
+                    or committed.payload.get("operationId") != operation.operation_id):
+                raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+            fresh = deps.binding_client.current()
+            fresh.require_same(committed)
+            if fresh.payload.get("operationId") != operation.operation_id:
+                raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+            if fresh.payload["verificationState"] != "VERIFIED":
+                raise AttendanceBindingError("ATTENDANCE_REPLACEMENT_UNVERIFIED")
+            committed = fresh
+        # Publication is durable before the local cache changes. Failure here is
+        # recovered from that same registry ID, never by creating another file.
+        _restore_registry_record(config_dir, committed)
+        result = replace(result, setup_account=status.current_user, school_year=str(committed.year),
+                         subject_key=committed.payload["subjectKey"], binding_generation=committed.payload["generation"])
+        deps.write_record(profile_json, result)
+        action.update(phase='published', publishedSpreadsheetId=result.spreadsheet_id, publishedGeneration=committed.payload['generation'])
+        setup_evidence.update(state='created', account=status.current_user, operation_id=operation.operation_id, attendance_action=action)
+        _write_setup_status(config_dir, setup_evidence)
+        refreshed = read_attendance_status(config_dir, deps.run_command, gws_executable=gws,
+                                           binding_client=deps.binding_client)
+        return replace(refreshed, created=True, attendance_action=action, **action_correlation)
+    except (AttendanceScopeError, AttendanceInstallRecordError, OSError, ValueError) as error:
+        _remember_setup_failure(config_dir, error, status.current_user)
+        return _failed_attendance_action(config_dir, deps, status, action, error)
+    except Exception as error:
+        _remember_setup_failure(config_dir, error, status.current_user)
+        return _failed_attendance_action(config_dir, deps, status, action, error)
 
 
-def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None) -> AttendanceStatus:
-    """학년도가 달라졌을 때 후보를 완성한 뒤 현재 Sheet 번호를 마지막에 바꾼다."""
+def _failed_attendance_action(config_dir, deps, status, action, error):
+    try:
+        fresh = deps.binding_client.current()
+        if fresh.payload['subjectKey'] == action['subjectKey'] and fresh.year == action['expectedSchoolYear']:
+            status = replace(status, attendance_scope=fresh.payload)
+            if fresh.payload.get('operationId'):
+                operation = deps.binding_client.operation(fresh.payload['operationId'])
+                action = attendance_workbook_transition.correlate_attendance_operation(action, operation)
+    except (AttendanceScopeError, OSError, ValueError):
+        pass
+    action = {**action, 'phase': 'blocked'}
+    try:
+        saved = _protected_attendance_setup(config_dir, status.current_user)
+        saved['attendance_action'] = action
+        _write_setup_status(config_dir, saved)
+    except (AttendanceScopeError, OSError, ValueError):
+        saved = {}
+    failure = _attendance_failure_fields(error) or {'failure_code': 'ATTENDANCE_RESULT_UNKNOWN'}
+    result = replace(status, state='verification-unavailable', replacement_previous_spreadsheet_id='',
+        detail=str(error) if isinstance(error, AttendanceScopeError) else '출석부 준비 결과를 확인하지 못했어요. 기록을 보존했습니다.',
+        verification_state='UNVERIFIED', automation_state='BLOCKED', **failure)
+    return _action_status(result, action, saved)
 
-    deps = deps or AttendanceDeps()
-    config_dir = Path(config_dir)
-    gws = str(deps.gws_resolver())
-    usable_states = {"ready", "script-check-required", "script-update-required"}
-    preflight = read_attendance_status(
-        config_dir, deps.run_command, gws_executable=gws
-    )
-    if preflight.state not in usable_states:
-        return preflight
-    if not preflight.year_mismatch:
-        return preflight
 
-    with attendance_setup_lock(config_dir):
-        current = read_attendance_status(
-            config_dir, deps.run_command, gws_executable=gws
-        )
-        if current.state not in usable_states:
-            return current
-        if not current.year_mismatch:
-            return current
+def _require_replacement_intent(scope: AttendanceScope, intent: dict) -> None:
+    expected_id = (scope.payload.get("replacement") or {}).get("previousSpreadsheetId") or scope.payload.get("previousSpreadsheetId")
+    confirmation = {"explicitConfirmation", "failureCode", "failureStage"} if isinstance(intent, dict) and intent.get("reason") == "replace-unavailable" else set()
+    if (not isinstance(intent, dict)
+            or set(intent) - confirmation not in ({"reason", "subjectKey", "expectedSchoolYear", "expectedGeneration", "previousSpreadsheetId", "idempotencyKey"},
+                {"reason", "subjectKey", "expectedSchoolYear", "expectedGeneration", "previousSpreadsheetId", "previousOperationId", "idempotencyKey"})
+            or intent.get("previousOperationId") != ((scope.payload.get("replacement") or {}).get("previousOperationId") or scope.payload.get("previousOperationId"))
+            or intent.get("reason") not in ("replace-trashed", "replace-unavailable")
+            or intent.get("reason") != ((scope.payload.get("replacement") or {}).get("reason") or scope.payload.get("operationReason"))
+            or (confirmation and (intent.get("explicitConfirmation") is not True or not intent.get("previousOperationId")))
+            or (confirmation and any(intent.get(key) != ((scope.payload.get("replacement") or {}).get(key) or scope.payload.get(key)) for key in ("failureCode", "failureStage")))
+            or intent.get("subjectKey") != scope.payload["subjectKey"]
+            or type(intent.get("expectedSchoolYear")) is not int or intent["expectedSchoolYear"] != scope.year
+            or type(intent.get("expectedGeneration")) is not int or intent["expectedGeneration"] != scope.payload["generation"]
+            or not expected_id or intent.get("previousSpreadsheetId") != expected_id
+            or not isinstance(intent.get("idempotencyKey"), str) or not 8 <= len(intent["idempotencyKey"]) <= 128
+            or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in intent["idempotencyKey"])):
+        raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
 
-        transition_deps = deps.transition_deps_factory(
-            runner=deps.attendance_runner,
-            gws_executable=gws,
-            account=current.current_user,
-        )
-        result = deps.new_school_year_starter(
-            config_dir, deps=transition_deps
-        )
-        if str(getattr(result, "state", "") or "") != "complete":
-            detail = (
-                str(result.detail or "")
-                if isinstance(result, attendance_workbook_transition.TransitionResult)
-                else attendance_workbook_transition.NEW_SCHOOL_YEAR_FAILURE
-            )
-            return replace(
-                current,
-                state="failed",
-                detail=detail or "새 학년도 출석부를 시작하지 못했어요.",
-                failed_service="sheet",
-                created=False,
-            )
 
-        final = read_attendance_status(
-            config_dir, deps.run_command, gws_executable=gws
-        )
-        expected_url = str(getattr(result, "spreadsheet_url", "") or "")
-        if (
-            final.state not in usable_states
-            or final.year_mismatch
-            or (expected_url and final.spreadsheet_url != expected_url)
-        ):
-            return replace(
-                final,
-                state="failed",
-                detail="새 학년도 출석부로 연결된 결과를 다시 확인하지 못했어요.",
-                failed_service="sheet",
-                created=False,
-            )
-        return replace(final, created=True)
+def start_new_attendance(config_dir: Path, deps: AttendanceDeps | None = None, intent: dict | None = None) -> AttendanceStatus:
+    """The sole explicit creation action; its scope comes from the registry."""
+    prepared = prepare_attendance_action(config_dir, deps, intent=intent)
+    if not prepared.attendance_action or prepared.attendance_action['phase'] == 'published': return prepared
+    return execute_attendance_action(config_dir, deps, expected_action=prepared.attendance_action)
 
 
 def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates: dict,
@@ -5871,18 +6212,18 @@ def apply_all(config_dir: Path, profile_values: dict, grid: list, bridge_updates
     results.append(StepResult("xlsx", "시간표 저장", "done", "이 컴퓨터에 저장함"))
 
     parse_ok, parse_detail = run_parser(config_dir)
-    results.append(StepResult("parse", "설정 파서", "done" if parse_ok else "failed", parse_detail))
+    results.append(StepResult("parse", "시간표와 하루 일과 적용", "done" if parse_ok else "failed", parse_detail))
 
     bridge = {key: value for key, value in bridge_updates.items() if key != "autostart"}
     save_bridge_settings(config_dir, bridge)
     if bridge_updates.get("autostart"):
         deps.enable_autostart()
-    results.append(StepResult("bridge", "도우미 설정 저장", "done", "이 컴퓨터에 저장함"))
+    results.append(StepResult("bridge", "메신저 단축키 설정 저장", "done", "이 컴퓨터에 저장함"))
 
     if deps.stop_helper() and deps.start_helper():
-        results.append(StepResult("helper", "도우미 재시작", "done", "새 설정으로 실행 중"))
+        results.append(StepResult("helper", "메신저 단축키 적용", "done", "새 설정으로 실행 중"))
     else:
-        results.append(StepResult("helper", "도우미 재시작", "failed", "Teacher Manager를 다시 시작해 주세요"))
+        results.append(StepResult("helper", "메신저 단축키 적용", "failed", "저장한 설정을 적용하지 못했어요."))
     return results
 
 

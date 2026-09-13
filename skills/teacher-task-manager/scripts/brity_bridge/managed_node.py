@@ -52,7 +52,7 @@ class _PrepareError(RuntimeError):
         super().__init__(f"{code}: {detail}")
 
 
-def _missing_runtime(code="NODE_NOT_INSTALLED", detail="Teacher Manager 전용 Node가 아직 준비되지 않았습니다."):
+def _missing_runtime(code="NODE_NOT_INSTALLED", detail="AI 연결에 필요한 파일이 아직 준비되지 않았어요."):
     return tool_runtime.NodeRuntime(False, code, detail, "", None, None, None, None)
 
 
@@ -65,7 +65,7 @@ def _required_spec(manifest: ManagedNodeSpec | None) -> ManagedNodeSpec:
     if spec is None:
         raise _PrepareError(
             error or "NODE_MANIFEST_MISSING",
-            "Teacher Manager 전용 Node 설치 목록을 안전하게 읽지 못했습니다.",
+            "AI 연결에 필요한 설치 정보를 확인하지 못했어요. 기존 AI 프로그램 설정은 바꾸지 않았습니다.",
         )
     return spec
 
@@ -548,8 +548,8 @@ def _activate(stage_root: Path, component: Path, spec: ManagedNodeSpec, run_comm
         if rollback_errors:
             raise _PrepareError(
                 "NODE_ROLLBACK_INCOMPLETE",
-                "Node 교체를 되돌리는 중 일부 파일이 잠겨 완전히 복구하지 못했습니다. "
-                "Teacher Manager를 다시 실행하지 말고 컴퓨터를 다시 시작한 뒤 설치를 다시 눌러 주세요.",
+                "AI 연결 파일을 준비하는 중 일부 파일이 잠겨 이전 상태로 모두 되돌리지 못했어요. "
+                "기존 AI 프로그램과 설정은 그대로 보관해 주세요.",
             ) from original_error
         raise
 

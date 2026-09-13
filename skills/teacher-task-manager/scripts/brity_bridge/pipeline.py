@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import functools
+import inspect
 import json
 import re
 from dataclasses import dataclass, replace
@@ -15,7 +17,7 @@ from attendance_script_update import (
     inspect_attendance_script_update,
     target_bundle_sha256,
 )
-from brity_bridge import bundle_paths, capture_store, message_archive, paths, status_log
+from brity_bridge import atomic_io, account_sessions, bundle_paths, capture_store, message_archive, paths, status_log
 from brity_bridge.gemini_analyze import (
     AnalysisError,
     run_gemini_analysis_with_recovery,
@@ -26,7 +28,7 @@ from brity_bridge.gws_exec import (
     ExecutionReport,
     execute_actions,
 )
-from brity_bridge.history import HistoryStore
+from brity_bridge.history import HistoryStore, HistoryUnavailableError, HISTORY_UNAVAILABLE_DETAIL
 from brity_bridge.local_attachment_links import (
     add_local_attachment_links,
 )
@@ -52,7 +54,7 @@ from brity_bridge.proposal_check import (
 GEMINI_FAILURE_MESSAGES = {
     "key-missing": "Gemini API 키가 없습니다. 설정 대시보드에서 키를 넣어 주세요.",
     "key-invalid": "API 키가 맞지 않습니다. 설정 대시보드에서 키를 다시 확인해 주세요.",
-    "rate-limited": "요청 한도에 걸렸습니다. 1~2분 뒤 다시, 계속되면 내일 다시 시도해 주세요.",
+    "rate-limited": "Gemini 사용 한도에 도달했어요. 한도가 언제 다시 열리는지는 확인하지 못했습니다. AI Studio에서 사용량을 확인해 주세요.",
     "network": "인터넷 연결(학교 방화벽)을 확인해 주세요.",
     "shape": "분석 결과가 올바르지 않아 등록하지 않았습니다. 다시 시도해 주세요.",
     "upload-uncertain": (
@@ -75,12 +77,12 @@ _CALENDAR_TIME_LINE_RE = re.compile(
 RETRY_MESSAGE = capture_store.CHECK_RETRY
 CURRENT_UNREAD_PREVIEW = "메시지 내용을 읽지 못해 어떤 메시지인지 확인할 수 없음"
 ATTACHMENT_HELPER_FAILURE_MESSAGE = (
-    "일정에 파일 링크는 넣었지만 이 컴퓨터에서 파일 열기 준비에 실패했습니다. "
-    "Teacher Manager를 다시 시작해 주세요."
+    "일정은 등록했지만 첨부파일을 바로 여는 기능을 켜지 못했어요. "
+    "파일은 Brity 다운로드 폴더에서 직접 열 수 있습니다."
 )
 ATTACHMENT_HELPER_PORT_MESSAGE = (
-    "일정에 파일 링크는 넣었지만 다른 프로그램이 파일 열기 자리를 사용하고 있습니다. "
-    "다른 프로그램을 닫고 Teacher Manager를 다시 시작해 주세요."
+    "일정은 등록했지만 첨부파일을 바로 여는 기능을 켜지 못했어요. "
+    "파일은 Brity 다운로드 폴더에서 직접 열 수 있습니다."
 )
 
 @dataclass
@@ -504,6 +506,25 @@ def _legacy_class_notice_actions(
     return actions
 
 
+def _account_work(method):
+    signature = inspect.signature(method)
+
+    @functools.wraps(method)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        config_dir = bound.arguments["config_dir"]
+        expected = account_sessions.token(config_dir)
+        try:
+            with account_sessions.work(config_dir, expected_token=expected) as state:
+                bound.arguments["config_dir"] = account_sessions.active_config_dir(config_dir, state)
+                return method(*bound.args, **bound.kwargs)
+        except account_sessions.AccountSessionError as error:
+            # Do not append the old job or its text to another account's history.
+            return FlowResult(False, "profile", str(error))
+    return wrapped
+
+
+@_account_work
 def retry_saved_capture(
     config_dir: Path,
     source_hash: str,
@@ -540,8 +561,11 @@ def retry_saved_capture(
             )
     capture = capture_store.find_capture(state_dir, source_hash, capture_when)
     if not capture or capture.get("ok") is not False:
-        return FlowResult(False, "retry", "이 기록은 안전하게 다시 시도할 수 없어요.")
+        return FlowResult(False, "retry", "이 메시지의 이전 등록 결과를 확인하지 못해 다시 처리하지 않았어요. Teacher Manager의 [최근 기록]에서 확인해 주세요.")
     document = message_archive.load(state_dir, source_hash)
+    session = account_sessions.read_state(config_dir)
+    if session.get("managed") and (not isinstance(document, dict) or document.get("account_owner") != session.get("account")):
+        return FlowResult(False, "retry", "이 메시지를 저장한 계정을 확인하지 못해 다시 보내지 않았어요. 기존 기록은 그대로 남겨 두었습니다.")
     recovery = document.get("recovery") if isinstance(document, dict) else None
     has_checked_resume = (
         isinstance(recovery, dict)
@@ -551,7 +575,7 @@ def retry_saved_capture(
         and bool(recovery.get("checked_actions"))
     )
     if not capture.get("retry") and not has_checked_resume:
-        return FlowResult(False, "retry", "이 기록은 안전하게 다시 시도할 수 없어요.")
+        return FlowResult(False, "retry", "이 메시지의 이전 등록 결과를 확인하지 못해 다시 처리하지 않았어요. Teacher Manager의 [최근 기록]에서 확인해 주세요.")
     message = document.get("message") if isinstance(document, dict) else None
 
     profile = _load_profile(config_dir)
@@ -568,6 +592,10 @@ def retry_saved_capture(
 
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
+    try:
+        history.require_usable()
+    except HistoryUnavailableError:
+        return FlowResult(False, "execute", HISTORY_UNAVAILABLE_DETAIL)
     completed_keys = history.completed_keys(source_hash)
     pending = [action for action in actions if action.action_key not in completed_keys]
     if not pending:
@@ -681,6 +709,10 @@ def saved_capture_retry_available(
         return False
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
+    try:
+        history.require_usable()
+    except HistoryUnavailableError:
+        return False
     completed = history.completed_keys(source_hash)
     return any(action.action_key not in completed for action in actions)
 
@@ -713,11 +745,11 @@ def _attachment_preflight_guidance(message: str) -> tuple[str, str, str]:
             "첨부파일을 내려받아야 함",
             "첨부파일을 모두 내려받은 뒤 같은 메시지에서 단축키를 다시 눌러 주세요.",
         )
-    if "너무 커" in safe_hint:
+    if "너무 커" in safe_hint or "크기를 넘" in safe_hint:
         return (
-            "첨부파일이 너무 커서 등록하지 않았어요.",
-            "첨부파일 용량을 줄여야 함",
-            "파일 용량을 줄이거나 작은 사본을 내려받은 뒤 같은 메시지에서 단축키를 다시 눌러 주세요.",
+            "첨부파일은 Teacher Manager에서 읽을 수 있는 크기를 넘어 등록하지 않았어요. Brity 다운로드 폴더에서 직접 확인해 주세요.",
+            "첨부파일을 직접 확인해야 함",
+            "Brity 다운로드 폴더에서 첨부파일을 직접 열어 확인해 주세요.",
         )
     if "암호" in safe_hint or "상태" in safe_hint:
         return (
@@ -896,6 +928,9 @@ def _remote_notice_script_preflight(
 def _load_attendance_owner(config_dir: Path) -> str:
     """이 설정 폴더에서 처음 출결을 준비한 Google 계정. 옛 기록은 빈 값이다."""
 
+    session = account_sessions.read_state(config_dir)
+    if session.get("managed"):
+        return str(session.get("account") or "")
     try:
         raw = json.loads(
             paths.attendance_setup_status_path(config_dir).read_text(encoding="utf-8")
@@ -960,7 +995,7 @@ def _notice_created_note(report: ExecutionReport) -> str:
     if not created:
         return ""
     return (
-        "\n학생 안내는 학생 안내표에 대기 상태로 옮겼어요. "
+        "\n학생 안내는 출석부의 [메신저 개인톡 내용] 또는 [메신저 단체톡 내용]에 대기 상태로 옮겼어요. "
         "아직 학생에게 보내지 않았어요 — 발송 버튼을 누르면 보낼 수 있어요."
     )
 
@@ -997,6 +1032,7 @@ def _account_blocked_note(report: ExecutionReport) -> str:
     return ""
 
 
+@_account_work
 def run_capture_flow(
     context: CaptureContext,
     config_dir: Path,
@@ -1064,11 +1100,21 @@ def run_capture_flow(
     attachment_analyzed_names, attachment_skipped_names = _split_attachment_names(record)
     identity = message_identity(record)
     state_dir = paths.bridge_state_dir(config_dir)
+    session = account_sessions.read_state(config_dir)
+    existing = message_archive.load(state_dir, record.source_hash)
+    if session.get("managed") and existing is not None and existing.get("account_owner") != session.get("account"):
+        return FlowResult(False, "retry", "이 메시지를 저장한 계정을 확인하지 못해 다시 보내지 않았어요. 기존 기록은 그대로 남겨 두었습니다.")
     message_archive.begin(
         state_dir,
         record,
         getattr(bridge_settings, "brity_download_dir", ""),
     )
+    if session.get("managed") and existing is None:
+        document = message_archive.load(state_dir, record.source_hash)
+        if document is None:
+            return FlowResult(False, "retry", "메시지와 사용 계정을 저장하지 못했어요. 저장 폴더를 확인해 주세요.")
+        document["account_owner"] = session["account"]
+        atomic_io.atomic_write_text(message_archive.message_path(state_dir, record.source_hash), json.dumps(document, ensure_ascii=False, indent=2) + "\n")
     recovery_state = message_archive.recovery_state(state_dir, record.source_hash)
     if not recovery_state:
         initial_attempt_counts = {}
@@ -1109,6 +1155,17 @@ def run_capture_flow(
     run["attempt_counts"] = attempt_counts
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
+    try:
+        history.require_usable()
+    except HistoryUnavailableError:
+        return _finish(
+            config_dir, FlowResult(False, "execute", HISTORY_UNAVAILABLE_DETAIL),
+            record.source_hash, summary="중복 방지 기록 확인 실패", progress=progress,
+            attachment_count=attachment_count, identity=identity, retry="",
+            attachment_names=attachment_names,
+            attachment_analyzed_names=attachment_analyzed_names,
+            attachment_skipped_names=attachment_skipped_names, run=run,
+        )
     if history.is_completed(record.source_hash):
         original = capture_store.latest_successful_done(
             state_dir, record.source_hash
@@ -1469,8 +1526,9 @@ def run_capture_flow(
             "Google에 쓰기 전에 멈췄습니다."
         )
     elif retry_blocked:
+        failure_lead = "일부만 처리됐습니다" if report.created or report.duplicates else "등록 결과를 확인하지 못했습니다"
         message = (
-            f"등록 결과를 안전하게 기록하지 못했습니다 ({summary}). "
+            f"{failure_lead} ({summary}). "
             + RESULT_RECORD_FAILURE_DETAIL
         )
     else:

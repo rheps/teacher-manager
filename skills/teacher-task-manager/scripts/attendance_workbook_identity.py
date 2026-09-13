@@ -6,6 +6,7 @@ import datetime
 import hashlib
 from pathlib import Path
 from typing import Any, Mapping
+from attendance_context import SEOUL
 
 
 ATTENDANCE_WORKBOOK_TITLE_SUFFIX = "(Teacher manager 출결 자동화)"
@@ -37,17 +38,21 @@ def attendance_connection_code(spreadsheet_id: object) -> str:
 def current_school_year(today: datetime.date | None = None) -> str:
     """한국 학년도는 3월 1일에 바뀐다."""
 
-    day = today or datetime.date.today()
+    # This is a display fallback, never creation authority. Writes use server scope.
+    day = today or datetime.datetime.now(SEOUL).date()
+    if isinstance(day, datetime.datetime):
+        if day.tzinfo is None:
+            raise ValueError("An aware instant is required for the school year.")
+        day = day.astimezone(SEOUL).date()
     return str(day.year if day.month >= 3 else day.year - 1)
 
 
 def attendance_workbook_name(
-    profile: Mapping[str, Any], today: datetime.date | None = None
+    profile: Mapping[str, Any], today: datetime.date | None = None, *, school_year: str | int | None = None
 ) -> str:
     """사람이 알아볼 정식 출결 파일 이름을 만든다."""
 
-    school = profile.get("school") or {}
-    year = str(school.get("year", "") or "").strip() or current_school_year(today)
+    year = str(school_year) if school_year is not None else current_school_year(today)
     homeroom = profile.get("homeroom") or {}
     grade = str(homeroom.get("grade", "") or "").strip()
     klass = str(homeroom.get("class", "") or "").strip()
@@ -95,12 +100,11 @@ def previous_attendance_workbook_name(
 
 
 def attendance_workbook_app_properties(
-    profile: Mapping[str, Any], today: datetime.date | None = None
+    profile: Mapping[str, Any], today: datetime.date | None = None, *, school_year: str | int | None = None
 ) -> dict[str, str]:
     """이름이 바뀌어도 정식 출결 파일을 다시 찾게 하는 Drive 표식."""
 
-    school = profile.get("school") or {}
-    year = str(school.get("year", "") or "").strip() or current_school_year(today)
+    year = str(school_year) if school_year is not None else current_school_year(today)
     return {
         ATTENDANCE_ROLE_PROPERTY: ATTENDANCE_ROLE_VALUE,
         ATTENDANCE_SCHOOL_YEAR_PROPERTY: year,

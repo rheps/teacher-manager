@@ -30,7 +30,7 @@ def stage_text(step: str, message: str = "") -> str:
     if step == "done":
         return message or "처리를 마쳤어요"
     if step == "fail":
-        return message or "처리하지 못했어요. 다시 시도해 주세요."
+        return message or "이 메시지는 처리 결과 확인이 필요해요. Teacher Manager의 [최근 기록]에서 확인해 주세요."
     return _STAGE_TEXTS.get(step, message or step)
 
 

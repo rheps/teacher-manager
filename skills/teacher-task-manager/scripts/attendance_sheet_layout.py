@@ -14,6 +14,7 @@ from brity_bridge import process_win
 
 LAYOUT_VERSION = 'monthly-ai-chat-1'
 MONTHS = tuple(f'{m}월' for m in (*range(3, 13), 1, 2))
+MONTH_SHEET_IDS_SETTING = 'ATTENDANCE_MONTH_SHEET_IDS'
 HEADERS = ('날짜','번호+이름','구분','종류','사유','교시','신고서','첨부') + CHAT_RESULT_HEADERS + ('AI 입력',)
 AI_LABEL = 'AI 출결 입력'
 AI_HINT = '여기에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르세요'
@@ -22,7 +23,7 @@ STUDENT_FORMULA = '=IF(AND(\'학생명단\'!A2<>"",\'학생명단\'!B2<>""),\'�
 
 USAGE_TITLE = 'Teacher Manager 출결 사용 안내'
 PREVIOUS_USAGE_TITLE = '출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용'
-USAGE_ROWS = [['순서', '작업', '설명', '', '', ''], ['1', '처음 설정', 'Teacher Manager에서 출결 준비를 마친 뒤, 출석부 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 실행합니다.', '', '', ''], ['2', '학생명단', '학생명단에 번호, 이름, 학생 Google 이메일을 각각 입력합니다.', '', '', ''], ['3', '월별 출결 입력', '각 월의 맨 위 AI 출결 입력칸에 문장을 적거나, 3행부터 날짜·학생·구분·종류·사유를 입력합니다.', '', '', ''], ['4', '학생 선택', '월별 출결표의 학생 선택목록은 학생명단의 번호와 이름으로 만들어집니다.', '', '', ''], ['5', '신고서', '출결표에서 행을 선택하고 출결 신고서 만들기 메뉴를 사용합니다.', '', '', ''], ['6', 'Google Chat', '발송상태·발송시각·결과를 월별 출결표에서 확인합니다.', '', '', ''], ['7', '안내와 할 일', '메신저 개인톡 내용과 메신저 단체톡 내용에서 안내를 확인하고 출결 미제출 할 일을 관리합니다.', '', '', ''], ['8', '휴일', '휴일 탭에서 학교의 수업일과 휴무일을 확인합니다.', '', '', '']]
+USAGE_ROWS = [['순서', '작업', '설명', '', '', ''], ['1', '처음 설정', 'Teacher Manager에서 출결 준비를 마친 뒤, 출석부 메뉴 [처음 한 번 설정하기 → 처음 설정 한 번에 끝내기]를 실행합니다.', '', '', ''], ['2', '학생명단', '학생명단에 번호, 이름, 학생 Google 이메일을 각각 입력합니다.', '', '', ''], ['3', '월별 출결 입력', '각 월의 맨 위 AI 출결 입력칸에 문장을 적거나, 3행부터 날짜·학생·구분·종류·사유를 입력합니다.', '', '', ''], ['4', '학생 선택', '월별 출결표의 학생 선택목록은 학생명단의 번호와 이름으로 만들어집니다.', '', '', ''], ['5', '신고서', '출결표에서 행을 선택한 뒤 [출결 업무 자동화 → 선택 행 출결신고서 Google Docs에 만들기]를 누릅니다.', '', '', ''], ['6', 'Google Chat', '발송상태·발송시각·결과를 월별 출결표에서 확인합니다.', '', '', ''], ['7', '안내와 할 일', '메신저 개인톡 내용과 메신저 단체톡 내용에서 안내를 확인하고 출결 미제출 할 일을 관리합니다.', '', '', ''], ['8', '휴일', '휴일 탭에서 학교의 수업일과 휴무일을 확인합니다.', '', '', '']]
 
 
 def validate_template(path):
@@ -179,8 +180,68 @@ def _usage_title_repairs(guide):
     return requests
 
 
-def plan_layout(snapshot):
+def validate_month_sheet_ids(value):
+    """The role map is identity evidence, not a list of current tab titles."""
+    if isinstance(value, str):
+        def strict(pairs):
+            result = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ValueError('월별 연결 기록에 같은 월이 두 번 있습니다.')
+                result[key] = item
+            return result
+        value = json.loads(value, object_pairs_hook=strict)
+    if not isinstance(value, dict) or set(value) != {str(month) for month in range(1, 13)}:
+        raise ValueError('월별 연결 기록을 확인하지 못했습니다. 빈 탭을 만들지 않았습니다.')
+    if any(type(sid) is not int or not 0 <= sid <= 2147483647 for sid in value.values()):
+        raise ValueError('월별 연결 기록의 탭 번호가 올바르지 않습니다.')
+    if len(set(value.values())) != 12:
+        raise ValueError('서로 다른 월이 같은 탭으로 연결되어 있습니다.')
+    return {str(month): value[str(month)] for month in (*range(3, 13), 1, 2)}
+
+
+def resolve_month_sheets(snapshot, month_sheet_ids):
+    manifest = validate_month_sheet_ids(month_sheet_ids)
+    raw_sheets = snapshot.get('sheets') if isinstance(snapshot, dict) else None
+    if not isinstance(raw_sheets, list):
+        raise ValueError('출결표의 탭 목록을 끝까지 읽지 못했습니다.')
+    by_id = {}
+    for sheet in raw_sheets:
+        props = sheet.get('properties') if isinstance(sheet, dict) else None
+        sid = props.get('sheetId') if isinstance(props, dict) else None
+        if type(sid) is not int or sid < 0 or sid in by_id:
+            raise ValueError('출결표의 탭 번호 응답을 확인하지 못했습니다.')
+        by_id[sid] = sheet
+    if any(sid not in by_id for sid in manifest.values()):
+        raise ValueError('연결된 월별 출결표가 없습니다. 빈 탭을 만들지 않았습니다.')
+    return {f'{month}월': by_id[sid] for month, sid in manifest.items()}
+
+
+def bootstrap_month_sheet_ids(snapshot):
+    """Explicitly trusted new/adopted workbook only; inspect every role first."""
+    sheets = snapshot.get('sheets', []) if isinstance(snapshot, dict) else []
+    names = {}
+    for sheet in sheets:
+        name = sheet.get('properties', {}).get('title')
+        if name in names:
+            raise ValueError('출결표의 탭 목록이 중복되어 있습니다.')
+        names[name] = sheet
+    if any(name not in names for name in MONTHS):
+        raise ValueError('처음 출석부의 월별 탭을 끝까지 확인하지 못했습니다.')
+    for name in MONTHS:
+        _header_kind(names[name])
+    return validate_month_sheet_ids({name[:-1]: names[name]['properties']['sheetId'] for name in MONTHS})
+
+
+def plan_layout(snapshot, month_sheet_ids=None):
     sheets = {s.get('properties',{}).get('title'):s for s in snapshot.get('sheets',[])}
+    if month_sheet_ids is not None:
+        monthly_ids = set(validate_month_sheet_ids(month_sheet_ids).values())
+        for name in ('드롭다운', '학생명단', '00_사용법'):
+            if sheets.get(name, {}).get('properties', {}).get('sheetId') in monthly_ids:
+                raise ValueError('월별 출결표와 다른 업무 탭의 역할이 겹쳐 기존 자료를 보존하고 멈췄습니다.')
+        # Copy the lookup only; role names do not rename any actual Google tab.
+        sheets.update(resolve_month_sheets(snapshot, month_sheet_ids))
     if any(name not in sheets for name in (*MONTHS, '드롭다운', '학생명단')):
         raise ValueError('출결표의 월별 탭이나 학생 선택목록을 끝까지 확인하지 못했어요.')
     # Validate all months before producing any mutating request.
@@ -268,10 +329,35 @@ def plan_layout(snapshot):
     return requests
 
 
-def ensure_layout(runner, workdir, spreadsheet_id, gws):
+def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
+                  allow_manifest_bootstrap=False):
+    manifest = validate_month_sheet_ids(month_sheet_ids) if month_sheet_ids is not None else None
+    metadata = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',
+        json.dumps({'spreadsheetId':spreadsheet_id,'fields':'spreadsheetId,sheets(properties(sheetId,title))'}),
+        '--format','json'],workdir))
+    if not isinstance(metadata, dict) or metadata.get('spreadsheetId') != spreadsheet_id:
+        raise ValueError('연결된 출석부의 탭 목록을 확인하지 못했습니다.')
+    if manifest is None and not allow_manifest_bootstrap:
+        settings = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','values','get','--params',
+            json.dumps({'spreadsheetId':spreadsheet_id,'range':"'설정'!A:B"},ensure_ascii=False),
+            '--format','json'],workdir))
+        rows = settings.get('values') if isinstance(settings, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError('월별 연결 설정을 읽지 못했습니다.')
+        values = [row[1] for row in rows if isinstance(row,list) and len(row)>1 and row[0] == MONTH_SHEET_IDS_SETTING]
+        if len(values) != 1:
+            raise ValueError('월별 연결 기록을 확인하지 못했습니다. 빈 탭을 만들지 않았습니다.')
+        manifest = validate_month_sheet_ids(values[0])
+    if manifest is not None:
+        resolved = resolve_month_sheets(metadata, manifest)
+        titles = [resolved[name]['properties']['title'] for name in MONTHS]
+    else:
+        titles = list(MONTHS)
+    def quote(title):
+        return "'" + title.replace("'", "''") + "'"
     def read():
         params = {'spreadsheetId':spreadsheet_id,'includeGridData':True,
-                  'ranges':[f"'{m}'!1:3" for m in MONTHS]+["'드롭다운'!J1:J2","'학생명단'!A1:C1"],
+                  'ranges':[f"{quote(title)}!1:3" for title in titles]+["'드롭다운'!J1:J2","'학생명단'!A1:C1"],
                   'fields':'spreadsheetId,sheets(properties,merges,data(startRow,startColumn,columnMetadata(hiddenByUser),rowData(values(userEnteredValue,note,dataValidation,userEnteredFormat(backgroundColor,backgroundColorStyle)))))'}
         reply = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',json.dumps(params,ensure_ascii=False),'--format','json'],workdir))
         if not isinstance(reply,dict) or reply.get('spreadsheetId') != spreadsheet_id:
@@ -289,7 +375,10 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws):
             reply['sheets'] = [item for item in reply['sheets'] if item['properties']['title'] != '00_사용법']
             reply['sheets'].extend((guide_reply or {}).get('sheets', []))
         return reply
-    requests = plan_layout(read())
+    snapshot = read()
+    if manifest is None:
+        manifest = bootstrap_month_sheet_ids(snapshot)
+    requests = plan_layout(snapshot, manifest)
     if requests:
         # Keep each month's insert and formatting in one atomic Sheets request,
         # and keep the Windows command line below its 32,767-character limit.
@@ -308,6 +397,6 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws):
                 raise RuntimeError('출결 서식 적용 요청이 너무 커서 안전하게 보내지 않았어요.')
             runner([gws,'sheets','spreadsheets','batchUpdate','--params',json.dumps({'spreadsheetId':spreadsheet_id}),
                     '--json',body,'--format','json'],workdir)
-        if plan_layout(read()):
+        if plan_layout(read(), manifest):
             raise RuntimeError('최신 출결 서식이 적용된 것을 확인하지 못했어요. 준비 완료로 표시하지 않았습니다.')
-    return True
+    return manifest

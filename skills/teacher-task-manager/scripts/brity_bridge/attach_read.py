@@ -19,8 +19,8 @@ from brity_bridge import hwp_text, office_read
 from brity_bridge.message_parse import MediaPart
 
 UNSUPPORTED_MESSAGE = "아직 읽을 수 없는 첨부파일 형식이에요."
-BROKEN_MESSAGE = "첨부파일을 읽을 수 없어요. 파일의 암호나 상태를 확인해 주세요."
-TOO_LARGE_MESSAGE = "첨부파일이 너무 커서 읽을 수 없어요."
+BROKEN_MESSAGE = "이 첨부파일을 읽지 못했어요. Brity 다운로드 폴더에서 파일이 정상적으로 열리는지 확인해 주세요."
+TOO_LARGE_MESSAGE = "이 첨부파일은 Teacher Manager에서 읽을 수 있는 크기를 넘었어요. Brity 다운로드 폴더에서 직접 열어 확인해 주세요."
 TEMPORARY_READ_MESSAGE = "첨부파일 저장이 끝나기를 기다렸지만 읽지 못했어요."
 IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 SUPPORTED_SUFFIXES = {

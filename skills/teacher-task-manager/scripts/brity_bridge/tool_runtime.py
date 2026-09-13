@@ -241,9 +241,9 @@ def resolve_node(
         return _node_not_ready(
             manifest_error or "NODE_MANIFEST_MISSING",
             (
-                "Teacher Manager 전용 Node 설치 목록이 올바르지 않습니다."
+                "AI 연결에 필요한 설치 정보가 올바르지 않아요."
                 if manifest_error == "NODE_MANIFEST_INVALID"
-                else "Teacher Manager 전용 Node 설치 목록이 없습니다."
+                else "AI 연결에 필요한 설치 정보가 없어요."
             ),
         )
     component = component_node_root(local_app_data=local_app_data)
@@ -256,7 +256,7 @@ def resolve_node(
     if not os.path.lexists(active_path):
         return _node_not_ready(
             "NODE_NOT_INSTALLED",
-            "Teacher Manager 전용 Node가 아직 준비되지 않았습니다.",
+            "AI 연결에 필요한 파일이 아직 준비되지 않았어요.",
         )
     try:
         active_stat = os.lstat(active_path)

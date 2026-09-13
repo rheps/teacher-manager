@@ -45,8 +45,9 @@ class UserIssue:
     diagnostic_id: str = ""
     # 교사가 지금 할 수 있는 일. 화면은 이 문장들만 행동 안내로 그린다.
     steps: tuple[str, ...] = ()
-    # 개발자에게 자동 보고 대기열에 들어갔는지. 화면의 "보고됐어요" 한 줄 근거.
+    # reported means acknowledged delivery; local queueing is a separate state.
     reported: bool = False
+    report_queued: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,7 +71,10 @@ class UserIssue:
         )
 
     def mark_reported(self) -> "UserIssue":
-        return replace(self, reported=True)
+        return replace(self, reported=True, report_queued=False)
+
+    def mark_report_queued(self) -> "UserIssue":
+        return replace(self, reported=False, report_queued=True)
 
     @classmethod
     def needs_user(

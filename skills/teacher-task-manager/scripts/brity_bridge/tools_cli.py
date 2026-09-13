@@ -8,13 +8,13 @@ import os
 import re
 import stat
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from . import bundle_paths, gws_env, paths, process_supervision, process_win, tool_runtime
+from . import account_sessions, bundle_paths, gws_env, paths, process_supervision, process_win, tool_runtime
 from .google_account import (
     GOEDU_ACCOUNT_REQUIRED_MESSAGE,
     extract_email,
@@ -131,17 +131,35 @@ def _parse(parser: argparse.ArgumentParser, argv: Sequence[str]):
 
 
 def _config_dir(raw: str, expected_config_dir: Path | None = None) -> Path:
-    expected = Path(expected_config_dir or paths.default_config_dir())
+    expected = account_sessions.root_config_dir(expected_config_dir or paths.default_config_dir())
     requested = Path(str(raw or ""))
     if not requested.is_absolute() or str(requested.anchor).startswith("\\\\"):
         raise ValueError("개인 설정 폴더는 이 컴퓨터의 전체 경로여야 합니다.")
     expected_key = os.path.normcase(os.path.abspath(str(expected)))
     requested_key = os.path.normcase(os.path.abspath(str(requested)))
-    if requested_key != expected_key:
+    current = account_sessions.active_config_dir(expected)
+    current_key = os.path.normcase(str(current))
+    if requested_key not in {expected_key, current_key}:
         raise ValueError("Teacher Manager가 사용하는 개인 설정 폴더만 선택할 수 있습니다.")
-    selected = Path(os.path.abspath(str(requested)))
-    _reject_reparse_components(selected)
-    return selected
+    _reject_reparse_components(Path(os.path.abspath(str(requested))))
+    _reject_reparse_components(expected)
+    return expected
+
+
+@contextmanager
+def _configuration_command(raw, expected_config_dir=None):
+    root = _config_dir(raw, expected_config_dir)
+    expected = account_sessions.token(root)
+    with account_sessions.work(root, expected_token=expected) as state:
+        yield account_sessions.active_config_dir(root, state)
+
+
+def _checked_configuration_account(config, resolver):
+    account = _checked_goedu_account(resolver)
+    state = account_sessions.read_state(config)
+    if account and state.get('managed') and str(account).casefold() != state.get('account'):
+        raise account_sessions.AccountSessionError()
+    return account
 
 
 def _reject_reparse_components(path: Path) -> None:
@@ -337,14 +355,14 @@ def run_setup_init(
     args = _parse(parser, argv)
     if args is None:
         return 2
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if init_func is None:
-        from parse_settings import init_config_dir
+    with _configuration_command(args.config_dir, expected_config_dir) as config:
+        if init_func is None:
+            from parse_settings import init_config_dir
 
-        init_func = init_config_dir
-    created = init_func(config)
-    _print_result({"config_dir": str(config), "created": [str(Path(item).name) for item in created]})
-    return 0
+            init_func = init_config_dir
+        created = init_func(config)
+        _print_result({"config_dir": str(config), "created": [str(Path(item).name) for item in created]})
+        return 0
 
 
 def run_parse_settings(
@@ -356,13 +374,13 @@ def run_parse_settings(
     args = _parse(parser, argv)
     if args is None:
         return 2
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if parse_func is None:
-        from parse_settings import parse_config_dir
+    with _configuration_command(args.config_dir, expected_config_dir) as config:
+        if parse_func is None:
+            from parse_settings import parse_config_dir
 
-        parse_func = parse_config_dir
-    _print_result({"profile": str(parse_func(config))})
-    return 0
+            parse_func = parse_config_dir
+        _print_result({"profile": str(parse_func(config))})
+        return 0
 
 
 def run_attendance_install(
@@ -379,77 +397,77 @@ def run_attendance_install(
     args = _parse(parser, argv)
     if args is None:
         return 2
-    config = _config_dir(args.config_dir, expected_config_dir)
-    if args.apply:
-        if not _checked_goedu_account(account_resolver):
+    with _configuration_command(args.config_dir, expected_config_dir) as config:
+        if args.apply:
+            if not _checked_configuration_account(config, account_resolver):
+                return 2
+            captured = io.StringIO()
+            if ensure_func is None:
+                from dashboard import engine
+                from install_attendance_automation import install_attendance_automation
+
+                fixed_sender_url = central_url_loader()
+
+                def fixed_installer(profile_json, **kwargs):
+                    # 화면의 출결 준비와 똑같은 잠금·계정·진행저장·재시도 절차를 쓰되,
+                    # 중앙 주소만 설치본의 고정값으로 덮어 외부 환경값을 받지 않는다.
+                    kwargs["central_chat_sender_url"] = fixed_sender_url
+                    return install_attendance_automation(profile_json, **kwargs)
+
+                deps = engine.AttendanceDeps(attendance_installer=fixed_installer)
+                with redirect_stdout(captured):
+                    result = engine.ensure_attendance(config, deps)
+            else:
+                with redirect_stdout(captured):
+                    result = ensure_func(config)
+            return _print_result_with_exit(_with_notices(result, captured.getvalue()), {"ready"})
+
+        profile = config / "profile.generated.json"
+        if not profile.is_file():
+            _print_result({
+                "state": "profile-required",
+                "mode": "dry_run",
+                "changes_applied": False,
+                "detail": "개인 설정 파일이 없어 확인 실행을 시작하지 않았습니다.",
+            })
             return 2
-        captured = io.StringIO()
-        if ensure_func is None:
-            from dashboard import engine
-            from install_attendance_automation import install_attendance_automation
+        profile_data = _strict_json_dict(profile, "개인 설정 파일")
+        calendars = profile_data.get("calendars")
+        task_list_id = str((calendars or {}).get("homeroom_tasks_id", "") or "") if isinstance(calendars, dict) else ""
+        if not _checked_configuration_account(config, account_resolver):
+            return 2
+        if dry_run_func is None:
+            from install_attendance_automation import (
+                install_attendance_automation,
+                local_gemini_api_key,
+            )
 
-            fixed_sender_url = central_url_loader()
-
-            def fixed_installer(profile_json, **kwargs):
-                # 화면의 출결 준비와 똑같은 잠금·계정·진행저장·재시도 절차를 쓰되,
-                # 중앙 주소만 설치본의 고정값으로 덮어 외부 환경값을 받지 않는다.
-                kwargs["central_chat_sender_url"] = fixed_sender_url
-                return install_attendance_automation(profile_json, **kwargs)
-
-            deps = engine.AttendanceDeps(attendance_installer=fixed_installer)
-            with redirect_stdout(captured):
-                result = engine.ensure_attendance(config, deps)
+            dry_run_func = install_attendance_automation
+            gemini_api_key = local_gemini_api_key(config)
         else:
-            with redirect_stdout(captured):
-                result = ensure_func(config)
-        return _print_result_with_exit(_with_notices(result, captured.getvalue()), {"ready"})
-
-    profile = config / "profile.generated.json"
-    if not profile.is_file():
-        _print_result({
-            "state": "profile-required",
+            gemini_api_key = ""
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            preview = dry_run_func(
+                profile,
+                dry_run=True,
+                attendance_task_list_title="조종례시 담임학급 안내사항",
+                attendance_task_list_id=task_list_id,
+                central_chat_sender_url=central_url_loader(),
+                gemini_api_key=gemini_api_key,
+                gws_executable=gws_resolver(),
+            )
+        payload = {
+            "state": "ready_for_apply",
             "mode": "dry_run",
             "changes_applied": False,
-            "detail": "개인 설정 파일이 없어 확인 실행을 시작하지 않았습니다.",
-        })
-        return 2
-    profile_data = _strict_json_dict(profile, "개인 설정 파일")
-    calendars = profile_data.get("calendars")
-    task_list_id = str((calendars or {}).get("homeroom_tasks_id", "") or "") if isinstance(calendars, dict) else ""
-    if not _checked_goedu_account(account_resolver):
-        return 2
-    if dry_run_func is None:
-        from install_attendance_automation import (
-            install_attendance_automation,
-            local_gemini_api_key,
-        )
-
-        dry_run_func = install_attendance_automation
-        gemini_api_key = local_gemini_api_key(config)
-    else:
-        gemini_api_key = ""
-    captured = io.StringIO()
-    with redirect_stdout(captured):
-        preview = dry_run_func(
-            profile,
-            dry_run=True,
-            attendance_task_list_title="조종례시 담임학급 안내사항",
-            attendance_task_list_id=task_list_id,
-            central_chat_sender_url=central_url_loader(),
-            gemini_api_key=gemini_api_key,
-            gws_executable=gws_resolver(),
-        )
-    payload = {
-        "state": "ready_for_apply",
-        "mode": "dry_run",
-        "changes_applied": False,
-        "preview": asdict(preview) if is_dataclass(preview) else preview,
-    }
-    notices = _captured_notices(captured.getvalue())
-    if notices:
-        payload["notices"] = notices
-    _print_result(payload)
-    return 0
+            "preview": asdict(preview) if is_dataclass(preview) else preview,
+        }
+        notices = _captured_notices(captured.getvalue())
+        if notices:
+            payload["notices"] = notices
+        _print_result(payload)
+        return 0
 
 
 def _default_handlers() -> dict[str, Callable[[Sequence[str]], int]]:

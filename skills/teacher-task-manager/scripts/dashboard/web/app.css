@@ -47,6 +47,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .section-h { font-size:15px; font-weight:700; color:#333D4B; margin:22px 0 10px; }
 .section-head { display:flex; align-items:baseline; justify-content:space-between; gap:16px; }
 .section-head > span:last-child:not(:first-child) { color:var(--tm-faint); font-size:12.5px; font-weight:500; }
+.google-account-section-head { flex-wrap:wrap; }
+.google-account-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-left:auto; }
 
 /* 시작 화면 — 워드마크 + 두 기능 기둥 */
 .start-eyebrow { font-size:10px; font-weight:800; letter-spacing:.18em; text-transform:uppercase; color:var(--tm-faint); margin:0 0 6px; }
@@ -240,6 +242,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .form-table th, .form-table td { border-bottom:1px solid var(--tm-line); padding:11px 14px; text-align:left; vertical-align:middle; font-size:14px; }
 .form-table tr:last-child th, .form-table tr:last-child td { border-bottom:0; }
 .form-table th { width:44%; background:var(--tm-surface); font-weight:600; color:#333D4B; }
+.google-role-fields .form-table th { word-break:keep-all; overflow-wrap:normal; }
 .form-table .field { margin-bottom:0; }
 .pair-cell { display:flex; gap:10px; }
 .pair-cell .field { flex:1; }
@@ -271,11 +274,19 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 
 /* 배너·토스트 */
 .banner { display:flex; gap:10px; align-items:flex-start; border-radius:12px; padding:13px 16px; font-size:14px; margin:0 0 18px; }
+.attendance-account-consent { align-items:center; flex-wrap:wrap; gap:12px 20px; }
+.attendance-account-consent > span { flex:1 1 260px; }
+.attendance-account-consent > button { margin-left:auto; flex:0 0 auto; }
 .banner.warn { background:var(--tm-amber-soft); color:#8a5a10; }
+.attendance-script-permission { align-items:center; flex-wrap:wrap; }
+.attendance-script-permission > span { flex:1 1 240px; }
+.attendance-script-permission > button { margin-left:auto; }
 .banner.error { background:var(--tm-red-soft); color:#a03325; }
 .problem-panel { margin:0 0 18px; padding:18px; border:1px solid var(--tm-red); background:var(--tm-red-soft); border-radius:14px; }
 .problem-panel h2 { margin:0 0 7px; color:#a03325; font-size:17px; }
 .problem-panel > p { margin:0; color:#5d2e2a; }
+.problem-panel.read-uncertain { border-color:var(--tm-line); background:#f7f9fc; }
+.problem-panel.read-uncertain h2, .problem-panel.read-uncertain > p { color:var(--tm-sub); }
 .problem-status { margin-top:12px !important; }
 .problem-reason { margin:0; color:#5d2e2a; }
 .problem-steps { margin:12px 0 0; }
@@ -445,6 +456,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .class-space-actions { margin-top:0; margin-left:auto; }
 .svc-subrow.chat-space-existing { display:grid; grid-template-columns:minmax(0,1fr) auto;
   column-gap:10px; row-gap:6px; }
+.chat-space-existing > .nameblock small { word-break:keep-all; overflow-wrap:normal; }
 .chat-space-controls { grid-column:2; margin-top:0; }
 .chat-space-reload-status { display:inline-flex; align-items:center; gap:11px; flex:none; }
 .svc-subrow [data-action="class-space-reload"] { padding:0 9px; flex:none; }
@@ -452,15 +464,22 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .chat-space-status.warn { color:var(--tm-amber); }
 .chat-space-status.muted { color:var(--tm-faint); }
 .class-space-section { display:block; }
+.class-space-section > .first-setup-head { align-items:flex-start; }
+.class-space-section > .chat-space-existing { margin-top:18px; }
+.class-space-section > .chat-space-existing select { width:100%; }
+.class-space-section > .attendance-picture-guide { margin:14px 0 0; }
+.attendance-management .first-setup-subrow,
+.attendance-management .student-roster-subrow { min-height:60px; box-sizing:border-box; }
+.attendance-management .first-setup-head { min-height:36px; }
 .class-space-section > .svc-subrow { padding:8px 0; border:0; }
 .class-space-section .problem-panel { margin:12px 0 0; }
 .class-space-section .chat-space-status { width:64px; text-align:right; }
 .class-space-section .class-space-actions { justify-content:flex-end; flex-wrap:wrap; }
 .class-space-section select { max-width:100%; }
-.chat-new-space-guide { grid-column:2; margin-top:0; margin-left:auto; }
+.chat-new-space-guide { grid-column:1 / -1; margin-top:0; margin-left:auto; }
 .chat-new-space-guide small { color:var(--tm-faint); font-size:12px; line-height:1.45;
   text-align:right; }
-@media (max-width:700px) {
+@media (max-width:420px) {
   .svc-subrow.chat-space-existing { grid-template-columns:1fr; }
   .chat-space-controls, .chat-new-space-guide { grid-column:1; margin-left:0; }
   .chat-space-controls { justify-content:flex-start; flex-wrap:wrap; }
@@ -470,7 +489,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-service .nameblock { flex:1; min-width:0; }
 /* 출결 탭 상태 셀 — 글자 색만, 모든 줄 같은 폭, 맨 오른쪽 (2026-07-31 설계) */
 /* 폭은 가장 긴 낱말(준비 필요)에 맞춘다 — 넓으면 단추와 상태 사이가 벌어진다(2026-07-31) */
-.svc-status { flex:none; width:64px; text-align:right; font-size:12.5px; font-weight:700; }
+.svc-status { flex:none; min-width:64px; white-space:nowrap; text-align:right; font-size:12.5px; font-weight:700; }
 .svc-status.ok { color:var(--tm-green); }
 .svc-status.warn { color:var(--tm-amber); }
 .svc-status.bad { color:var(--tm-red); }
@@ -488,20 +507,17 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 /* First setup and student preparation share their parent service's border. */
 .first-setup-subrow,.student-roster-subrow,.student-chat-guide { display:block; }
 .first-setup-subrow,.student-roster-subrow { background:#fff; }
-.student-chat-guide details { width:100%; min-width:0; }
-.student-chat-guide summary { cursor:pointer; font-size:13px; font-weight:700; color:var(--tm-ink); }
-.student-chat-guide p,.student-chat-guide li { color:var(--tm-sub); font-size:12.5px; line-height:1.7; word-break:keep-all; overflow-wrap:anywhere; }
-.student-chat-guide p { margin:8px 0; }
-.student-chat-guide ol { margin:10px 0; padding-left:20px; }
-.student-chat-guide li+li { margin-top:7px; }
-.student-chat-guide li b { color:var(--tm-ink); }
-.student-chat-guide .action-line { justify-content:flex-end; }
 .first-setup-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
 .first-setup-head b { font-size:13px; color:var(--tm-ink); }
 .first-setup-subrow .svc-status { width:64px; white-space:nowrap; }
 .student-roster-subrow .svc-status { width:64px; white-space:nowrap; }
 .first-setup-subrow p,.student-roster-subrow p { margin:8px 0 0; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
-.first-setup-subrow .first-setup-menu { color:var(--tm-blue); font-weight:700; }
+.first-setup-guide { margin-top:10px; }
+.first-setup-guide > summary { width:fit-content; max-width:100%; color:var(--tm-blue); font-size:12.5px; font-weight:700; cursor:pointer; }
+.first-setup-guide > summary:focus-visible { outline:2px solid var(--tm-blue); outline-offset:4px; border-radius:3px; }
+.first-setup-guide figure { min-width:0; margin:14px 0 0; }
+.first-setup-guide figcaption { margin-bottom:7px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; }
+.first-setup-guide img { display:block; width:100%; max-width:100%; height:auto; border:1px solid var(--tm-line); border-radius:8px; }
 .attendance-script-update { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tm-line); border-radius:12px; color:var(--tm-sub); font-size:13px; line-height:1.55; }
 .attendance-script-update span { flex:1 1 auto; min-width:0; }
 .attendance-script-update button { flex:0 0 auto; }
@@ -513,22 +529,45 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog p { margin:10px 0 20px; color:var(--tm-sub); line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog p.attendance-update-dialog-note { margin:-8px 0 20px; font-size:13px; color:var(--tm-faint); }
 .attendance-update-dialog-actions { display:flex; justify-content:flex-end; gap:8px; }
-.attendance-connection-dialog { width:min(680px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; }
+.attendance-connection-dialog { width:min(760px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; display:flex; flex-direction:column; box-sizing:border-box; }
+.attendance-connection-dialog > h3,.attendance-connection-dialog > p { flex:none; }
+.attendance-picker-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; padding:2px; }
 .attendance-candidate-list { display:grid; gap:10px; margin:14px 0 20px; }
-.attendance-candidate-row { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:13px; border:1px solid var(--tm-line); border-radius:12px; }
-.attendance-candidate-row > div { min-width:0; }
-.attendance-candidate-row b,.attendance-candidate-row small { display:block; overflow-wrap:anywhere; }
-.attendance-candidate-row small { margin-top:5px; color:var(--tm-sub); }
-.attendance-connection-manual { margin:0 0 20px; padding:13px; border:1px solid var(--tm-line); border-radius:12px; }
+.attendance-candidate-group { min-width:0; margin:0; padding:9px; border:1px solid var(--tm-line); border-radius:12px; }
+.attendance-candidate-group legend { max-width:100%; padding:0 6px; font-size:14px; font-weight:700; word-break:keep-all; overflow-wrap:anywhere; }
+.attendance-candidate-row { display:flex; align-items:center; gap:10px; border:1px solid transparent; border-radius:8px; }
+.attendance-candidate-row + .attendance-candidate-row { margin-top:5px; }
+.attendance-candidate-row:has(input:checked) { background:var(--tm-blue-soft); border-color:var(--tm-blue); }
+.attendance-candidate-choice { display:flex; align-items:center; gap:11px; flex:1; min-width:0; padding:11px 9px; cursor:pointer; }
+.attendance-candidate-choice input { flex:none; width:17px; height:17px; margin:0; accent-color:var(--tm-blue); }
+.attendance-candidate-choice input:focus-visible { outline:2px solid var(--tm-blue); outline-offset:3px; }
+.attendance-candidate-choice > span { display:flex; flex:1; flex-wrap:wrap; align-items:center; gap:5px 20px; min-width:0; }
+.attendance-candidate-time { font-size:13px; color:var(--tm-ink); }
+.attendance-candidate-code { font-size:12px; color:var(--tm-sub); }
+.attendance-candidate-code code { white-space:nowrap; font:inherit; color:var(--tm-ink); }
+.attendance-candidate-row small { display:block; flex-basis:100%; color:var(--tm-sub); word-break:keep-all; overflow-wrap:anywhere; }
+.attendance-candidate-row > button { flex:none; margin-right:9px; }
+.attendance-picker-footer { flex:none; border-top:1px solid var(--tm-line); padding-top:10px; background:#fff; }
+.attendance-update-dialog p.attendance-picker-selection-note { margin:0 0 10px; font-size:12.5px; }
+.attendance-picker-buttons,.attendance-picker-primary,.attendance-picker-secondary { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.attendance-picker-buttons,.attendance-picker-primary,.attendance-picker-secondary { justify-content:flex-end; }
+.attendance-connection-manual { margin:0 0 12px; padding:8px 2px; font-size:12.5px; color:var(--tm-sub); }
 .attendance-connection-code-entry { display:flex; gap:8px; margin:9px 0 6px; }
 .attendance-connection-code-entry input { flex:1; min-width:0; text-transform:uppercase; }
 .attendance-connection-manual > small { color:var(--tm-sub); }
 .attendance-connection-code-error { margin:8px 0 0; }
-@media (max-width:560px) { .attendance-candidate-row { align-items:stretch; flex-direction:column; } }
 @media (max-width:560px) { .attendance-connection-code-entry { align-items:stretch; flex-direction:column; } }
 
 /* 1단계 "화면에서 찾기" — 구글 워크스페이스 위치 캡처 안내 */
 .guide-overlay { position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:20px; background:rgba(15,23,42,.5); }
+.attendance-picture-guide { display:flex; flex-wrap:wrap; align-items:center; gap:5px 12px; }
+.attendance-picture-guide .text-link { padding:0; min-height:30px; font-size:13px; }
+.attendance-picture-guide small { font-size:12px; color:var(--tm-faint); }
+.attendance-chat-guide-dialog { padding:0; border:1px solid var(--tm-line); border-radius:16px; width:min(1120px,94vw); max-width:94vw; height:92vh; max-height:92vh; overflow:hidden; background:#fff; }
+.attendance-chat-guide-dialog::backdrop { background:rgba(15,23,42,.55); }
+.attendance-chat-guide-dialog > header { height:58px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 18px; border-bottom:1px solid var(--tm-line); }
+.attendance-chat-guide-dialog > header strong { font-size:14px; }
+.attendance-chat-guide-dialog > iframe { display:block; border:0; width:100%; height:calc(100% - 58px); }
 .guide-box { width:min(760px,94vw); max-height:88vh; overflow:auto; background:#fff; border:1px solid var(--tm-line); border-radius:16px; padding:18px 20px 20px; box-shadow:0 24px 64px rgba(15,23,42,.28); }
 .guide-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
 .guide-head b { font-size:16px; }
@@ -611,3 +650,18 @@ body.win-open { overflow:hidden; }
   .decision-banner { padding:17px 16px; }
   .student-links > button { flex:1 1 100%; }
 }
+
+/* Roster entry uses the existing timetable window. */
+.roster-scroll { overflow:auto; max-height:440px; border:1px solid var(--tm-line); border-radius:10px; }
+.roster-table { width:100%; min-width:480px; table-layout:fixed; }
+.roster-table th { position:sticky; top:0; z-index:1; background:var(--tm-surface,#f7f8fa); text-align:left; padding:10px 12px; }
+.roster-table td { padding:0; border-top:1px solid var(--tm-line); }
+.roster-table th+th,.roster-table td+td { border-left:1px solid var(--tm-line); }
+.roster-table th:first-child,.roster-table td:first-child { width:65px; }
+.roster-table th:nth-child(2) { width:130px; }
+.roster-table td input { display:block; width:100%; min-width:0; box-sizing:border-box; border:0; border-radius:0; padding:9px 12px; text-align:left; background:transparent; }
+.roster-table td:first-child input,.roster-table th:first-child { text-align:center; }
+.roster-table td input:focus { outline:2px solid var(--tm-blue); outline-offset:-2px; }
+.roster-actions { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:8px; margin:16px 0; }
+.timetable-tabs .connect-tab:disabled { opacity:.45; cursor:default; }
+.step:disabled { opacity:.45; cursor:default; }

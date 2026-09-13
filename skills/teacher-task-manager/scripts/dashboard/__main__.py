@@ -18,12 +18,12 @@ WEB_INDEX = Path(__file__).resolve().parent / "web" / "index.html"
 _IMPORT = object()  # "실제 pywebview를 임포트해라" 표식
 
 MISSING_WEBVIEW_MESSAGE = (
-    "화면 부품(pywebview)이 없어요. 배포판 프로그램에는 들어 있고,\n"
-    "소스로 실행할 때만 한 번 설치하면 돼요: pip install pywebview"
+    "Teacher Manager 화면 파일이 빠져 있어 실행하지 못했어요.\n"
+    "공식 Teacher Manager 설치 파일을 다시 받아 설치해 주세요."
 )
 WEBVIEW2_HELP_MESSAGE = (
-    "화면을 여는 데 실패했어요. Windows 구성 요소인 WebView2가 없을 수 있어요.\n"
-    "Windows 11에는 기본 내장이고, Windows 10은 아래 주소에서 설치할 수 있어요:\n"
+    "화면을 표시하는 Microsoft Edge WebView2를 사용할 수 없어 Teacher Manager를 열지 못했어요.\n"
+    "Microsoft 공식 설치 페이지에서 Microsoft Edge WebView2 Runtime을 설치해 주세요:\n"
     "https://developer.microsoft.com/microsoft-edge/webview2/"
 )
 SETTINGS_RECOVERY_HELP_MESSAGE = (
@@ -31,8 +31,8 @@ SETTINGS_RECOVERY_HELP_MESSAGE = (
     "기존 백업은 그대로 보관되어 있습니다. 프로그램을 다시 실행해 주세요."
 )
 DEV_RESET_WARNING_MESSAGE = (
-    "설정 준비 중 문제가 있었지만 실행은 계속해요.\n"
-    "옮기던 설정은 백업 폴더에 그대로 보존됩니다."
+    "기존 설정을 준비하는 중 문제가 생겼지만 Teacher Manager는 계속 열어요.\n"
+    "옮기던 설정은 백업 폴더에 그대로 보관되어 있습니다."
 )
 INITIAL_WINDOW_WIDTH = 980
 INITIAL_WINDOW_HEIGHT_FALLBACK = 700
@@ -115,7 +115,9 @@ def _run_background(config_dir) -> None:
 
         config_dir = Path(config_dir)
         try:
-            app_info = Api(config_dir).get_app_info()
+            api = Api(config_dir)
+            api.google_status()
+            app_info = api.get_app_info()
         except Exception:  # noqa: BLE001 - 설정 확인 실패 시 도우미만 건너뛴다
             app_info = {}
         _background_setup(
@@ -198,15 +200,19 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None) -> int
         _notify_safely(notify, app_name, SETTINGS_RECOVERY_HELP_MESSAGE)
         return 1
     except Exception as error:  # noqa: BLE001 - 초기화 실패가 실행을 막으면 안 되지만 조용히 삼키지도 않는다
-        message = f"{DEV_RESET_WARNING_MESSAGE}\n(자세한 원인: {error})"
-        print(message)
-        _notify_safely(notify, app_name, message)
+        print(f"{DEV_RESET_WARNING_MESSAGE}\n(자세한 원인: {error})")
+        _notify_safely(notify, app_name, DEV_RESET_WARNING_MESSAGE)
     api = Api(Path(args.config_dir))
     if args.verify_settings_only:
         if not installed:
             return 1
-        app_info = api.get_app_info()
-        return 0 if (app_info or {}).get("data", {}).get("mode") == "home" else 1
+        # This installed-package check proves saved local setup survived. It
+        # returns only an exit code and must not expose drafts, check Google,
+        # deliver reports or grant the user-facing bootstrap identity bypass.
+        try:
+            return 0 if api._load_state().get("completed") is True else 1
+        except Exception:
+            return 1
 
     def _apply_window_icon():
         # 창이 뜬 직후엔 제목이 아직 안 잡혀 FindWindow가 실패할 수 있다 — 잠깐 재시도한다.

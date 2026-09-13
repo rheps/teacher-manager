@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from brity_bridge.google_account import (
     extract_email,
     require_goedu_email,
 )
-from brity_bridge.history import HistoryStore
+from brity_bridge.history import HistoryStore, HistoryUnavailableError, HISTORY_UNAVAILABLE_DETAIL
 from brity_bridge.proposal_check import CheckedAction
 
 DUPLICATE_KEY_PROPERTY = "brityBridgeKey"
@@ -247,7 +248,7 @@ def _probe_calendar_duplicate(runner, gws_command, action) -> str:
         runner, gws_command + ["calendar", "events", "list"], params
     )
     if len(items) > 1:
-        raise AmbiguousGoogleResult("같은 등록 표식의 일정이 둘 이상입니다")
+        raise AmbiguousGoogleResult("이 메시지로 만든 일정이 둘 이상 있습니다")
     return str(items[0].get("id") or "") if items else ""
 
 
@@ -257,7 +258,7 @@ def _probe_calendar_three_cycles(runner, gws_command, action) -> tuple[bool, str
         try:
             return True, _probe_calendar_duplicate(runner, gws_command, action), ""
         except AmbiguousGoogleResult:
-            return False, "", "같은 등록 표식의 일정이 둘 이상이라 자동 등록을 멈췄습니다."
+            return False, "", "이 메시지로 만든 일정이 둘 이상 있어 추가 등록을 멈췄어요. Google Calendar에서 같은 제목과 날짜의 일정을 확인해 주세요."
         except Exception as error:  # noqa: BLE001 - 외부 원문은 사용자 화면에 내보내지 않는다
             detail = _safe_google_failure(error)
             if _is_google_user_action(detail):
@@ -432,7 +433,7 @@ def _execute_calendar_action(
                 action,
                 "failed",
                 "",
-                "같은 등록 표식의 일정이 둘 이상이라 자동 등록을 멈췄습니다.",
+                "이 메시지로 만든 일정이 둘 이상 있어 추가 등록을 멈췄어요. Google Calendar에서 같은 제목과 날짜의 일정을 확인해 주세요.",
                 retry_allowed=False,
             )
         except Exception as error:  # noqa: BLE001 - 외부 원문은 화면에 내보내지 않는다
@@ -636,7 +637,7 @@ def _execute_task_action(
                 action,
                 "failed",
                 "",
-                "예전 등록 표식이 붙은 할 일이 둘 이상이라 자동 등록을 멈췄습니다.",
+                "이 메시지로 만든 할 일이 둘 이상 있어 추가 등록을 멈췄어요. Google Tasks에서 같은 제목의 할 일을 확인해 주세요.",
                 retry_allowed=False,
             )
 
@@ -772,11 +773,18 @@ def _values_get(runner, gws_command, spreadsheet_id: str, a1_range: str) -> list
         ),
         "--format", "json",
     ]
-    values = _run_json(runner, args).get("values")
-    return values if isinstance(values, list) else []
+    payload = _run_json_strict(runner, args)
+    values = payload.get("values", [])
+    if ("error" in payload or not isinstance(values, list)
+            or payload.get("majorDimension", "ROWS") != "ROWS"
+            or any(not isinstance(row, list) or any(
+                type(cell) not in (str, int, float, bool) for cell in row
+            ) for row in values)):
+        raise GoogleListError("학생 안내표의 기존 기록 응답을 확인하지 못했습니다.")
+    return values
 
 
-def _values_append(runner, gws_command, spreadsheet_id: str, sheet_name: str, rows: list) -> None:
+def _values_append(runner, gws_command, spreadsheet_id: str, sheet_name: str, rows: list) -> dict:
     args = gws_command + [
         "sheets", "spreadsheets", "values", "append",
         "--params", json.dumps(
@@ -791,11 +799,36 @@ def _values_append(runner, gws_command, spreadsheet_id: str, sheet_name: str, ro
         "--json", json.dumps({"values": rows}, ensure_ascii=False),
         "--format", "json",
     ]
-    _run_json(runner, args)
+    payload = _run_json_strict(runner, args)
+    updates = payload.get("updates")
+    if ("error" in payload or payload.get("spreadsheetId") != spreadsheet_id
+            or not isinstance(updates, dict)
+            or updates.get("spreadsheetId") != spreadsheet_id):
+        raise AmbiguousGoogleResult("학생 안내 등록 결과의 문서를 확인하지 못했습니다.")
+    updated_range = updates.get("updatedRange")
+    sheet_ref = "'" + sheet_name.replace("'", "''") + "'"
+    match = re.fullmatch(
+        rf"(?:{re.escape(sheet_ref)}|{re.escape(sheet_name)})!A([1-9][0-9]*):([A-Z]+)([1-9][0-9]*)",
+        updated_range if isinstance(updated_range, str) else "",
+    )
+    columns = updates.get("updatedColumns")
+    cells = updates.get("updatedCells")
+    row_count = updates.get("updatedRows")
+    end_column = 0
+    if match:
+        for char in match[2]:
+            end_column = end_column * 26 + ord(char) - ord("A") + 1
+    if (not match or match[1] != match[3]
+            or type(row_count) is not int or row_count != 1
+            or type(columns) is not int or type(cells) is not int
+            or columns != len(rows[0]) or cells != columns or columns <= 0
+            or end_column != columns):
+        raise AmbiguousGoogleResult("학생 안내 등록 결과의 행과 셀을 확인하지 못했습니다.")
+    return payload
 
 
-def _append_notice(runner, gws_command, action) -> str:
-    """학생 안내를 Google Sheet에 직접 적는다.
+def _prepare_notice(runner, gws_command, action) -> tuple[str, list | None]:
+    """학생 안내 행을 준비하고 단체톡의 기존 중복을 확인한다.
 
     예전에는 Apps Script 실행(scripts.run)을 썼지만, 그 API는 호출한 프로그램과
     스크립트가 같은 클라우드 프로젝트를 공유해야 해서(사용자가 콘솔에서 수동
@@ -810,8 +843,7 @@ def _append_notice(runner, gws_command, action) -> str:
             today, "", str(action.payload.get("name", "")).strip(), "기타",
             content, "자동분석", "대기", "", "", "",
         ]
-        _values_append(runner, gws_command, action.google_id, PERSONAL_QUEUE_SHEET, [row])
-        return "created"
+        return PERSONAL_QUEUE_SHEET, row
     # 단체톡 — 같은 날짜·같은 내용이 '보냄' 아닌 상태로 이미 있으면 다시 넣지 않는다.
     existing = _values_get(
         runner, gws_command, action.google_id, f"'{CLASS_QUEUE_SHEET}'!A2:G"
@@ -821,10 +853,68 @@ def _append_notice(runner, gws_command, action) -> str:
         row_text = _normalize_message_line(sheet_row[2] if len(sheet_row) > 2 else "")
         row_status = str(sheet_row[4] if len(sheet_row) > 4 else "").strip()
         if row_date == today and row_text == content and row_status != "보냄":
-            return "duplicate"
+            return CLASS_QUEUE_SHEET, None
     row = [today, "기타", content, "자동분석", "대기", "", ""]
-    _values_append(runner, gws_command, action.google_id, CLASS_QUEUE_SHEET, [row])
-    return "created"
+    return CLASS_QUEUE_SHEET, row
+
+
+def _execute_notice_action(runner, gws_command, action, history, source_hash, account):
+    if not source_hash or not action.action_key or action.target not in {"personal", "class"}:
+        return ActionResult(action, "failed", "", "학생 안내의 등록 식별 정보를 확인하지 못해 멈췄습니다.", retry_allowed=False)
+    fingerprint = hashlib.sha256(json.dumps(
+        {"source_hash": source_hash, "action_key": action.action_key,
+         "account": account.casefold(), "spreadsheet_id": action.google_id,
+         "target": action.target, "payload": action.payload},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    intent = history.write_intent(source_hash, action.action_key)
+    if intent is not None:
+        # No remote operation ID is available for personal rows. Even matching
+        # content cannot prove this request's outcome, so never append again.
+        matching = (
+            intent.get("kind") == "notice" and intent.get("intent_hash") == fingerprint
+            and intent.get("account") == account.casefold()
+            and intent.get("spreadsheet_id") == action.google_id
+            and intent.get("target") == action.target
+        )
+        detail = (RESULT_RECORD_FAILURE_DETAIL if matching else
+                  "저장된 학생 안내 등록 상태가 현재 계정·대상·내용과 달라 추가 등록을 멈췄습니다.")
+        return ActionResult(action, "failed", "", detail, retry_allowed=False)
+    try:
+        sheet_name, row = _prepare_notice(runner, gws_command, action)
+    except GoogleListError:
+        return ActionResult(action, "failed", "", "학생 안내표의 기존 기록 응답을 확인하지 못해 추가 등록하지 않았습니다.", retry_allowed=False)
+    if row is None:
+        return ActionResult(action, "duplicate", "", "학생 안내표에 같은 안내가 있음")
+    before_intent = copy.deepcopy(history.entry(source_hash))
+    try:
+        history.record_write_intent(
+            source_hash, action.action_key, "notice", [], fingerprint,
+            account=account.casefold(), spreadsheet_id=action.google_id, target=action.target,
+        )
+        history.save()
+    except Exception:
+        # This request was never dispatched. A later action's save must not
+        # persist its failed preparation as an unresolved remote operation.
+        if before_intent is None:
+            history.data["messages"].pop(source_hash, None)
+        else:
+            history.data["messages"][source_hash] = before_intent
+        return ActionResult(action, "failed", "", "학생 안내 등록 준비를 안전하게 저장하지 못했습니다. Google에 쓰기 전에 멈췄습니다.", retry_allowed=False)
+    try:
+        _values_append(runner, gws_command, action.google_id, sheet_name, [row])
+    except Exception:
+        return ActionResult(action, "failed", "", RESULT_RECORD_FAILURE_DETAIL, retry_allowed=False)
+    # A failed completion save must not leave in-memory confirmed evidence that
+    # a later unrelated save could accidentally commit as this action's success.
+    pending_entry = copy.deepcopy(history.entry(source_hash))
+    try:
+        history.record_action(source_hash, action.action_key, "notice", "")
+        history.save()
+    except Exception:
+        history.data["messages"][source_hash] = pending_entry
+        return ActionResult(action, "failed", "", RESULT_RECORD_FAILURE_DETAIL, retry_allowed=False)
+    return ActionResult(action, "created", "")
 
 
 def execute_actions(
@@ -839,6 +929,10 @@ def execute_actions(
     expected_account: str = "",
     notice_preflight=None,
 ) -> ExecutionReport:
+    try:
+        history.require_usable()
+    except HistoryUnavailableError:
+        return _preparation_failures(actions, HISTORY_UNAVAILABLE_DETAIL, retry_allowed=False)
     runtime_run_command = None
     try:
         if runner is None:
@@ -973,45 +1067,14 @@ def execute_actions(
                         ActionResult(action, "failed", "", notice_preflight_error)
                     )
                     continue
-                status = _append_notice(runner, gws_command, action)
-                if status == "duplicate":
-                    results.append(ActionResult(action, "duplicate", "", "학생 안내표에 같은 안내가 있음"))
-                    continue
-                created_id = ""  # 시트 줄이라 Google ID 없음
+                results.append(_execute_notice_action(
+                    runner, gws_command, action, history, source_hash, current_account,
+                ))
+                continue
+        except HistoryUnavailableError:
+            results.append(ActionResult(action, "failed", "", HISTORY_UNAVAILABLE_DETAIL, retry_allowed=False))
+            continue
         except Exception as error:  # noqa: BLE001 - 외부 원문은 사용자 화면에 내보내지 않는다
             results.append(ActionResult(action, "failed", "", _safe_google_failure(error)))
             continue
-        if action.kind in {"calendar", "task"} and not created_id:
-            results.append(
-                ActionResult(
-                    action, "failed", "", RESULT_RECORD_FAILURE_DETAIL, retry_allowed=False
-                )
-            )
-            continue
-        if source_hash:
-            try:
-                history.record_action(source_hash, action.action_key, action.kind, created_id)
-                history.save()
-            except Exception:  # noqa: BLE001 - 저장 경로·원문은 사용자 화면에 내보내지 않는다
-                results.append(
-                    ActionResult(
-                        action,
-                        "failed",
-                        created_id,
-                        RESULT_RECORD_FAILURE_DETAIL,
-                        retry_allowed=False,
-                    )
-                )
-                continue
-        if action.kind == "calendar" and not _calendar_response_preserves_local_links(action, created_event):
-            results.append(
-                ActionResult(
-                    action,
-                    "failed",
-                    created_id,
-                    "일정은 만들었지만 첨부 연결이 확인되지 않았습니다.",
-                )
-            )
-            continue
-        results.append(ActionResult(action, "created", created_id))
     return ExecutionReport(results=results)

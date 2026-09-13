@@ -8,7 +8,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brity_bridge import autostart_win, gws_env, paths, process_win, status_log
+from brity_bridge import account_sessions, autostart_win, gws_env, paths, process_win, status_log
 
 
 def main(argv=None) -> int:
@@ -42,16 +42,28 @@ def main(argv=None) -> int:
         )
         print("설정 대시보드를 열었습니다.")
         return 0
-    if args.command == "doctor":
-        from brity_bridge import doctor
-
-        results = doctor.run_doctor_checks(config_dir)
-        print(doctor.format_report(results))
-        return doctor.exit_code(results)
-    if args.command == "status":
-        last = status_log.read_last_status(paths.bridge_state_dir(config_dir))
-        print(json.dumps(last or {"message": "아직 처리한 메시지가 없습니다."}, ensure_ascii=False, indent=2))
-        return 0
+    if args.command in {"doctor", "status"}:
+        try:
+            session = account_sessions.read_state(config_dir)
+            if session.get("managed") and session.get("phase") != "active":
+                raise account_sessions.AccountSessionError("설정에서 현재 Google 연결을 확인해 주세요.")
+            expected = (session["account"], session["generation"])
+            current = account_sessions.active_config_dir(config_dir, session)
+            if args.command == "doctor":
+                from brity_bridge import doctor
+                results = doctor.run_doctor_checks(current)
+                output, code = doctor.format_report(results), doctor.exit_code(results)
+            else:
+                last = status_log.read_last_status(paths.bridge_state_dir(current))
+                output = json.dumps(last or {"message": "아직 처리한 메시지가 없습니다."}, ensure_ascii=False, indent=2)
+                code = 0
+            if expected != account_sessions.token(config_dir):
+                raise account_sessions.AccountSessionError()
+            print(output)
+            return code
+        except account_sessions.AccountSessionError as error:
+            print(str(error), file=sys.stderr)
+            return 2
     if args.command == "enable-autostart":
         autostart_win.enable_autostart()
         print("Windows 시작 시 자동 실행을 켰습니다.")

@@ -135,6 +135,13 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Exact delivered Setup sources rechecked on 2026-09-10, including the
+    # same-version predecessor found in the installed account's saved record.
+    '16532566089614786f86afb4998a16d947a1110ee1aebe5fb87f7a377c9c082a': (('4.2-simple-google-candidate', '9365c63f3071dd8f1979160b2715abb28f8962ce'), ('4.2-attendance-feedback-candidate', '28eb0489c98e71d25a59dd8af9f912289f7c4c0e')),
+    '8c0b3d0f00f040ca0452fccb7d7aa38e5fc1f6213f4b2f8f8df1b1b92a0ed363': (('4.2-login-sync-candidate', '3ee1a79225c0c31779c53793d54a952c15d89e8a'),),
+    # Exact 4.2 account-session Candidate: source files and delivered Setup hash
+    # were checked against 94d4873 on 2026-09-09. Frozen evidence is independent.
+    '9dd0f97423b8def309bcf22cce7f5df2bad83014ddaae915388359fbd4a26df7': (('4.2-account-session-candidate', '94d487345cab8d9145f34d93f4580d4800583530'),),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     'd1b41c62807847f8fca8417b37a3bac52940509ab165cedc23fe8f85478c8161': (('4.2-google-accounts-candidate', '0dc4d72d3776c646f12bed8554bc9f3e256ff738'),),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
@@ -185,12 +192,21 @@ TRUSTED_PRERELEASE_BUNDLE_SHA256 = frozenset(
 )
 
 
-# Delivery order only for the three independently proven 4.2 bundles. Unknown
+# Delivery order only for the independently proven 4.2 bundles. Unknown
 # content is never assigned an order or trusted from version labels.
 _DELIVERED_42_ORDER = {
     "5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8": 1,
     "8ab8e3c8eb2bf3e7467ad45cf10652d8a4fe697c599beb22a241c1361d93d045": 2,
     "d1b41c62807847f8fca8417b37a3bac52940509ab165cedc23fe8f85478c8161": 3,
+    "9dd0f97423b8def309bcf22cce7f5df2bad83014ddaae915388359fbd4a26df7": 4,
+    "16532566089614786f86afb4998a16d947a1110ee1aebe5fb87f7a377c9c082a": 5,
+    "8c0b3d0f00f040ca0452fccb7d7aa38e5fc1f6213f4b2f8f8df1b1b92a0ed363": 6,
+    # Reviewed next delivery target; frozen separately from delivered predecessors.
+    "f6ccbc57a59cff820edb5a9f739af8c190040f775e4bf87e877e10c03adbb0fc": 7,
+    # Reviewed roster/recovery Candidate target; not trusted as a delivered predecessor.
+    "371688554d25fb9f" "84adda39d481fe09" "36183bd761c85f0d" "30d6e5ee92d2afb1": 8,
+    # Reviewed integrated Candidate target; frozen evidence, not a delivered predecessor.
+    "c14b3959d435009e57b4c5d8da6f7d0f1934f49621b524841f97a5d6c5ce1eea": 9,
 }
 
 

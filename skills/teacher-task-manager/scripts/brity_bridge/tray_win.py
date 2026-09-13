@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from brity_bridge import (
+    account_sessions,
     attach_read,
     autostart_win,
     capture_store,
@@ -156,6 +157,7 @@ class QueuedCapture(NamedTuple):
     capture: screen_read.ScreenCapture
     attachment_paths: tuple[Path, ...]
     preflight_message: str
+    session_token: tuple[str, str] | None = None
 
 
 class StatusNotice(NamedTuple):
@@ -180,7 +182,7 @@ def menu_items(autostart_enabled: bool, app_label_text: str) -> list:
     return [
         MenuItem(CMD_VERSION_LABEL, app_label_text, enabled=False),
         MENU_SEPARATOR,
-        MenuItem(CMD_OPEN_DASHBOARD, "대시보드 열기"),
+        MenuItem(CMD_OPEN_DASHBOARD, "Teacher Manager 열기"),
         MenuItem(CMD_CHECK_UPDATE, "새 버전 확인"),
         MENU_SEPARATOR,
         MenuItem(CMD_TOGGLE_AUTOSTART, "Windows 시작 시 자동 실행", checked=autostart_enabled),
@@ -239,8 +241,12 @@ class WNDCLASSW(ctypes.Structure):
 
 
 class TrayApp:
+    @property
+    def config_dir(self):
+        return account_sessions.active_config_dir(self._account_root)
+
     def __init__(self, config_dir: Path, toast_factory=None, attachment_server_factory=None):
-        self.config_dir = Path(config_dir)
+        self._account_root = account_sessions.root_config_dir(config_dir)
         self.settings = settings_module.load_settings(paths.settings_path(self.config_dir))
         # busy는 도우미 종료가 받아 둔 작업을 기다리는 표지다. 화면 읽기만
         # 직렬화하는 잠금은 따로 두어, Google 등록 중에도 다음 메시지를 받는다.
@@ -404,6 +410,14 @@ class TrayApp:
         self.on_hotkey()
 
     def on_hotkey(self) -> None:
+        try:
+            session = account_sessions.peek_state(self.config_dir)
+            if session.get("managed") and session.get("phase") != "active":
+                raise account_sessions.AccountSessionError("설정에서 Google 로그인을 마친 뒤 쪽지를 등록해 주세요.")
+            session_token = (session["account"], session["generation"])
+        except account_sessions.AccountSessionError as error:
+            self._show_batch_text(str(error))
+            return
         # 현재 보이는 화면을 저장하는 아주 짧은 순간만 겹치지 않게 한다. 첨부파일
         # 내용 읽기와 Google 등록은 이 잠금 밖의 대기열에서 차례로 처리한다.
         if not self._capture_lock.acquire(blocking=False):
@@ -449,7 +463,7 @@ class TrayApp:
         # 워커를 띄우기 전에 즉시 한 창에서 반응을 보여준다.
         self._show_batch_text(capture_toast.PRESSED_TEXT)
         # non-daemon: 인터프리터 종료가 저장 중인 워커를 얼리지 않고 완료를 기다린다.
-        threading.Thread(target=self._capture_once_locked, daemon=False).start()
+        threading.Thread(target=self._capture_once_locked, args=(session_token,), daemon=False).start()
 
     def _capture_idle(self) -> bool:
         if self.busy.acquire(blocking=False):
@@ -469,13 +483,13 @@ class TrayApp:
             post = ctypes.windll.user32.PostMessageW
         post(hwnd, WM_CLOSE, 0, 0)
 
-    def _capture_once_locked(self) -> None:
+    def _capture_once_locked(self, session_token=None) -> None:
         failure_message = ""
         try:
             capture = screen_read.capture_brity_text()
             if not capture.ok:
                 retry = screen_read.capture_failure_message(capture.reason)
-                self._enqueue_capture(capture, (), retry)
+                self._enqueue_capture(capture, (), retry, session_token)
             else:
                 attachment_paths = ()
                 preflight_message = ""
@@ -485,7 +499,9 @@ class TrayApp:
                     )
                 except attach_read.AttachmentBlocked as error:
                     preflight_message = error.message or "첨부파일을 먼저 내려받아 주세요."
-                self._enqueue_capture(capture, attachment_paths, preflight_message)
+                self._enqueue_capture(capture, attachment_paths, preflight_message, session_token)
+        except account_sessions.AccountSessionError as error:
+            failure_message = str(error)
         except Exception:  # noqa: BLE001 - 외부 원문은 기록·화면에 내보내지 않는다
             capture = screen_read.ScreenCapture(False, "unexpected", "", [])
             unexpected_retry = (
@@ -493,7 +509,7 @@ class TrayApp:
                 "Teacher Manager를 다시 시작한 뒤 같은 메시지에서 단축키를 다시 눌러 주세요."
             )
             try:
-                self._enqueue_capture(capture, (), unexpected_retry)
+                self._enqueue_capture(capture, (), unexpected_retry, session_token)
             except Exception:
                 failure_message = unexpected_retry
         finally:
@@ -534,13 +550,16 @@ class TrayApp:
         capture: screen_read.ScreenCapture,
         attachment_paths: tuple[Path, ...],
         preflight_message: str,
+        session_token=None,
     ) -> None:
+        if session_token is None:
+            session_token = account_sessions.peek_token(self.config_dir)
         start_worker = False
         with self._queue_lock:
             self._batch_total += 1
             sequence = self._batch_total
             self._pending_captures += 1
-            queued = QueuedCapture(sequence, capture, attachment_paths, preflight_message)
+            queued = QueuedCapture(sequence, capture, attachment_paths, preflight_message, session_token)
             self._capture_queue.put_nowait(queued)
             if not self._queue_worker_running:
                 self._queue_worker_running = True
@@ -563,91 +582,100 @@ class TrayApp:
                 self._finish_batch_if_idle()
                 return
 
-            writer = capture_store.ProgressWriter(paths.bridge_state_dir(self.config_dir))
-            writer.emit("capture")
-
-            def emit(step: str, message: str = "") -> None:
-                writer.emit(step, message)
-                if step in ("analyze", "register"):
-                    self._update_batch_status(
-                        f"{queued.sequence}번째 쪽지 · {capture_toast.stage_text(step, message)}"
-                    )
-
             succeeded = False
             result_message = ""
             try:
-                if queued.preflight_message:
-                    result_message = queued.preflight_message
-                    if queued.capture.ok:
-                        pipeline.record_preflight_failure(
-                            self.config_dir,
-                            result_message,
-                            "등록하지 않음 · " + result_message,
-                            capture=queued.capture,
-                        )
-                    else:
-                        pipeline.record_screen_failure(
-                            self.config_dir, queued.capture, result_message
-                        )
-                    emit("fail", result_message)
-                elif queued.capture.attachments:
-                    self._update_batch_status(f"{queued.sequence}번째 쪽지 · 첨부 읽는 중")
+                if queued.session_token is None and account_sessions.read_state(self._account_root).get("managed"):
+                    raise account_sessions.AccountSessionError("이 쪽지를 읽은 계정을 확인하지 못해 보내지 않았어요.")
+                with account_sessions.work(self._account_root, expected_token=queued.session_token):
+                    self.settings = settings_module.load_settings(paths.settings_path(self.config_dir))
+                    writer = capture_store.ProgressWriter(paths.bridge_state_dir(self.config_dir))
+                    writer.emit("capture")
+
+                    def emit(step: str, message: str = "") -> None:
+                        writer.emit(step, message)
+                        if step in ("analyze", "register"):
+                            self._update_batch_status(
+                                f"{queued.sequence}번째 쪽지 · {capture_toast.stage_text(step, message)}"
+                            )
+
+                    succeeded = False
+                    result_message = ""
                     try:
-                        record, note = screen_read.build_screen_record(
-                            queued.capture,
-                            Path(self.settings.brity_download_dir),
-                            attachment_paths=queued.attachment_paths,
-                        )
-                    except attach_read.AttachmentBlocked as error:
-                        result_message = error.message or "첨부파일을 읽지 못했어요."
-                        queued.capture.attachment_attempt_count = error.attempt_count
-                        pipeline.record_preflight_failure(
-                            self.config_dir,
-                            result_message,
-                            "등록하지 않음 · " + result_message,
-                            capture=queued.capture,
-                        )
+                        if queued.preflight_message:
+                            result_message = queued.preflight_message
+                            if queued.capture.ok:
+                                pipeline.record_preflight_failure(
+                                    self.config_dir,
+                                    result_message,
+                                    "등록하지 않음 · " + result_message,
+                                    capture=queued.capture,
+                                )
+                            else:
+                                pipeline.record_screen_failure(
+                                    self.config_dir, queued.capture, result_message
+                                )
+                            emit("fail", result_message)
+                        elif queued.capture.attachments:
+                            self._update_batch_status(f"{queued.sequence}번째 쪽지 · 첨부 읽는 중")
+                            try:
+                                record, note = screen_read.build_screen_record(
+                                    queued.capture,
+                                    Path(self.settings.brity_download_dir),
+                                    attachment_paths=queued.attachment_paths,
+                                )
+                            except attach_read.AttachmentBlocked as error:
+                                result_message = error.message or "첨부파일을 읽지 못했어요."
+                                queued.capture.attachment_attempt_count = error.attempt_count
+                                pipeline.record_preflight_failure(
+                                    self.config_dir,
+                                    result_message,
+                                    "등록하지 않음 · " + result_message,
+                                    capture=queued.capture,
+                                )
+                                emit("fail", result_message)
+                            else:
+                                result = pipeline.run_capture_flow(
+                                    pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
+                                    self.config_dir,
+                                    self.settings,
+                                    record=record,
+                                    progress=emit,
+                                    attachment_link_ready=self._attachment_link_ready,
+                                    attachment_link_failure=self._attachment_link_failure,
+                                )
+                                succeeded = bool(result.ok)
+                                result_message = result.message
+                                if note:
+                                    result_message = result_message + "\n" + note
+                        else:
+                            record, note = screen_read.build_screen_record(
+                                queued.capture,
+                                Path(self.settings.brity_download_dir),
+                                attachment_paths=(),
+                            )
+                            result = pipeline.run_capture_flow(
+                                pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
+                                self.config_dir,
+                                self.settings,
+                                record=record,
+                                progress=emit,
+                                attachment_link_ready=self._attachment_link_ready,
+                                attachment_link_failure=self._attachment_link_failure,
+                            )
+                            succeeded = bool(result.ok)
+                            result_message = result.message
+                            if note:
+                                result_message = result_message + "\n" + note
+                    except Exception:  # noqa: BLE001 - 한 건의 실패가 뒤 메시지를 막으면 안 된다
+                        result_message = "처리 중 예상하지 못한 오류가 발생했어요. 다음 쪽지는 계속 처리합니다."
+                        try:
+                            pipeline.record_unexpected_failure(self.config_dir, queued.capture)
+                        except Exception:  # noqa: BLE001 - 기록 실패도 다음 쪽지를 막으면 안 된다
+                            pass
                         emit("fail", result_message)
-                    else:
-                        result = pipeline.run_capture_flow(
-                            pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
-                            self.config_dir,
-                            self.settings,
-                            record=record,
-                            progress=emit,
-                            attachment_link_ready=self._attachment_link_ready,
-                            attachment_link_failure=self._attachment_link_failure,
-                        )
-                        succeeded = bool(result.ok)
-                        result_message = result.message
-                        if note:
-                            result_message = result_message + "\n" + note
-                else:
-                    record, note = screen_read.build_screen_record(
-                        queued.capture,
-                        Path(self.settings.brity_download_dir),
-                        attachment_paths=(),
-                    )
-                    result = pipeline.run_capture_flow(
-                        pipeline.CaptureContext(clipboard_text=None, clipboard_html=None),
-                        self.config_dir,
-                        self.settings,
-                        record=record,
-                        progress=emit,
-                        attachment_link_ready=self._attachment_link_ready,
-                        attachment_link_failure=self._attachment_link_failure,
-                    )
-                    succeeded = bool(result.ok)
-                    result_message = result.message
-                    if note:
-                        result_message = result_message + "\n" + note
-            except Exception:  # noqa: BLE001 - 한 건의 실패가 뒤 메시지를 막으면 안 된다
-                result_message = "처리 중 예상하지 못한 오류가 발생했어요. 다음 쪽지는 계속 처리합니다."
-                try:
-                    pipeline.record_unexpected_failure(self.config_dir, queued.capture)
-                except Exception:  # noqa: BLE001 - 기록 실패도 다음 쪽지를 막으면 안 된다
-                    pass
-                emit("fail", result_message)
+            except account_sessions.AccountSessionError as error:
+                result_message = str(error)
             finally:
                 self._capture_queue.task_done()
                 self._complete_queued_capture(queued.sequence, succeeded, result_message)
@@ -737,9 +765,9 @@ class TrayApp:
             return
         self._dashboard_click_guard = now + 4.0
         try:
-            open_dashboard(self.config_dir)
+            open_dashboard(self._account_root)
         except Exception:  # noqa: BLE001 - 대시보드 실행 실패가 트레이를 죽이면 안 된다
-            self.notify("Teacher Manager", "대시보드를 여는 데 실패했습니다. 바탕화면 아이콘으로 실행해 주세요.")
+            self.notify("Teacher Manager", "Teacher Manager를 열지 못했어요. 바탕화면의 [Teacher Manager] 아이콘을 눌러 주세요.")
 
     def _check_update_clicked(self, runner=None) -> None:
         """[새 버전 확인]을 눌렀다 — 인터넷에 나가 보고 결과를 알림으로 알린다.
@@ -871,6 +899,9 @@ class TrayApp:
                 current_download_dir,
                 state_dir_provider=lambda: paths.bridge_state_dir(self.config_dir),
             )
+            configure_session = getattr(server, "configure_account_session", None)
+            if callable(configure_session):
+                configure_session(self._account_root)
             server.start()
         except Exception as error:  # noqa: BLE001 - 파일 링크 실패가 단축키·메시지 처리를 막으면 안 된다
             failure_message = status_log.attachment_link_start_failure_message(error)
@@ -928,7 +959,7 @@ class TrayApp:
         try:
             spec = hotkey.parse_hotkey(self.settings.hotkey)
         except ValueError:
-            self.notify("Brity 연결 도우미", "저장된 단축키 설정이 올바르지 않아 트레이 메뉴만 동작합니다.")
+            self.notify("Teacher Manager", "메신저 단축키는 꺼져 있어요. 작업표시줄 오른쪽 Teacher Manager 아이콘에서 [Teacher Manager 열기]를 눌러 설정해 주세요.")
         else:
             if spec.modifier_only:
                 self._modifier_listener = hotkey_win.ModifierHotkeyListener(spec, self._dispatch_hotkey)
@@ -938,14 +969,13 @@ class TrayApp:
                 self._registered_hotkey = registered
             if not registered:
                 self.notify(
-                    "Brity 연결 도우미",
-                    f"단축키 {self.settings.hotkey} 등록에 실패했습니다. 다른 프로그램이 쓰고 있을 수 있습니다. "
-                    "설정 대시보드에서 단축키를 바꾼 뒤 다시 적용해 주세요.",
+                    "Teacher Manager",
+                    f"단축키 {self.settings.hotkey}을(를) 사용할 수 없어요. Teacher Manager의 [설정]에서 [단축키 바꾸기]를 눌러 다른 조합을 저장해 주세요.",
                 )
             else:
                 self.notify(
-                    "Brity 연결 도우미",
-                    f"도우미가 시작됐습니다 — 단축키 {self.settings.hotkey}",
+                    "Teacher Manager",
+                    f"메신저 단축키를 사용할 수 있어요 — {self.settings.hotkey}",
                 )
 
         message = wintypes.MSG()
@@ -1140,7 +1170,7 @@ def check_update_now(config_dir, today, notify, checker=None) -> dict | None:
     if not info or info.get("status") == "failed":
         notify(
             "새 버전을 확인하지 못했습니다",
-            "인터넷 연결을 확인한 뒤 다시 눌러 주세요.",
+            "새 버전 정보를 받지 못했어요. 인터넷 연결을 확인한 뒤 [새 버전 확인]을 다시 눌러 주세요.",
         )
         return None
     # 확인에 성공했으니 오늘 몫의 자동 확인은 다시 나갈 필요가 없다. 실패를 여기 적으면

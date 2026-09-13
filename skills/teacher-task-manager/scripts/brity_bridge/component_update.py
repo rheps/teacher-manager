@@ -153,11 +153,11 @@ class _InstallError(RuntimeError):
 
 
 _USER_ACTION_FAILURES = {
-    "COMPONENT_DISK_FULL": "저장 공간이 부족해 Google 연결 기능을 갱신하지 못했어요. 공간을 확보한 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
-    "COMPONENT_FILE_LOCKED": "다른 프로그램이 Google 연결 기능 갱신 파일을 사용하고 있어요. 다른 작업을 마친 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
-    "COMPONENT_SECURITY_BLOCKED": "학교 보안 프로그램이 Google 연결 기능 갱신을 막았어요. 학교 전산 담당자에게 문의해 주세요. 현재 기능은 그대로 사용할 수 있어요.",
-    "COMPONENT_DIR_NOT_WRITABLE": "Google 연결 기능을 저장하지 못했어요. Teacher Manager를 다시 실행한 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
-    "COMPONENT_UPDATE_BUSY": "다른 설치나 갱신이 끝난 뒤 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요.",
+    "COMPONENT_DISK_FULL": "저장 공간이 부족해 Google 연결 기능을 갱신하지 못했어요. 공간을 확보한 뒤 다시 눌러 주세요.",
+    "COMPONENT_FILE_LOCKED": "다른 프로그램이 Google 연결 기능 갱신 파일을 사용하고 있어요. 다른 작업을 마친 뒤 다시 눌러 주세요.",
+    "COMPONENT_SECURITY_BLOCKED": "학교 보안 프로그램이 Google 연결 기능 갱신을 막았어요. 학교 전산 담당자에게 문의해 주세요.",
+    "COMPONENT_DIR_NOT_WRITABLE": "Google 연결 기능을 저장하지 못했어요. Teacher Manager를 다시 실행한 뒤 다시 눌러 주세요.",
+    "COMPONENT_UPDATE_BUSY": "다른 설치나 갱신이 끝난 뒤 다시 눌러 주세요.",
 }
 
 
@@ -168,8 +168,8 @@ def user_update_failure_detail(code: str) -> str:
     if safe_code in _USER_ACTION_FAILURES:
         return _USER_ACTION_FAILURES[safe_code]
     if safe_code.startswith("NETWORK_") or safe_code.startswith("GWS_DOWNLOAD_"):
-        return "Google 공식 파일을 지금 받지 못했어요. 인터넷 연결을 확인한 뒤 잠시 후 다시 눌러 주세요. 현재 기능은 그대로 사용할 수 있어요."
-    return "공식 파일이 안전 확인 정보와 일치하지 않아 적용하지 않았어요. 현재 기능은 그대로 사용할 수 있어요. 잠시 뒤 다시 눌러 주세요."
+        return "Google 연결 기능 설치 파일을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+    return "받은 파일이 공식 파일과 달라 설치하지 않았어요."
 
 
 def _text(raw: Mapping[str, object], key: str) -> str:
@@ -382,7 +382,7 @@ def _safe_failure(error: BaseException) -> tuple[str, str]:
     if isinstance(error, urllib.error.HTTPError) and error.code == 404:
         return (
             "APPROVAL_NOT_PUBLISHED",
-            "새 Google 도구 승인 파일이 아직 공개되지 않아 현재 기본판을 계속 사용합니다.",
+            "Google 연결 기능 업데이트 파일이 아직 준비되지 않았어요. 현재 기능은 그대로 사용할 수 있어요.",
         )
     if isinstance(error, urllib.error.HTTPError) and error.code == 407:
         return "NETWORK_PROXY_AUTH_REQUIRED", "학교나 기관의 인터넷 인증이 필요해 확인하지 못했습니다."
@@ -391,7 +391,7 @@ def _safe_failure(error: BaseException) -> tuple[str, str]:
         # 서버 원문은 화면에 내보내지 않고, 잠시 뒤 재시도할 수 있다는 것만 알린다.
         return (
             "APPROVAL_SERVER_UNAVAILABLE",
-            "새 Google 도구 승인 파일 서버가 응답했지만 지금 확인을 마치지 못했습니다. 잠시 뒤 다시 점검해 주세요.",
+            "Google 연결 기능 업데이트 정보를 지금 확인하지 못했어요. 현재 기능은 그대로 사용할 수 있어요.",
         )
     if isinstance(error, (TimeoutError, socket.timeout)):
         return "NETWORK_TIMEOUT", "인터넷 응답을 기다리는 시간이 지났습니다."
@@ -409,7 +409,7 @@ def _safe_failure(error: BaseException) -> tuple[str, str]:
         return "NETWORK_OFFLINE", "인터넷에 연결되지 않아 새 Google 도구를 확인하지 못했습니다."
     return (
         "APPROVAL_CHECK_FAILED",
-        "새 Google 도구 승인 파일을 확인하는 중 문제가 생겼습니다. 잠시 뒤 다시 점검해 주세요.",
+        "Google 연결 기능 업데이트 정보를 확인하지 못했어요. 현재 기능은 그대로 사용할 수 있어요.",
     )
 
 
@@ -501,7 +501,7 @@ def check_gws_update(
                     result = GwsUpdateCheck(
                         True,
                         "UP_TO_DATE",
-                        "현재 기본 Google 도구가 승인 목록과 같거나 더 최신입니다.",
+                        "Google 연결 기능을 사용할 수 있어요.",
                         None,
                         day,
                     )
@@ -523,7 +523,7 @@ def check_gws_update(
                 result = GwsUpdateCheck(
                     True,
                     "UPDATE_AVAILABLE",
-                    "승인된 Google 도구 새 판을 확인했습니다.",
+                    "Google 연결 기능 업데이트가 있어요.",
                     GwsUpdateOffer(manifest, day, approval_bytes, digest),
                     day,
                 )
@@ -541,7 +541,7 @@ def check_gws_update(
                 return result
             except ApprovedManifestError as error:
                 code = error.code
-                detail = "공식 승인 파일의 모양이 맞지 않아 현재 기본판을 계속 사용합니다."
+                detail = "받은 업데이트 정보가 공식 정보와 달라 적용하지 않았어요. 현재 기능은 그대로 사용할 수 있어요."
             except Exception as error:  # 인터넷 라이브러리의 여러 Windows 오류를 안전 문장으로 줄인다.
                 if download_finished and isinstance(error, OSError):
                     local = _local_failure(error, stage="write")
@@ -634,13 +634,13 @@ def _network_failure(error: BaseException) -> _InstallError:
     if isinstance(error, urllib.error.HTTPError) and error.code == 404:
         return _InstallError(
             "GWS_DOWNLOAD_NOT_FOUND",
-            "승인된 Google 도구의 공식 압축 파일을 찾지 못했습니다. 잠시 뒤 다시 점검해 주세요.",
+            "Google 연결 기능 설치 파일을 공식 다운로드 위치에서 찾지 못했어요.",
             mark_bad=False,
         )
     if isinstance(error, urllib.error.HTTPError) and error.code != 407:
         return _InstallError(
             "GWS_DOWNLOAD_SERVER_UNAVAILABLE",
-            "Google 공식 파일 서버가 응답했지만 지금 압축 파일을 받지 못했습니다. 잠시 뒤 다시 눌러 주세요.",
+            "Google 연결 기능 설치 파일을 지금 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해 주세요.",
             mark_bad=False,
         )
     code, detail = _safe_failure(error)
@@ -1395,7 +1395,7 @@ def install_gws_update(
                     return _failure_result(
                         _InstallError(
                             error.code,
-                            "설치된 Teacher Manager의 기본 Google 도구가 손상됐습니다. 설치 파일을 다시 실행해 주세요.",
+                            "설치된 Google 연결 기능을 실행할 수 없어요. 공식 Teacher Manager 설치 파일을 다시 실행해 주세요.",
                             mark_bad=False,
                         ),
                         None,

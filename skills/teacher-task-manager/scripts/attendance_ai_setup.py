@@ -38,7 +38,7 @@ class AttendanceAiSetupStatus:
 
 
 _ACTION_REQUIRED = (
-    "출석부 안의 확인 표시를 찾지 못했어요. 새 정본을 열고 "
+    "출석부 안의 확인 표시를 찾지 못했어요. 출석부를 열고 "
     "[처음 한 번 설정하기]에서 [처음 설정 한 번에 끝내기]를 눌러 주세요."
 )
 
@@ -48,6 +48,7 @@ def _result(
     verified: bool,
     spreadsheet_matches: bool = False,
     trigger_count: int = 0,
+    unavailable: bool = False,
 ) -> AttendanceAiSetupStatus:
     return AttendanceAiSetupStatus(
         ok=verified,
@@ -57,8 +58,8 @@ def _result(
         target_matches=verified,
         trigger_count=trigger_count if type(trigger_count) is int else 0,
         setup_done=verified,
-        detail="" if verified else _ACTION_REQUIRED,
-        state="verified" if verified else "ai-action-required",
+        detail=("" if verified else "출석부의 설정 완료 표시를 읽지 못했어요. 설정을 다시 실행하지 말고 잠시 뒤 다시 확인해 주세요." if unavailable else _ACTION_REQUIRED),
+        state="verified" if verified else "unavailable" if unavailable else "ai-action-required",
     )
 
 
@@ -102,7 +103,7 @@ def inspect_attendance_ai_setup(
     expected_id = str(spreadsheet_id or "").strip()
     gws = str(gws_executable or "").strip()
     if not (expected_id and gws and callable(runner)):
-        return _result(verified=False)
+        return _result(verified=False, unavailable=True)
     try:
         reply = attendance_script_update._run_one_json(
             runner,
@@ -131,7 +132,7 @@ def inspect_attendance_ai_setup(
             and isinstance(reply.get("range"), str)
             and reply.get("majorDimension") == "ROWS"
         ):
-            return _result(verified=False)
+            return _result(verified=False, unavailable=True)
         marker = _marker_from_rows(reply.get("values", []))
         if marker is None:
             return _result(verified=False)
@@ -161,7 +162,7 @@ def inspect_attendance_ai_setup(
             trigger_count=trigger_count if type(trigger_count) is int else 0,
         )
     except Exception:
-        return _result(verified=False)
+        return _result(verified=False, unavailable=True)
 
 
 __all__ = [

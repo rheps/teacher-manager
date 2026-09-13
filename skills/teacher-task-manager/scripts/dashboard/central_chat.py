@@ -32,27 +32,27 @@ CONFIG_BROKEN_MESSAGE = "출결 시트의 설정 값을 읽지 못했어요. 시
 # 다시 읽어도 같으므로 세 번 묶음에 넣지 않고 한 번에 멈춘다(2026-09-04). 화면에 보일 수
 # 있는 문장이라 내부 값 이름을 넣지 않는다.
 CONFIG_VALUE_MISSING_MESSAGE = (
-    "출석부의 Google Chat 연결값이 비어 있어요. 출석부를 열고 [처음 한 번 설정하기] → "
-    "[연결 상태 확인]을 누른 뒤 다시 확인해 주세요."
+    "출석부의 Google Chat 연결 정보가 비어 있어요. 출석부를 열고 위쪽 [🔵 처음 한 번 설정하기] → "
+    "현재 연결 상태를 다시 확인해 주세요."
 )
 SERVER_ERROR_MESSAGE = "발송 서버와 연결하지 못했어요. 인터넷 연결을 확인해 주세요."
 # 서버가 답을 준 경우는 인터넷 탓이 아니다. 답에 적힌 뜻을 그대로 옮긴다 —
 # "인터넷을 확인하세요"라고만 하면 몇 번을 다시 눌러도 달라질 게 없다(2026-07-30 확인).
 SHEET_MOVED_MESSAGE = (
-    "Google Chat 발송은 새 정식 출석부로 이미 옮겼어요. "
+    "Google Chat 발송은 다른 출석부로 이미 옮겼어요. "
     "Teacher Manager에서 현재 출석부를 열어 보내 주세요."
 )
 SHEET_AUTH_REQUIRED_MESSAGE = (
-    "이 출석부는 아직 발송 서버에 등록되지 않았어요. 출결 준비를 먼저 마쳐 주세요."
+    "이 출석부에서 Google Chat을 보내기 위한 연결이 끝나지 않았어요. [Google 연결]의 [출결]에서 연결 상태를 확인해 주세요."
 )
 SPACE_BLOCKED_MESSAGE = (
-    "이 Google 계정으로는 프로그램이 방을 만들 수 없어요. Google Chat에서 직접 만들어 주세요."
+    "Google에서 이 방 만들기 요청을 허용하지 않았어요. Google Chat에서 직접 방을 만든 뒤 목록을 다시 불러와 주세요."
 )
-SPACE_NAME_TAKEN_MESSAGE = "같은 이름의 방이 이미 있어요. 이름을 조금 바꿔서 다시 만들어 주세요."
+SPACE_NAME_TAKEN_MESSAGE = "Google에서 다른 방 만들기 요청과 충돌했다고 알려 왔어요. Google Chat에서 이미 만들어진 방이 있는지 확인해 주세요."
 SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
 # 403(SPACE_CREATE_FORBIDDEN)·409(SPACE_NAME_TAKEN)가 아닌 나머지 실패는 전부 이 코드로 온다
 # (services/central-chat-sender의 spaceCreateError 기본값).
-SPACE_CREATE_FAILED_MESSAGE = "방을 만들지 못했어요. 잠시 뒤 다시 눌러 주세요."
+SPACE_CREATE_FAILED_MESSAGE = "방 만들기 결과를 확인하지 못했어요. Google Chat에서 방이 만들어졌는지 확인해 주세요."
 SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌었어요. 현재 상태를 다시 확인해 주세요."
 CLASS_SPACE_SELECTION_CHANGED_CODE = "CHAT_SPACE_SELECTION_CHANGED"
 GOEDU_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
@@ -78,10 +78,10 @@ SERVER_ANSWER_MESSAGES = {
     "SPREADSHEET_ACCESS_DENIED": CHAT_SHEET_ACCESS_MESSAGE,
 }
 UNKNOWN_SERVER_ANSWER_MESSAGE = (
-    "발송 서버가 요청을 처리하지 못했어요. 잠시 뒤 다시 시도해 주세요."
+    "Google Chat 연결 요청을 처리하지 못했어요."
 )
 CHAT_STATUS_FAILURE_MESSAGE = (
-    "학급 단톡방 상태를 확인하지 못했어요. 잠시 뒤 다시 확인해 주세요."
+    "학급 단톡방 상태를 확인하지 못했어요. Google Chat에서 방을 열어 확인해 주세요."
 )
 CHAT_HANDOVER_RECOVERY_REQUIRED_MESSAGE = (
     "Google Chat 연결이 중간에 멈춰 원래 대상 출석부 설정을 안전하게 확인할 수 없어요. "
@@ -512,6 +512,44 @@ def list_spaces(
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
     })
     return _validated_spaces(response)
+
+
+def sync_profile_settings(profile, spreadsheet_id, run_command, *, gws_executable, before_write):
+    """Update only profile-owned rows in an already verified current workbook."""
+    school, teacher = profile.get('school', {}), profile.get('teacher', {})
+    homeroom, calendars = profile.get('homeroom', {}), profile.get('calendars', {})
+    grade, classroom = str(homeroom.get('grade') or ''), str(homeroom.get('class') or '')
+    expected = {'SCHOOL_NAME': str(school.get('name') or ''),
+                'TEACHER_NAME': str(teacher.get('name') or ''),
+                'GRADE': grade, 'CLASS_NUMBER': classroom,
+                'CLASS_LABEL': grade + '-' + classroom if grade and classroom else '',
+                'HOMEROOM_TASK_LIST_ID': str(calendars.get('homeroom_tasks_id') or '')}
+
+    def mapped(rows):
+        values = {}
+        if not isinstance(rows, list):
+            raise ConfigValueMissingError(CONFIG_BROKEN_MESSAGE)
+        for row in rows:
+            if not isinstance(row, list) or not row:
+                continue
+            key = str(row[0]).strip()
+            if key in expected:
+                if key in values:
+                    raise ConfigValueMissingError(CONFIG_BROKEN_MESSAGE)
+                values[key] = str(row[1] or '') if len(row) > 1 else ''
+        if set(values) != set(expected):
+            raise ConfigValueMissingError(CONFIG_BROKEN_MESSAGE)
+        return values
+
+    rows = _read_settings_rows(spreadsheet_id, run_command, gws_executable)
+    actual = mapped(rows)
+    changes = [(key, value) for key, value in expected.items() if actual[key] != value]
+    if changes:
+        before_write()
+        _update_settings_values(spreadsheet_id, rows, changes, run_command, gws_executable)
+        if mapped(_read_settings_rows(spreadsheet_id, run_command, gws_executable)) != expected:
+            raise ConfigValueMissingError(CONFIG_BROKEN_MESSAGE)
+    return {'state': 'applied', 'detail': '저장한 설정을 현재 출석부에도 반영했어요.', 'error_code': ''}
 
 
 def _update_settings_value(
@@ -1374,7 +1412,7 @@ def chat_status(
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
         })
     except CentralChatError as error:
-        return {"connected": False, "registered": False, "account": "",
+        return {"connected": None, "read_failed": True, "registered": False, "account": "",
                 "class_space_name": "", "class_space_id": "",
                 "moved": False,
                 "reason": _safe_central_error_detail(

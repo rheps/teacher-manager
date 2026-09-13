@@ -26,8 +26,8 @@ CLIENT_FILE_NAME = "gws-oauth-client.json"
 UPSTREAM_CLIENT_FILE_NAME = "client_secret.json"
 ACCOUNT_STORAGE_ERROR_CODE = "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
 ACCOUNT_STORAGE_ERROR_MESSAGE = (
-    "Google 로그인 저장 위치가 현재 Windows 계정 폴더 밖을 가리키고 있어요. "
-    "공용 또는 다른 계정의 환경 설정을 지운 뒤 Teacher Manager를 다시 열어 주세요."
+    "이 컴퓨터의 Google 로그인 저장 위치를 안전하게 사용할 수 없어요. "
+    "기존 사용자 설정은 그대로 보관해 주세요."
 )
 _ACCOUNT_STORAGE_KEYS = (
     "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",

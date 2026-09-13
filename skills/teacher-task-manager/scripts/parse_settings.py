@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 from brity_bridge import bundle_paths
+from attendance_workbook_identity import current_school_year
 
 
 DAYS = ["월", "화", "수", "목", "금"]
@@ -89,7 +90,9 @@ def parse_config_dir(config_dir: str | Path, *, require_links: bool = True) -> P
         },
         "school": {
             "name": profile["학교명"],
-            "year": profile.get("학년도", "").strip(),
+            # Retained for old consumers as a display value only. Creation takes
+            # its year from the authenticated registry, never this CSV field.
+            "year": current_school_year(),
             "level": profile["학교급"],
             "class_minutes": class_minutes,
             "break_minutes": 10,

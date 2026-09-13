@@ -38,18 +38,24 @@ _PENDING_SCRIPT_TITLE = "pending_script_project_title"
 _PENDING_SCRIPT_RECOVERY_ID = "pending_script_recovery_id"
 _PENDING_SCRIPT_UPLOAD_SHA256 = "pending_script_upload_sha256"
 _PENDING_SCRIPT_VERSION_DESCRIPTION = "pending_script_version_description"
-# Apps Script 제목은 시트 승인 창(동의 화면)에 앱 이름으로 그대로 뜬다.
-# Google 검수(2026-08-11)에 맞춰 마법사·Chat 연결 동의 화면과 같은 이름으로 시작한다.
+# Apps Script titles appear verbatim on Google's consent screen.
+_SCRIPT_DISPLAY_TITLE = "Teacher Manager 출결 자동화"
+# Keep the old pending-record shape locally so interrupted installs still resume.
+# Bound-script recovery verifies the exact script, parent and creator, not its title.
 _SCRIPT_TITLE_PREFIX = "Big-Silver Teacher Manager 출결 자동화 [설치표식 "
 # 이 접두로 만들던 시절에 끊긴 설치 기록을 이어받을 때만 쓴다.
 _LEGACY_SCRIPT_TITLE_PREFIXES = ("출결 신고서 자동화 [설치표식 ",)
 _VERSION_DESCRIPTION_PREFIX = "teacher-manager-attendance-version-"
 ATTENDANCE_CREATION_FIRST_SETUP = "first-setup"
 ATTENDANCE_CREATION_NEW_SCHOOL_YEAR = "new-school-year"
+ATTENDANCE_CREATION_REPLACE_TRASHED = "replace-trashed"
+ATTENDANCE_CREATION_REPLACE_UNAVAILABLE = "replace-unavailable"
 ATTENDANCE_CREATION_REASONS = frozenset(
     {
         ATTENDANCE_CREATION_FIRST_SETUP,
         ATTENDANCE_CREATION_NEW_SCHOOL_YEAR,
+        ATTENDANCE_CREATION_REPLACE_TRASHED,
+        ATTENDANCE_CREATION_REPLACE_UNAVAILABLE,
     }
 )
 _ATTENDANCE_SHEET_CREATION_SEAL = object()
@@ -63,6 +69,8 @@ class _AttendanceSheetCreationAuthorization:
     reason: str
     workbook_name: str
     school_year: str
+    registry_operation: object = None
+    dry_run: bool = False
 
 
 def _pending_script_title_suffix(title: str) -> str:
@@ -122,6 +130,10 @@ class AttendanceInstallResult:
     script_bundle_sha256: str = ""
     workbook_role: str = attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
     setup_account: str = ""
+    school_year: str = ""
+    binding_generation: int = 0
+    subject_key: str = ""
+    monthly_sheet_ids: dict | None = None
 
 
 def default_runner(args: Sequence[str], cwd: Path) -> str:
@@ -200,6 +212,8 @@ def build_config_rows(
     task_list_title: str,
     central_chat: dict[str, str],
     gemini_api_key: str = "",
+    *, school_year: str | int | None = None, binding_generation: int | None = None,
+    subject_key: str = "", month_sheet_ids: dict | None = None,
 ) -> list[list[str]]:
     teacher = profile.get("teacher", {})
     school = profile.get("school", {})
@@ -208,20 +222,20 @@ def build_config_rows(
     grade = str(homeroom.get("grade", "") or "")
     class_number = str(homeroom.get("class", "") or "")
     class_label = f"{grade}-{class_number}" if grade and class_number else ""
-    school_year_value = (
-        str(profile.get("school_year", "") or "").strip()
-        or str(school.get("year", "") or "").strip()
-        or current_school_year()
-    )
+    school_year_value = str(school_year) if school_year is not None else current_school_year()
     return [
         ["설정키", "값", "설명", "예시/필수"],
         ["SCHOOL_NAME", str(school.get("name", "") or ""), "학교명입니다.", "예: ○○고등학교"],
         [
             "SCHOOL_YEAR",
             school_year_value,
-            "이 출석부의 학년도입니다. 티처 매니저 내 정보의 학년도와 맞아야 합니다.",
+            "이 출석부가 사용하는 고정 학년도입니다. 내 정보나 현재 날짜로 바꾸지 않습니다.",
             "자동 입력",
         ],
+        ["ATTENDANCE_PROTOCOL_VERSION", "1" if binding_generation is not None else "", "출석부 연결 확인 규약입니다.", "자동 입력"],
+        ["ATTENDANCE_BINDING_GENERATION", str(binding_generation) if binding_generation is not None else "", "현재 출석부 연결 세대입니다.", "자동 입력"],
+        ["ATTENDANCE_SUBJECT_KEY", subject_key, "확인된 계정에 묶인 출석부 연결입니다.", "자동 입력"],
+        ["ATTENDANCE_MONTH_SHEET_IDS", json.dumps(month_sheet_ids, separators=(",", ":")) if month_sheet_ids else "", "월별 시트의 고정 번호입니다.", "자동 입력"],
         ["GRADE", grade, "담임 학년입니다.", "예: 2"],
         ["CLASS_NUMBER", class_number, "담임 반입니다.", "예: 3"],
         ["CLASS_LABEL", class_label, "학반 표시입니다.", "예: 2-3"],
@@ -234,26 +248,26 @@ def build_config_rows(
         [
             "TEMPLATE_DOC_ID",
             ids["template_doc_id"],
-            "설치 도우미가 자동으로 입력한 Google Docs 템플릿 문서 ID입니다.",
-            "필수",
+            "신고서 양식 연결입니다. Teacher Manager가 자동으로 채웁니다.",
+            "자동 입력 / 필수",
         ],
         [
             "DEST_FOLDER_ID",
             ids["folder_id"],
-            "생성된 신고서가 저장될 Google Drive 폴더 ID입니다.",
-            "자동 입력",
+            "완성한 신고서를 저장할 Google Drive 폴더 연결입니다. Teacher Manager가 자동으로 채웁니다.",
+            "자동 입력 / 필수",
         ],
         ["DEST_FOLDER_NAME", "출결 증빙", "출력 폴더 이름입니다.", "출결 증빙"],
         [
             "TASK_LIST_ID",
             ids["task_list_id"],
-            "출결 미제출 확인에 사용할 Google Tasks 목록 ID입니다.",
-            "자동 입력",
+            "출결 미제출 할 일을 저장할 Google Tasks 목록 연결입니다. Teacher Manager가 자동으로 채웁니다.",
+            "자동 입력 / 할 일 사용 시 필수",
         ],
         ["TASK_LIST_TITLE", task_list_title, "Tasks 목록 이름입니다.", task_list_title],
         ["HOLIDAY_SHEET_NAME", "휴일", "휴일 시트 이름입니다.", "휴일"],
         ["ROSTER_SHEET_NAME", "학생명단", "학생 드롭다운 원본 시트입니다.", "학생명단"],
-        ["STUDENT_DROPDOWN_RANGE", "J2:J200", "드롭다운 시트의 숨은 학생 목록입니다.", "J2:J200"],
+        ["STUDENT_DROPDOWN_RANGE", "J2:J200", "월별 출결표의 학생 선택목록을 만드는 자리입니다.", "프로그램이 자동으로 관리"],
         ["TIMEZONE", "Asia/Seoul", "날짜 표시 시간대입니다.", "Asia/Seoul"],
         [
             "MONTH_SHEET_NAMES",
@@ -261,11 +275,11 @@ def build_config_rows(
             "자동화 대상 월별 입력 시트 이름입니다.",
             "3월부터 2월까지",
         ],
-        ["HOMEROOM_TASK_LIST_ID", homeroom_task_list_id, "조종례시 담임학급 안내사항 Google Tasks 목록 ID입니다.", "담임일 때 자동 입력"],
-        ["CENTRAL_CHAT_SENDER_URL", central_chat["CENTRAL_CHAT_SENDER_URL"], "중앙 Google Chat 발송소 주소입니다. 공개 배포판에서 설정됩니다.", "예: https://chat-sender.example.com"],
-        ["CENTRAL_CHAT_SHEET_ID", central_chat["CENTRAL_CHAT_SHEET_ID"], "이 시트를 중앙 발송소가 구분하는 번호입니다. 자동 생성됩니다.", "자동"],
-        ["CENTRAL_CHAT_SHEET_SECRET", central_chat["CENTRAL_CHAT_SHEET_SECRET"], "이 시트에서 온 요청인지 확인하는 값입니다. 자동 생성됩니다.", "자동"],
-        ["CLASS_CHAT_SPACE_ID", "", "학급 단체방 Google Chat 스페이스 ID입니다.", "교육청 메신저 정리·발송 메뉴에서 선택"],
+        ["HOMEROOM_TASK_LIST_ID", homeroom_task_list_id, "조종례 안내를 저장할 담임학급 Google Tasks 목록 연결입니다.", "담임일 때 자동 입력"],
+        ["CENTRAL_CHAT_SENDER_URL", central_chat["CENTRAL_CHAT_SENDER_URL"], "Google Chat 자동 발송에 필요한 연결 정보입니다.", "프로그램이 자동으로 관리"],
+        ["CENTRAL_CHAT_SHEET_ID", central_chat["CENTRAL_CHAT_SHEET_ID"], "이 출석부의 Google Chat 연결 정보입니다.", "프로그램이 자동으로 관리"],
+        ["CENTRAL_CHAT_SHEET_SECRET", central_chat["CENTRAL_CHAT_SHEET_SECRET"], "이 출석부의 Google Chat 연결을 보호하는 값입니다.", "프로그램이 자동으로 관리"],
+        ["CLASS_CHAT_SPACE_ID", "", "학급 쪽지를 보낼 Google Chat 단톡방 연결입니다.", "Teacher Manager에서 학급 단톡방 선택"],
         ["CLASS_CHAT_SPACE_NAME", "", "선생님이 알아볼 학급 Chat 방 이름입니다.", "예: 2학년 3반"],
         ["CHAT_LOG_SHEET_NAME", "발송기록", "교육청 메신저 발송 기록 시트 이름입니다.", "발송기록"],
         ["PERSONAL_MESSAGE_QUEUE_SHEET_NAME", "메신저 개인톡 내용", "개인에게 보낼 쪽지를 모아두는 시트 이름입니다.", "메신저 개인톡 내용"],
@@ -273,19 +287,19 @@ def build_config_rows(
         [
             "SCRIPT_ID",
             ids["script_id"],
-            "이 시트에 연결된 Apps Script 프로젝트 ID입니다. 설치 기록 파일이 없는 컴퓨터에서도 시트만 열면 스크립트를 찾을 수 있습니다.",
-            "자동 입력",
+            "Teacher Manager가 이 출석부의 자동 기능을 확인할 때 사용하는 연결 정보입니다.",
+            "프로그램이 자동으로 관리",
         ],
         [
             "DEPLOYMENT_ID",
             ids["deployment_id"],
-            "Apps Script API 실행용 배포 ID입니다. 설치 도우미가 자동으로 입력합니다.",
-            "자동 입력",
+            "Teacher Manager가 출석부의 자동 기능을 실행할 때 사용하는 연결 정보입니다.",
+            "프로그램이 자동으로 관리",
         ],
         [
             "GEMINI_API_KEY",
             str(gemini_api_key or "").strip(),
-            "AI 출결 입력이 쓰는 Gemini API 키입니다. 티처 매니저 연결 화면에 넣은 값이 자동으로 들어옵니다.",
+            "AI 출결 입력에 필요한 Gemini 연결 키입니다. Teacher Manager에서 저장한 값이 자동으로 들어옵니다.",
             "자동 입력",
         ],
         # Code.gs의 ATTENDANCE_AI_ALLOWED_SETTING/VALUE와 이름·값이 같아야 한다.
@@ -293,8 +307,8 @@ def build_config_rows(
         [
             "ATTENDANCE_AI_ALLOWED",
             "예",
-            "이 시트에서 1행 AI 출결 입력을 켤 수 있는지입니다. 티처 매니저가 시트를 만들 때 자동으로 넣습니다.",
-            "자동 입력",
+            "이 출석부에서 AI 입력을 사용할 수 있게 하는 값입니다.",
+            "프로그램이 자동으로 관리",
         ],
     ]
 
@@ -551,8 +565,7 @@ def _recover_drive_resource(
 ) -> dict:
     query = (
         f"appProperties has {{ key='{_DRIVE_INTENT_PROPERTY}' and value='{intent}' }} and "
-        f"name = '{name}' and mimeType = '{mime_type}' and "
-        "trashed = false and 'me' in owners"
+        f"mimeType = '{mime_type}' and 'me' in owners"
     )
     candidates = _drive_files_all(
         runner,
@@ -561,7 +574,7 @@ def _recover_drive_resource(
             "q": query,
             "fields": (
                 "nextPageToken,incompleteSearch,"
-                "files(id,name,mimeType,ownedByMe,appProperties,webViewLink,parents)"
+                "files(id,name,mimeType,ownedByMe,trashed,appProperties,webViewLink,parents)"
             ),
             "pageSize": 1000,
             "supportsAllDrives": True,
@@ -572,13 +585,14 @@ def _recover_drive_resource(
         item
         for item in candidates
         if str(item.get("id", "") or "").strip()
-        and item.get("name") == name
         and item.get("mimeType") == mime_type
         and item.get("ownedByMe") is True
         and isinstance(item.get("appProperties"), dict)
         and item["appProperties"].get(_DRIVE_INTENT_PROPERTY) == intent
     ]
     if len(exact) == 1:
+        if exact[0].get("trashed") is True:
+            raise CreationRecoveryPendingError("앞서 만든 자료가 휴지통에 있어요. 원본을 복구해야 하므로 추가로 만들지 않습니다.")
         return exact[0]
     if len(exact) > 1:
         raise CreationRecoveryPendingError(
@@ -722,7 +736,7 @@ def verify_bound_script_recovery(
         and re.fullmatch(r"\s*function\s+myFunction\s*\(\s*\)\s*\{\s*\}\s*", str(starters[0].get("source", "")))
     )
     if not empty:
-        raise ValueError("이미 작성된 자동화 내용이 있어 덮어쓰지 않았어요. 도움 요청으로 확인해 주세요.")
+        raise ValueError("이미 작성된 자동화 내용이 있어 덮어쓰지 않았어요. 기존 자동화 내용을 확인해 주세요.")
     return script_id
 
 
@@ -1141,7 +1155,7 @@ def find_existing_attendance_sheets(
             "q": query,
             "fields": (
                 "nextPageToken,incompleteSearch,"
-                "files(id,name,mimeType,ownedByMe,webViewLink)"
+                "files(id,name,mimeType,ownedByMe,trashed,appProperties,webViewLink,modifiedTime)"
             ),
             "pageSize": 1000,
             "supportsAllDrives": True,
@@ -1242,7 +1256,7 @@ def _connection_choice_message(files: Sequence[dict]) -> str:
         [
             "기존 출결 시트를 찾았어요.",
             "현재 연결을 고르기 전에는 새 시트를 만들지 않습니다.",
-            "Teacher Manager의 [사용할 출석부 고르기]에서 연결 확인번호를 비교해 주세요.",
+            "Teacher Manager의 [사용할 출석부 고르기]에서 파일을 열어 내용을 확인해 주세요.",
             "",
         ]
         + _sheet_lines(files)
@@ -1310,8 +1324,17 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
     profile = load_profile(profile_json)
     school = profile.get("school") or {}
     homeroom = profile.get("homeroom") or {}
+    record_year = str(getattr(result, "school_year", "") or "")
+    if not record_year and record_path.exists():
+        from attendance_install_record import load_attendance_install_record
+        previous = load_attendance_install_record(record_path)
+        if previous.get("spreadsheet_id") == result.spreadsheet_id:
+            record_year = str(previous.get("school_year") or "")
+    if not record_year:
+        raise ValueError("출석부의 확인된 학년도 없이 연결 기록을 저장할 수 없습니다.")
     record = {
         "spreadsheet_id": result.spreadsheet_id,
+        "connection_code": attendance_workbook_identity.attendance_connection_code(result.spreadsheet_id),
         "spreadsheet_url": result.spreadsheet_url,
         "template_doc_id": result.template_doc_id,
         "template_doc_url": result.template_doc_url,
@@ -1319,7 +1342,10 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
         "deployment_id": result.deployment_id,
         "folder_id": result.folder_id,
         "task_list_id": result.task_list_id,
-        "school_year": str(school.get("year", "") or "").strip() or current_school_year(),
+        "school_year": record_year,
+        "binding_generation": result.binding_generation,
+        "binding_protocol_version": 1 if result.subject_key else 0,
+        "subject_key": result.subject_key,
         "homeroom_grade": str(homeroom.get("grade", "") or "").strip(),
         "homeroom_class": str(homeroom.get("class", "") or "").strip(),
         "workbook_name": result.workbook_name,
@@ -1328,6 +1354,8 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
             or attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
         ),
     }
+    if result.monthly_sheet_ids:
+        record["monthly_sheet_ids"] = attendance_sheet_layout.validate_month_sheet_ids(result.monthly_sheet_ids)
     setup_account = str(getattr(result, "setup_account", "") or "").strip().lower()
     if setup_account:
         record["setup_account"] = setup_account
@@ -1340,19 +1368,11 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
         record[SCRIPT_ATTESTATION_FIELD] = build_script_attestation(
             record, script_bundle_sha256
         )
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=".attendance-install-", suffix=".tmp", dir=str(record_path.parent)
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-            file.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-            file.flush()
-            os.fsync(file.fileno())
-        temp_path.replace(record_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    from attendance_install_record import restore_verified_registry_record, write_attendance_install_record
+    if result.subject_key:
+        restore_verified_registry_record(record_path, record)
+    else:
+        write_attendance_install_record(record_path, record)
     return record_path
 
 
@@ -1379,8 +1399,7 @@ def _require_attendance_creation_reason(reason: str) -> str:
     checked = str(reason or "").strip()
     if checked not in ATTENDANCE_CREATION_REASONS:
         raise ValueError(
-            "새 출결 시트를 만들 수 없는 요청입니다. 처음 설정에서 기존 파일이 "
-            "하나도 없을 때와 사용자가 누른 새 학년도 시작에서만 만들 수 있습니다."
+            "확인된 출석부 생성 요청과 일치하지 않아 새 출석부를 만들지 않습니다."
         )
     return checked
 
@@ -1405,10 +1424,28 @@ def _authorize_attendance_sheet_creation(
     creation_reason: str,
     resume: dict | None,
     write_record_on_success: bool,
+    registry_operation=None,
+    dry_run: bool = False,
 ) -> _AttendanceSheetCreationAuthorization:
     """새 Sheet를 허용할 실제 주변 상태를 Google 작업 전에 확인한다."""
 
     reason = _require_attendance_creation_reason(creation_reason)
+    from attendance_binding import RegistryCreationOperation, AttendanceBindingError
+    if isinstance(registry_operation, RegistryCreationOperation):
+        if reason in (ATTENDANCE_CREATION_REPLACE_TRASHED, ATTENDANCE_CREATION_REPLACE_UNAVAILABLE) or registry_operation.operation.get("reason") in (ATTENDANCE_CREATION_REPLACE_TRASHED, ATTENDANCE_CREATION_REPLACE_UNAVAILABLE):
+            if (registry_operation.operation.get("reason") != reason
+                    or not registry_operation.operation.get("previousSpreadsheetId")):
+                raise AttendanceBindingError("ATTENDANCE_SCOPE_CHANGED")
+        registry_operation.authorize_write()
+        return _AttendanceSheetCreationAuthorization(
+            seal=_ATTENDANCE_SHEET_CREATION_SEAL, reason=reason,
+            workbook_name=workbook_name, school_year=str(registry_operation.year),
+            registry_operation=registry_operation,
+        )
+    if not dry_run:
+        raise AttendanceBindingError("ATTENDANCE_AUTH_REQUIRED")
+    if reason in (ATTENDANCE_CREATION_REPLACE_TRASHED, ATTENDANCE_CREATION_REPLACE_UNAVAILABLE):
+        raise AttendanceBindingError("ATTENDANCE_AUTH_REQUIRED")
     config_dir = Path(profile_json).parent
     record_path = config_dir / "attendance-install.generated.json"
     school_year = (
@@ -1465,6 +1502,7 @@ def _authorize_attendance_sheet_creation(
         reason=reason,
         workbook_name=str(workbook_name or "").strip(),
         school_year=school_year,
+        dry_run=True,
     )
 
 
@@ -1475,16 +1513,16 @@ def _require_attendance_sheet_creation_authorization(
     workbook_name: str,
     profile: dict,
 ) -> None:
-    school_year = (
-        str((profile.get("school") or {}).get("year", "") or "").strip()
-        or attendance_workbook_identity.current_school_year()
-    )
+    school_year = getattr(authorization, "school_year", "")
+    if isinstance(authorization, _AttendanceSheetCreationAuthorization) and authorization.registry_operation is not None:
+        authorization.registry_operation.authorize_write()
     if not (
         isinstance(authorization, _AttendanceSheetCreationAuthorization)
         and authorization.seal is _ATTENDANCE_SHEET_CREATION_SEAL
         and authorization.reason == creation_reason
         and authorization.workbook_name == str(workbook_name or "").strip()
         and authorization.school_year == school_year
+        and (authorization.registry_operation is not None or authorization.dry_run)
     ):
         raise ValueError(
             "확인된 최초 설치 또는 새 학년도 시작 흐름이 아니어서 "
@@ -1504,7 +1542,7 @@ def create_canonical_attendance_workbook(
     dry_run: bool,
     gws_executable: str,
 ) -> dict:
-    """확인된 최초 설치와 새 학년도 시작에서만 Google Sheet를 만든다."""
+    """Create a Google workbook only for first setup or a confirmed new school year."""
 
     creation_reason = _require_attendance_creation_reason(creation_reason)
     _require_attendance_sheet_creation_authorization(
@@ -1513,6 +1551,8 @@ def create_canonical_attendance_workbook(
         workbook_name=workbook_name,
         profile=profile,
     )
+    if creation_authorization.registry_operation is not None:
+        runner = creation_authorization.registry_operation.runner(runner)
     dry = ["--dry-run"] if dry_run else []
     sheet = run_json(
         runner,
@@ -1530,7 +1570,7 @@ def create_canonical_attendance_workbook(
                     "appProperties": {
                         _DRIVE_INTENT_PROPERTY: intent,
                         **attendance_workbook_identity.attendance_workbook_app_properties(
-                            profile
+                            profile, school_year=creation_authorization.school_year
                         ),
                     },
                 },
@@ -1573,12 +1613,19 @@ def install_attendance_automation(
     gws_executable: str,
     creation_reason: str = ATTENDANCE_CREATION_FIRST_SETUP,
     write_record_on_success: bool = True,
+    registry_operation=None,
 ) -> AttendanceInstallResult:
     creation_reason = _require_attendance_creation_reason(creation_reason)
     profile_json = Path(profile_json)
     asset_root = bundle_paths.bundle_root() / "assets"
     profile = load_profile(profile_json)
-    workbook_name = attendance_workbook_name(profile)
+    from attendance_binding import RegistryCreationOperation, AttendanceBindingError
+    if not dry_run and not isinstance(registry_operation, RegistryCreationOperation):
+        raise AttendanceBindingError("ATTENDANCE_AUTH_REQUIRED")
+    if not dry_run and write_record_on_success:
+        raise AttendanceBindingError("ATTENDANCE_PUBLICATION_REQUIRED")
+    verified_year = registry_operation.year if registry_operation is not None else current_school_year()
+    workbook_name = attendance_workbook_identity.attendance_workbook_name(profile, school_year=verified_year)
     creation_authorization = _authorize_attendance_sheet_creation(
         profile_json,
         profile,
@@ -1586,6 +1633,8 @@ def install_attendance_automation(
         creation_reason=creation_reason,
         resume=resume,
         write_record_on_success=write_record_on_success,
+        registry_operation=registry_operation,
+        dry_run=dry_run,
     )
     # 지난 시도에서 이미 만든 Google 자료 ID — 있으면 생성 명령을 건너뛴다.
     created_ids: dict[str, str] = {
@@ -1593,10 +1642,13 @@ def install_attendance_automation(
     }
 
     def report_progress() -> None:
+        if registry_operation is not None:
+            registry_operation.reconcile_progress(dict(created_ids))
+            registry_operation.checkpoint(dict(created_ids))
         if progress is not None:
             progress(dict(created_ids))
 
-    original_runner = runner
+    original_runner = registry_operation.runner(runner) if registry_operation is not None else runner
 
     def runner(args, cwd):
         try:
@@ -1605,7 +1657,7 @@ def install_attendance_automation(
             # A rejected request did not perform its write. A timeout, conflict,
             # server error or malformed reply remains ambiguous and must be read
             # back before any repeated creation.
-            if google_error_status(error) in {400, 401, 403, 404, 429}:
+            if registry_operation is None and google_error_status(error) in {400, 401, 403, 404, 429}:
                 keys = rejected_creation_intents(args)
                 changed = any(key in created_ids for key in keys)
                 for key in keys:
@@ -1613,6 +1665,9 @@ def install_attendance_automation(
                 if changed:
                     report_progress()
             raise
+
+    if registry_operation is not None:
+        runner._attendance_registry_operation = registry_operation
 
     with tempfile.TemporaryDirectory(prefix="teacher-attendance-") as temp_name:
         workdir = Path(temp_name)
@@ -1623,6 +1678,7 @@ def install_attendance_automation(
         # 만들지 않고 사용자가 확인하는 한 번의 정리 절차로 넘긴다.
         if (
             creation_reason == ATTENDANCE_CREATION_FIRST_SETUP
+            and registry_operation is None
             and
             not created_ids.get("spreadsheet_id")
             and not created_ids.get(_PENDING_SHEET_INTENT)
@@ -1789,9 +1845,12 @@ def install_attendance_automation(
         # operation can fail. File existence alone is not worksheet readiness.
         if created_ids.get("workbook_layout_ready") != attendance_sheet_layout.LAYOUT_VERSION:
             if not dry_run:
-                attendance_sheet_layout.ensure_layout(
-                    runner, workdir, created_ids["spreadsheet_id"], gws_executable
+                month_ids = attendance_sheet_layout.ensure_layout(
+                    runner, workdir, created_ids["spreadsheet_id"], gws_executable,
+                    month_sheet_ids=json.loads(created_ids["monthly_sheet_ids"]) if created_ids.get("monthly_sheet_ids") else None,
+                    allow_manifest_bootstrap=True,
                 )
+                created_ids["monthly_sheet_ids"] = json.dumps(month_ids, separators=(",", ":"))
             created_ids["workbook_layout_ready"] = attendance_sheet_layout.LAYOUT_VERSION
             report_progress()
         if not created_ids.get("folder_id"):
@@ -1941,14 +2000,14 @@ def install_attendance_automation(
                         runner,
                         [
                             gws_executable, "script", "projects", "create", *dry, "--json",
-                            json.dumps({"title": pending_title, "parentId": created_ids["spreadsheet_id"]}, ensure_ascii=False),
+                            json.dumps({"title": _SCRIPT_DISPLAY_TITLE, "parentId": created_ids["spreadsheet_id"]}, ensure_ascii=False),
                             "--format", "json",
                         ], workdir,
                     )
                 except Exception as error:
                     # A definite rejected request did not create a project. Keep
                     # ambiguity for lost responses, timeouts, conflicts and 5xx.
-                    if google_error_status(error) in {400, 401, 403, 404, 429}:
+                    if registry_operation is None and google_error_status(error) in {400, 401, 403, 404, 429}:
                         created_ids.pop(_PENDING_SCRIPT_TITLE, None)
                         report_progress()
                     raise
@@ -2223,12 +2282,21 @@ def install_attendance_automation(
             created_ids["spreadsheet_id"],
             central_chat_sender_url,
         )
+        config_profile = profile
+        if creation_reason in (ATTENDANCE_CREATION_REPLACE_TRASHED, ATTENDANCE_CREATION_REPLACE_UNAVAILABLE):
+            # Isolate only this new workbook's target. The teacher's saved
+            # profile and the old task list (including its contents) stay intact.
+            config_profile = {**profile, "calendars": {**(profile.get("calendars") or {}), "homeroom_tasks_id": ids["task_list_id"]}}
         config_rows = build_config_rows(
-            profile,
+            config_profile,
             ids,
             str(task_list["title"]),
             central_chat,
             gemini_api_key=gemini_api_key,
+            school_year=verified_year,
+            binding_generation=registry_operation.scope.payload["generation"] + 1 if registry_operation is not None else None,
+            subject_key=registry_operation.scope.payload["subjectKey"] if registry_operation is not None else "",
+            month_sheet_ids=json.loads(created_ids["monthly_sheet_ids"]) if created_ids.get("monthly_sheet_ids") else None,
         )
         values_body = {
             "majorDimension": "ROWS",
@@ -2395,6 +2463,10 @@ def install_attendance_automation(
             task_list_id=created_ids["task_list_id"],
             workbook_name=workbook_name,
             script_bundle_sha256=script_bundle_sha256,
+            school_year=str(verified_year),
+            binding_generation=registry_operation.scope.payload["generation"] + 1 if registry_operation is not None else 0,
+            subject_key=registry_operation.scope.payload["subjectKey"] if registry_operation is not None else "",
+            monthly_sheet_ids=json.loads(created_ids["monthly_sheet_ids"]) if created_ids.get("monthly_sheet_ids") else None,
         )
         if not dry_run and write_record_on_success:
             write_install_record(profile_json, result)

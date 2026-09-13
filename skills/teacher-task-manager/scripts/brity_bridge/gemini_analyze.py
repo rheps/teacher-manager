@@ -94,6 +94,18 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
         "period_times": profile.get("period_times", {}),
         "afternoon_homeroom_times": profile.get("afternoon_homeroom_times", {}),
     }
+    # Pass scheduling inputs only; teacher identity and destination IDs stay local.
+    for section, keys in (
+        ("teacher", ("work_start", "work_end")),
+        ("school", ("morning_homeroom_start", "homeroom_minutes")),
+    ):
+        values = profile.get(section) or {}
+        selected = {key: values[key] for key in keys if values.get(key) is not None}
+        if selected:
+            reference[section] = selected
+    for key in ("free_periods", "weekly_timetable"):
+        if profile.get(key) is not None:
+            reference[key] = profile[key]
     message = {
         "sender": record.sender,
         "sent_at": record.sent_at,
@@ -152,6 +164,8 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
         "  자연스럽게 이어 읽는다.",
         "- homeroom_enabled가 false이면 tasks는 항상 빈 배열이다.",
         "- 기준 정보의 now로 오늘·내일·이번 주 토요일과 일요일을 실제 날짜로 계산한다.",
+        "- 업무 시간 배치는 기준 정보의 현재 free_periods와 시간표, 근무시간, 조회·종례 시간을 적용한다.",
+        "  제공되지 않은 시간 설정은 추측하지 않고 기존 시간 분석 규칙을 따른다.",
         "- tasks의 due는 YYYY-MM-DD로만 쓰고, 기한이 전혀 없으면 빈 문자열로 둔다.",
         "- tasks의 due는 Google Tasks에 날짜를 보내는 값이 아닙니다. 상대 날짜 해석과 중복 확인에만 쓴다.",
         "- 학생이나 학급에게 전달할 안내가 명시적으로 있을 때만 student_notices에 넣는다.",
@@ -593,7 +607,7 @@ def run_gemini_analysis_with_recovery(
 
 
 def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str]:
-    """키 실전 확인 1회 호출. doctor와 대시보드가 같은 함수를 쓴다."""
+    """Check once, with at most two retries for temporary service/transport failure."""
     api_key = (api_key or "").strip()
     if not api_key:
         return "missing", "키가 비어 있음"
@@ -613,14 +627,34 @@ def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str
     ).encode("utf-8")
     url = API_URL_TEMPLATE.format(model=model)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    try:
-        status, _reply = transport(url, headers, body, TIMEOUT_SECONDS)
-    except OSError as error:
-        return "network", str(error)
+    for attempt, delay in enumerate((0.0, 1.0, 2.0)):
+        if delay:
+            time.sleep(delay)
+        try:
+            status, reply = transport(url, headers, body, 10.0)
+        except OSError as error:
+            if attempt < 2:
+                continue
+            return "network", type(error).__name__
+        if status in (500, 502, 503, 504) and attempt < 2:
+            continue
+        break
     if status == 200:
         return "ok", ""
-    if status in (401, 403):
+    try:
+        error = json.loads(reply).get("error", {})
+        invalid_key = any(row.get("reason") in {"API_KEY_INVALID", "API_KEY_EXPIRED"}
+                          for row in error.get("details", []) if isinstance(row, dict))
+    except (ValueError, TypeError, AttributeError):
+        invalid_key = False
+    if status == 401 or invalid_key:
         return "invalid", f"http {status}"
+    if status == 403:
+        return "forbidden", "http 403"
     if status == 429:
         return "rate-limited", "http 429"
-    return "network", f"http {status}"
+    if status == 404:
+        return "model-unavailable", "http 404"
+    if 500 <= status < 600:
+        return "service-unavailable", f"http {status}"
+    return "request-rejected", f"http {status}"

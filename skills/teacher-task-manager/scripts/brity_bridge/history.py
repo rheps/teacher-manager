@@ -1,11 +1,73 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 
 from brity_bridge import atomic_io
+
+
+HISTORY_UNAVAILABLE_DETAIL = (
+    "중복 방지 기록을 안전하게 읽지 못해 Google에 추가 등록하지 않았습니다. "
+    "기존 기록을 지우지 말고 Teacher Manager의 최근 기록과 Google 등록 결과를 확인해 주세요."
+)
+
+
+class HistoryUnavailableError(RuntimeError):
+    """Existing execution evidence cannot safely authorize more writes."""
+
+
+def _unique_history_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("ambiguous history key")
+        result[key] = value
+    return result
+
+
+def _valid_history(raw: object) -> bool:
+    if not isinstance(raw, dict) or not isinstance(raw.get("messages"), dict):
+        return False
+    kinds = ("calendar", "task", "notice")
+    for source, entry in raw["messages"].items():
+        if not isinstance(source, str) or not source or not isinstance(entry, dict):
+            return False
+        if "completed" in entry and type(entry["completed"]) is not bool:
+            return False
+        actions = entry.get("actions", {})
+        intents = entry.get("write_intents", {})
+        if not isinstance(actions, dict) or not isinstance(intents, dict):
+            return False
+        if entry.get("completed") is True and not actions:
+            return False
+        for key, action in actions.items():
+            if not isinstance(key, str) or not key or not isinstance(action, dict):
+                return False
+            kind, google_id = action.get("kind"), action.get("google_id")
+            if kind not in kinds or not isinstance(google_id, str):
+                return False
+            if kind != "notice" and not google_id.strip():
+                return False
+        for key, intent in intents.items():
+            if not isinstance(key, str) or not key or not isinstance(intent, dict):
+                return False
+            if (intent.get("kind") not in kinds
+                    or intent.get("state") not in ("write_started", "confirmed")
+                    or not isinstance(intent.get("intent_hash"), str)
+                    or not intent["intent_hash"]
+                    or not isinstance(intent.get("pre_ids"), list)
+                    or any(not isinstance(item, str) or not item for item in intent["pre_ids"])):
+                return False
+            if "google_id" in intent and not isinstance(intent["google_id"], str):
+                return False
+            if intent["kind"] == "notice" and (
+                not isinstance(intent.get("account"), str) or not intent["account"]
+                or not isinstance(intent.get("spreadsheet_id"), str) or not intent["spreadsheet_id"]
+                or intent.get("target") not in ("personal", "class")
+            ):
+                return False
+    return True
 
 
 class HistoryStore:
@@ -14,39 +76,69 @@ class HistoryStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.data: dict = {"messages": {}}
+        self.load_state = "unloaded"
 
     def load(self) -> None:
         try:
             text = self.path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
+            # Missing primary evidence beside an old backup is not a first run.
+            if self.load_state not in {"unloaded", "new"}:
+                self.load_state = "unavailable"
+                return
+            for evidence in (self.path, self.path.with_name(self.path.name + ".bak")):
+                try:
+                    evidence.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    self.load_state = "unavailable"
+                    return
+                else:
+                    self.load_state = "unavailable"
+                    return
+            self.data = {"messages": {}}
+            self.load_state = "new"
+            return
+        except (OSError, UnicodeError):
+            self.load_state = "unavailable"
             return
         try:
-            raw = json.loads(text)
+            raw = json.loads(text, object_pairs_hook=_unique_history_object)
         except ValueError:
-            # 파손본을 옆으로 치워야 다음 save가 남은 기억(중복 방지 증거)을
-            # 덮어써 영구 소실시키지 않는다. 개인톡 안내는 이 기억이 유일한
-            # 중복 방어선이다.
-            try:
-                os.replace(self.path, self.path.with_name(self.path.name + ".bak"))
-            except OSError:
-                pass
+            self.load_state = "corrupt"
             return
-        if isinstance(raw, dict) and isinstance(raw.get("messages"), dict):
+        if _valid_history(raw):
             self.data = raw
+            self.load_state = "valid"
+        else:
+            self.load_state = "unsupported"
+
+    def require_usable(self) -> None:
+        if self.load_state == "unloaded":
+            self.load()
+        if self.load_state not in {"new", "valid"} or not _valid_history(self.data):
+            raise HistoryUnavailableError(HISTORY_UNAVAILABLE_DETAIL)
 
     def save(self) -> None:
+        self.require_usable()
         atomic_io.atomic_write_text(
             self.path, json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
         )
+        self.load_state = "valid"
 
     def entry(self, source_hash: str) -> dict | None:
+        self.require_usable()
         return self.data["messages"].get(source_hash)
 
     def _ensure_entry(self, source_hash: str) -> dict:
-        return self.data["messages"].setdefault(
+        self.require_usable()
+        entry = self.data["messages"].setdefault(
             source_hash,
             {"when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed": False, "actions": {}},
         )
+        entry.setdefault("actions", {})
+        return entry
 
     def is_completed(self, source_hash: str) -> bool:
         entry = self.entry(source_hash)
@@ -79,6 +171,10 @@ class HistoryStore:
         kind: str,
         pre_ids,
         intent_hash: str,
+        *,
+        account: str = "",
+        spreadsheet_id: str = "",
+        target: str = "",
     ) -> None:
         entry = self._ensure_entry(source_hash)
         intents = entry.setdefault("write_intents", {})
@@ -88,6 +184,10 @@ class HistoryStore:
             "intent_hash": str(intent_hash),
             "state": "write_started",
         }
+        if kind == "notice":
+            intents[action_key].update(
+                account=account, spreadsheet_id=spreadsheet_id, target=target,
+            )
 
     def clear_write_intent(self, source_hash: str, action_key: str) -> None:
         entry = self.entry(source_hash)

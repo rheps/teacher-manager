@@ -15,7 +15,8 @@ import re
 import subprocess
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +24,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brity_bridge import (
+    account_sessions,
     ai_skill_install,
     bundle_paths,
     capture_store,
@@ -41,10 +43,11 @@ from dashboard import engine
 from dashboard import external_url
 from dashboard import problem_guidance
 from dashboard import version
+from attendance_binding import AttendanceBindingClient, AttendanceBindingError
 
 SETUP_STATE_NAME = "setup-state.json"
-SETUP_STATE_VERSION = 2
-SETUP_LAST_STEP = 8
+SETUP_STATE_VERSION = 3
+SETUP_LAST_STEP = 9
 _FRESH_STATE = {
     "version": SETUP_STATE_VERSION,
     "completed": False,
@@ -94,7 +97,7 @@ _SCREEN_FAILURES = {
     "check_attachment_folder": "첨부파일 폴더 상태를 확인하지 못했어요.",
     "attendance_status": "출결 상태를 확인하지 못했어요.",
     "attendance_status_cached": "저장된 출결 상태를 확인하지 못했어요.",
-    "attendance_connection_candidates": "기존 정식 출석부 목록을 확인하지 못했어요.",
+    "attendance_connection_candidates": "기존 출석부 목록을 확인하지 못했어요.",
     "select_attendance_connection": "고른 출석부 연결을 확인하지 못했어요.",
     "select_attendance_connection_by_code": "붙여 넣은 확인번호로 출석부 연결을 확인하지 못했어요.",
     "ensure_attendance": "출결 자료를 준비하지 못했어요.",
@@ -115,13 +118,14 @@ _SCREEN_FAILURES = {
     "google_status": "Google 연결 상태를 확인하지 못했어요.",
     "list_calendars": "캘린더 목록을 가져오지 못했어요.",
     "list_tasklists": "할 일 목록을 가져오지 못했어요.",
-    "gws_login_start": "Google 로그인 준비 파일을 확인하지 못했어요.",
+    "gws_login_start": "Google 로그인을 시작하지 못했어요.",
     "gws_login_status": "Google 로그인 상태를 확인하지 못했어요.",
     "gws_logout": "Google 로그아웃을 마치지 못했어요.",
     "ensure_calendar_named": "캘린더를 만들지 못했어요.",
     "ensure_tasklist_named": "할 일 목록을 만들지 못했어요.",
     "open_logs": "기록 폴더를 열지 못했어요.",
     "open_url": "안전한 https 주소만 열 수 있어요.",
+    "open_picture_guide": "그림 안내를 기본 브라우저에서 열지 못했어요.",
     "retry_capture": "실패한 항목을 다시 처리하지 못했어요.",
 }
 
@@ -143,7 +147,7 @@ class AttendanceScriptRecheckError(ScreenSafeError):
 
 
 class AttendanceScriptChangedOutsideError(ScreenSafeError):
-    """편집본이 프로그램 밖에서 바뀐 결정적 상태 — 되풀이하지 않고 출결 탭·도움 요청을 안내한다."""
+    """편집본이 프로그램 밖에서 바뀐 결정적 상태 — 되풀이하지 않고 출결 탭의 현재 상태 확인을 안내한다."""
 
 
 class _AttendanceRemoteWorkLease:
@@ -177,7 +181,7 @@ def _fail(error, operation: str = "", config_dir=None, reporter=None):
         issue = error.issue
     else:
         message = _SCREEN_FAILURES.get(str(operation or ""), _DEFAULT_SCREEN_FAILURE)
-        if isinstance(error, (ScreenSafeError, gws_env.GwsAccountStorageError)):
+        if isinstance(error, (ScreenSafeError, AttendanceBindingError, gws_env.GwsAccountStorageError, account_sessions.AccountSessionError)):
             # 화면용으로 준비된 문장을 작업 이름 기반 고정 제목으로 덮지 않는다.
             # 준비된 안내를 사람 행동 안내(needs_user)로 그대로 보여 준다.
             issue = _screen_safe_user_issue(error, operation)
@@ -185,7 +189,7 @@ def _fail(error, operation: str = "", config_dir=None, reporter=None):
             issue = recovery.unexpected_final_issue(
                 operation=str(operation or "unknown_operation"),
                 title=message,
-                change_status="확인된 자료는 바꾸지 않았습니다.",
+                change_status="작업 결과를 확인하지 못했어요. 현재 화면과 저장된 자료를 확인해 주세요.",
                 app_version=version.APP_VERSION,
             )
             # 옛 한 문장 응답(error)은 무엇을 못 했는지(제목)로 유지한다.
@@ -195,11 +199,18 @@ def _fail(error, operation: str = "", config_dir=None, reporter=None):
     _record_issue_journal(config_dir, issue, error)
     if reporter is not None:
         try:
-            if reporter(issue, error):
+            report_state = reporter(issue, error)
+            if report_state == "queued":
+                issue = issue.mark_report_queued()
+            elif report_state is True or report_state == "sent":
                 issue = issue.mark_reported()
         except Exception:  # noqa: BLE001 - 보고 실패가 안내를 막으면 안 된다.
             pass
     reply = _issue_reply(issue, error_text=error_text)
+    for cause in _journal_error_chain(error):
+        if isinstance(cause, AttendanceBindingError):
+            reply['issue'].update(engine._attendance_failure_fields(cause))
+            break
     if isinstance(error, external_url.ExternalUrlOpenError):
         reply["error"] = str(error)
         reply["code"] = external_url.NO_EXTERNAL_BROWSER
@@ -266,7 +277,11 @@ def _journal_error_detail(error) -> str:
         central_chat = None
     parts = []
     for current in _journal_error_chain(error):
-        if isinstance(current, (ScreenSafeError, gws_env.GwsAccountStorageError)):
+        if isinstance(current, AttendanceBindingError):
+            status = current.status if type(current.status) is int and 100 <= current.status <= 599 else "unknown"
+            parts.append(f"{current.diagnostic_code}; http_status={status}; failure_domain={current.failure_domain}; "
+                         f"failure_stage={current.failure_stage}; operation={current.operation}: {current}")
+        elif isinstance(current, (ScreenSafeError, gws_env.GwsAccountStorageError)):
             parts.append(str(current))
         elif isinstance(current, recovery.RetryableOperationError):
             parts.append(f"{current.code}: {current.safe_reason}")
@@ -345,7 +360,7 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
     message = str(error).strip()
     if isinstance(error, AttendanceScriptChangedOutsideError):
         # 결정적 상태라 되풀이하지 않는다. 출결 탭에는 누를 버튼이 없으므로
-        # 상태 확인과 도움 요청만 안내한다(2026-09-03).
+        # 현재 상태 확인만 안내한다(2026-09-03).
         return recovery.UserIssue.needs_user(
             operation=str(operation or "attendance_script_changed_outside"),
             title="출결 기능 확인이 필요해요.",
@@ -355,7 +370,7 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
             resume="attendance-tab",
         ).with_guidance(steps=(
             "출결 탭 맨 위 한 줄 안내에서 출결 기능 상태를 확인해 주세요.",
-            "아래 도움 요청을 눌러 주세요. 필요한 정보는 프로그램이 함께 채워요.",
+            "현재 자료와 입력한 값을 그대로 보관해 주세요.",
         ))
     if message == engine.ATTENDANCE_ACCOUNT_MESSAGE:
         return recovery.UserIssue.needs_user(
@@ -409,7 +424,7 @@ def _screen_safe_user_issue(error, operation: str) -> recovery.UserIssue:
         operation=str(operation or "screen_safe_stop"),
         title="확인이 필요해요.",
         message=message or fallback,
-        change_status="확인된 자료는 바꾸지 않았습니다.",
+        change_status="현재 화면과 저장된 자료를 확인해 주세요.",
         actions=(),
     )
 
@@ -464,7 +479,56 @@ def _attendance_workbook_layout_is_current(
         if isinstance(row, list) and len(row) >= 2 and str(row[0] or "").strip()
     }
     roster_name = settings_map.get("ROSTER_SHEET_NAME") or "학생명단"
-    roster = read_values(f"{quote_sheet(roster_name)}!A:D")
+    value_ranges = [
+        f"{quote_sheet(roster_name)}!A:D",
+        "'드롭다운'!J1:J200",
+        "'드롭다운'!G1:G6",
+        "'메신저 개인톡 내용'!G:G",
+        "'메신저 단체톡 내용'!E:E",
+    ]
+    # The settings determine the roster name. The remaining values can be read
+    # together, with the same formatted row values used by individual GETs.
+    batch = _run_one_json(
+        runner,
+        [
+            gws, "sheets", "spreadsheets", "values", "batchGet", "--params",
+            json.dumps(
+                {
+                    "spreadsheetId": spreadsheet,
+                    "ranges": value_ranges,
+                    "majorDimension": "ROWS",
+                    "valueRenderOption": "FORMATTED_VALUE",
+                },
+                ensure_ascii=False,
+            ),
+            "--format", "json",
+        ],
+        Path(workdir),
+    )
+    replies = batch.get("valueRanges") if isinstance(batch, dict) else None
+    if (
+        not isinstance(batch, dict)
+        or batch.get("spreadsheetId") != spreadsheet
+        or not isinstance(replies, list)
+        or len(replies) != len(value_ranges)
+    ):
+        raise ValueError("출석부의 읽기 결과를 모두 확인하지 못했어요.")
+    values_by_range = {}
+    # Sheets returns one entry per requested range, in the requested order.
+    # An empty range omits `values`; it must still retain its position.
+    for requested_range, reply in zip(value_ranges, replies):
+        if (
+            not isinstance(reply, dict)
+            or not isinstance(reply.get("range"), str)
+            or not reply["range"].strip()
+            or reply.get("majorDimension", "ROWS") != "ROWS"
+        ):
+            raise ValueError("출석부의 읽기 범위를 확인하지 못했어요.")
+        values = reply.get("values", [])
+        if not isinstance(values, list) or any(not isinstance(row, list) for row in values):
+            raise ValueError("출석부의 읽기 결과 모양을 확인하지 못했어요.")
+        values_by_range[requested_range] = values
+    roster = values_by_range[value_ranges[0]]
 
     def row4(row) -> list[str]:
         values = [str(value or "").strip() for value in list(row or [])[:4]]
@@ -480,7 +544,7 @@ def _attendance_workbook_layout_is_current(
         return False
 
     combined = [row[0] + row[1] for row in rows[1:] if row[0] and row[1]]
-    if first_column(read_values("'드롭다운'!J1:J200")) != [
+    if first_column(values_by_range["'드롭다운'!J1:J200"]) != [
         "학생_번호이름",
         *combined,
     ]:
@@ -489,7 +553,7 @@ def _attendance_workbook_layout_is_current(
         return False
 
     queue_status_options = ["대기", "발송중", "제외", "보냄", "실패"]
-    if first_column(read_values("'드롭다운'!G1:G6")) != [
+    if first_column(values_by_range["'드롭다운'!G1:G6"]) != [
         "쪽지_상태",
         *queue_status_options,
     ]:
@@ -498,17 +562,18 @@ def _attendance_workbook_layout_is_current(
         "'메신저 개인톡 내용'!G:G",
         "'메신저 단체톡 내용'!E:E",
     ):
-        if "확인필요" in first_column(read_values(status_range)):
+        if "확인필요" in first_column(values_by_range[status_range]):
             return False
 
-    month_names = [
-        value.strip()
-        for value in settings_map.get(
-            "MONTH_SHEET_NAMES",
-            "3월,4월,5월,6월,7월,8월,9월,10월,11월,12월,1월,2월",
-        ).split(",")
-        if value.strip()
-    ]
+    from attendance_sheet_layout import validate_month_sheet_ids, resolve_month_sheets
+    try:
+        month_ids = validate_month_sheet_ids(json.loads(settings_map.get("ATTENDANCE_MONTH_SHEET_IDS", "")))
+        snapshot = _run_one_json(runner, [gws, "sheets", "spreadsheets", "get", "--params",
+            json.dumps({"spreadsheetId": spreadsheet, "fields": "sheets(properties(sheetId,title))"}), "--format", "json"], Path(workdir))
+        resolved_months = resolve_month_sheets(snapshot, month_ids)
+        month_names = [item["properties"]["title"] for item in resolved_months.values()]
+    except (ValueError, TypeError, KeyError):
+        return False
     validation_ranges = [f"{quote_sheet(name)}!B3" for name in month_names]
     validation_ranges.extend(
         ["'메신저 개인톡 내용'!G2", "'메신저 단체톡 내용'!E2"]
@@ -526,7 +591,7 @@ def _attendance_workbook_layout_is_current(
                     "spreadsheetId": spreadsheet,
                     "ranges": validation_ranges,
                     "includeGridData": True,
-                    "fields": "sheets(properties(title),data(rowData(values(dataValidation))))",
+                    "fields": "sheets(properties(sheetId,title),data(rowData(values(dataValidation))))",
                 },
                 ensure_ascii=False,
             ),
@@ -535,6 +600,10 @@ def _attendance_workbook_layout_is_current(
         ],
         Path(workdir),
     )
+    try:
+        resolve_month_sheets(validation_state, month_ids)
+    except (ValueError, TypeError, KeyError):
+        return False
     validations = {}
     for item in validation_state.get("sheets", []) if isinstance(validation_state, dict) else []:
         title = str(((item.get("properties") or {}).get("title")) or "")
@@ -704,13 +773,14 @@ def _migrate_attendance_roster_layout(
         if title:
             sheet_properties[title] = props
 
-    month_names = [
-        value.strip()
-        for value in settings_map.get(
-            "MONTH_SHEET_NAMES", "3월,4월,5월,6월,7월,8월,9월,10월,11월,12월,1월,2월"
-        ).split(",")
-        if value.strip()
-    ]
+    from attendance_sheet_layout import validate_month_sheet_ids, resolve_month_sheets, ensure_layout
+    try:
+        month_ids = validate_month_sheet_ids(settings_map.get("ATTENDANCE_MONTH_SHEET_IDS", ""))
+        resolved_months = resolve_month_sheets(metadata, month_ids)
+        month_names = [sheet["properties"]["title"] for sheet in resolved_months.values()]
+        ensure_layout(runner, Path(workdir), spreadsheet, gws, month_sheet_ids=month_ids)
+    except (ValueError, TypeError, KeyError):
+        return False
     required_sheets = month_names + [personal_sheet, class_sheet]
     if any(name not in sheet_properties for name in required_sheets):
         return False
@@ -918,7 +988,7 @@ def _migrate_attendance_roster_layout(
                     "spreadsheetId": spreadsheet,
                     "ranges": validation_ranges,
                     "includeGridData": True,
-                    "fields": "sheets(properties(title),data(rowData(values(dataValidation))))",
+                    "fields": "sheets(properties(sheetId,title),data(rowData(values(dataValidation))))",
                 },
                 ensure_ascii=False,
             ),
@@ -970,19 +1040,138 @@ def _migrate_attendance_roster_layout(
     return True
 
 
+_SESSION_TRANSITIONS = frozenset({
+    "google_status", "gws_login_start", "gws_login_status", "gws_login_cancel",
+    "gws_logout", "get_app_info",
+})
+_SESSION_GLOBAL = _SESSION_TRANSITIONS | frozenset({
+    "get_update_info", "update_offer", "decline_update", "start_update", "quit_app",
+    "computer_status", "network_status", "gws_update_status", "install_gws_update",
+    "gws_repair_oauth_client", "open_url", "open_picture_guide", "open_support_email", "open_logs",
+    "ai_tools_status", "ai_node_status", "ai_node_prepare", "ai_skills_install",
+    "restart_helper", "pause_helper_hotkey", "resume_helper_hotkey",
+})
+_SESSION_EMPTY_READS = frozenset({
+    "read_profile", "read_grid", "get_messenger_settings", "attendance_status_cached",
+    "recent_captures", "capture_history_page", "capture_progress",
+})
+_SESSION_GOOGLE_WORK = frozenset({
+    "list_calendars", "list_tasklists", "google_target_statuses", "verify_google_target_candidate",
+    "ensure_calendar_named", "ensure_tasklist_named", "ensure_attendance", "start_new_attendance",
+    "attendance_prepare_start", "attendance_prepare_resume", "attendance_script_update_apply", "attendance_script_update_resume",
+    "attendance_chat_connect", "attendance_chat_set_space", "attendance_chat_create_space",
+    "select_attendance_connection", "select_attendance_connection_by_code",
+    "apply_all", "save_profile_grid", "save_gemini", "sync_roster_editor",
+})
+
+
+_SESSION_READS = _SESSION_EMPTY_READS | frozenset({
+    "home_checks", "attendance_status", "attendance_connection_candidates",
+    "attendance_prepare_status", "attendance_first_setup_status", "attendance_roster_status",
+    "attendance_script_update_status", "attendance_chat_status", "attendance_chat_spaces",
+    "list_calendars", "list_tasklists", "google_target_statuses", "verify_google_target_candidate",
+    "verify_gemini_key", "probe_hotkey", "check_attachment_folder", "choose_attachment_folder",
+    "open_attendance_chat", "open_attendance_script_settings", "open_attendance_roster",
+    "open_current_attendance",
+})
+
+
 def guarded(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        request_token = None
+        request_dir = None
+        capture_gate = None
+        previous_dir = getattr(self._session_context, "config_dir", None)
+        previous_observed = getattr(self._session_context, "observed", None)
+        name = method.__name__
         try:
-            return _ok(method(self, *args, **kwargs))
-        except Exception as error:  # noqa: BLE001 - JS에는 한국어 한 문장만 보낸다
-            return _fail(
-                error,
-                method.__name__,
-                getattr(self, "_config_dir", None),
-                getattr(self, "_report_issue", None),
-            )
+            if name == "retry_capture":
+                if not self._capture_retry_lock.acquire(blocking=False):
+                    raise ScreenSafeError("다른 실패 기록을 다시 처리하고 있어요. 끝난 뒤 눌러 주세요.")
+                capture_gate = self._capture_retry_lock
+            expected = getattr(self._session_context, "expected", None)
+            # A duplicate preparation request only observes an already owned worker.
+            # Taking its write/session lock here would wait for it to stop and could
+            # inadvertently start it again. The snapshot checks account fencing twice.
+            if name in ('attendance_prepare_start', 'attendance_prepare_resume', 'start_new_attendance'):
+                snapshot = self._running_attendance_snapshot(expected)
+                if snapshot is not None:
+                    receipt = snapshot['data']['status'].get('attendance_action') or {}
+                    requested = args[0] if args and name != 'attendance_prepare_start' else None
+                    if requested:
+                        fields = ('subjectKey', 'expectedSchoolYear', 'expectedGeneration', 'previousSpreadsheetId', 'idempotencyKey', 'operationId')
+                        if any(key in requested and requested.get(key) != receipt.get(key) for key in fields):
+                            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                    if name == 'start_new_attendance':
+                        snapshot['data'] = snapshot['data']['status']
+                    else:
+                        snapshot['data'].update(started=True, reason='이미 준비하는 중이에요')
+                    return snapshot
+            # Status is observable while a write runs. Only writes exclude
+            # credential changes; per-operation duplicate locks remain in place.
+            writes = name not in _SESSION_READS and name not in _SESSION_GLOBAL
+            credential_change = name in {"gws_login_start", "gws_login_cancel", "gws_logout"}
+            lock = account_sessions.session_lock(self._account_root, timeout=self._session_timeout()) if writes or credential_change else nullcontext()
+            with lock:
+                try:
+                    state = account_sessions.read_state(self._account_root)
+                    request_token = (state["account"], state["generation"])
+                    request_dir = account_sessions.active_config_dir(self._account_root, state)
+                except account_sessions.AccountSessionStorageError:
+                    if name not in {"google_status", "gws_login_start", "gws_login_status", "gws_login_cancel"}:
+                        raise
+                    state = {"managed": True, "phase": "unavailable"}
+                    request_dir = self._account_root
+                self._session_context.config_dir = request_dir
+                self._session_context.observed = request_token
+                if name not in {"google_status", "get_app_info"} and expected is not None and tuple(expected) != request_token:
+                    raise account_sessions.AccountSessionError()
+                if name not in _SESSION_GLOBAL:
+                    if self._local_settings_error and self._local_settings_error_token == request_token:
+                        raise account_sessions.AccountSessionError(self._local_settings_error)
+                    known = self._verified_google_account
+                    if known and state.get("managed") and known != state.get("account"):
+                        raise account_sessions.AccountSessionError("이 컴퓨터에 새 계정 설정을 저장하지 못했어요. 설정의 저장 폴더 안내를 확인해 주세요.")
+                    if state.get("managed") and state.get("phase") != "active":
+                        if name in _SESSION_EMPTY_READS and state.get("phase") == "signed_out":
+                            return self._signed_out_read(name, request_token)
+                        if name not in _SESSION_READS:
+                            raise account_sessions.AccountSessionError("설정에서 Google 연결을 확인한 뒤 다시 진행해 주세요.")
+                if state.get("managed") and name in _SESSION_GOOGLE_WORK:
+                    run, gws = self._resolve_gws_or_fail()
+                    current = engine.require_goedu_gws_session(run, gws)
+                    self._assert_current_session_account(current)
+                result = _ok(method(self, *args, **kwargs))
+                try:
+                    current_token = account_sessions.token(self._account_root)
+                except account_sessions.AccountSessionStorageError:
+                    if name not in _SESSION_TRANSITIONS:
+                        raise
+                    current_token = request_token or ("", "")
+                if name not in {"google_status", "gws_login_start", "gws_login_status", "gws_logout"} and current_token != request_token:
+                    raise account_sessions.AccountSessionError()
+                local_problem = self._local_settings_error and self._local_settings_error_token == request_token
+                empty_problem_bootstrap = name == "get_app_info" and bool(result.get("data", {}).get("local_settings_error"))
+                if local_problem and (name not in _SESSION_GLOBAL or (name == "get_app_info" and not empty_problem_bootstrap)):
+                    raise account_sessions.AccountSessionError(self._local_settings_error)
+                result["session"] = list(current_token)
+                return result
+        except Exception as error:  # noqa: BLE001 - JS에는 사람이 읽을 안내만 보낸다
+            if request_token is not None and not isinstance(error, account_sessions.AccountSessionError):
+                try:
+                    if request_token == account_sessions.token(self._account_root):
+                        return _fail(error, name, request_dir, self._report_issue)
+                except account_sessions.AccountSessionError:
+                    pass
+            return _fail(error, name)
+        finally:
+            self._session_context.config_dir = previous_dir
+            self._session_context.observed = previous_observed
+            if capture_gate is not None:
+                capture_gate.release()
 
+    wrapper._session_guarded = True
     return wrapper
 
 
@@ -998,6 +1187,7 @@ class BridgeDeps:
     home_check_deps: object = None
     apply_deps: object = None
     attendance_deps: object = None
+    attendance_binding_client: object = None
     helper_restart: object = None
     helper_window_exists: object = None
     recovery_sleeper: object = None
@@ -1056,7 +1246,12 @@ class BridgeDeps:
 
 class Api:
     def __init__(self, config_dir, deps: BridgeDeps | None = None):
-        self._config_dir = Path(config_dir)
+        self._account_root = account_sessions.root_config_dir(config_dir)
+        self._session_context = threading.local()
+        self._session_identity_available = None
+        self._verified_google_account = None
+        self._local_settings_error = ""
+        self._local_settings_error_token = None
         self._deps = deps or BridgeDeps()
         self._login = engine.LoginSession()
         self._gws_update_offer = None
@@ -1072,12 +1267,109 @@ class Api:
         self._attendance_prepare_thread = None
         self._attendance_prepare_result = None
         self._attendance_prepare_issue = None
+        self._attendance_prepare_token = None
         # 완료 확인 폴링용 gws 경로 캐시 — 3초 폴마다 resolve_gws(동봉본 SHA-256 검증
         # + 판 확인 실행)를 통째로 다시 돌리지 않는다(검토 C7). 승인된 갱신을 설치하면
         # 실행 파일이 바뀔 수 있어 install_gws_update 성공 시 비운다.
         self._attendance_gws_cache = None
+        self._attendance_binding = self._deps.attendance_binding_client
+        from attendance_session_store import AttendanceSessionStore
+        self._attendance_session_store = AttendanceSessionStore(self._config_dir)
+        self._attendance_revocation_unconfirmed = False
         self._support_mail_opener = self._deps.support_mail_opener
         self._error_report_flush_lock = threading.Lock()
+
+    @property
+    def _config_dir(self):
+        pinned = getattr(self._session_context, "config_dir", None)
+        return pinned if pinned is not None else account_sessions.active_config_dir(self._account_root)
+
+    def _signed_out_read(self, name, token):
+        empty = {
+            "read_profile": {}, "read_grid": [], "get_messenger_settings": {},
+            "attendance_status_cached": asdict(engine.AttendanceStatus(state="not_ready")),
+            "recent_captures": [], "capture_history_page": {"items": [], "total": 0, "page": 1},
+            "capture_progress": {},
+        }
+        return {"ok": True, "data": empty[name], "session": list(token)}
+
+    def _session_timeout(self):
+        configured = self._deps.attendance_remote_work_timeout_seconds
+        return 10.0 if configured is None else max(0.01, float(configured))
+
+    def account_call(self, name, args, expected_token=None):
+        """Bind a screen request to its displayed account before any mutation."""
+        target = getattr(self, str(name), None) if isinstance(name, str) and not name.startswith("_") else None
+        if not callable(target) or not getattr(target, "_session_guarded", False) or not isinstance(args, list):
+            return _fail(ScreenSafeError("이 화면의 작업을 확인하지 못했어요."), "account_call")
+        if expected_token is not None and (
+            not isinstance(expected_token, list) or len(expected_token) != 2
+            or not all(isinstance(value, str) for value in expected_token)
+        ):
+            return _fail(ScreenSafeError("현재 Google 계정을 다시 확인해 주세요."), str(name))
+        self._session_context.expected = expected_token
+        try:
+            return target(*args)
+        finally:
+            self._session_context.expected = None
+
+    def _assert_current_session_account(self, account):
+        state = account_sessions.read_state(self._config_dir)
+        if state.get("managed") and (
+            state.get("phase") != "active"
+            or str(state.get("account") or "").casefold() != str(account or "").strip().casefold()
+        ):
+            raise ScreenSafeError("Google 계정이 바뀌었어요. 설정에서 Google 연결을 다시 확인해 주세요.")
+
+    def _reset_account_results(self):
+        self._attendance_prepare_thread = None
+        self._attendance_prepare_token = None
+        self._attendance_prepare_result = None
+        self._attendance_prepare_issue = None
+        self._attendance_gws_cache = None
+        client = self._attendance_binding_client()
+        if isinstance(client, AttendanceBindingClient):
+            self._attendance_revocation_unconfirmed = not client.clear(revoke=True)
+            self._attendance_binding = None
+            from attendance_session_store import AttendanceSessionStore
+            self._attendance_session_store = AttendanceSessionStore(account_sessions.active_config_dir(self._account_root))
+        else:
+            client.clear()
+
+    def _attendance_binding_client(self):
+        if self._attendance_binding is None:
+            self._attendance_binding = AttendanceBindingClient(
+                engine.install_attendance_automation.resolve_central_chat_sender_url(),
+                session_store=self._attendance_session_store,
+            )
+        return self._attendance_binding
+
+    def _attendance_registry_deps(self):
+        deps = self._deps.attendance_deps or engine.AttendanceDeps(run_command=self._attendance_remote_run())
+        return replace(deps, binding_client=self._attendance_binding_client())
+
+    @guarded
+    def attendance_account_authorize(self):
+        _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+        subject_hint = ""
+        try:
+            from attendance_install_record import read_verified_canonical_record
+            record = read_verified_canonical_record(paths.attendance_install_record_path(self._config_dir))
+            if str(record.get("setup_account") or "").casefold() == account.casefold():
+                subject_hint = str(record.get("subject_key") or "")
+        except (ValueError, OSError):
+            pass
+        result = self._attendance_binding_client().begin_authorization(account, expected_subject_key=subject_hint)
+        # Only this explicit action opens consent; status reads never navigate.
+        opened = self._open_external_url(result["auth_url"])
+        if not isinstance(opened, dict) or opened.get("opened") is not True:
+            raise ScreenSafeError("Google 권한 승인 화면을 열지 못했어요. 기본 브라우저 설정을 확인해 주세요.")
+        return {"state": result["state"], "expires_at": result.get("expires_at")}
+
+    @guarded
+    def attendance_account_authorization_status(self):
+        _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+        return self._attendance_binding_client().authorization_status(account)
 
     def _open_external_url(self, url) -> dict:
         return external_url.open_external_url(
@@ -1106,7 +1398,7 @@ class Api:
         )
 
     def _migrate_state(self, state: dict) -> tuple[dict, bool]:
-        """Keep saved input while mapping old progress to the eight-step flow."""
+        """Keep saved input while mapping old progress to the nine-step flow."""
 
         merged = self._fresh_state()
         merged.update(state)
@@ -1121,6 +1413,17 @@ class Api:
             except (TypeError, ValueError):
                 number = default
             return max(1, min(SETUP_LAST_STEP, number))
+
+        if saved_version == 2:
+            def insert_roster(value):
+                old = min(8, bounded_step(value))
+                return old + 1 if old >= 6 else old
+            merged["step"] = insert_roster(merged.get("step"))
+            merged["max_step"] = max(merged["step"], insert_roster(merged.get("max_step")))
+            merged["version"] = SETUP_STATE_VERSION
+            if merged.get("completed"):
+                merged["step"] = merged["max_step"] = SETUP_LAST_STEP
+            return merged, True
 
         if saved_version >= SETUP_STATE_VERSION:
             if bool(merged.get("completed")):
@@ -1149,7 +1452,8 @@ class Api:
                 # Incomplete legacy setup returns to Google connection, which now
                 # includes student preparation and the first-setup completion gate.
                 return SETUP_LAST_STEP - 1
-            return _V1_STEP_TO_V2.get(max(1, old), 1)
+            mapped = _V1_STEP_TO_V2.get(max(1, old), 1)
+            return mapped + 1 if mapped >= 6 else mapped
 
         merged["version"] = SETUP_STATE_VERSION
         merged["step"] = move(merged.get("step"))
@@ -1191,9 +1495,23 @@ class Api:
 
     @guarded
     def get_app_info(self):
-        state = self._load_state()
+        session = account_sessions.read_state(self._config_dir)
+        local_problem = self._local_settings_error if self._local_settings_error_token == (session.get("account"), session.get("generation")) else ""
+        verified = (self._session_identity_available is True and session.get("phase") == "active"
+                    and self._verified_google_account == session.get("account") and not local_problem)
+        inactive = not verified
+        state = self._fresh_state() if inactive else self._load_state()
+        if inactive:
+            # An empty first installation still begins with its introduction.
+            # Existing saved data stays hidden until identity is established.
+            if session.get("managed") or paths.profile_path(self._config_dir).exists() or self._state_path().exists():
+                state.update(step=2, max_step=2)
+        elif session.get("managed") and not state["completed"]:
+            state["step"] = max(3, state["step"])
+            state["max_step"] = max(3, state.get("max_step", 1))
         # 켤 때 못 보낸 오류 보고가 남아 있으면 이 기회에 다시 보낸다(화면을 막지 않음).
-        self._start_error_report_flush()
+        if not inactive:
+            self._start_error_report_flush()
         return {
             "version": version.APP_VERSION,
             "branding": dict(version.BRANDING),
@@ -1201,6 +1519,8 @@ class Api:
             "step": state["step"],
             "max_step": int(state.get("max_step") or state["step"]),
             "draft": state["draft"],
+            "account_session": session.get("phase", "legacy"),
+            "local_settings_error": local_problem,
             "features": {
                 "ai_skill_install_enabled": engine.ai_skill_install_enabled(),
                 "attendance_ui_enabled": engine.attendance_ui_enabled(),
@@ -1669,6 +1989,13 @@ class Api:
             deps = engine.HomeCheckDeps(
                 doctor_deps=engine.DoctorDeps(run_command=self._run())
             )
+        def attendance_probe():
+            result = self.attendance_status()
+            if result.get("ok") is False:
+                return engine.AttendanceStatus(state="verification-unavailable", detail="현재 출결 상태를 확인하지 못했어요.")
+            value = result.get("data", result)
+            return engine.AttendanceStatus(**{key: val for key, val in value.items() if key in engine.AttendanceStatus.__dataclass_fields__})
+        deps = replace(deps, binding_client=self._attendance_binding_client(), attendance_status_probe=attendance_probe)
         results = self._local_read(
             "home_checks", "이 컴퓨터의 점검 내용을 읽지 못했어요.",
             lambda: engine.home_checks(self._config_dir, deps=deps),
@@ -1684,6 +2011,7 @@ class Api:
         status_value = engine.read_attendance_status(
             self._config_dir,
             self._attendance_remote_run(),
+            binding_client=self._attendance_binding_client(),
         )
         if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
             return asdict(status_value)
@@ -1737,17 +2065,40 @@ class Api:
                 except recovery.FinalOperationFailure:
                     layout_current = None
             layout_unreadable = layout_current is None
-            if layout_current is not True:
-                status["state"] = (
-                    "script-update-required"
-                    if layout_current is False
-                    else "script-check-required"
-                )
-                status["detail"] = (
-                    _ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE
-                    if layout_current is False
-                    else engine.ATTENDANCE_SCRIPT_CHECK_REQUIRED_MESSAGE
-                )
+            if layout_current is False:
+                status["state"] = "script-update-required"
+                status["detail"] = _ATTENDANCE_WORKBOOK_LAYOUT_UPDATE_MESSAGE
+            elif layout_unreadable:
+                # Ownership/access was checked above. A layout read failure is
+                # not evidence that the workbook or its script is outdated.
+                status["layout_check"] = "unavailable"
+                status["state"] = "verification-unavailable"
+                status["verification_state"] = "UNVERIFIED"
+                status["automation_state"] = "BLOCKED"
+                status["creation_allowed"] = False
+                status["detail"] = "현재 출석부 상태를 확인하지 못했어요. 기존 자료와 연결 기록은 그대로입니다."
+        if status.get("state") == "ready" and (status.get("write_allowed") is not True or status.get("automation_state") not in ("AUTHORIZED", "READY")):
+            status.update(state="verification-unavailable", automation_state="BLOCKED",
+                          detail="현재 출석부의 쓰기 권한을 확인하지 못했어요. 파일 권한을 다시 확인해 주세요.")
+        if status.get("state") == "ready" and status.get("initial_setup_required"):
+            status.update(state="initial-setup-required", automation_state="BLOCKED",
+                          detail="출석부에서 처음 설정을 한 번 마쳐 주세요.")
+        if status.get("state") == "ready":
+            from attendance_ai_setup import inspect_attendance_ai_setup
+            inspector = self._deps.attendance_ai_inspector or inspect_attendance_ai_setup
+            try:
+                ai = inspector(runner=self._attendance_script_runner(), workdir=self._config_dir,
+                    gws_executable=gws, spreadsheet_id=record["spreadsheet_id"])
+            except Exception:
+                ai = None
+            if ai is None or getattr(ai, "state", "") == "unavailable":
+                status.update(state="verification-unavailable", verification_state="UNVERIFIED", automation_state="BLOCKED",
+                              detail="출석부의 현재 설정 완료 표시를 읽지 못했어요. 기존 자료는 그대로입니다.")
+            elif not self._attendance_ai_setup_is_current(ai):
+                status.update(state="ai-action-required", automation_state="BLOCKED",
+                              detail="출석부에서 처음 설정 완료 상태를 확인해 주세요.")
+            else:
+                status["automation_state"] = "READY"
         # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다. 시트를 읽지 못해
         # 알 수 없는 상태는 저장하지 않는다 — 다음 실행에서 옛 정상 저장본이 먼저 보인다.
         if not layout_unreadable:
@@ -1757,85 +2108,32 @@ class Api:
     @guarded
     def attendance_status_cached(self):
         """켠 직후 화면이 먼저 집는 저장본 — 없으면 None(화면이 확인 문구를 보인다)."""
-        return engine.load_attendance_status_cache(self._config_dir)
+        saved = engine.load_attendance_status_cache(self._config_dir)
+        if saved is not None:
+            saved = dict(saved)
+            saved.update(state="verification-unavailable", verification_state="UNVERIFIED",
+                         automation_state="BLOCKED", creation_allowed=False, replacement_allowed=False,
+                         replacement_previous_spreadsheet_id="", replacement_request_key="", replacement_operation_id="", year_verified=False,
+                         initial_setup_required=False, roster_input_required=False, can_edit=None, write_allowed=False,
+                         detail="이전에 확인한 출석부 정보입니다. 현재 상태를 다시 확인합니다.")
+        return saved
 
     @guarded
     def attendance_connection_candidates(self):
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        return asdict(
-            self._attendance_operation(
-                "attendance_connection_candidates",
-                "기존 정식 출석부 목록을 확인하지 못했어요.",
-                lambda: engine.attendance_connection_candidates(
-                self._config_dir,
-                deps=deps,
-                include_row_counts=False,
-                ),
-            )
-        )
+        return {"state": "recovery-required", "candidates": [], "detail": "출석부는 현재 계정의 확인된 연결로 자동 복구합니다. 여러 파일이나 확인번호로 연결을 바꿀 수 없습니다."}
 
     @guarded
     def select_attendance_connection(self, spreadsheet_id):
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        result = self._attendance_operation(
-            "select_attendance_connection",
-            "고른 출석부 연결을 확인하지 못했어요.",
-            lambda: engine.select_attendance_connection(
-                self._config_dir, str(spreadsheet_id or ""), deps=deps
-            ),
-        )
-        if result.state == "selected":
-            try:
-                (self._config_dir / engine.ATTENDANCE_STATUS_CACHE_NAME).unlink()
-            except OSError:
-                # 정본 선택은 이미 원자 교체로 끝났다. 옛 화면 저장본을 치우지
-                # 못했다는 이유로 선택 성공을 실패처럼 돌려주지 않는다. 저장본은
-                # 다음 읽기에서 현재 정본 URL과 대조되어 맞지 않으면 버려진다.
-                pass
-        return asdict(result)
+        return {"state": "recovery-required", "candidates": [], "detail": "출석부는 현재 계정의 확인된 연결로 자동 복구합니다. 여러 파일이나 확인번호로 연결을 바꿀 수 없습니다."}
 
     @guarded
     def select_attendance_connection_by_code(self, connection_code):
-        """붙여 넣은 확인번호를 정식 후보 하나와 대조해 현재 연결을 바꾼다."""
-
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        def action():
-            return engine.select_attendance_connection_by_code(
-                self._config_dir, str(connection_code or ""), deps=deps
-            )
-        checked_code = str(connection_code or "").strip().upper()
-        if re.fullmatch(r"TM-[0-9A-F]{6}-[0-9A-F]{6}", checked_code) is None:
-            # 모양이 틀린 번호는 선생님이 바로 고칠 일이다. Google 재시도로
-            # 바꾸거나 공통 문제 화면으로 보내지 않는다.
-            result = action()
-        else:
-            result = self._attendance_operation(
-                "select_attendance_connection_by_code",
-                "확인번호로 출석부 연결을 확인하지 못했어요.",
-                action,
-            )
-        if result.state == "selected":
-            try:
-                (self._config_dir / engine.ATTENDANCE_STATUS_CACHE_NAME).unlink()
-            except OSError:
-                pass
-        return asdict(result)
+        return {"state": "recovery-required", "candidates": [], "detail": "출석부는 현재 계정의 확인된 연결로 자동 복구합니다. 여러 파일이나 확인번호로 연결을 바꿀 수 없습니다."}
 
     @guarded
     def ensure_attendance(self):
         self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
+        deps = self._attendance_registry_deps()
         status = asdict(self._attendance_operation(
             "ensure_attendance",
             "출결 자료를 준비하지 못했어요.",
@@ -1846,24 +2144,21 @@ class Api:
             engine.save_attendance_status_cache(self._config_dir, status)
         return status
 
-    @guarded
-    def start_new_attendance(self):
-        self._require_safe_gws_account_storage()
-        deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
-        status = asdict(self._attendance_operation(
-            "start_new_attendance",
-            "새 학년도 출석부를 시작하지 못했어요.",
-            lambda: engine.start_new_attendance(self._config_dir, deps=deps),
-        ))
-        # 다음에 켤 때 저장본부터 보여주는 화면이 방금 만든 결과를 곧바로 보게 한다.
-        if status.get("state") not in _ATTENDANCE_AUTH_BLOCKED_STATES:
-            engine.save_attendance_status_cache(self._config_dir, status)
-        return status
 
     @guarded
-    def attendance_prepare_start(self, profile, grid, bridge_updates):
+    def start_new_attendance(self, intent=None):
+        self._require_safe_gws_account_storage()
+        with self._attendance_prepare_lock:
+            running = self._running_attendance_snapshot(getattr(self._session_context, 'expected', None))
+            if running is not None: return running['data']['status']
+            deps = self._attendance_registry_deps()
+            prepared = engine.prepare_attendance_action(self._config_dir, deps, intent=intent)
+            if prepared.attendance_action and prepared.attendance_action['phase'] != 'published':
+                self._launch_attendance_prepare(prepared.attendance_action, prepared)
+            return asdict(prepared)
+
+    @guarded
+    def attendance_prepare_start(self, profile=None, grid=None, bridge_updates=None):
         """메신저 탭 [다음] — 입력 저장 후 출결 준비를 뒤에서 시작한다. 여러 번 불려도 안전."""
         self._require_safe_gws_account_storage()
         # pywebview는 js_api 호출마다 새 스레드를 만든다 — [다음] 더블클릭이면
@@ -1873,15 +2168,20 @@ class Api:
         with self._attendance_prepare_lock:
             thread = self._attendance_prepare_thread
             if thread is not None and thread.is_alive():
-                return {"started": True, "reason": "이미 준비하는 중이에요"}
+                snapshot = self._running_attendance_snapshot(getattr(self._session_context, 'expected', None))
+                if snapshot is None: raise account_sessions.AccountSessionError()
+                return {"started": True, "reason": "이미 준비하는 중이에요", **snapshot['data']}
             save_deps = self._deps.apply_deps or engine.ApplyDeps(
                 run_command=self._attendance_remote_run()
             )
             try:
-                ok, reason = engine.save_wizard_inputs(
-                    self._config_dir, dict(profile), list(grid), dict(bridge_updates),
-                    deps=save_deps,
-                )
+                if profile is None and grid is None and bridge_updates is None:
+                    ok, reason = True, ''
+                elif profile is None or grid is None or bridge_updates is None:
+                    return {"started": False, "reason": "처음 설정 입력을 모두 확인한 뒤 다시 진행해 주세요."}
+                else:
+                    ok, reason = engine.save_wizard_inputs(
+                        self._config_dir, dict(profile), list(grid), dict(bridge_updates), deps=save_deps)
             except RuntimeError:
                 # 로그인 문제(require_goedu_gws_session)는 guarded의 오류 응답이 아니라
                 # started=False + 사연으로 화면에 가야 배너를 띄울 수 있다.
@@ -1894,13 +2194,15 @@ class Api:
                 }
             if not ok:
                 return {"started": False, "reason": reason}
-            return self._launch_attendance_prepare()
+            prepared = engine.prepare_attendance_action(self._config_dir, self._attendance_registry_deps(), origin='initial-auto')
+            if not prepared.attendance_action or prepared.attendance_action['phase'] == 'published':
+                return {'started': False, 'reason': prepared.detail, 'status': asdict(prepared)}
+            return self._launch_attendance_prepare(prepared.attendance_action, prepared)
 
-    def _launch_attendance_prepare(self):
+    def _launch_attendance_prepare(self, action=None, prepared=None):
         """Caller holds the prepare lock; resume never re-saves wizard inputs."""
-        att_deps = self._deps.attendance_deps or engine.AttendanceDeps(
-            run_command=self._attendance_remote_run()
-        )
+        session_token = account_sessions.token(self._config_dir)
+        att_deps = self._attendance_registry_deps()
 
         def _prepare():
             # 예외로 조용히 죽으면 화면은 running=False + 사유 0글자만 본다.
@@ -1910,9 +2212,8 @@ class Api:
                     self._attendance_operation(
                         "attendance_prepare_start",
                         "출결 자료를 준비하지 못했어요.",
-                        lambda: engine.ensure_attendance(
-                            self._config_dir, deps=att_deps
-                        ),
+                        lambda: engine.execute_attendance_action(self._config_dir, deps=att_deps, expected_action=action)
+                            if action is not None else engine.ensure_attendance(self._config_dir, deps=att_deps),
                     )
                 )
                 # ensure_attendance와 같은 규칙: 허용 계정으로 만든 결과만 저장본에 남긴다.
@@ -1926,20 +2227,108 @@ class Api:
                     self._attendance_prepare_issue = error
                     return
                 failed_service, detail = engine.friendly_attendance_error(error)
-                status = asdict(engine.AttendanceStatus(
-                    state="failed", failed_service=failed_service,
-                    detail=detail[:engine.ATTENDANCE_DETAIL_LIMIT],
-                ))
+                self._attendance_prepare_issue = ScreenSafeError(
+                    "출결 자료를 준비하지 못했어요. " + detail[:engine.ATTENDANCE_DETAIL_LIMIT]
+                )
+                return
             self._attendance_prepare_result = status
 
         self._attendance_prepare_result = None
         self._attendance_prepare_issue = None
+        self._attendance_prepare_token = session_token
+        self._attendance_prepare_action = dict(action) if action else None
+        self._attendance_prepare_initial_status = asdict(prepared) if prepared is not None else {}
+        def prepare_for_account():
+            while True:
+                began = False
+                try:
+                    with account_sessions.work(self._config_dir, expected_token=session_token):
+                        began = True
+                        _prepare()
+                    return
+                except account_sessions.AccountSessionBusy:
+                    # Still queued, not failed. Never replay any started work.
+                    if began or account_sessions.peek_token(self._config_dir) != session_token:
+                        return
+                except account_sessions.AccountSessionError:
+                    # A queued worker from the old session cannot publish into
+                    # the next account's results or active files.
+                    return
+
         thread = threading.Thread(
-            target=_prepare, name="attendance-prepare", daemon=True
+            target=prepare_for_account, name="attendance-prepare", daemon=True
         )
         self._attendance_prepare_thread = thread
         thread.start()
-        return {"started": True, "reason": ""}
+        return {"started": True, "reason": "", "running": True,
+                "status": asdict(prepared) if prepared is not None else {"state": "preparing"}}
+
+    def _running_attendance_snapshot(self, expected):
+        """Observe an owned running job without waiting for that job's lock.
+
+        The progress record is atomically replaced. Validate its owner and the
+        session on both sides of the read; this observation never authorizes
+        writes or reports completion. All non-running paths retain the guard.
+        """
+        thread = self._attendance_prepare_thread
+        if thread is None or not thread.is_alive():
+            return None
+        before = account_sessions.peek_state(self._account_root)
+        token = (before["account"], before["generation"])
+        if token != self._attendance_prepare_token:
+            return None
+        if before.get("managed") and before.get("phase") != "active":
+            return None
+        if expected is not None and tuple(expected) != token:
+            raise account_sessions.AccountSessionError()
+        config_dir = account_sessions.active_config_dir(self._account_root, before)
+        path = engine.paths.attendance_setup_status_path(config_dir)
+        setup = engine.attendance_workbook_transition._read_dict(path) if path.exists() else {}
+        owner = str(setup.get("account", "") or "").strip().casefold()
+        if owner and token[0] and owner != token[0]:
+            return None
+        # Legacy local sessions had no owner field. Managed sessions must never
+        # expose that unowned record; the before/after check also guards adoption.
+        owned = owner == token[0] and bool(owner)
+        progress = setup.get("progress") if owned or not before.get("managed") else None
+        after = account_sessions.peek_state(self._account_root)
+        if before != after or thread is not self._attendance_prepare_thread:
+            raise account_sessions.AccountSessionError()
+        action = setup.get('attendance_action') if owned or not before.get('managed') else None
+        if action:
+            action = engine.attendance_workbook_transition.validate_attendance_action(action)
+            expected_action = getattr(self, '_attendance_prepare_action', None)
+            if expected_action and not engine._same_attendance_action(action, expected_action):
+                raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        status = {**getattr(self, '_attendance_prepare_initial_status', {}),
+            'state': 'installing' if action and action.get('operationId') else 'preparing',
+            'progress': dict(progress) if isinstance(progress, dict) else {},
+            'attendance_action': action or {}, 'creation_allowed': False, 'replacement_allowed': False,
+            'initial_preparation_allowed': False}
+        if action and action.get('operationId'):
+            # The initial response predates admission (and may name the replaced
+            # operation). Pair the owned journal receipt with its own pending
+            # scope, never with that old operation. This is progress only;
+            # publication still requires a fresh server read after the worker.
+            initial_scope = status.get('attendance_scope') or {}
+            if (initial_scope.get('subjectKey') != action['subjectKey']
+                    or initial_scope.get('currentSchoolYear') != action['expectedSchoolYear']
+                    or initial_scope.get('generation') != action['expectedGeneration']):
+                raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+            status['attendance_scope'] = {
+                **initial_scope, 'operationId': action['operationId'],
+                'spreadsheetId': None, 'bindingState': 'PREPARING',
+                'verificationState': 'UNVERIFIED', 'automationState': 'BLOCKED',
+                'preparationRunning': True, 'createAllowed': False,
+                'initialPreparationAllowed': False, 'writeAllowed': False,
+                'operationReason': action['reason'],
+                'previousSpreadsheetId': action.get('previousSpreadsheetId'),
+                'previousOperationId': action.get('previousOperationId'),
+            }
+            status['attendance_scope'].pop('replacement', None)
+        reply = _ok({"running": True, "status": status})
+        reply["session"] = list(token)
+        return reply
 
     @guarded
     def open_attendance_chat(self):
@@ -1961,8 +2350,6 @@ class Api:
     @guarded
     def open_attendance_script_settings(self):
         """Open the app's verified account, never the browser's default account."""
-        from urllib.parse import urlencode
-
         self._require_safe_gws_account_storage()
         run = self._attendance_remote_run()
         gws = engine.resolve_gws(run)
@@ -1971,22 +2358,26 @@ class Api:
         owner = str(saved.get("account") or "").strip()
         if owner and owner.casefold() != account.casefold():
             raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+        self._assert_current_session_account(account)
         return self._open_external_url(
-            "https://script.google.com/home/usersettings?" + urlencode({"authuser": account})
+            external_url.with_google_account("https://script.google.com/home/usersettings", account)
         )
 
     @guarded
-    def attendance_prepare_resume(self):
+    def attendance_prepare_resume(self, expected_action=None):
         """Resume saved setup without overwriting the user's wizard settings."""
         self._require_safe_gws_account_storage()
         with self._attendance_prepare_lock:
             thread = self._attendance_prepare_thread
             if thread is not None and thread.is_alive():
                 return {"started": True, "reason": "이미 준비하는 중이에요"}
-            return self._launch_attendance_prepare()
+            prepared = engine.prepare_attendance_resume(self._config_dir, self._attendance_registry_deps(), expected_action=expected_action)
+            if not prepared.attendance_action or prepared.attendance_action['phase'] == 'published':
+                return {'started': False, 'reason': prepared.detail, 'status': asdict(prepared)}
+            return self._launch_attendance_prepare(prepared.attendance_action, prepared)
 
     @guarded
-    def attendance_prepare_status(self):
+    def attendance_prepare_status(self, expected_action=None):
         """뒤에서 도는 출결 준비의 진행 여부와 현재 출결 상태.
 
         도는 동안에는 gws를 부르지 않는다 — 3초 폴마다 gws 3회 실행과 동봉본
@@ -1995,26 +2386,37 @@ class Api:
         """
         thread = self._attendance_prepare_thread
         if thread is not None and thread.is_alive():
-            setup = engine._read_setup_status(self._config_dir)
-            progress = setup.get("progress")
-            return {"running": True, "status": {
-                "state": "installing",
-                "progress": dict(progress) if isinstance(progress, dict) else {},
-            }}
-        result = self._attendance_prepare_result
-        if result is not None:
-            return {"running": False, "status": dict(result)}
+            snapshot = self._running_attendance_snapshot(getattr(self._session_context, "expected", None))
+            if snapshot is not None:
+                action = snapshot['data']['status'].get('attendance_action')
+                if expected_action and (not action or not engine._same_attendance_action(action, expected_action)):
+                    raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                return snapshot["data"]
+            raise account_sessions.AccountSessionError()
         issue = self._attendance_prepare_issue
         if issue is not None:
             raise issue
-        # 이 창에서 준비를 돌린 적이 없을 때(재시작 등)만 실제 상태를 읽는다.
-        # 폴마다 부를 수 있는 네트워크 명령이므로 제한 시간 없는 self._run() 대신
-        # 자식 작업까지 제한 시간이 있는 감독 실행 경로를 쓴다(검토 C7).
+        # Completion is historical evidence. A new poll must verify the current
+        # server year, generation and workbook rather than replaying green state.
         self._require_safe_gws_account_storage()
-        status_value = engine.read_attendance_status(
-            self._config_dir, self._attendance_remote_run()
-        )
-        return {"running": False, "status": asdict(status_value)}
+        result = self.attendance_status()
+        if result.get("ok") is False:
+            issue = result.get('issue') or {}
+            if issue.get('failure_code'):
+                raise AttendanceBindingError(issue['failure_code'], status=issue.get('http_status', 0),
+                    failure_domain=issue.get('failure_domain'), failure_stage=issue.get('failure_stage'),
+                    recovery_action=issue.get('recovery_action'))
+            raise ScreenSafeError(result.get('error') or '출석부의 현재 준비 결과를 확인하지 못했어요.')
+        status = result.get('data', result)
+        expected_action = expected_action or getattr(self, '_attendance_prepare_action', None)
+        if expected_action is None and status.get('attendance_scope'):
+            saved = engine._protected_attendance_setup(self._config_dir, status.get('current_user', ''))
+            if saved.get('attendance_action'):
+                expected_action = engine.attendance_workbook_transition.validate_attendance_action(saved['attendance_action'])
+        if expected_action:
+            status = asdict(engine.attendance_action_status(self._config_dir, self._attendance_registry_deps(),
+                                                          expected_action=expected_action))
+        return {"running": False, "status": status}
 
     @guarded
     def attendance_first_setup_status(self):
@@ -2034,7 +2436,7 @@ class Api:
                 run, self._attendance_gws_cache, owner
             )
             return engine.read_first_time_setup_done(
-                self._config_dir, run, self._attendance_gws_cache
+                self._config_dir, run, self._attendance_gws_cache, include_reason=True
             )
 
         return recovery.run_operation(
@@ -2046,6 +2448,54 @@ class Api:
             app_version=version.APP_VERSION,
             **self._network_recovery_options(),
         )
+
+    def _roster_editor(self):
+        from dashboard import roster
+        saved = engine.read_profile_values(self._config_dir)
+        setup = self._load_state()
+        draft = {} if setup.get("completed") else setup.get("draft", {}).get("profile", {})
+        profile = {**saved, **draft}
+        if profile.get("담임여부") != "예":
+            raise ScreenSafeError("담임학급 학생명단은 담임 선생님만 입력할 수 있어요.")
+        state = account_sessions.read_state(self._account_root)
+        account = state.get("account") or self._verified_google_account
+        if not account:
+            run, gws = self._resolve_gws_or_fail()
+            account = engine.require_goedu_gws_session(run, gws)
+        def remote():
+            if not paths.attendance_install_record_path(self._config_dir).exists():
+                return None
+            run, gws = self._resolve_attendance_goedu_gws_or_fail()
+            return roster.Sheet(self._config_dir, account, run, gws)
+        def read():
+            sheet = remote()
+            return sheet.read() if sheet else None
+        def write(before, rows):
+            sheet = remote()
+            if sheet is None:
+                raise ValueError("출석부 연결을 확인하지 못했어요.")
+            self._require_attendance_binding()
+            sheet.write(before, rows)
+        def record_failure(diagnostic):
+            error = ScreenSafeError("학생명단 반영 결과를 확인하지 못했어요.")
+            error.diagnostic_detail = json.dumps(diagnostic, ensure_ascii=True, sort_keys=True)
+            _fail(error, 'sync_roster_editor', self._config_dir)
+        return roster.Editor(self._config_dir, account, read, write, on_failure=record_failure,
+                             authorize_target=self._require_attendance_binding)
+
+    @guarded
+    def read_roster_editor(self, refresh=False, local_only=False, expected_revision=None):
+        return self._roster_editor().read(refresh is True, local_only=local_only is True,
+                                          expected_revision=expected_revision)
+
+    @guarded
+    def save_roster_editor(self, rows, expected_revision):
+        return self._roster_editor().save(rows, expected_revision)
+
+    @guarded
+    def sync_roster_editor(self, expected_revision=None):
+        with engine.attendance_remote_work_lock(self._config_dir):
+            return self._roster_editor().sync(expected_revision=expected_revision)
 
     @guarded
     def attendance_roster_status(self):
@@ -2073,6 +2523,7 @@ class Api:
         self,
         *,
         apply: bool,
+        resume: bool = False,
         record_snapshot=None,
         resolved=None,
         account: str = "",
@@ -2107,21 +2558,39 @@ class Api:
             if resolved is not None
             else self._resolve_attendance_goedu_gws_or_fail()
         )
+        if apply and (not record.get("subject_key") or not record.get("monthly_sheet_ids") or record.get("binding_protocol_version") != 1):
+            from attendance_legacy_adoption import adopt_existing_workbook
+            scope = adopt_existing_workbook(self._attendance_binding_client(), record["spreadsheet_id"],
+                self._attendance_script_runner(), self._config_dir, gws)
+            engine._restore_registry_record(self._config_dir, scope)
+            record_snapshot = read_attendance_install_snapshot(record_path)
+            record = validate_verified_canonical_record(record_snapshot.record)
         mutation_guard = self._attendance_update_mutation_guard(
             run, gws, account
-        ) if apply else None
-        if apply and not mutation_guard():
+        ) if apply or resume else None
+        if (apply or resume) and not mutation_guard():
             return {
                 "state": "permission-required",
                 "verified": False,
                 "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
             }
+        finish_path = self._config_dir / "attendance-update-progress.generated.json"
+        finish_context = {
+            "record_sha256": record_snapshot.sha256,
+            "bundle_sha256": engine.current_attendance_script_bundle_sha256(),
+        }
+        from attendance_workbook_transition import _read_dict
+        checkpoint = _read_dict(finish_path) if finish_path.exists() else {}
+        can_resume = all(checkpoint.get(key) == value for key, value in finish_context.items())
+        if resume and (not can_resume or checkpoint.get("account") != account):
+            return {"state": "finishing_required", "verified": False,
+                    "detail": "출결 연결이 바뀌었거나 마무리 기록을 확인하지 못했어요. 출결 기능을 다시 확인해 주세요."}
         updater = self._deps.attendance_script_updater
         if updater is None:
             from attendance_script_update import inspect_or_update_attendance_script
 
             updater = inspect_or_update_attendance_script
-        script_runner = self._attendance_script_runner()
+        script_runner = self._attendance_scoped_runner(record, self._attendance_script_runner()) if apply or resume else self._attendance_script_runner()
         assets_dir = bundle_paths.bundle_root() / "assets"
         update_options = {
             "assets_dir": assets_dir,
@@ -2143,7 +2612,7 @@ class Api:
                 "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
             }
         if (
-            apply
+            (apply or resume)
             and payload.get("verified") is True
             and payload.get("state") in {"current", "updated"}
         ):
@@ -2164,23 +2633,25 @@ class Api:
                     "verified": False,
                     "detail": _ATTENDANCE_UPDATE_PERMISSION_MESSAGE,
                 }
-            roster_migrator = self._deps.attendance_roster_migrator
-            if roster_migrator is None:
-                roster_migrator = _migrate_attendance_roster_layout
-            try:
-                roster_migrated = roster_migrator(
-                    runner=script_runner,
-                    workdir=self._config_dir,
-                    gws_executable=gws,
-                    spreadsheet_id=record["spreadsheet_id"],
-                )
-            except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
-                roster_migrated = False
-            if roster_migrated is not True:
-                payload["state"] = "hold"
-                payload["verified"] = False
-                payload["detail"] = _ATTENDANCE_ROSTER_MIGRATION_MESSAGE
-                return payload
+            if not resume:
+                roster_migrator = self._deps.attendance_roster_migrator
+                if roster_migrator is None:
+                    roster_migrator = _migrate_attendance_roster_layout
+                try:
+                    roster_migrated = roster_migrator(
+                        runner=script_runner,
+                        workdir=self._config_dir,
+                        gws_executable=gws,
+                        spreadsheet_id=record["spreadsheet_id"],
+                    )
+                except Exception:  # noqa: BLE001 - Google 원문은 화면에 내보내지 않는다.
+                    roster_migrated = False
+                if roster_migrated is not True:
+                    payload["state"] = "hold"
+                    payload["verified"] = False
+                    payload["detail"] = _ATTENDANCE_ROSTER_MIGRATION_MESSAGE
+                    return payload
+                engine._atomic_write_json(finish_path, {**finish_context, "account": account})
             ai_inspector = self._deps.attendance_ai_inspector
             if ai_inspector is None:
                 from attendance_ai_setup import inspect_attendance_ai_setup
@@ -2196,6 +2667,10 @@ class Api:
                 ai_status = ai_inspector(**ai_args)
             except Exception:  # noqa: BLE001 - 외부 원문을 화면에 내보내지 않는다.
                 ai_status = None
+            if ai_status is None or getattr(ai_status, "state", "") == "unavailable":
+                payload.update(state="verification-unavailable", verified=False,
+                    detail="출석부의 설정 완료 표시를 읽지 못했어요. 설정을 다시 실행하지 말고 [다시 확인]을 눌러 주세요.")
+                return payload
             if not self._attendance_ai_setup_is_current(ai_status):
                 payload["state"] = "ai-action-required"
                 payload["verified"] = False
@@ -2215,7 +2690,37 @@ class Api:
             mark_attendance_script_current(
                 record_path, record_snapshot, expected_sha256
             )
+            engine._atomic_write_json(finish_path, {})
+        elif not apply and not resume and can_resume and payload.get("state") == "current" and payload.get("verified") is True:
+            payload["state"] = "verification_required"
         return payload
+
+    def _require_attendance_binding(self, record=None, *, purpose="repair"):
+        from attendance_install_record import load_attendance_install_record
+        record = record or load_attendance_install_record(paths.attendance_install_record_path(self._config_dir))
+        client = self._attendance_binding_client()
+        _, _, account = self._resolve_attendance_goedu_gws_context_or_fail()
+        if isinstance(client, AttendanceBindingClient):
+            try:
+                client.restore(account)
+            except AttendanceBindingError as error:
+                error.attendance_auth_origin = 'restore-failed'
+                raise
+        if not client.email:
+            error = AttendanceBindingError("ATTENDANCE_AUTH_REQUIRED")
+            error.attendance_auth_origin = 'local-session-missing'
+            raise error
+        if client.email.casefold() != account.casefold():
+            client.clear()
+            raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+        return client.authorize_workbook(record, purpose=purpose)
+
+    def _attendance_scoped_runner(self, record, runner):
+        def scoped(args, cwd):
+            if any(word in {"create", "insert", "update", "delete", "clear", "batchUpdate", "updateContent", "+push"} for word in list(args)[1:6]):
+                self._require_attendance_binding(record)
+            return runner(args, cwd)
+        return scoped
 
     def _attendance_update_mutation_guard(self, run, gws, expected_account):
         expected = str(expected_account or "").strip().casefold()
@@ -2229,9 +2734,6 @@ class Api:
             return (
                 str(auth.get("user", "")).casefold() == expected
                 and auth.get("authorization_state") == "ready"
-                and engine.has_current_gws_scope_grant(
-                    self._config_dir, expected_account
-                )
             )
 
         return guard
@@ -2315,7 +2817,7 @@ class Api:
         elif str(payload.get("state") or "") == "customized":
             # 신뢰 여부를 확정하지 못한 상태를 보호한다. 누가 바꿨는지는 단정하지 않는다.
             error = AttendanceScriptChangedOutsideError(
-                "출결 기능이 확인된 정식 버전과 달라 학급 단톡방 작업을 시작하지 않았어요."
+                "출석부의 자동 처리 내용이 프로그램에서 확인한 버전과 달라 학급 단톡방 작업을 시작하지 않았어요. 누가 바꿨는지는 확인되지 않았습니다."
             )
             mismatch = f"{payload.get('detail') or ''} | {mismatch}".strip(" |")
         else:
@@ -2363,6 +2865,7 @@ class Api:
                         "출결 연결이 방금 바뀌었어요. 현재 출결 상태를 다시 확인해 주세요."
                     )
                 run, gws = resolved
+                self._require_attendance_binding(record_snapshot.record, purpose="health")
                 self._require_current_attendance_script(record_snapshot.record)
                 try:
                     self._require_current_remote_attendance_script(
@@ -2449,6 +2952,18 @@ class Api:
                 )
         finally:
             self._attendance_script_update_lock.release()
+
+    @guarded
+    def attendance_script_update_resume(self):
+        """Resume only reads and the local completion stamp; never replay Google writes."""
+        with engine.attendance_remote_work_lock(self._config_dir):
+            run, gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            return self._attendance_operation(
+                "attendance_script_update_resume", "출결 설정 완료 여부를 확인하지 못했어요.",
+                lambda: self._attendance_script_update(
+                    apply=False, resume=True, resolved=(run, gws), account=account),
+                retry_states={"hold"},
+            )
 
     @guarded
     def attendance_chat_status(self):
@@ -2657,6 +3172,9 @@ class Api:
 
     @guarded
     def google_status(self):
+        return self._google_status_payload()
+
+    def _google_status_payload(self, *, explicit_login=False):
         base, config_dir, _bundled, selection = self._oauth_context()
         credential_override = bool(
             str(base.get("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") or "").strip()
@@ -2695,6 +3213,44 @@ class Api:
                 "error_code": "",
             }
         )
+        local_settings_error = ""
+        account = str(auth.get("user") or "").casefold() if auth.get("logged_in") and auth.get("account_allowed") else ""
+        expected = getattr(self._session_context, "observed", None)
+        try:
+            with account_sessions.auth_observation(self._account_root, expected, account, timeout=self._session_timeout()) as session:
+                # Assign no shared identity/result fields until this observation
+                # is known to belong to the still-current local generation.
+                self._session_identity_available = bool(account)
+                self._verified_google_account = account or None
+                self._local_settings_error = ""
+                self._local_settings_error_token = None
+                try:
+                    if account:
+                        if not self._login.snapshot().get("running"):
+                            switched = account_sessions.activate_verified(
+                                self._account_root, account, explicit_login=explicit_login
+                            )
+                            if switched.get("changed"):
+                                self._reset_account_results()
+                    elif session.get("managed") and auth.get("login_state") not in {"error", "not_checked"}:
+                        if session.get("phase") not in {"login_pending", "signed_out"}:
+                            account_sessions.begin_logout(self._account_root)
+                            account_sessions.complete_logout(self._account_root)
+                            self._reset_account_results()
+                    session = account_sessions.read_state(self._account_root)
+                except account_sessions.AccountSessionStorageError as error:
+                    self._local_settings_error = local_settings_error = str(error)
+                    self._local_settings_error_token = expected
+                    session = {"phase": "unavailable"}
+        except (account_sessions.AccountSessionStorageError, account_sessions.AccountSessionBusy) as error:
+            # Storage/active-write problems remain separate from Google's reply.
+            # A stale observation is deliberately not caught here.
+            session = {"phase": "unavailable"}
+            local_settings_error = str(error)
+            # Bind a local problem to the observed generation, so a delayed
+            # failure cannot hide or relabel a newer account's configuration.
+            self._local_settings_error = local_settings_error
+            self._local_settings_error_token = expected
         error_code = runtime_error or selection.error_code or auth.get("error_code", "")
         return {
             "gws_runtime_ready": bool(gws),
@@ -2707,6 +3263,8 @@ class Api:
             "logged_in": bool(auth["logged_in"]),
             "account_allowed": bool(auth.get("account_allowed")),
             "user": auth["user"],
+            "account_session": session.get("phase", "legacy"),
+            "local_settings_error": local_settings_error,
             **{key: auth.get(key, "") for key in ("authorization_state", "authorization_reason", "authorization_detail")},
         }
 
@@ -2780,12 +3338,12 @@ class Api:
     @guarded
     def list_calendars(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_calendars(run, gws)
+        return engine.list_calendars(run, gws, **self._network_recovery_options())
 
     @guarded
     def list_tasklists(self):
         run, gws = self._resolve_gws_or_fail()
-        return engine.list_tasklists(run, gws)
+        return engine.list_tasklists(run, gws, **self._network_recovery_options())
 
     @guarded
     def google_target_statuses(self, targets):
@@ -2871,16 +3429,11 @@ class Api:
     def retry_capture(self, source_hash, capture_when=""):
         source_hash = str(source_hash or "")
         capture_when = str(capture_when or "")
-        if not self._capture_retry_lock.acquire(blocking=False):
-            raise ScreenSafeError("다른 실패 기록을 다시 처리하고 있어요. 끝난 뒤 눌러 주세요.")
-        try:
-            result = pipeline.retry_saved_capture(
-                self._config_dir,
-                source_hash,
-                capture_when=capture_when,
-            )
-        finally:
-            self._capture_retry_lock.release()
+        result = pipeline.retry_saved_capture(
+            self._config_dir,
+            source_hash,
+            capture_when=capture_when,
+        )
         return {
             "success": bool(result.ok),
             "stage": str(result.stage),
@@ -3041,20 +3594,22 @@ class Api:
                     if selection.error_code == "OAUTH_CLIENT_CONFLICT":
                         raise ScreenSafeError(
                             "기존 Google 로그인 설정과 Teacher Manager의 로그인 설정이 서로 달라요. "
-                            "로그인 설정을 확인해 주세요."
+                            "기존 로그인 설정을 보호하기 위해 멈췄습니다."
                         )
                     if selection.error_code == "OAUTH_CLIENT_MISSING":
                         raise ScreenSafeError(
-                            "이 확인용 Teacher Manager에는 Google 로그인 준비 파일이 없어요."
+                            "프로그램의 Google 로그인에 필요한 파일이 없습니다. Teacher Manager 설치 파일을 다시 실행해 주세요."
                         )
                     raise ScreenSafeError(
-                        "Google 로그인 준비 파일을 안전하게 읽지 못했어요."
+                        "프로그램의 Google 로그인 설정을 읽지 못했어요. Teacher Manager 설치 파일을 다시 실행해 주세요."
                     )
                 child_env = gws_env.login_environ(
                     base,
                     selection,
                     gws_config_dir=config_dir,
                 )
+                account_sessions.begin_login(self._account_root)
+                self._reset_account_results()
                 started = self._login.start(
                     engine.login_command(gws),
                     popen=self._deps.popen_factory,
@@ -3104,23 +3659,26 @@ class Api:
     def gws_login_status(self):
         snapshot = self._login.snapshot()
         if snapshot.get("ok") is True:
-            run, gws = self._resolve_gws_or_fail()
-            auth = engine.gws_auth_status(run, gws)
-            if auth.get("logged_in") and auth.get("account_allowed") and auth.get("scope_state") == "verified":
-                engine.record_gws_scope_grant(self._config_dir, auth.get("user", ""))
-            elif auth.get("logged_in") and auth.get("account_allowed"):
+            # One actual observation supplies both completion and the screen.
+            # A second token refresh could be slower or fail after the first succeeded.
+            status = self._google_status_payload(explicit_login=True)
+            snapshot = {**snapshot, "google_status": status,
+                        "local_settings_error": status.get("local_settings_error", "")}
+            if status.get("authorization_state") != "ready":
+                state = status.get("authorization_state")
                 snapshot = {**snapshot, "ok": False, "error_code": (
-                    "GWS_CONSENT_INCOMPLETE" if auth.get("scope_state") == "missing" else "GWS_CONSENT_CHECK_FAILED"
+                    "GWS_CONSENT_INCOMPLETE" if state == "reauth_required" else
+                    "GWS_LOGIN_REVOKED" if status.get("login_state") == "logged_out" else
+                    "GWS_CONSENT_CHECK_FAILED"
                 )}
-            elif auth.get("login_state") == "error":
-                snapshot = {**snapshot, "ok": False, "error_code": "GWS_CONSENT_CHECK_FAILED"}
-            elif not auth.get("logged_in"):
-                snapshot = {**snapshot, "ok": False, "error_code": "GWS_LOGIN_REVOKED"}
         return engine.annotate_login_snapshot(snapshot)
 
     @guarded
     def gws_login_cancel(self):
-        return {"cancelled": self._login.cancel()}
+        cancelled = self._login.cancel()
+        # The next real identity check reuses original settings if the account
+        # did not change. Cancellation never clears or restores local records.
+        return {"cancelled": cancelled}
 
     @guarded
     def gws_repair_oauth_client(self):
@@ -3154,7 +3712,8 @@ class Api:
 
     def _resolve_goedu_gws_or_fail(self):
         run, gws = self._resolve_gws_or_fail()
-        self._goedu_session_or_screen_stop(run, gws)
+        current = self._goedu_session_or_screen_stop(run, gws)
+        self._assert_current_session_account(current)
         return run, gws
 
     def _resolve_attendance_goedu_gws_context_or_fail(self):
@@ -3166,6 +3725,7 @@ class Api:
         if not gws:
             raise ScreenSafeError("Google 연결 도구가 아직 없어요. 설정에서 준비해 주세요.")
         current = self._goedu_session_or_screen_stop(run, gws)
+        self._assert_current_session_account(current)
         saved = engine._read_setup_status(self._config_dir)
         owner = str(saved.get("account", "") or "").strip()
         if owner and owner.casefold() != current.casefold():
@@ -3188,7 +3748,19 @@ class Api:
             self._config_dir, **self._attendance_remote_lock_options()
         ):
             run, gws = self._resolve_gws_or_fail()
-            return self._success(*engine.gws_logout(run, gws))
+            account_sessions.begin_logout(self._config_dir)
+            self._reset_account_results()
+            ok, detail = engine.gws_logout(run, gws)
+            if not ok:
+                return self._success(False, "로그아웃을 마치지 못했어요. 기존 기록을 보관하고 작업을 멈췄습니다. Google 로그인을 다시 진행해 주세요.")
+            auth = engine.gws_auth_status(run, gws)
+            if auth.get("logged_in") or auth.get("login_state") != "logged_out":
+                return self._success(False, "로그인 해제를 확인하지 못했어요. 기존 기록은 보관되어 있습니다. Google 로그인을 다시 진행해 주세요.")
+            account_sessions.complete_logout(self._config_dir)
+            message = "Teacher Manager에서 로그아웃했어요. 기존 출석부와 설정 파일은 그대로 남아 있습니다."
+            if self._attendance_revocation_unconfirmed:
+                message += " 이 PC의 출석부 연결은 지웠지만 서버 연결 폐기는 확인하지 못했어요."
+            return self._success(True, message)
 
     @guarded
     def ensure_calendar_named(self, name):
@@ -3218,25 +3790,72 @@ class Api:
             raise ScreenSafeError("할 일 목록을 만들지 못했어요. 이름을 확인하고 잠시 뒤 다시 시도해 주세요.")
         return {"id": made_id, "name": name}
 
+    def _sync_saved_profile_settings(self, result):
+        """Local save remains durable even when linked settings cannot be applied."""
+        if result.get('parsed') is not True:
+            return {**result, 'settings_sync': {'state': 'waiting',
+                'detail': '입력은 저장했지만 설정을 완성하지 못해 출석부에는 반영하지 않았어요.',
+                'error_code': 'SETTINGS_PROFILE_UNAVAILABLE'}}
+        record_path = paths.attendance_install_record_path(self._config_dir)
+        if not record_path.exists():
+            return {**result, 'settings_sync': {'state': 'not-linked',
+                'detail': '이 컴퓨터에 저장했어요. 연결된 출석부는 아직 없어요.', 'error_code': ''}}
+        stage = 'SETTINGS_TARGET_UNVERIFIED'
+        try:
+            from attendance_install_record import read_verified_canonical_record
+            from dashboard import central_chat
+            record = read_verified_canonical_record(record_path)
+            run, gws, _account = self._resolve_attendance_goedu_gws_context_or_fail()
+            with engine.attendance_remote_work_lock(self._config_dir):
+                self._require_attendance_binding(record, purpose='automatic')
+                stage = 'SETTINGS_SETUP_UNVERIFIED'
+                ready = engine.read_first_time_setup_done(self._config_dir, run, gws, include_reason=True)
+                if ready.get('done') is not True:
+                    if ready.get('reason') != 'setup_required':
+                        raise ValueError('SETTINGS_SETUP_UNVERIFIED')
+                    return {**result, 'settings_sync': {'state': 'waiting',
+                        'detail': '설정은 저장했어요. 출석부의 처음 설정이 끝나야 반영할 수 있어요.',
+                        'error_code': 'SETTINGS_SETUP_REQUIRED'}}
+                stage = 'SETTINGS_PROFILE_UNAVAILABLE'
+                profile = json.loads(paths.profile_path(self._config_dir).read_text(encoding='utf-8'))
+                def guard_write():
+                    if read_verified_canonical_record(record_path) != record:
+                        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+                    self._require_attendance_binding(record, purpose='automatic')
+                stage = 'SETTINGS_SHEET_UNVERIFIED'
+                synced = central_chat.sync_profile_settings(profile, record['spreadsheet_id'], run,
+                    gws_executable=gws, before_write=guard_write)
+            return {**result, 'settings_sync': synced}
+        except Exception as error:
+            code = error.diagnostic_code if isinstance(error, AttendanceBindingError) else stage
+            return {**result, 'settings_sync': {'state': 'failed',
+                'detail': '설정은 이 컴퓨터에 저장했지만 출석부 반영을 확인하지 못했어요. 연결 상태를 확인한 뒤 다시 저장해 주세요.',
+                'error_code': code}}
+
     @guarded
     def apply_all(self, profile, grid, bridge_updates):
         results = engine.apply_all(
             self._config_dir, dict(profile), list(grid), dict(bridge_updates), deps=self._deps.apply_deps
         )
-        return [
+        output = [
             {"key": r.key, "label": r.label, "status": r.status, "detail": r.detail} for r in results
         ]
+        sync = self._sync_saved_profile_settings({'parsed': any(r.key == 'parse' and r.status == 'done' for r in results)})['settings_sync']
+        output.append({'key': 'settings_sync', 'label': '출석부 설정 반영',
+            'status': 'done' if sync['state'] == 'applied' else 'failed' if sync['state'] == 'failed' else 'pending',
+            'detail': sync['detail'], 'settings_sync': sync})
+        return output
 
     @guarded
     def save_profile_grid(self, profile, grid, require_links=True):
         engine.write_profile_values(self._config_dir, dict(profile))
         engine.write_timetable_grid(self._config_dir, list(grid))
         parsed, detail = engine.run_parser(self._config_dir, require_links=bool(require_links))
-        return {"parsed": parsed, "detail": detail}
+        return self._sync_saved_profile_settings({"parsed": parsed, "detail": detail})
 
     @guarded
     def save_identity(self, updates):
-        return engine.save_identity(self._config_dir, dict(updates))
+        return self._sync_saved_profile_settings(engine.save_identity(self._config_dir, dict(updates)))
 
     @guarded
     def save_timetable(self, grid):
@@ -3248,7 +3867,7 @@ class Api:
 
     @guarded
     def save_tasks(self, updates):
-        return engine.save_tasks(self._config_dir, dict(updates))
+        return self._sync_saved_profile_settings(engine.save_tasks(self._config_dir, dict(updates)))
 
     @guarded
     def save_gemini(self, updates):
@@ -3310,12 +3929,14 @@ class Api:
 
     def _journal_error_code(self, error) -> str:
         for item in _journal_error_chain(error):
+            if isinstance(item, AttendanceBindingError):
+                return item.diagnostic_code
             if isinstance(item, recovery.RetryableOperationError):
                 return item.code
         return type(error).__name__
 
-    def _report_issue(self, issue: recovery.UserIssue, error) -> bool:
-        """실패 화면이 뜰 때 개발자 보고를 대기열에 넣는다. 넣었으면 True.
+    def _report_issue(self, issue: recovery.UserIssue, error) -> str | bool:
+        """실패 보고를 저장하면 queued. 실제 전달 완료로 표시하지 않는다.
 
         동의 화면 없이 자동으로 보내되(2026-09-02 사용자 결정), 설정의 스위치가
         꺼져 있으면 적지도 보내지도 않는다. 보고는 최선 노력이라 어떤 예외도
@@ -3351,13 +3972,18 @@ class Api:
             if not error_reports.enqueue(self._config_dir, report):
                 return False
             self._start_error_report_flush()
-            return True
+            return "queued"
         except Exception:  # noqa: BLE001 - 보고는 최선 노력이다.
             return False
 
     def _start_error_report_flush(self) -> None:
         """대기 중인 보고를 배경에서 보낸다. 주소가 없거나 https가 아니면 조용히 넘긴다."""
 
+        session = account_sessions.read_state(self._account_root)
+        local_problem = self._local_settings_error and self._local_settings_error_token == (session.get("account"), session.get("generation"))
+        if (self._session_identity_available is not True or local_problem
+                or session.get("phase") != "active" or self._verified_google_account != session.get("account")):
+            return
         try:
             environ = (
                 dict(os.environ) if self._deps.environ is None else dict(self._deps.environ)
@@ -3374,12 +4000,18 @@ class Api:
         except Exception:  # noqa: BLE001 - 주소가 없으면 보고를 미룬다.
             return
         poster = self._deps.error_report_poster or error_reports.default_poster
+        session_token = account_sessions.token(self._config_dir)
 
         def work():
             if not self._error_report_flush_lock.acquire(blocking=False):
                 return
             try:
-                error_reports.flush(self._config_dir, endpoint, poster)
+                with account_sessions.work(self._config_dir, expected_token=session_token):
+                    local_problem = self._local_settings_error and self._local_settings_error_token == session_token
+                    if (self._session_identity_available is not True or local_problem
+                            or self._verified_google_account != session_token[0]):
+                        return
+                    error_reports.flush(self._config_dir, endpoint, poster)
             except Exception:  # noqa: BLE001 - 다음 기회에 다시 보낸다.
                 pass
             finally:
@@ -3533,9 +4165,12 @@ class Api:
             title,
             once,
             delays=recovery.NETWORK_DELAYS,
-            change_status=("저장 상태를 다시 확인해 주세요. 기존 출결 기록은 그대로입니다."
-                           if operation == "attendance_chat_set_space"
-                           else "기존 출결 자료와 현재 연결은 그대로입니다."),
+            change_status=(
+                "이 확인 작업에서는 자료를 바꾸지 않았습니다."
+                if operation in {"attendance_status", "attendance_status_cached", "attendance_connection_candidates",
+                                 "attendance_first_setup_status", "attendance_script_update_status", "attendance_chat_status"}
+                else "작업 결과를 확인하지 못했어요. 출석부와 현재 연결 상태를 확인해 주세요."
+            ),
             app_version=version.APP_VERSION,
             **self._network_recovery_options(),
         )
@@ -3559,6 +4194,31 @@ class Api:
         return True
 
     @guarded
+    def open_picture_guide(self, kind):
+        """Open one bundled, account-independent guide in the default browser."""
+        import webbrowser
+
+        filename = {
+            "login": "google-login.html",
+            "setup": "attendance-first-setup.html",
+            "chat": "google-chat-space.html",
+            "roster": "attendance-roster.html",
+        }.get(kind) if isinstance(kind, str) else None
+        if filename is None:
+            raise ScreenSafeError("열 수 있는 그림 안내를 확인해 주세요.")
+        guide_root = Path(__file__).resolve().parent / "web" / "guides"
+        guide = (guide_root / filename).resolve()
+        if guide.parent != guide_root or not guide.is_file():
+            raise ScreenSafeError("그림 안내 파일을 찾지 못했어요. 프로그램 설치 상태를 확인해 주세요.")
+        opener = self._deps.url_opener or webbrowser.open
+        try:
+            if opener(guide.as_uri()) is False:
+                raise RuntimeError()
+        except Exception:
+            raise ScreenSafeError("기본 브라우저에서 그림 안내를 열지 못했어요. Windows의 기본 브라우저 설정을 확인해 주세요.") from None
+        return {"opened": True, "method": "default"}
+
+    @guarded
     def open_url(self, url):
         try:
             return self._open_external_url(url)
@@ -3574,19 +4234,11 @@ class Api:
         )
 
     @guarded
-    def open_current_attendance(self):
-        """화면에 남은 주소 대신 누른 순간의 검증된 정본 출석부만 연다."""
-
-        from attendance_install_record import (
-            AttendanceInstallRecordError,
-            read_verified_canonical_record,
-        )
-
-        record_path = paths.attendance_install_record_path(self._config_dir)
-        try:
-            record = read_verified_canonical_record(record_path)
-        except (OSError, AttendanceInstallRecordError) as error:
-            raise ScreenSafeError(
-                "현재 출석부 연결을 먼저 바로잡아 주세요."
-            ) from error
-        return self._open_external_url(record["spreadsheet_url"])
+    def open_current_attendance(self, expected_context=None, automatic=False):
+        """Open only the current exact registry binding, with a scoped one-attempt auto-open."""
+        self._require_safe_gws_account_storage()
+        def open_verified(url, account):
+            self._assert_current_session_account(account)
+            return self._open_external_url(external_url.with_google_account(url, account))
+        return engine.open_attendance_action(self._config_dir, self._attendance_registry_deps(),
+            expected_context=expected_context, automatic=automatic, opener=open_verified)

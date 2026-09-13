@@ -19,12 +19,12 @@ from brity_bridge.settings import load_settings
 
 GEMINI_KEY_MISSING_FIX = "Gemini API key가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요."
 GEMINI_KEY_INVALID_FIX = "Gemini API key가 맞지 않아요. AI Studio에서 다시 복사해 주세요."
-GEMINI_NETWORK_FIX = "인터넷 연결을 확인한 뒤 Gemini API key를 다시 확인해 주세요."
-GEMINI_RATE_LIMIT_DETAIL = "현재 사용 한도에 도달했어요. 잠시 뒤 다시 확인해 주세요."
+GEMINI_NETWORK_FIX = "Gemini 응답을 받지 못했어요. 잠시 후 다시 확인해 주세요."
+GEMINI_RATE_LIMIT_DETAIL = "Gemini 사용 한도에 도달했어요. 한도가 언제 다시 열리는지는 확인하지 못했습니다. AI Studio에서 사용량을 확인해 주세요."
 HOTKEY_FIX = "설정에서 메신저 단축키를 다시 눌러 주세요."
 GOOGLE_LOGIN_FIX = "설정에서 Google 계정으로 로그인해 주세요."
 GWS_CLI_FIX = "설정에서 Google Workspace CLI를 준비해 주세요."
-HELPER_FIX = "설정에서 저장하기를 눌러 도우미를 다시 시작해 주세요."
+HELPER_FIX = "Teacher Manager의 [설정]에서 [저장]을 눌러 메신저 단축키를 다시 켜 주세요."
 
 
 @dataclass
@@ -211,7 +211,10 @@ def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
         "missing": GEMINI_KEY_MISSING_FIX,
         "invalid": GEMINI_KEY_INVALID_FIX,
         "network": GEMINI_NETWORK_FIX,
-    }.get(key_status, GEMINI_KEY_INVALID_FIX)
+        "service-unavailable": "Google Gemini가 일시적으로 응답하지 못했어요. 키를 바꾸지 말고 잠시 후 다시 확인해 주세요.",
+        "model-unavailable": "선택한 AI 모델을 사용할 수 없어요. 다른 모델을 선택해 확인해 주세요.",
+        "forbidden": "Google AI Studio에서 키의 사용 권한을 확인해 주세요.",
+    }.get(key_status, "Google이 키 확인 요청을 처리하지 못했어요. 키 오류로 확인된 것은 아닙니다.")
     detail = "아직 입력하지 않았어요" if key_status == "missing" else (key_detail or key_status)
     return CheckResult("connect.gemini-key", "Gemini API key", False, detail, fix, **common)
 
@@ -305,7 +308,7 @@ def run_doctor_checks(
 
     running = bool(deps.find_helper_window())
     results.append(CheckResult(
-        "settings.helper", "도우미 실행 상태", running,
+        "settings.helper", "메신저 단축키", running,
         "실행 중" if running else "꺼져 있음 — 단축키가 동작하지 않아요",
         "" if running else HELPER_FIX,
         card="settings", target="helper",

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import html
+import functools
 import os
 import secrets
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
-from brity_bridge import message_archive
+from brity_bridge import account_sessions, message_archive
 from brity_bridge.local_attachment_links import (
     LOCAL_ATTACHMENT_HOST,
     LOCAL_ATTACHMENT_PORT,
@@ -22,9 +24,9 @@ from brity_bridge.local_attachment_links import (
 )
 
 SUCCESS_MESSAGE = "파일을 열었습니다. 이 탭은 닫아도 됩니다."
-MISSING_MESSAGE = "첨부파일을 찾지 못했습니다. Brity 첨부파일 다운로드 폴더를 확인해 주세요."
-BLOCKED_MESSAGE = "안전을 위해 이 파일은 자동으로 열지 않습니다."
-CANNOT_OPEN_MESSAGE = "이 첨부파일 링크를 열 수 없습니다."
+MISSING_MESSAGE = "이 컴퓨터에서 파일을 찾지 못했어요. 원래 Brity에서 내려받은 컴퓨터와 다운로드 폴더를 확인해 주세요."
+BLOCKED_MESSAGE = "이 파일은 실행 프로그램이어서 Teacher Manager에서 열지 않아요. Brity 다운로드 폴더에서 파일을 확인해 주세요."
+CANNOT_OPEN_MESSAGE = "첨부파일 주소가 올바르지 않거나 사용 시간이 지나 열 수 없어요. 원래 일정에서 첨부파일 링크를 다시 열어 주세요."
 CANCELLED_MESSAGE = "파일 열기를 취소했습니다. 이 탭은 닫아도 됩니다."
 CONFIRMATION_TTL_SECONDS = 120.0
 _DRAIN_LIMIT_BYTES = 64 * 1024
@@ -45,6 +47,7 @@ class _AttachmentHTTPServer(ThreadingHTTPServer):
     expected_origin: str
     confirmations: dict[str, tuple[str, float]]
     confirmation_lock: threading.Lock
+    account_config_dir: Path | None = None
 
     def issue_confirmation(self, name: str) -> str:
         now = time.monotonic()
@@ -55,7 +58,8 @@ class _AttachmentHTTPServer(ThreadingHTTPServer):
                 for key, value in self.confirmations.items()
                 if value[1] > now
             }
-            self.confirmations[token] = (name, now + CONFIRMATION_TTL_SECONDS)
+            context = account_sessions.peek_token(self.account_config_dir) if self.account_config_dir else None
+            self.confirmations[token] = (name, now + CONFIRMATION_TTL_SECONDS, context)
         return token
 
     def consume_confirmation(self, token: str) -> str | None:
@@ -63,6 +67,8 @@ class _AttachmentHTTPServer(ThreadingHTTPServer):
         with self.confirmation_lock:
             confirmation = self.confirmations.pop(token, None)
         if confirmation is None or confirmation[1] <= now:
+            return None
+        if self.account_config_dir and confirmation[2] != account_sessions.peek_token(self.account_config_dir):
             return None
         return confirmation[0]
 
@@ -74,6 +80,25 @@ class _AttachmentHTTPServer(ThreadingHTTPServer):
                 1,
             )
         super().server_bind()
+
+
+def _account_request(method):
+    @functools.wraps(method)
+    def wrapped(self):
+        root = getattr(self.server, "account_config_dir", None)
+        if root is None:
+            return method(self)
+        try:
+            state = account_sessions.read_state(root)
+            if state.get("managed") and state.get("phase") != "active":
+                raise account_sessions.AccountSessionError()
+            self._request_account_token = (state["account"], state["generation"])
+            lock = account_sessions.work(root, expected_token=self._request_account_token) if method.__name__ == "do_POST" else nullcontext()
+            with lock:
+                return method(self)
+        except account_sessions.AccountSessionError:
+            self._reply(403, CANNOT_OPEN_MESSAGE)
+    return wrapped
 
 
 class _AttachmentRequestHandler(BaseHTTPRequestHandler):
@@ -111,6 +136,15 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             remaining -= len(block)
 
     def _reply_html(self, status: int, content: str) -> None:
+        root = getattr(self.server, "account_config_dir", None)
+        expected = getattr(self, "_request_account_token", None)
+        if root is not None and expected is not None:
+            try:
+                current = account_sessions.peek_token(root)
+            except account_sessions.AccountSessionError:
+                current = None
+            if expected != current:
+                status, content = 403, "<p>" + html.escape(CANNOT_OPEN_MESSAGE) + "</p>"
         self._drain_request_body()
         body = (
             "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
@@ -169,7 +203,7 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             try:
                 target = resolve_local_attachment(server.download_dir_provider(), name)
             except InvalidAttachmentName:
-                rows.append("<p>열 수 없는 첨부파일입니다.</p>")
+                rows.append("<p>첨부파일 이름이 올바르지 않아 열지 않았어요. 원래 일정에서 첨부파일 링크를 다시 열어 주세요.</p>")
                 continue
             except AttachmentNotFound:
                 rows.append(
@@ -198,6 +232,7 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._reply(405, CANNOT_OPEN_MESSAGE)
 
+    @_account_request
     def do_POST(self) -> None:
         server = self.server
         if not isinstance(server, _AttachmentHTTPServer):
@@ -264,6 +299,7 @@ class _AttachmentRequestHandler(BaseHTTPRequestHandler):
             return
         self._reply(200, SUCCESS_MESSAGE)
 
+    @_account_request
     def do_GET(self) -> None:
         server = self.server
         if not isinstance(server, _AttachmentHTTPServer):
@@ -359,9 +395,13 @@ class LocalAttachmentServer:
         self._host = host
         self._port = port
         self._state_dir_provider = state_dir_provider
+        self._account_config_dir = None
         self._server: _AttachmentHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+
+    def configure_account_session(self, config_dir):
+        self._account_config_dir = Path(config_dir)
 
     @property
     def address(self) -> tuple[str, int]:
@@ -384,6 +424,7 @@ class LocalAttachmentServer:
                 host, port = server.server_address[:2]
                 server.download_dir_provider = self._download_dir_provider
                 server.state_dir_provider = self._state_dir_provider
+                server.account_config_dir = self._account_config_dir
                 server.opener = self._opener
                 server.expected_host = f"{host}:{port}"
                 server.expected_origin = f"http://{host}:{port}"

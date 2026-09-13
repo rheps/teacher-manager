@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.13.5
+ * 버전: 5.13.7
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.13.5';
+const APP_VERSION = '5.13.7';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -86,7 +86,8 @@ const STUDENT_DROPDOWN_RANGE = 'J2:J200';
 
 const DEFAULT_CONFIG = Object.freeze({
   SCHOOL_NAME: '',
-  SCHOOL_YEAR: String(new Date().getFullYear()),
+  // Workbook identity is supplied by the verified installer; a clock never fills it.
+  SCHOOL_YEAR: '',
   GRADE: '',
   CLASS_NUMBER: '',
   CLASS_LABEL: FALLBACK_CLASS_LABEL,
@@ -195,14 +196,45 @@ function attendanceConnectionCodeForSpreadsheetId_(spreadsheetId) {
  */
 function runFirstTimeSetup() {
   requireGoeduTeacherAccount_();
-  SpreadsheetApp.getUi().showModalDialog(
+  const ui = SpreadsheetApp.getUi();
+  ui.showModalDialog(
     HtmlService.createHtmlOutput(firstTimeSetupProgressHtml_()).setWidth(520).setHeight(480),
     '처음 한 번 설정하기'
   );
+
+  // Keep setup in the authorized menu execution, as before the progress dialog
+  // was introduced. The dialog must never start a second browser/server request.
+  let result;
+  let failure = null;
+  try {
+    result = runFirstTimeSetupWork();
+  } catch (error) {
+    failure = error;
+    result = firstTimeSetupFailureResult_(error);
+  }
+  // Consent has opened its own dialog. Leave it visible until the user finishes.
+  if (result && result.pending) return;
+  ui.showModalDialog(
+    HtmlService.createHtmlOutput(firstTimeSetupProgressHtml_(result)).setWidth(520).setHeight(480),
+    '처음 한 번 설정하기'
+  );
+  // Preserve the original exception in Google's execution record after showing
+  // safe feedback. Do not turn an unsuccessful execution into a successful one.
+  if (failure) throw failure;
 }
 
-/** Open the wait notice before making any slow calls. The worker runs in the same Sheet. */
-function firstTimeSetupProgressHtml_() {
+/** Render status only; all setup work belongs to the original menu execution. */
+function firstTimeSetupProgressHtml_(result) {
+  const waiting = arguments.length === 0;
+  const valid = result && typeof result.message === 'string';
+  const title = waiting ? '처음 설정을 진행하고 있어요'
+    : !valid ? '설정 결과를 확인해 주세요'
+    : result.code ? result.title
+    : result.complete ? '처음 설정이 끝났어요' : '남은 설정을 확인해 주세요';
+  const message = waiting
+    ? '완료 안내가 나올 때까지 이 창과 출결 시트를 닫지 말고 기다려 주세요.\n준비에 시간이 걸릴 수 있습니다. 권한 허용이나 방 선택 안내가 나타나면 따라 주세요.'
+    : valid ? result.message
+    : '설정 결과 응답을 확인하지 못했어요. Teacher Manager로 돌아가 현재 설정 상태를 확인해 주세요. 처음 설정 메뉴를 바로 다시 누르지 마세요.';
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><style>
     body{font:14px/1.7 sans-serif;color:#24364b;margin:24px}
     h2{font-size:19px;color:#2265b5;margin:0 0 14px}
@@ -211,34 +243,235 @@ function firstTimeSetupProgressHtml_() {
     button{background:#e8f2ff;color:#1760b5;border:0;border-radius:8px;padding:10px 18px;margin-top:16px;cursor:pointer}
     @keyframes spin{to{transform:rotate(360deg)}}
   </style></head><body>
-    <div id="spinner" aria-hidden="true"></div>
-    <h2 id="title">처음 설정을 진행하고 있어요</h2>
-    <div id="message" role="status" aria-live="polite">완료 안내가 나올 때까지 이 창과 출결 시트를 닫지 말고 기다려 주세요.
-준비에 시간이 걸릴 수 있습니다. 권한 허용이나 방 선택 안내가 나타나면 따라 주세요.</div>
-    <button id="close" hidden onclick="google.script.host.close()">확인</button>
-    <script>
-      function finish(title, message) {
-        document.getElementById('spinner').hidden = true;
-        document.getElementById('title').textContent = title;
-        document.getElementById('message').textContent = message;
-        document.getElementById('close').hidden = false;
+    <div id="spinner" aria-hidden="true"${waiting ? '' : ' hidden'}></div>
+    <h2 id="title">${escapeHtml_(title)}</h2>
+    <div id="message" role="status" aria-live="polite">${escapeHtml_(message)}</div>
+    <button id="close"${waiting ? ' hidden' : ''} onclick="google.script.host.close()">확인</button>
+  </body></html>`;
+}
+
+function firstTimeSetupFailureResult_(error) {
+  let cause = String(error && error.name || '') + ' ' + String(error && error.message || error || '');
+  let title = '처음 설정의 완료 여부를 확인하지 못했어요';
+  let message = 'Teacher Manager로 돌아가 현재 설정 상태를 확인해 주세요. 일부 작업은 이미 끝났을 수 있으므로 처음 설정 메뉴를 바로 다시 누르지 마세요.';
+  let code = 'SETUP_RESULT_UNKNOWN';
+  if (/Authorization is required|Required permissions|insufficient authentication scopes|권한 부여가 필요|승인이 필요/i.test(cause)) {
+    title = 'Google 권한 허용이 더 필요해요';
+    message = 'Google에서 필요한 권한이 아직 허용되지 않았다고 응답했어요. 권한 요청 화면의 선택 항목을 확인하고 허용을 마쳐 주세요. 이미 끝난 설정은 Teacher Manager에서 먼저 확인해 주세요.';
+    code = 'SETUP_AUTHORIZATION_REQUIRED';
+  } else if (/exceeded maximum execution time|maximum execution time|execution timed out|실행 시간이 초과/i.test(cause)) {
+    title = '설정 처리 결과를 확인해 주세요';
+    message = 'Google에서 한 번에 실행할 수 있는 시간이 끝났어요. 일부 설정은 저장되었을 수 있어요. Teacher Manager로 돌아가 현재 상태를 확인하고, 처음 설정 메뉴를 바로 다시 누르지 마세요.';
+    code = 'SETUP_EXECUTION_TIMEOUT';
+  } else if (/NetworkError|Failed to fetch|Network error|Error communicating|Service unavailable|서버와.*통신/i.test(cause)) {
+    title = '설정 결과 응답을 받지 못했어요';
+    message = '응답을 받지 못해 설정이 끝났는지 아직 알 수 없어요. 잠시 뒤 Teacher Manager에서 상태를 확인해 주세요. 설정 메뉴를 다시 누르면 작업이 겹칠 수 있어요.';
+    code = 'SETUP_RESPONSE_UNAVAILABLE';
+  } else if (/TypeError|ReferenceError|SyntaxError|is not defined|is not a function|Script function not found/i.test(cause)) {
+    title = '처음 설정 중 프로그램 오류가 발생했어요';
+    message = '설정 프로그램을 실행하는 중 오류가 발생했어요. 계정 변경이나 권한 재허용으로 해결된다고 판단할 수 없어요. 아래 확인 코드를 함께 알려 주세요.';
+    code = 'SETUP_PROGRAM_ERROR';
+  } else if (/Access denied|PERMISSION_DENIED|permission denied/i.test(cause)) {
+    title = 'Google에서 설정 요청을 허용하지 않았어요';
+    message = '접근이 거절된 정확한 항목을 실행 기록에서 확인해야 해요. 계정을 바꾸거나 설정을 반복하기 전에 아래 확인 코드를 함께 알려 주세요.';
+    code = 'SETUP_ACCESS_DENIED';
+  }
+  return { title: title, message: message + '\n\n오류 확인 코드: ' + code, code: code, complete: false };
+}
+
+function readAttendanceConfigStrict_(spreadsheet) {
+  const sheet = spreadsheet.getSheetByName(CONFIG_SHEET_NAME);
+  if (!sheet) throw new Error('출석부 설정을 확인하지 못했습니다. 기존 자료는 그대로 두었습니다.');
+  const rows = sheet.getDataRange().getValues();
+  if (!Array.isArray(rows)) throw new Error('출석부 설정 응답을 확인하지 못했습니다.');
+  const config = Object.create(null);
+  rows.forEach(row => {
+    if (!Array.isArray(row)) throw new Error('출석부 설정 응답을 확인하지 못했습니다.');
+    const key = String(row[0] || '').trim();
+    if (!key) return;
+    if (Object.prototype.hasOwnProperty.call(config, key)) {
+      throw new Error('출석부 설정에 같은 항목이 두 번 있어 자동 처리를 멈췄습니다.');
+    }
+    config[key] = row[1];
+  });
+  return config;
+}
+
+function parseAttendanceMonthSheetIds_(value) {
+  let result = value;
+  if (typeof value === 'string') {
+    const keys = value.match(/"(?:\\.|[^"\\])*"\s*:/g) || [];
+    if (keys.length !== 12) throw new Error('월별 출결표 연결 기록을 확인하지 못했습니다.');
+    try { result = JSON.parse(value); } catch (err) {
+      throw new Error('월별 출결표 연결 기록을 읽지 못했습니다.');
+    }
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+      || Object.keys(result).length !== 12) {
+    throw new Error('월별 출결표 연결 기록이 없습니다. 빈 월별 탭을 만들지 않았습니다.');
+  }
+  const checked = {};
+  const seen = new Set();
+  for (let month = 1; month <= 12; month++) {
+    const id = result[String(month)];
+    if (!Number.isSafeInteger(id) || id < 0 || id > 2147483647 || seen.has(id)) {
+      throw new Error('월별 출결표 연결 기록이 서로 겹치거나 올바르지 않습니다.');
+    }
+    checked[String(month)] = id;
+    seen.add(id);
+  }
+  return checked;
+}
+
+function attendanceMonthSheetsFor_(spreadsheet, config) {
+  const manifest = parseAttendanceMonthSheetIds_(config.ATTENDANCE_MONTH_SHEET_IDS);
+  // A renamed monthly tab must never become an auxiliary tab that setup or
+  // queue helpers may rewrite. This is a role collision, not title identity.
+  const reservedNames = new Set(['설정','드롭다운','학생명단','휴일','템플릿_치환표','발송기록','00_사용법',
+    '메신저 개인톡 내용','메신저 단체톡 내용','개인톡 내용','개인 쪽지 대장','단체톡 내용','단체 쪽지 대장',
+    config.ROSTER_SHEET_NAME,config.HOLIDAY_SHEET_NAME,config.CHAT_LOG_SHEET_NAME].filter(Boolean));
+  const sheets = spreadsheet.getSheets();
+  const byId = new Map();
+  sheets.forEach(sheet => {
+    const id = sheet.getSheetId();
+    if (byId.has(id)) throw new Error('월별 출결표 응답이 중복되어 멈췄습니다.');
+    byId.set(id, sheet);
+  });
+  return [3,4,5,6,7,8,9,10,11,12,1,2].map(month => {
+    const sheet = byId.get(manifest[String(month)]);
+    if (!sheet) throw new Error('연결된 월별 출결표를 찾지 못했습니다. 빈 탭을 만들지 않았습니다.');
+    if (reservedNames.has(sheet.getName())) throw new Error('월별 출결표와 다른 업무 탭의 역할이 겹쳐 기존 자료를 보존하고 멈췄습니다.');
+    return { month: month, sheet: sheet };
+  });
+}
+
+function attendanceMonthLayoutKind_(sheet) {
+  const rows = sheet.getRange(1, 1, 2, 13).getValues();
+  if (!Array.isArray(rows) || rows.length !== 2 || rows.some(row => !Array.isArray(row))) {
+    throw new Error('월별 출결표의 제목을 읽지 못했습니다.');
+  }
+  const matches = row => INPUT_HEADERS.every((value, index) => String(row[index] || '').trim() === value);
+  const kind = matches(rows[1]) ? 'current' : matches(rows[0]) ? 'one-header-row' : '';
+  if (!kind) throw new Error('알 수 없는 출결표 구조입니다. 기존 내용을 덮어쓰지 않았습니다.');
+  const header = kind === 'current' ? rows[1] : rows[0];
+  MONTHLY_CHAT_RESULT_HEADERS.concat([MONTHLY_ATTENDANCE_AI_MARK_HEADER]).forEach((label, index) => {
+    const value = String(header[index + 8] || '').replace(/\s+/g, ' ').trim();
+    const allowed = ['', label.replace(/\s+/g, ' ').trim()];
+    if (index < 4) allowed.push(['Google Chat 발송상태','Google Chat 시도시각','Google Chat 결과','Google Chat 내용기준'][index]);
+    if (allowed.indexOf(value) < 0) throw new Error('출결표에 직접 추가한 제목이 있어 덮어쓰지 않았습니다.');
+  });
+  if (kind === 'current' && (rows[0].slice(2).some(value => value !== '' && value !== null)
+      || ['', MONTHLY_ATTENDANCE_AI_INPUT_LABEL, MONTHLY_ATTENDANCE_AI_INPUT_PLACEHOLDER].indexOf(String(rows[0][0] || '')) < 0)) {
+    throw new Error('출결 입력칸에 기존 내용이 있어 합치지 않았습니다.');
+  }
+  return kind;
+}
+
+function prepareAttendanceMonthManifest_(spreadsheet, config) {
+  if (config.ATTENDANCE_MONTH_SHEET_IDS) return attendanceMonthSheetsFor_(spreadsheet, config);
+  if (config.FIRST_TIME_SETUP_DONE || config.FIRST_TIME_SETUP_SHEET_DONE) {
+    throw new Error('기존 출석부의 월별 연결 기록을 먼저 복구해야 합니다. 빈 탭을 만들지 않았습니다.');
+  }
+  // Only an explicit initial setup may bootstrap the intact shipped template.
+  // Inspect all twelve roles before writing a manifest or touching any cells.
+  const manifest = {};
+  const months = [3,4,5,6,7,8,9,10,11,12,1,2].map(month => {
+    const sheet = spreadsheet.getSheetByName(String(month) + '월');
+    if (!sheet) throw new Error('처음 출석부의 월별 탭이 없습니다. 빈 탭을 만들지 않았습니다.');
+    attendanceMonthLayoutKind_(sheet);
+    manifest[String(month)] = sheet.getSheetId();
+    return {month: month, sheet: sheet};
+  });
+  parseAttendanceMonthSheetIds_(manifest);
+  setConfigValue_('ATTENDANCE_MONTH_SHEET_IDS', JSON.stringify(manifest));
+  SpreadsheetApp.flush();
+  const reread = parseAttendanceMonthSheetIds_(readAttendanceConfigStrict_(spreadsheet).ATTENDANCE_MONTH_SHEET_IDS);
+  if (JSON.stringify(reread) !== JSON.stringify(parseAttendanceMonthSheetIds_(manifest))) {
+    throw new Error('월별 연결 기록의 저장 결과를 확인하지 못했습니다.');
+  }
+  return months;
+}
+
+function attendanceSetupMarkerMatches_(marker, spreadsheetId, account) {
+  const parts = String(marker || '').trim().split(/\s+/);
+  return parts.length >= 3 && parts[0] === attendanceConnectionCodeForSpreadsheetId_(spreadsheetId)
+    && !!account && parts[1].toLowerCase() === String(account).trim().toLowerCase();
+}
+
+function attendanceWorkbookHealthFor_(spreadsheet, expectedAccount) {
+  const result = { setupCompletionEvidence: false, currentReadState: 'unavailable',
+    structureClassification: 'unknown', automationState: 'unverified', recoveryAction: 'diagnose-workbook' };
+  try {
+    const config = readAttendanceConfigStrict_(spreadsheet);
+    const setupMarker = config.FIRST_TIME_SETUP_SHEET_DONE || config.FIRST_TIME_SETUP_DONE;
+    result.setupMarkerPresent = !!String(setupMarker || '').trim();
+    result.setupCompletionEvidence = attendanceSetupMarkerMatches_(setupMarker, spreadsheet.getId(), expectedAccount);
+    if (result.setupMarkerPresent && !result.setupCompletionEvidence) {
+      result.recoveryAction = 'verify-setup-account';
+      throw new Error('기존 설정 완료 기록의 계정 또는 출석부가 현재 대상과 다릅니다. 기존 설정을 보존했습니다.');
+    }
+    const year = String(config.SCHOOL_YEAR || '').trim();
+    if (!/^\d{4}$/.test(year)) throw new Error('이 출석부의 학년도를 확인하지 못했습니다.');
+    result.workbookSchoolYear = Number(year);
+    const months = attendanceMonthSheetsFor_(spreadsheet, config);
+    const kinds = months.map(item => attendanceMonthLayoutKind_(item.sheet));
+    result.currentReadState = 'verified';
+    result.structureClassification = kinds.every(kind => kind === 'current') ? 'current' : 'repairable';
+    result.recoveryAction = result.structureClassification === 'current' ? '' : 'repair-layout';
+    result.monthlySheetIds = parseAttendanceMonthSheetIds_(config.ATTENDANCE_MONTH_SHEET_IDS);
+  } catch (err) {
+    result.detail = String(err && err.message || '현재 출석부 상태를 확인하지 못했습니다.');
+  }
+  return result;
+}
+
+function apiAttendanceWorkbookHealth() {
+  const account = requireGoeduTeacherAccount_();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const health = attendanceWorkbookHealthFor_(spreadsheet, account);
+  health.aiReadState = 'unavailable';
+  health.aiReady = false;
+  if (health.currentReadState === 'verified') {
+    try {
+      const authority = authorizeAttendanceOperation_('health', '');
+      health.bindingVerified = true;
+      health.generation = authority.generation;
+      health.currentSchoolYear = authority.currentSchoolYear;
+      const ai = attendanceAiSetupStatusFor_(spreadsheet, account, spreadsheet);
+      health.aiReady = ai.ok === true;
+      // The legacy AI inspector intentionally suppresses some read exceptions;
+      // only its fully positive result is current readiness evidence.
+      health.aiReadState = health.aiReady ? 'verified' : 'unavailable';
+      health.automationState = health.setupCompletionEvidence
+        && health.structureClassification === 'current' && health.aiReady
+        && authority.automationState === 'AUTHORIZED' ? 'ready' : 'blocked';
+      if (health.automationState !== 'ready') {
+        health.recoveryAction = !health.setupCompletionEvidence ? 'complete-initial-setup'
+          : !health.aiReady ? 'repair-ai-input' : 'check-current-connection';
       }
-      google.script.run.withSuccessHandler(function(result) {
-        // A pending authorization opens its own dialog. Never cover or close it.
-        if (result && result.pending) return;
-        if (!result || typeof result.message !== 'string') {
-          finish('설정 결과를 확인해 주세요', 'Teacher Manager로 돌아가 설정 상태를 확인해 주세요. 완료되지 않았다면 시트의 처음 설정 메뉴를 다시 눌러 주세요.');
-          return;
-        }
-        finish(result.complete ? '처음 설정이 끝났어요' : '남은 설정을 확인해 주세요', result.message);
-      }).withFailureHandler(function() {
-        finish('처음 설정을 마치지 못했어요', '인터넷 연결과 Google 권한 허용을 확인한 뒤, 시트의 처음 설정 메뉴를 다시 눌러 주세요. 이미 끝난 단계는 건너뜁니다.');
-      }).runFirstTimeSetupWork();
-    </script></body></html>`;
+    } catch (err) {
+      if (health.bindingVerified !== true) health.bindingVerified = false;
+      health.automationState = 'blocked';
+      health.recoveryAction = 'check-current-connection';
+      health.detail = String(err && err.message || '현재 처리 권한을 확인하지 못했습니다.');
+    }
+  }
+  return health;
 }
 
 function runFirstTimeSetupWork() {
   const setupAccount = String(requireGoeduTeacherAccount_() || '').trim();
+  const previousHealth = attendanceWorkbookHealthFor_(SpreadsheetApp.getActiveSpreadsheet(), setupAccount);
+  if (previousHealth.setupMarkerPresent) {
+    return { title: '처음 한 번 설정하기', complete: false,
+      sheetReady: previousHealth.currentReadState === 'verified' && previousHealth.structureClassification === 'current',
+      setupCompletionEvidence: previousHealth.setupCompletionEvidence, currentHealth: previousHealth,
+      message: !previousHealth.setupCompletionEvidence
+        ? '기존 설정 완료 기록의 계정 또는 출석부를 확인해야 합니다. 처음 설정을 다시 실행하지 않았습니다.'
+        : previousHealth.currentReadState === 'verified'
+        ? '처음 시트 설정은 이미 마쳤습니다. Teacher Manager에서 현재 연결 상태를 확인합니다.'
+        : '처음 시트 설정을 마친 기록은 있습니다. 현재 상태를 확인하지 못해 설정을 다시 실행하지 않았습니다.' };
+  }
   const steps = [
     { title: '기본 시트/설정 점검', run: firstTimeSetupWorkbookStep_ },
     { title: 'AI 출결 입력 켜기', run: firstTimeSetupAiStep_ },
@@ -251,16 +484,21 @@ function runFirstTimeSetupWork() {
   const lines = [];
   const leftovers = [];
   let connectionCode = '';
+  let resultUncertain = false;
 
   steps.forEach(function (step, index) {
     let result;
     try {
-      result = step.run(context);
+      result = context.workbookFailed
+        ? { ok: false, message: '기본 시트 준비가 끝나지 않아 이 단계는 시작하지 않았습니다.' }
+        : step.run(context);
     } catch (err) {
-      // 한 단계가 무너져도 나머지는 이어서 한다.
-      result = { ok: false, message: errorMessage_(err) };
+      // 기본 시트 실패는 종속 단계를 멈춘다. AI 실패 뒤에도 독립적인 Chat 확인은 이어 간다.
+      resultUncertain = true;
+      result = { ok: false, message: sheetFacingErrorMessage_(err, step.title) };
     }
     result = result || { ok: false, message: '결과를 확인하지 못했습니다.' };
+    if (index === 0 && result.ok !== true) context.workbookFailed = true;
     const mark = result.ok === true ? (result.skipped === true ? '[이미]' : '[됨]') : '[못 함]';
     lines.push(mark + ' ' + step.title + (result.message ? ' — ' + firstTimeSetupOneLine_(result.message) : ''));
     if (result.ok !== true) leftovers.push(step.title + '\n' + String(result.message || ''));
@@ -279,9 +517,10 @@ function runFirstTimeSetupWork() {
         SpreadsheetApp.flush();
         context.sheetReady = true;
       } catch (err) {
-        const connectionError = errorMessage_(err);
-        lines.push('[못 함] 시트 설정 완료 기록 — ' + connectionError);
-        leftovers.push('시트 설정 완료 기록\n' + connectionError);
+        resultUncertain = true;
+        const connectionError = sheetFacingErrorMessage_(err, '출석부 연결 저장');
+        lines.push('[못 함] 출석부 연결 저장 — ' + connectionError);
+        leftovers.push('출석부 연결 저장\n' + connectionError);
       }
     }
   });
@@ -303,16 +542,22 @@ function runFirstTimeSetupWork() {
       SpreadsheetApp.flush();
     } catch (err) {
       // 네 단계가 끝났어도 표시가 없으면 프로그램의 [다음]이 계속 잠긴다.
-      // 다시 눌렀을 때 이미 끝난 네 단계는 건너뛰고 이 표시만 다시 적게 안내한다.
-      const markerError = errorMessage_(err);
-      lines.push('[못 함] 완료 표시 기록 — ' + markerError);
-      leftovers.push('완료 표시 기록\n' + markerError);
+      // 저장 결과가 불확실하므로 재실행을 권하지 않는다.
+      resultUncertain = true;
+      const markerError = sheetFacingErrorMessage_(err, '처음 설정 완료 여부 저장');
+      lines.push('[못 함] 처음 설정 완료 여부 저장 — ' + markerError);
+      leftovers.push('처음 설정 완료 여부 저장\n' + markerError);
     }
   }
 
   const chatOnlyPending = context.sheetReady && leftovers.length > 0
     && leftovers.every(item => item.indexOf('Google Chat ') === 0);
-  const closing = chatOnlyPending
+  const closing = resultUncertain
+    ? '결과를 확인하지 못한 설정이 있어요. 아래 안내를 확인하고, 같은 작업을 다시 실행하기 전에 문의해 주세요.\n\n' + leftovers.join('\n\n')
+    : context.chatCheckUncertain && context.sheetReady
+    ? '시트 설정은 끝났습니다. Google Chat 연결 상태를 확인하지 못해 기존 연결을 바꾸지 않았습니다.\n' +
+      'Teacher Manager로 돌아가 연결 상태를 확인해 주세요. 이 시트 메뉴는 다시 누르지 않아도 됩니다.'
+    : chatOnlyPending
     ? '시트 설정은 끝났습니다. Teacher Manager로 돌아가 Google Chat 연결과 학급 단톡방 선택을 마쳐 주세요.\n' +
       '이 메뉴는 다시 누르지 않아도 됩니다.\n\n아직 남은 것\n\n' + leftovers.join('\n\n')
     : leftovers.length
@@ -381,7 +626,7 @@ function firstTimeSetupWorkbookStep_() {
   return { ok: true, message: '월별 시트·학생명단·설정 시트를 확인했습니다.' };
 }
 
-/** 2단계 — 1행 AI 입력 켜기(편집 감지기 만들기). */
+/** 2단계 — 맨 위 입력칸의 AI 출결 입력 켜기. */
 function firstTimeSetupAiStep_() {
   // 켤 수 있는 사본인지 먼저 본다. 아닌 시트에서도 나머지 단계는 계속하되 전체 완료로 적지는 않는다.
   let state = null;
@@ -397,7 +642,7 @@ function firstTimeSetupAiStep_() {
     };
   }
   const result = enableAttendanceAiInput({ quiet: true }) || { ok: false, message: '결과를 확인하지 못했습니다.' };
-  // 이미 있던 감지기를 그대로 쓴 경우는 새로 만든 것과 구분해 보여 준다.
+  // 이미 준비된 경우는 새로 켠 경우와 구분해 보여 준다.
   if (result.ok === true && result.created !== true) result.skipped = true;
   return result;
 }
@@ -408,10 +653,17 @@ function firstTimeSetupChatStep_(context) {
   try {
     status = callCentralChatSender_('/v1/status', {});
   } catch (err) {
-    // 상태를 못 읽었다고 건너뛰면 첫 연결이 영영 시작되지 않는다. 연결부터 시도한다.
+    // A failed read does not establish that existing consent is missing.
     status = null;
   }
-  if (status && status.connected) {
+  if (!status || typeof status.connected !== 'boolean') {
+    if (context) context.chatCheckUncertain = true;
+    return {
+      ok: false,
+      message: '연결 상태를 확인하지 못해 기존 연결을 바꾸지 않았습니다. Teacher Manager로 돌아가 현재 상태를 확인해 주세요.'
+    };
+  }
+  if (status.connected === true) {
     if (context) context.chatReady = true;
     return {
       ok: true,
@@ -425,6 +677,9 @@ function firstTimeSetupChatStep_(context) {
 
 /** 4단계 — 학급 단톡방 고르기. 목록에서 고르는 화면은 사람이 눌러야 끝난다. */
 function firstTimeSetupClassSpaceStep_(context) {
+  if (context && context.chatCheckUncertain) {
+    return { ok: false, message: '연결 상태가 확인되면 Teacher Manager에서 단톡방을 확인해 주세요. 기존 선택은 그대로입니다.' };
+  }
   if (context && context.chatReady !== true) {
     // 연결 전에는 단톡방 목록 자체를 받아올 수 없어, 물어봐야 실패만 한다.
     return {
@@ -495,13 +750,19 @@ function apiMigrateRosterLayoutAfterUpdate() {
 
 function setupAttendanceWorkbookCore_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const initial = readAttendanceConfigStrict_(ss);
+  if (!/^\d{4}$/.test(String(initial.SCHOOL_YEAR || '').trim())) {
+    throw new Error('이 출석부의 학년도를 확인하지 못했습니다. 현재 연도로 대신 설정하지 않았습니다.');
+  }
+  const months = prepareAttendanceMonthManifest_(ss, initial);
+  months.forEach(item => attendanceMonthLayoutKind_(item.sheet));
   ensureConfigSheet_(ss);
   recordScriptIdInConfig_();
   ensureCentralChatConfig_();
   const cfg = getConfig_();
-  const monthNames = getMonthSheetNames_(cfg);
+  const monthNames = months.map(item => item.sheet.getName());
 
-  monthNames.forEach(name => ensureMonthSheet_(ss, name));
+  months.forEach(item => ensureMonthSheet_(ss, item.sheet));
   ensureRosterSheet_(ss);
   ensureHolidaySheet_(ss);
   ensureDropdownSheet_(ss);
@@ -522,12 +783,9 @@ function setupAttendanceWorkbookCore_() {
     '00_사용법'
   ]));
 
-  monthNames.forEach(name => {
-    const sh = ss.getSheetByName(name);
-    if (sh) {
-      applyInputSheetFormatting_(sh);
-      ensureMonthlyChatResultColumns_(sh);
-    }
+  months.forEach(item => {
+    applyInputSheetFormatting_(item.sheet);
+    ensureMonthlyChatResultColumns_(item.sheet);
   });
   applyStudentDropdowns_(ss, cfg);
 }
@@ -536,40 +794,40 @@ function ensureConfigSheet_(ss) {
   let sh = ss.getSheetByName(CONFIG_SHEET_NAME);
   if (!sh) sh = ss.insertSheet(CONFIG_SHEET_NAME);
 
-  if (!String(sh.getRange(1, 1).getValue() || '').trim()) {
-    sh.getRange(1, 1, 1, 4).setValues([['설정키','값','설명','예시/필수']]);
-  }
+  sh.getRange(1, 1, 1, 4).setValues([
+    ['자동 처리용 설정 — 프로그램이 채웁니다','값','설명','예시/필수']
+  ]);
 
   const existing = readConfigMapFromSheet_(sh);
   const rows = [
-    ['SCHOOL_NAME', DEFAULT_CONFIG.SCHOOL_NAME, '기존 Google Docs 템플릿의 {학교명} 자리에 들어갈 학교명입니다.', '예: ○○중학교 / 필수'],
-    ['SCHOOL_YEAR', DEFAULT_CONFIG.SCHOOL_YEAR, '학년도 표기용 기본값입니다. 실제 신고서 날짜 연도는 A열 날짜/확인일에서 계산됩니다.', '예: 2026'],
-    ['GRADE', DEFAULT_CONFIG.GRADE, '템플릿에 {학년} placeholder가 있을 때만 사용합니다.', '예: 2'],
-    ['CLASS_NUMBER', DEFAULT_CONFIG.CLASS_NUMBER, '템플릿에 {반} placeholder가 있을 때만 사용합니다.', '예: 2'],
-    ['CLASS_LABEL', DEFAULT_CONFIG.CLASS_LABEL, '{반번호} 또는 파일명/Tasks 제목에 쓰는 학반 표시입니다.', '예: 2-2'],
-    ['TEACHER_NAME', DEFAULT_CONFIG.TEACHER_NAME, '템플릿에 {담임} placeholder가 있을 때만 사용합니다.', '예: 홍길동'],
-    ['TEMPLATE_DOC_ID', '', '설치 도우미가 자동으로 입력합니다. 비어 있으면 출결 자동화 시트를 만든 설치 도우미를 다시 실행하세요.', '필수 / Google Docs 문서 ID'],
-    ['DEST_FOLDER_ID', '', '설치 도우미가 자동으로 입력한 신고서 저장 폴더 번호입니다. 비어 있으면 Teacher Manager의 출결 연결을 다시 점검하세요.', '자동 입력 / 필수'],
+    ['SCHOOL_NAME', DEFAULT_CONFIG.SCHOOL_NAME, '신고서 양식의 학교명 자리에 들어갈 이름입니다.', '예: ○○중학교 / 필수'],
+    ['SCHOOL_YEAR', DEFAULT_CONFIG.SCHOOL_YEAR, '출결표에서 사용하는 학년도입니다. 신고서 날짜 연도는 출결 날짜에 맞춰 계산합니다.', '예: 2026'],
+    ['GRADE', DEFAULT_CONFIG.GRADE, '신고서 양식에 학년을 자동으로 채울 때 사용합니다.', '예: 2'],
+    ['CLASS_NUMBER', DEFAULT_CONFIG.CLASS_NUMBER, '신고서 양식에 반을 자동으로 채울 때 사용합니다.', '예: 2'],
+    ['CLASS_LABEL', DEFAULT_CONFIG.CLASS_LABEL, '신고서 파일명과 할 일 제목에 쓰는 학년·반 표시입니다.', '예: 2-2'],
+    ['TEACHER_NAME', DEFAULT_CONFIG.TEACHER_NAME, '신고서 양식에 담임 이름을 자동으로 채울 때 사용합니다.', '예: 홍길동'],
+    ['TEMPLATE_DOC_ID', '', '신고서 양식 연결입니다. Teacher Manager가 자동으로 채웁니다.', '자동 입력 / 필수'],
+    ['DEST_FOLDER_ID', '', '완성한 신고서를 저장할 Google Drive 폴더 연결입니다. Teacher Manager가 자동으로 채웁니다.', '자동 입력 / 필수'],
     ['DEST_FOLDER_NAME', DEFAULT_CONFIG.DEST_FOLDER_NAME, '출력 폴더 자동 생성 시 사용할 폴더명입니다.', '출결 증빙'],
-    ['TASK_LIST_ID', '', 'Teacher Manager에서 고른 Google Tasks 목록 번호입니다. 비어 있으면 Teacher Manager의 연결 화면을 다시 점검하세요.', '자동 입력 / Tasks 사용 시 필수'],
-    ['TASK_LIST_TITLE', DEFAULT_CONFIG.TASK_LIST_TITLE, 'Tasks 목록 자동 생성 시 사용할 이름입니다.', '출결 미제출 확인'],
+    ['TASK_LIST_ID', '', '출결 미제출 할 일을 저장할 Google Tasks 목록 연결입니다. Teacher Manager가 자동으로 채웁니다.', '자동 입력 / 할 일 사용 시 필수'],
+    ['TASK_LIST_TITLE', DEFAULT_CONFIG.TASK_LIST_TITLE, '출결 미제출 할 일을 모아 둘 목록 이름입니다.', '출결 미제출 확인'],
     ['HOLIDAY_SHEET_NAME', DEFAULT_CONFIG.HOLIDAY_SHEET_NAME, '수업일 계산에서 제외할 휴일 시트 이름입니다.', '휴일'],
     ['ROSTER_SHEET_NAME', DEFAULT_CONFIG.ROSTER_SHEET_NAME, '학생명단 시트입니다. A열 번호, B열 이름, C열 학생 Google 이메일을 씁니다.', '학생명단'],
-    ['STUDENT_DROPDOWN_RANGE', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE, '월별 시트 B열이 읽는 드롭다운 시트의 숨은 학생 목록입니다.', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE],
+    ['STUDENT_DROPDOWN_RANGE', DEFAULT_CONFIG.STUDENT_DROPDOWN_RANGE, '월별 출결표의 학생 선택목록을 만드는 자리입니다.', '프로그램이 자동으로 관리'],
     ['TIMEZONE', DEFAULT_CONFIG.TIMEZONE, '날짜 표시 시간대입니다.', 'Asia/Seoul'],
     ['MONTH_SHEET_NAMES', DEFAULT_CONFIG.MONTH_SHEET_NAMES, '자동화 대상 월별 입력 시트 이름입니다.', DEFAULT_CONFIG.MONTH_SHEET_NAMES],
-    ['HOMEROOM_TASK_LIST_ID', DEFAULT_CONFIG.HOMEROOM_TASK_LIST_ID, '조종례시 담임학급 안내사항 Google Tasks 목록 ID입니다. 설치 도우미가 담임 설정에서 가져옵니다.', '담임일 때 자동 입력'],
-    ['CENTRAL_CHAT_SENDER_URL', DEFAULT_CONFIG.CENTRAL_CHAT_SENDER_URL, '중앙 Google Chat 발송소 주소입니다. 공개 배포판에서 설정됩니다.', '예: https://chat-sender.example.com'],
-    ['CENTRAL_CHAT_SHEET_ID', DEFAULT_CONFIG.CENTRAL_CHAT_SHEET_ID, '이 시트를 중앙 발송소가 구분하는 번호입니다. 자동 생성됩니다.', '자동'],
-    ['CENTRAL_CHAT_SHEET_SECRET', DEFAULT_CONFIG.CENTRAL_CHAT_SHEET_SECRET, '이 시트에서 온 요청인지 확인하는 값입니다. 자동 생성됩니다.', '자동'],
-    ['CLASS_CHAT_SPACE_ID', DEFAULT_CONFIG.CLASS_CHAT_SPACE_ID, '학급 단체방 Google Chat 스페이스 ID입니다. 교육청 메신저 정리·발송 메뉴에서 선택합니다.', '예: spaces/AAA...'],
+    ['HOMEROOM_TASK_LIST_ID', DEFAULT_CONFIG.HOMEROOM_TASK_LIST_ID, '조종례 안내를 저장할 담임학급 Google Tasks 목록 연결입니다.', '담임일 때 자동 입력'],
+    ['CENTRAL_CHAT_SENDER_URL', DEFAULT_CONFIG.CENTRAL_CHAT_SENDER_URL, 'Google Chat 자동 발송에 필요한 연결 정보입니다.', '프로그램이 자동으로 관리'],
+    ['CENTRAL_CHAT_SHEET_ID', DEFAULT_CONFIG.CENTRAL_CHAT_SHEET_ID, '이 출석부의 Google Chat 연결 정보입니다.', '프로그램이 자동으로 관리'],
+    ['CENTRAL_CHAT_SHEET_SECRET', DEFAULT_CONFIG.CENTRAL_CHAT_SHEET_SECRET, '이 출석부의 Google Chat 연결을 보호하는 값입니다.', '프로그램이 자동으로 관리'],
+    ['CLASS_CHAT_SPACE_ID', DEFAULT_CONFIG.CLASS_CHAT_SPACE_ID, '학급 쪽지를 보낼 Google Chat 단톡방 연결입니다. Teacher Manager에서 학급 단톡방을 고르면 채워집니다.', '자동 입력'],
     ['CLASS_CHAT_SPACE_NAME', DEFAULT_CONFIG.CLASS_CHAT_SPACE_NAME, '선생님이 알아볼 학급 Chat 방 이름입니다.', '예: 2학년 3반'],
     ['CHAT_LOG_SHEET_NAME', DEFAULT_CONFIG.CHAT_LOG_SHEET_NAME, '교육청 메신저 발송 기록 시트 이름입니다.', '발송기록'],
     ['PERSONAL_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_PERSONAL_SHEET_NAME, '개인에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 개인톡 내용'],
     ['CLASS_MESSAGE_QUEUE_SHEET_NAME', MESSENGER_CLASS_SHEET_NAME, '학급 전체에게 보낼 쪽지를 모아두는 시트 이름입니다.', '메신저 단체톡 내용'],
-    ['ATTENDANCE_AI_ALLOWED', ATTENDANCE_AI_ALLOWED_VALUE, 'Teacher Manager 정식 출석부에서 AI 입력을 켤 수 있게 하는 값입니다.', '예'],
-    ['ATTENDANCE_CONNECTION_CODE', '', '이 출석부의 실제 Google Sheet 번호에서 만든 연결 확인번호입니다. 처음 설정 결과와 Teacher Manager 화면의 번호를 대조합니다.', '자동 입력'],
-    ['SCRIPT_ID', DEFAULT_CONFIG.SCRIPT_ID, '이 시트에 연결된 Apps Script 프로젝트 ID입니다. 설치/점검 때 자동 기록되어, 설치 기록 파일이 없는 컴퓨터나 사본 시트에서도 스크립트를 찾을 수 있습니다.', '자동 입력']
+    ['ATTENDANCE_AI_ALLOWED', ATTENDANCE_AI_ALLOWED_VALUE, '이 출석부에서 AI 입력을 사용할 수 있게 하는 값입니다.', '프로그램이 자동으로 관리'],
+    ['ATTENDANCE_CONNECTION_CODE', '', 'Teacher Manager가 현재 사용할 출석부를 확인하는 값입니다.', '프로그램이 자동으로 관리'],
+    ['SCRIPT_ID', DEFAULT_CONFIG.SCRIPT_ID, 'Teacher Manager가 이 출석부의 자동 기능을 확인할 때 사용하는 연결 정보입니다.', '프로그램이 자동으로 관리']
   ];
 
   const existingKeys = new Set(Object.keys(existing));
@@ -588,11 +846,10 @@ function ensureConfigSheet_(ss) {
 
 /** Prepare every month in place; inserting the input row preserves all records. */
 function ensureMonthSheet_(ss, name) {
-  let sh = ss.getSheetByName(name);
-  const created = !sh;
-  if (created) sh = ss.insertSheet(name);
-  if (created || hasMonthlyHeaderInFirstRow_(sh)) {
-    if (!created) sh.insertRowBefore(MONTHLY_ATTENDANCE_INPUT_ROW);
+  const sh = typeof name === 'string' ? ss.getSheetByName(name) : name;
+  if (!sh) throw new Error('연결된 월별 출결표가 없습니다. 빈 탭을 만들지 않았습니다.');
+  if (hasMonthlyHeaderInFirstRow_(sh)) {
+    sh.insertRowBefore(MONTHLY_ATTENDANCE_INPUT_ROW);
     sh.getRange(MONTHLY_ATTENDANCE_INPUT_ROW, 1, 1, INPUT_HEADERS.length)
       .setValues([[MONTHLY_ATTENDANCE_AI_INPUT_LABEL, '']
         .concat(new Array(INPUT_HEADERS.length - 2).fill(''))]);
@@ -1109,7 +1366,7 @@ function validateAttendanceAiRecordsDetailed_(
   const failed = (code, message) => ({ records: null, code: code, message: message });
   const generic = () => failed(
     'shape',
-    '문장을 한 가지 출결로 정리하지 못했습니다. 학생별 표현과 날짜를 확인해 주세요.'
+    '입력한 문장을 출결표에 넣을 내용으로 정리하지 못했어요. 날짜·학생·출결 내용을 나누어 적어 주세요.'
   );
   const isPlainObject = value => (
     value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -1172,7 +1429,7 @@ function validateAttendanceAiRecordsDetailed_(
     ) {
       return failed(
         'attendance_value',
-        '출결 구분·종류 또는 교시를 확인해 주세요. 쓰지 않은 정보는 빈칸으로 둘 수 있습니다.'
+        '출결 구분은 질병·미인정·기타·출석인정, 종류는 결석·지각·조퇴·결과 중에서 적어 주세요. 지각·조퇴·결과에는 교시도 적어 주세요.'
       );
     }
 
@@ -1610,7 +1867,7 @@ function planAttendanceAiExistingUpdates_(
         context.sentence
       );
       if (!normalizedNew) {
-        return failed('value', '바꿀 값이 출결표에서 사용할 수 있는 값인지 확인해 주세요.');
+        return failed('value', '바꿀 값을 출결표의 선택값에 맞춰 적어 주세요. 구분은 질병·미인정·기타·출석인정, 종류는 결석·지각·조퇴·결과를 사용할 수 있습니다.');
       }
       let normalizedOld = null;
       if (change.old_value_stated) {
@@ -1929,17 +2186,8 @@ function handleAttendanceAiEdit(e, testPorts) {
     getTargetSpreadsheetId: () => PropertiesService.getScriptProperties()
       .getProperty(ATTENDANCE_AI_TARGET_SPREADSHEET_ID_PROPERTY),
     getGeminiApiKey: () => attendanceAiGeminiApiKey_(source),
-    getTodayDate: () => {
-      let timeZone = 'Asia/Seoul';
-      try {
-        if (typeof source.getSpreadsheetTimeZone === 'function') {
-          timeZone = String(source.getSpreadsheetTimeZone() || '').trim() || timeZone;
-        }
-      } catch (err) {
-        // 출석부 시간대를 읽지 못하면 한국 기준 날짜를 사용한다.
-      }
-      return Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd');
-    },
+    getTodayDate: () => Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd'),
+    authorizeWrite: eventDate => authorizeAttendanceOperation_('historical-manual', eventDate),
     tryDocumentLock: () => {
       const lock = LockService.getDocumentLock();
       return lock && lock.tryLock(5000) ? lock : null;
@@ -2033,7 +2281,7 @@ function handleAttendanceAiEdit(e, testPorts) {
     apiKey = String(ports.getGeminiApiKey() || '').trim();
   } catch (err) {
     attendanceAiSkipLog_('대상 시트/키를 읽지 못함: ' + (err && err.message ? err.message : err));
-    ports.showMessage('AI 출결 입력 설정을 읽지 못했습니다. 처음 설정을 다시 확인해 주세요.');
+    ports.showMessage('AI 출결 입력 연결을 읽지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 출결 기능 상태를 확인해 주세요.');
     return { status: 'check_required' };
   }
   if (!targetSpreadsheetId || !apiKey) {
@@ -2044,8 +2292,8 @@ function handleAttendanceAiEdit(e, testPorts) {
     );
     ports.showMessage(
       !targetSpreadsheetId
-        ? 'AI 출결 입력 연결을 찾지 못했습니다. 처음 설정을 다시 실행해 주세요.'
-        : 'Gemini API key를 찾지 못했습니다. Teacher Manager 연결 화면에서 확인해 주세요.'
+        ? 'AI 출결 입력 연결을 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 출결 기능 상태를 확인해 주세요.'
+        : 'AI 출결 입력에 필요한 Gemini 연결 키를 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 확인해 주세요.'
     );
     return { status: 'disabled' };
   }
@@ -2060,34 +2308,26 @@ function handleAttendanceAiEdit(e, testPorts) {
     try {
       const configSheet = source.getSheetByName(CONFIG_SHEET_NAME);
       if (!configSheet) {
-        ports.showMessage('설정 탭을 찾지 못했습니다. 출석부 처음 설정을 확인해 주세요.');
+        ports.showMessage('이 출석부의 자동 처리 설정을 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부를 다시 확인해 주세요.');
         return { status: 'check_required' };
       }
-      const configRows = configSheet.getDataRange().getValues();
-      const config = {};
-      configRows.forEach(row => {
-        const key = String(row[0] || '').trim();
-        if (key) config[key] = row[1];
-      });
-      const configuredMonthNames = String(config.MONTH_SHEET_NAMES || '')
-        .split(',')
-        .map(name => name.trim())
-        .filter(Boolean);
-      const monthMatch = /^(\d{1,2})월$/.exec(sheet.getName());
-      if (!monthMatch) {
-        attendanceAiSkipLog_('월 시트가 아님(시트 이름: ' + sheet.getName() + ')');
-        ports.showMessage('월별 출결 시트에서 AI 출결 입력을 사용해 주세요.');
+      const config = readAttendanceConfigStrict_(source);
+      const monthSheets = attendanceMonthSheetsFor_(source, config);
+      const role = monthSheets.find(item => item.sheet.getSheetId() === sheet.getSheetId());
+      if (!role) {
+        attendanceAiSkipLog_('월별 연결 기록에 없는 탭');
+        ports.showMessage('현재 탭을 연결된 월별 출결표로 확인하지 못했어요. 입력 문장을 그대로 남겼습니다.');
         return { status: 'ignored' };
       }
       sheetContext = {
         schoolYear: String(config.SCHOOL_YEAR || '').trim(),
-        month: Number(monthMatch[1]),
-        configuredMonthNames: configuredMonthNames,
+        month: role.month,
+        configuredMonthNames: monthSheets.map(item => item.sheet.getName()),
         rosterSheetName: String(config.ROSTER_SHEET_NAME || '학생명단').trim()
       };
     } catch (err) {
       attendanceAiSkipLog_('설정 탭을 읽지 못함: ' + (err && err.message ? err.message : err));
-      ports.showMessage('출석부 설정을 읽지 못했습니다. 설정 탭을 확인해 주세요.');
+      ports.showMessage('이 출석부의 자동 처리 설정을 읽지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부를 다시 확인해 주세요.');
       return { status: 'check_required' };
     }
   }
@@ -2097,19 +2337,18 @@ function handleAttendanceAiEdit(e, testPorts) {
     !sheetContext
     || !Array.isArray(sheetContext.configuredMonthNames)
     || sheetContext.configuredMonthNames.indexOf(monthName) < 0
-    || monthName !== String(Number(sheetContext.month)) + '월'
   ) {
-    attendanceAiSkipLog_('시트 이름이 설정의 월 목록과 맞지 않음(시트: ' + monthName + ')');
-    ports.showMessage('이 월 시트는 현재 출석부 설정과 맞지 않습니다. 출석부 설정을 확인해 주세요.');
+    attendanceAiSkipLog_('월별 연결 기록과 현재 탭이 일치하지 않음');
+    ports.showMessage('현재 탭을 연결된 월별 출결표로 확인하지 못했어요. 입력 문장은 그대로 남겨 두었습니다.');
     return { status: 'ignored' };
   }
   if (
     getAttendanceAiCalendarYear_(sheetContext.schoolYear, sheetContext.month) === null
   ) {
     attendanceAiSkipLog_(
-      '설정 탭 SCHOOL_YEAR가 4자리 연도가 아님(지금 값: "' + sheetContext.schoolYear + '") — 설정 탭에서 2026처럼 고치면 됨'
+      '출석부의 고정 학년도를 확인하지 못함 — Teacher Manager에서 원래 연결 기록을 복구해야 함'
     );
-    ports.showMessage('학년도를 확인하지 못했습니다. 설정 탭에서 학년도를 확인해 주세요.');
+    ports.showMessage('출석부의 학년도를 확인하지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 현재 출석부의 학년도를 확인해 주세요.');
     return { status: 'check_required' };
   }
   const expectedHeaders = INPUT_HEADERS.concat(MONTHLY_CHAT_RESULT_HEADERS);
@@ -2125,7 +2364,7 @@ function handleAttendanceAiEdit(e, testPorts) {
         '2행 제목 줄이 기대와 다름. 실제: ' + JSON.stringify(actualHeaders) +
         ' / 기대: ' + JSON.stringify(expectedHeaders)
       );
-      ports.showMessage('월별 출결표의 제목 줄이 예상과 다릅니다. 출석부 문제 해결을 먼저 실행해 주세요.');
+      ports.showMessage('월별 출결표의 제목 줄이 바뀌어 AI 입력을 멈췄어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부의 상태를 확인해 주세요.');
       return { status: 'ignored' };
     }
   } catch (err) {
@@ -2166,7 +2405,7 @@ function handleAttendanceAiEdit(e, testPorts) {
       attendanceAiSkipLog_(
         '휴일 탭에서 이 학년도의 휴일을 확인하지 못함 — 휴일 탭을 확인한 뒤 다시 입력'
       );
-      ports.showMessage('휴일 탭에서 이 학년도의 휴일을 확인하지 못했습니다.');
+      ports.showMessage(calendarYear + '년 휴일을 확인하지 못했어요. [휴일] 탭의 A열 날짜와 B열 휴일 이름을 확인해 주세요.');
       return { status: 'check_required' };
     }
 
@@ -2210,10 +2449,17 @@ function handleAttendanceAiEdit(e, testPorts) {
         : sheet.getSheetId();
       const batchRequest = buildAttendanceAiExistingUpdateBatch_(plan, sheetId);
       if (!batchRequest) {
-        ports.showMessage('수정할 내용을 안전한 모양으로 만들지 못했습니다. 입력 문장을 그대로 남겨 두었습니다.');
+        ports.showMessage('입력한 문장에서 바꿀 출결 내용을 정리하지 못했어요. 날짜·학생·바꿀 내용을 나누어 적어 주세요. 입력 문장은 그대로 남겨 두었습니다.');
         return { status: 'check_required' };
       }
       if (batchRequest.requests.length) {
+        if (ports.authorizeWrite) {
+          // Existing-update validation already fixes every selected row to this
+          // immutable workbook year/month; validate its actual event date too.
+          const first = plan.changes[0];
+          const value = first.field === 'date' ? first.newValue : existingState.values[first.rowOffset][0];
+          ports.authorizeWrite(attendanceAiDateKeyFromValue_(value));
+        }
         writeAttempted = true;
         const response = ports.batchUpdate(targetSpreadsheetId, batchRequest);
         if (
@@ -2311,9 +2557,10 @@ function handleAttendanceAiEdit(e, testPorts) {
     }
     const batchRequest = buildAttendanceAiBatchUpdate_(records, writeState);
     if (!batchRequest) {
-      ports.showMessage('출결 내용을 저장할 모양으로 만들지 못했습니다. 입력 문장을 남겨 두었습니다.');
+      ports.showMessage('입력한 문장을 출결표에 넣을 내용으로 정리하지 못했어요. 날짜·학생·출결 내용을 나누어 적어 주세요. 입력 문장은 그대로 남겨 두었습니다.');
       return { status: 'check_required' };
     }
+    if (ports.authorizeWrite) ports.authorizeWrite(records[0].date);
     writeAttempted = true;
     const response = ports.batchUpdate(targetSpreadsheetId, batchRequest);
     if (
@@ -2459,8 +2706,8 @@ function attendanceAiWorkbookStateFor_(spreadsheet) {
     ok: false,
     spreadsheetId: spreadsheetId,
     message:
-      '이 파일을 Teacher Manager 정식 출석부로 확인하지 못했습니다.\n\n' +
-      '컴퓨터의 Teacher Manager에서 출결 시트를 하나로 정리하거나 처음 출결 준비를 끝낸 뒤 다시 눌러 주세요.'
+      '이 파일을 Teacher Manager에서 만든 출석부로 확인하지 못했어요.\n\n' +
+      'Teacher Manager의 [Google 연결 → 출결]에서 [사용할 출석부 고르기]를 눌러 이번에 사용할 파일을 선택해 주세요. 다른 파일은 그대로 두셔도 됩니다.'
   };
 }
 
@@ -2742,9 +2989,9 @@ function enableAttendanceAiInput(options) {
 
   return finish_(
     true,
-    'AI 출결 입력을 켰습니다.\n\n' +
-    (!triggerAlreadyThere ? '1행 편집을 받는 감지기를 새로 하나 만들었습니다.\n' : '이미 있던 감지기 하나를 그대로 씁니다.\n') +
-    '\n월 시트 1행에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르면\n' +
+    'AI 출결 입력을 켰어요.\n\n' +
+    (!triggerAlreadyThere ? '맨 위 입력칸을 사용할 준비를 마쳤습니다.\n' : '이미 준비된 입력칸을 그대로 사용합니다.\n') +
+    '\n월 탭 맨 위 입력칸에 "3월 12일 김철수 병결"처럼 적고 Enter를 누르면\n' +
     '맨 아래에 연한 초록색 출결행이 생깁니다.\n\n' +
     '이름을 못 찾거나 날짜·구분을 해석하지 못하면 아무 줄도 만들지 않습니다.',
     !triggerAlreadyThere
@@ -3166,13 +3413,13 @@ function ensureTemplateMapSheet_(ss) {
   if (!sh) sh = ss.insertSheet('템플릿_치환표');
   if (String(sh.getRange(1,1).getValue() || '').trim()) return;
   const rows = [
-    ['placeholder','값 출처','적용 위치/규칙','비고'],
-    ['{학교명} 또는 {{학교명}}','설정!SCHOOL_NAME','하단 학교명장 귀하','기존 템플릿에 있으면 치환'],
-    ['{반번호}','설정!CLASS_LABEL + B열 번호','반번호 자리','예: 2-2 3번'],
+    ['자동으로 채워지는 자리','값 출처','적용 위치/규칙','비고'],
+    ['{학교명} 또는 {{학교명}}','Teacher Manager에 저장한 학교명','하단 학교명장 귀하','신고서 양식에 있으면 자동으로 채움'],
+    ['{반번호}','Teacher Manager에 저장한 학급과 B열 학생 번호','반번호 자리','예: 2-2 3번'],
     ['{번호}','B열 번호+이름에서 번호 분리','상단 번호','예: 3김가온 → 3'],
     ['{성명}','B열 번호+이름에서 이름 분리','성명/학생 서명','예: 3김가온 → 김가온'],
     ['{사유}','E열 사유','사유/확인내용',''],
-    ['{시작교시}, {종료교시}','F열 교시','지각/조퇴/결과 row','결과는 시작=종료'],
+    ['{시작교시}, {종료교시}','F열 교시','지각/조퇴/결과 행','결과는 시작 교시와 종료 교시를 같게 채움'],
     ['{확인월}, {확인일}','종료 다음 수업일','신고 날짜와 하단 확인 날짜','주말·휴일 제외']
   ];
   sh.getRange(1,1,rows.length,4).setValues(rows);
@@ -3279,7 +3526,7 @@ function ensureUsageSheet_(ss) {
   [
     "5",
     "신고서",
-    "출결표에서 행을 선택하고 출결 신고서 만들기 메뉴를 사용합니다.",
+    "출결표에서 행을 선택한 뒤 [출결 업무 자동화 → 선택 행 출결신고서 Google Docs에 만들기]를 누릅니다.",
     "",
     "",
     ""
@@ -3432,13 +3679,11 @@ function getMonthSheetNames_(cfg) {
 }
 
 function getInputSheets_(ss, cfg) {
-  const names = new Set(getMonthSheetNames_(cfg || getConfig_()));
-  return ss.getSheets().filter(sh => names.has(sh.getName()));
+  return attendanceMonthSheetsFor_(ss, cfg || readAttendanceConfigStrict_(ss)).map(item => item.sheet);
 }
 
 function isInputMonthSheet_(sheet) {
-  const names = new Set(getMonthSheetNames_(getConfig_()));
-  return names.has(sheet.getName());
+  return isConfiguredMonthlyAttendanceSheetReadOnly_(sheet);
 }
 
 function isConfiguredMonthlyAttendanceSheetReadOnly_(sheet) {
@@ -3448,16 +3693,8 @@ function isConfiguredMonthlyAttendanceSheetReadOnly_(sheet) {
     if (!spreadsheet || typeof spreadsheet.getSheetByName !== 'function') return false;
     const configSheet = spreadsheet.getSheetByName(CONFIG_SHEET_NAME);
     if (!configSheet) return false;
-    const config = readConfigMapFromSheet_(configSheet);
-    if (!Object.prototype.hasOwnProperty.call(config, 'MONTH_SHEET_NAMES')) return false;
-    const configuredNames = config.MONTH_SHEET_NAMES;
-    if (typeof configuredNames !== 'string' || !configuredNames.trim()) return false;
-    const rawNames = configuredNames.split(',').map(name => name.trim());
-    if (!rawNames.length || rawNames.some(name => !name)) return false;
-    const names = getMonthSheetNames_(config);
-    const uniqueNames = new Set(names);
-    if (names.length !== rawNames.length || uniqueNames.size !== names.length) return false;
-    return uniqueNames.has(sheet.getName());
+    const config = readAttendanceConfigStrict_(spreadsheet);
+    return attendanceMonthSheetsFor_(spreadsheet, config).some(item => item.sheet.getSheetId() === sheet.getSheetId());
   } catch (err) {
     return false;
   }
@@ -3611,7 +3848,7 @@ function getClassLabel_() {
 function getTemplateDocId_() {
   const cfg = getConfig_();
   const id = String(cfg.TEMPLATE_DOC_ID || FALLBACK_TEMPLATE_DOC_ID || '').trim();
-  if (!id) throw new Error('설정 시트의 TEMPLATE_DOC_ID가 비어 있습니다. 출결 자동화 시트를 만든 설치 도우미를 다시 실행하세요.');
+  if (!id) throw new Error('신고서 양식 연결을 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부를 다시 확인해 주세요.');
   return id;
 }
 
@@ -3619,7 +3856,7 @@ function getDestinationFolder_() {
   const cfg = getConfig_();
   const folderId = String(cfg.DEST_FOLDER_ID || '').trim();
   if (!folderId) {
-    throw new Error('설정 시트의 DEST_FOLDER_ID가 비어 있습니다. Teacher Manager에서 출결 연결을 다시 점검하세요. 새 폴더는 만들지 않습니다.');
+    throw new Error('신고서 저장 폴더 연결을 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부를 다시 확인해 주세요.');
   }
   return DriveApp.getFolderById(folderId);
 }
@@ -3627,7 +3864,7 @@ function getDestinationFolder_() {
 function getTaskListId_() {
   const cfg = getConfig_();
   const id = String(cfg.TASK_LIST_ID || FALLBACK_TASK_LIST_ID || '').trim();
-  if (!id) throw new Error('설정 시트의 TASK_LIST_ID가 비어 있습니다. Teacher Manager의 연결 화면에서 조종례 Tasks 목록을 다시 확인하세요. 새 목록은 만들지 않습니다.');
+  if (!id) throw new Error('출결 미제출 할 일 목록 연결을 찾지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 할 일 목록을 다시 확인해 주세요.');
   return id;
 }
 
@@ -3705,7 +3942,7 @@ function requireGoeduTeacherAccount_(options) {
   const email = readSessionEmail_(opts.event, opts.allowEffectiveUser !== false);
   if (!isExactGoeduEmail_(email)) {
     throw new Error(
-      '이 계정으로는 진행할 수 없어요. Google 계정으로 다시 로그인해 주세요.'
+      '현재 로그인한 Google 계정을 확인하지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 연결을 다시 시작해 주세요.'
     );
   }
   if (opts.requireEffectiveUser === true) {
@@ -3717,7 +3954,7 @@ function requireGoeduTeacherAccount_(options) {
     }
     if (!isExactGoeduEmail_(effectiveEmail)) {
       throw new Error(
-        '이 감지기를 만든 계정으로는 진행할 수 없어요. Google 계정으로 AI 출결 입력을 다시 켜 주세요.'
+        'AI 출결 입력을 켠 Google 계정을 확인하지 못했어요. 현재 사용할 Google 계정으로 AI 출결 입력을 다시 켜 주세요.'
       );
     }
     return effectiveEmail;
@@ -3736,6 +3973,60 @@ function requireStudentChatAccount_(value) {
   return email;
 }
 
+function attendanceManagedScope_(purpose, eventDate, operationId) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = readAttendanceConfigStrict_(spreadsheet);
+  const year = String(cfg.SCHOOL_YEAR || '').trim();
+  const generation = Number(cfg.ATTENDANCE_BINDING_GENERATION);
+  if (String(cfg.ATTENDANCE_PROTOCOL_VERSION || '') !== '1' || !/^\d{4}$/.test(year)
+      || !Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error('현재 출석부의 자동 처리 연결을 확인하지 못했습니다. Teacher Manager에서 연결 상태를 확인해 주세요.');
+  }
+  if (['automatic','historical-manual','health'].indexOf(purpose) < 0) {
+    throw new Error('출결 작업의 목적을 확인하지 못했습니다.');
+  }
+  const result = { protocolVersion: 1, spreadsheetId: String(spreadsheet.getId()),
+    workbookSchoolYear: Number(year), generation: generation, purpose: purpose,
+    operationId: String(operationId || '').trim(),
+    monthlySheetIds: parseAttendanceMonthSheetIds_(cfg.ATTENDANCE_MONTH_SHEET_IDS) };
+  if (eventDate) result.eventDate = String(eventDate);
+  if (purpose === 'historical-manual') {
+    const parsed = attendanceAiParseDateKey_(result.eventDate);
+    if (!parsed || (parsed.month >= 3 ? parsed.year : parsed.year - 1) !== result.workbookSchoolYear) {
+      throw new Error('출결 날짜가 이 출석부의 학년도와 다릅니다. 다른 출석부로 옮겨 기록하지 않았습니다.');
+    }
+  }
+  return result;
+}
+
+function readAttendanceCentralConfig_(spreadsheet) {
+  const cfg = readAttendanceConfigStrict_(spreadsheet);
+  const result = {url: String(cfg.CENTRAL_CHAT_SENDER_URL || '').trim(),
+    sheetId: String(cfg.CENTRAL_CHAT_SHEET_ID || '').trim(),
+    sheetSecret: String(cfg.CENTRAL_CHAT_SHEET_SECRET || '').trim()};
+  if (!result.sheetId.startsWith(String(spreadsheet.getId()) + ':') || !result.sheetSecret) {
+    throw new Error('이 출석부의 서버 연결을 확인하지 못했습니다. 기존 연결값은 바꾸지 않았습니다.');
+  }
+  return result;
+}
+
+function authorizeAttendanceOperation_(purpose, eventDate) {
+  const scope = attendanceManagedScope_(purpose, eventDate, '');
+  const response = callCentralChatSender_('/v1/attendance/authorize-operation',
+    Object.assign({}, scope, {readOnly: true}));
+  if (!response || response.authorized !== true
+      || response.spreadsheetId !== scope.spreadsheetId
+      || Number(response.workbookSchoolYear) !== scope.workbookSchoolYear
+      || Number(response.generation) !== scope.generation
+      || JSON.stringify(parseAttendanceMonthSheetIds_((response.resourceManifest || {}).monthlySheetIds))
+        !== JSON.stringify(scope.monthlySheetIds)
+      || ((purpose === 'automatic' || purpose === 'health')
+          && Number(response.currentSchoolYear) !== scope.workbookSchoolYear)) {
+    throw new Error('현재 출석부의 처리 권한을 확인하지 못했습니다. 기존 자료는 바꾸지 않았습니다.');
+  }
+  return response;
+}
+
 function centralChatPathNeedsTeacher_(path) {
   // 연결을 끊거나 서버 기록을 지우는 길만 예외다. 새 작업 주소가 나중에 생겨도
   // 목록에 깜빡하고 더하지 않았다는 이유로 계정 확인 없이 열리지 않게 기본은 차단한다.
@@ -3749,9 +4040,14 @@ function callCentralChatSender_(path, payload) {
   if (String(path || '').trim() === '/v1/send/personal') {
     safePayload.studentEmail = requireStudentChatAccount_(safePayload.studentEmail);
   }
-  const central = ensureCentralChatConfig_();
+  const managed = String(path).indexOf('/v1/attendance/') === 0 || String(path).indexOf('/v1/send/') === 0;
+  if (String(path).indexOf('/v1/send/') === 0) {
+    Object.assign(safePayload, attendanceManagedScope_('automatic', '', safePayload.requestId));
+  }
+  const central = managed
+    ? readAttendanceCentralConfig_(SpreadsheetApp.getActiveSpreadsheet()) : ensureCentralChatConfig_();
   if (!central.url) {
-    throw new Error('Google Chat 중앙 발송소 주소가 비어 있습니다. 공개 배포 설정을 확인해 주세요.');
+    throw new Error('Google Chat 자동 발송 기능을 사용할 수 없어요. Teacher Manager의 [Google 연결 → 출결]에서 연결 상태를 확인해 주세요.');
   }
   const body = Object.assign({}, safePayload, {
     sheetId: central.sheetId,
@@ -3769,7 +4065,7 @@ function callCentralChatSender_(path, payload) {
   try {
     data = JSON.parse(text);
   } catch (err) {
-    throw new Error('중앙 발송소 응답을 읽지 못했습니다: ' + text.slice(0, 200));
+    throw centralSenderError_(status, { error: 'INVALID_RESPONSE' });
   }
   if (status < 200 || status >= 300) {
     throw centralSenderError_(status, data);
@@ -3779,7 +4075,7 @@ function callCentralChatSender_(path, payload) {
 
 function centralSenderError_(status, data) {
   const code = String(data && (data.error || data.code) || 'CENTRAL_SENDER_ERROR').trim();
-  const err = new Error(String(data && data.message || code));
+  const err = new Error('Google Chat 요청을 마치지 못했어요.');
   err.centralCode = code;
   err.httpStatus = Number(status || 0);
   return err;
@@ -3787,6 +4083,11 @@ function centralSenderError_(status, data) {
 
 function errorMessage_(err) {
   return String(err && err.message ? err.message : err || '알 수 없는 오류');
+}
+
+function sheetFacingErrorMessage_(err, operation) {
+  if (err && err.centralCode) return centralChatErrorMessage_(err);
+  return String(operation || '작업') + '의 결과를 확인하지 못했어요. 출결표에서 바뀐 내용이 있는지 먼저 확인해 주세요. 같은 작업을 다시 실행하지 말고 contact@big-silver.xyz로 문의해 주세요.';
 }
 
 function escapeHtml_(value) {
@@ -3861,22 +4162,26 @@ function sendCentralClassChat_(spaceName, text, meta) {
   });
 }
 
-// 발송을 새 정식 출석부로 옮긴 뒤 옛 시트에서 보내려 할 때 서버가 주는 답.
+// 발송을 현재 사용할 출석부로 옮긴 뒤 옛 시트에서 보내려 할 때 서버가 주는 답.
 // 코드 글자를 그대로 보여주면 선생님은 고장 난 줄 알게 된다.
 const CENTRAL_SHEET_MOVED_CODE = 'SHEET_MOVED';
 const CENTRAL_SHEET_MOVED_MESSAGE =
-  '이 시트의 Google Chat 발송은 새 정식 출석부로 옮겼습니다.\n\n' +
+  '이 출석부의 Google Chat 발송은 현재 사용할 출석부로 옮겼습니다.\n\n' +
   'Teacher Manager에서 현재 출석부를 열어 보내 주세요.\n\n' +
-  '이 시트에서는 더 이상 보내지지 않습니다.';
+  '이 출석부의 내용은 그대로 남아 있습니다.';
 
-/** 중앙 발송소 오류를 선생님이 읽을 문장으로 바꾼다. 모르는 오류는 그대로 둔다. */
+/** Google Chat 오류를 선생님이 읽을 문장으로 바꾼다. 원문과 영문 코드는 보여주지 않는다. */
 function centralChatErrorMessage_(err) {
   const code = String(err && err.centralCode || '').trim();
   if (code === CENTRAL_SHEET_MOVED_CODE) return CENTRAL_SHEET_MOVED_MESSAGE;
-  if (code === 'GOEDU_ACCOUNT_REQUIRED') {
-    return '이 계정으로는 진행할 수 없어요. Google 계정으로 다시 로그인해 주세요.';
+  if (['CHAT_NOT_CONNECTED', 'SHEET_AUTH_REQUIRED', 'AUTH_STATE_EXPIRED'].indexOf(code) !== -1) {
+    return 'Google Chat 연결이 필요해요. Teacher Manager의 [Google 연결 → 출결]에서 [연결하기]를 눌러 주세요.';
   }
-  return errorMessage_(err);
+  if (code === 'GOEDU_ACCOUNT_REQUIRED') return '현재 로그인한 Google 계정을 확인하지 못했어요. Teacher Manager에서 연결을 다시 시작해 주세요.';
+  if (code === 'CLASS_SPACE_REQUIRED') return '학급 단톡방을 먼저 골라 주세요. Teacher Manager의 [Google 연결 → 출결]에서 학급 단톡방을 선택해 주세요.';
+  if (code === 'STUDENT_CHAT_ACCOUNT_REQUIRED') return '학생의 Google 이메일을 확인하지 못했어요. [학생명단] 탭 C열에서 해당 학생의 이메일을 확인해 주세요.';
+  if (code === 'MESSAGE_TOO_LARGE') return '보낼 내용이 너무 길어요. 내용을 나누어 다시 보내 주세요.';
+  return 'Google Chat 요청을 마치지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 연결 상태를 확인해 주세요.';
 }
 
 function isCentralChatConnectionError_(err) {
@@ -3886,8 +4191,7 @@ function isCentralChatConnectionError_(err) {
   const message = String(err && err.message ? err.message : err || '');
   return message.indexOf('최초 발송 연결') !== -1 ||
     message.indexOf('연결') !== -1 ||
-    message.indexOf('권한') !== -1 ||
-    message.indexOf('중앙 발송소') !== -1;
+    message.indexOf('권한') !== -1;
 }
 
 function showChatApiSetupRequired_(ui) {
@@ -3895,8 +4199,7 @@ function showChatApiSetupRequired_(ui) {
     'Google Chat 자동 발송 준비가 아직 끝나지 않았습니다.\n\n' +
     '같은 실패를 반복하지 않도록 발송을 멈췄습니다.\n\n' +
     '보낼 내용은 원래 시트의 상태 칸에 남겨두었습니다.\n' +
-    '준비가 끝난 뒤 같은 시트 메뉴를 다시 누르면 재시도됩니다.\n\n' +
-    '공개 배포판에서는 선생님이 별도 관리 화면을 열지 않아도 되도록 중앙 발송 방식이 준비되어야 합니다.'
+    'Teacher Manager의 [Google 연결 → 출결]에서 [연결하기]를 누르고, 학급 단톡방을 골라 주세요.'
   );
 }
 
@@ -3943,7 +4246,7 @@ function connectClassChatSpace(options) {
     });
     return finish_(true, 'Google Chat 학급 단톡방을 골랐습니다.\n\n' + selected.displayName);
   } catch (err) {
-    return finish_(false, 'Google Chat 학급 단톡방을 고르지 못했습니다.\n\n' + (err && err.message ? err.message : err));
+    return finish_(false, 'Google Chat 학급 단톡방을 고르지 못했습니다.\n\n' + centralChatErrorMessage_(err));
   }
 }
 
@@ -4222,6 +4525,7 @@ function appendClassMessageQueueLines_(lines, sendDateKey, source, status, kind)
 
 function appendPersonalMessageQueueItemsForAutomation(items) {
   requireGoeduTeacherAccount_();
+  authorizeAttendanceOperation_('automatic', '');
   const rows = [];
   (items || []).forEach(item => {
     const content = normalizeMessageLine_(item && item.content);
@@ -4250,6 +4554,7 @@ function appendPersonalMessageQueueItemsForAutomation(items) {
 
 function appendClassMessageQueueItemsForAutomation(items) {
   requireGoeduTeacherAccount_();
+  authorizeAttendanceOperation_('automatic', '');
   const lines = [];
   (items || []).forEach(item => {
     const content = item && item.content;
@@ -4392,7 +4697,7 @@ function safeAppendChatLog_(args) {
     appendChatLog_.apply(null, args || []);
     return '';
   } catch (err) {
-    return '메시지는 발송됐지만 발송기록 저장에 실패했습니다: ' + errorMessage_(err);
+    return '메시지는 보냈어요. 다시 보내지 말고 발송 결과를 확인해 주세요.';
   }
 }
 
@@ -4522,13 +4827,14 @@ function timestampKey_() {
 }
 
 function sendTodayClassMessageQueue_(targetDateKey) {
+  authorizeAttendanceOperation_('automatic', '');
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ensureClassMessageQueueSheet_(ss);
   recoverStaleQueueClaims_(sh, CLASS_MESSAGE_QUEUE_HEADERS.length, 4, 5);
   const rows = getQueueRows_(sh, CLASS_MESSAGE_QUEUE_HEADERS.length);
   const targetDate = String(targetDateKey || todayKey_()).trim();
   const grouped = groupClassMessageQueueRows_(rows, targetDate);
-  if (!grouped.lines.length) return { sent: 0, failed: 0, rows: 0 };
+  if (!grouped.lines.length) return { sent: 0, skipped: 0, failed: 0, sentButRecordUnconfirmed: 0, rows: 0 };
 
   const cfg = getConfig_();
   const classSpaceId = String(cfg.CLASS_CHAT_SPACE_ID || '').trim();
@@ -4543,7 +4849,7 @@ function sendTodayClassMessageQueue_(targetDateKey) {
     classSpaceId,
     text
   ]);
-  if (!claimClassQueueRows_(sh, grouped.rowNumbers, requestId)) return { sent: 0, failed: 0, rows: 0 };
+  if (!claimClassQueueRows_(sh, grouped.rowNumbers, requestId)) return { sent: 0, skipped: 1, failed: 0, sentButRecordUnconfirmed: 0, rows: grouped.rowNumbers.length };
   let sendResult;
   try {
     sendResult = sendCentralClassChat_(classSpaceId, text, {
@@ -4552,7 +4858,7 @@ function sendTodayClassMessageQueue_(targetDateKey) {
       targetDate: targetDate
     });
   } catch (err) {
-    const error = errorMessage_(err);
+    const error = centralChatErrorMessage_(err);
     if (isCentralChatConnectionError_(err)) {
       setClassQueueRowsResult_(sh, grouped.rowNumbers, '대기', timestampKey_(), error);
       appendChatLog_('단체방', classSpaceName, classSpaceId, text, '중단', error);
@@ -4569,16 +4875,20 @@ function sendTodayClassMessageQueue_(targetDateKey) {
   try {
     setClassQueueRowsResult_(sh, grouped.rowNumbers, '보냄', sentAt, success);
     const logWarning = safeAppendChatLog_(['단체방', classSpaceName, sendResult.spaceId || classSpaceId, text, success, '']);
-    if (logWarning) setClassQueueRowsResult_(sh, grouped.rowNumbers, '보냄', sentAt, success + '\n' + logWarning);
-    return { sent: 1, failed: 0, rows: grouped.rowNumbers.length };
+    if (logWarning) {
+      setClassQueueRowsResult_(sh, grouped.rowNumbers, '보냄', sentAt, success + '\n' + logWarning);
+      return { sent: 1, skipped: 0, failed: 0, sentButRecordUnconfirmed: 1, rows: grouped.rowNumbers.length, failures: [logWarning] };
+    }
+    return { sent: 1, skipped: 0, failed: 0, sentButRecordUnconfirmed: 0, rows: grouped.rowNumbers.length };
   } catch (err) {
-    const warning = '메시지는 발송됐지만 발송 기록 저장에 실패했습니다: ' + errorMessage_(err);
+    const warning = '메시지는 보냈어요. 다시 보내지 말고 발송 결과를 확인해 주세요.';
     safeAppendChatLog_(['단체방', classSpaceName, sendResult.spaceId || classSpaceId, text, '기록주의', warning]);
-    return { sent: 1, failed: 0, rows: grouped.rowNumbers.length, recordWarning: warning, failures: [warning] };
+    return { sent: 1, skipped: 0, failed: 0, sentButRecordUnconfirmed: 1, rows: grouped.rowNumbers.length, recordWarning: warning, failures: [warning] };
   }
 }
 
 function sendTodayPersonalMessageQueue_(targetDateKey) {
+  authorizeAttendanceOperation_('automatic', '');
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ensurePersonalMessageQueueSheet_(ss);
   recoverStaleQueueClaims_(sh, PERSONAL_MESSAGE_QUEUE_HEADERS.length, 6, 8);
@@ -4586,7 +4896,7 @@ function sendTodayPersonalMessageQueue_(targetDateKey) {
   const targetDate = String(targetDateKey || todayKey_()).trim();
   const groups = groupPersonalMessageQueueRows_(rows, targetDate);
   const rosterMap = loadStudentRosterForDm_();
-  const result = { sent: 0, failed: 0, rows: 0, failures: [], chatApiSetupBlocked: false };
+  const result = { sent: 0, skipped: 0, failed: 0, sentButRecordUnconfirmed: 0, rows: 0, failures: [], chatApiSetupBlocked: false };
 
   for (const group of groups) {
     const student = findQueueStudent_(group, rosterMap);
@@ -4609,7 +4919,11 @@ function sendTodayPersonalMessageQueue_(targetDateKey) {
       student.email,
       text
     ]);
-    if (!claimPersonalQueueRows_(sh, group, requestId)) continue;
+    if (!claimPersonalQueueRows_(sh, group, requestId)) {
+      result.skipped++;
+      result.rows += group.rowNumbers.length;
+      continue;
+    }
 
     let sendResult;
     try {
@@ -4621,7 +4935,7 @@ function sendTodayPersonalMessageQueue_(targetDateKey) {
         studentName: student.name || group.name || ''
       });
     } catch (err) {
-      const error = errorMessage_(err);
+      const error = centralChatErrorMessage_(err);
       if (isCentralChatConnectionError_(err)) {
         result.chatApiSetupBlocked = true;
         setPersonalQueueRowsResult_(sh, group.rowNumbers, '대기', timestampKey_(), error);
@@ -4645,16 +4959,31 @@ function sendTodayPersonalMessageQueue_(targetDateKey) {
     try {
       setPersonalQueueRowsResult_(sh, group.rowNumbers, '보냄', sentAt, success);
       const logWarning = safeAppendChatLog_(['개인DM', student.combined || target, sendResult.spaceId || '', text, success, '']);
-      if (logWarning) setPersonalQueueRowsResult_(sh, group.rowNumbers, '보냄', sentAt, success + '\n' + logWarning);
+      if (logWarning) {
+        setPersonalQueueRowsResult_(sh, group.rowNumbers, '보냄', sentAt, success + '\n' + logWarning);
+        result.sentButRecordUnconfirmed++;
+        result.failures.push((student.combined || target) + ': ' + logWarning);
+      }
     } catch (err) {
-      const warning = '메시지는 발송됐지만 발송 기록 저장에 실패했습니다: ' + errorMessage_(err);
+      const warning = '메시지는 보냈어요. 다시 보내지 말고 발송 결과를 확인해 주세요.';
       safeAppendChatLog_(['개인DM', student.combined || target, sendResult.spaceId || '', text, '기록주의', warning]);
       result.failures.push((student.combined || target) + ': ' + warning);
+      result.sentButRecordUnconfirmed++;
     }
     result.sent++;
     result.rows += group.rowNumbers.length;
   }
   return result;
+}
+
+function personalSendResultSummary_(result) {
+  const safe = result || {};
+  let message = '보냄 ' + Number(safe.sent || 0) + '명' +
+    ' · 이미 보내서 건너뜀 ' + Number(safe.skipped || 0) + '명' +
+    ' · 보내지 못함 ' + Number(safe.failed || 0) + '명';
+  const unconfirmed = Number(safe.sentButRecordUnconfirmed || 0);
+  if (unconfirmed) message += ' · 발송 결과를 확인할 항목 ' + unconfirmed + '명';
+  return message;
 }
 
 // 메신저 단체톡 내용의 오늘 '대기' 줄만 학급 단톡방으로 보낸다.
@@ -4688,7 +5017,7 @@ function sendTodayClassMessagesOnly() {
       showChatApiSetupRequired_(ui);
       return;
     }
-    ui.alert('메신저 쪽지 내용 Google Chat으로 단체톡 보내기 중 오류가 났습니다.\n\n' + (err && err.message ? err.message : err));
+    ui.alert('메신저 쪽지 내용 Google Chat으로 단체톡 보내기 중 오류가 났습니다.\n\nGoogle Chat 발송 결과를 확인하지 못했어요. 다시 보내지 말고 contact@big-silver.xyz로 문의해 주세요.');
   }
 }
 
@@ -4726,7 +5055,7 @@ function sendTodayPersonalMessagesOnly() {
     const done = [
       '메신저 쪽지 내용 Google Chat으로 개인톡 보내기를 마쳤습니다.',
       '',
-      '성공 ' + result.sent + '명, 실패/건너뜀 ' + result.failed + '명'
+      personalSendResultSummary_(result)
     ];
     if (result.failures.length) done.push('', '확인 필요:', ...result.failures.slice(0, 10));
     ui.alert(done.join('\n'));
@@ -4735,7 +5064,7 @@ function sendTodayPersonalMessagesOnly() {
       showChatApiSetupRequired_(ui);
       return;
     }
-    ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡 보내기 중 오류가 났습니다.\n\n' + (err && err.message ? err.message : err));
+    ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡 보내기 중 오류가 났습니다.\n\nGoogle Chat 발송 결과를 확인하지 못했어요. 다시 보내지 말고 contact@big-silver.xyz로 문의해 주세요.');
   }
 }
 
@@ -4773,8 +5102,8 @@ function sendTodayDismissalMessages() {
       return;
     }
 
-    let classResult = { sent: 0, failed: 0, rows: 0, error: '' };
-    let personalResult = { sent: 0, failed: 0, rows: 0, failures: [], chatApiSetupBlocked: false };
+    let classResult = { sent: 0, skipped: 0, failed: 0, sentButRecordUnconfirmed: 0, rows: 0, error: '' };
+    let personalResult = { sent: 0, skipped: 0, failed: 0, sentButRecordUnconfirmed: 0, rows: 0, failures: [], chatApiSetupBlocked: false };
     SpreadsheetApp.getActive().toast('단체 쪽지를 보내는 중입니다.', '진행 중', 3);
     try {
       classResult = sendTodayClassMessageQueue_(today);
@@ -4783,7 +5112,7 @@ function sendTodayDismissalMessages() {
         showChatApiSetupRequired_(ui);
         return;
       }
-      classResult = { sent: 0, failed: 1, rows: classGroup.rowNumbers.length, error: errorMessage_(err) };
+      classResult = { sent: 0, skipped: 0, failed: 1, sentButRecordUnconfirmed: 0, rows: classGroup.rowNumbers.length, error: centralChatErrorMessage_(err) };
     }
     SpreadsheetApp.getActive().toast('개인 쪽지를 보내는 중입니다.', '진행 중', 3);
     try {
@@ -4793,7 +5122,7 @@ function sendTodayDismissalMessages() {
         showChatApiSetupRequired_(ui);
         return;
       }
-      personalResult = { sent: 0, failed: 1, rows: 0, failures: [errorMessage_(err)], chatApiSetupBlocked: false };
+      personalResult = { sent: 0, skipped: 0, failed: 1, sentButRecordUnconfirmed: 0, rows: 0, failures: [centralChatErrorMessage_(err)], chatApiSetupBlocked: false };
     }
     if (personalResult.chatApiSetupBlocked) {
       showChatApiSetupRequired_(ui);
@@ -4804,8 +5133,9 @@ function sendTodayDismissalMessages() {
     const done = [
       '메신저 쪽지 내용 Google Chat으로 개인톡+단체톡 보내기를 마쳤습니다.',
       '',
-      '단체: ' + classResult.rows + '줄 처리',
-      '개인: 성공 ' + personalResult.sent + '명, 실패/건너뜀 ' + personalResult.failed + '명'
+      '단체: 보냄 ' + classResult.sent + '건 · 이미 보내서 건너뜀 ' + classResult.skipped + '건 · 보내지 못함 ' + classResult.failed + '건' +
+        (classResult.sentButRecordUnconfirmed ? ' · 발송 결과를 확인할 항목 ' + classResult.sentButRecordUnconfirmed + '건' : ''),
+      '개인: ' + personalSendResultSummary_(personalResult)
     ];
     if (classResult.error) done.push('', '단체 확인 필요:', classResult.error);
     if (personalResult.failures.length) done.push('', '확인 필요:', ...personalResult.failures.slice(0, 10));
@@ -4815,7 +5145,7 @@ function sendTodayDismissalMessages() {
       showChatApiSetupRequired_(ui);
       return;
     }
-    ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡+단체톡 보내기 중 오류가 났습니다.\n\n' + (err && err.message ? err.message : err));
+    ui.alert('메신저 쪽지 내용 Google Chat으로 개인톡+단체톡 보내기 중 오류가 났습니다.\n\nGoogle Chat 발송 결과를 확인하지 못했어요. 다시 보내지 말고 contact@big-silver.xyz로 문의해 주세요.');
   }
 }
 
@@ -4836,29 +5166,16 @@ function sendMessengerAllMessages() {
 
 function startCentralChatConnection(options) {
   const ui = SpreadsheetApp.getUi();
-  // 통합 설정이 부를 때는 실패 창을 띄우지 않고 결과만 돌려준다.
-  // 권한 허용·연결 화면은 조용해도 그대로 띄운다 — 사람이 눌러야 끝나는 일이라 없앨 수 없다.
+  // Chat approval starts only in Teacher Manager; the Sheet shows no competing link.
   const quiet = !!(options && options.quiet === true);
   try {
     requireGoeduTeacherAccount_();
-    const info = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL);
-    const authorizationUrl = info.getAuthorizationStatus() === ScriptApp.AuthorizationStatus.REQUIRED
-      ? String(info.getAuthorizationUrl() || '').trim()
-      : '';
-    if (authorizationUrl) {
-      const message = options && options.sheetSetupReady
-        ? '시트 설정은 끝났습니다. 권한 허용을 마친 뒤 Teacher Manager로 돌아가 Google Chat의 [연결하기]를 눌러 주세요. 이 시트 메뉴는 다시 누르지 않아도 됩니다.'
-        : '권한 허용을 마친 뒤 이 메뉴를 다시 눌러 주세요.';
-      showLinkDialog_('Google 권한 연결', authorizationUrl, message);
-      return { ok: false, pending: true, message: message };
-    }
-    const result = callCentralChatSender_('/v1/auth/start', {});
-    const message = options && options.sheetSetupReady
-      ? '시트 설정은 끝났습니다. 아래 연결 화면에서 Google 권한을 허용한 뒤 Teacher Manager로 돌아가 학급 단톡방을 골라 주세요. 이 시트 메뉴는 다시 누르지 않아도 됩니다.'
-      : '연결을 마친 뒤 시트로 돌아오세요.';
-    showLinkDialog_('Google Chat 최초 발송 연결하기', result.authUrl, message);
-    // 브라우저에서 연결을 마쳐야 끝나므로 이 자리에서는 아직 됐다고 하지 않는다.
-    return { ok: false, pending: true, message: '연결 화면을 열었습니다. 브라우저에서 연결을 마친 뒤 Teacher Manager로 돌아가 주세요.' };
+    const message = (options && options.sheetSetupReady ? '시트 설정은 끝났습니다. ' : '') +
+      'Teacher Manager의 [연결 → 출결 → Google Chat]에서 [연결하기]를 눌러 주세요. ' +
+      '그 버튼으로 열린 Google 화면에서 권한을 허용한 뒤 Teacher Manager에서 학급 단톡방을 고르세요. ' +
+      '이 시트 메뉴는 다시 누르지 않아도 됩니다.';
+    if (!quiet) ui.alert('Google Chat 연결은 Teacher Manager에서 진행해 주세요', message, ui.ButtonSet.OK);
+    return { ok: false, message: message };
   } catch (err) {
     const message = 'Google Chat 최초 발송 연결을 시작하지 못했습니다.\n\n' + centralChatErrorMessage_(err);
     if (!quiet) ui.alert(message);
@@ -4888,7 +5205,7 @@ function checkCentralChatStatus() {
     if (!status.connected) {
       ui.alert(
         '연결 확인번호: ' + connectionCode + '\n\n' +
-        (status.reason || 'Google Chat 최초 발송 연결이 아직 안 됐습니다.\n\n[Google Chat 최초 발송 연결하기]를 먼저 눌러 주세요.') +
+        (status.reason || 'Google Chat 연결이 아직 끝나지 않았습니다.\n\nTeacher Manager의 [Google 연결 → 출결]에서 [연결하기]를 눌러 주세요.') +
         connectionSettingNote
       );
       return;
@@ -4923,7 +5240,7 @@ function disconnectCentralChatSender() {
     callCentralChatSender_('/v1/disconnect', {});
     ui.alert('Google Chat 발송 연결을 끊었습니다.');
   } catch (err) {
-    ui.alert('Google Chat 발송 연결을 끊지 못했습니다.\n\n' + (err && err.message ? err.message : err));
+    ui.alert('Google Chat 발송 연결을 끊지 못했어요.\n\n' + centralChatErrorMessage_(err));
   }
 }
 
@@ -4976,12 +5293,13 @@ function createDocFromTemplate() {
     if (result.fails.length) msg.push('', '실패:', ...result.fails.slice(0, 10), result.fails.length > 10 ? `...외 ${result.fails.length - 10}건` : '');
     SpreadsheetApp.getUi().alert(msg.join('\n'));
   } catch (err) {
-    SpreadsheetApp.getActive().toast('신고서 생성 오류: ' + err, '오류', 6);
+    SpreadsheetApp.getActive().toast('신고서를 만들지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 이 출석부를 다시 확인해 주세요.', '오류', 6);
   }
 }
 
 function createDocFromRowForAutomation(sheetName, rowIdx) {
   requireGoeduTeacherAccount_();
+  authorizeAttendanceOperation_('automatic', '');
   const sheet = getSheetForAutomation_(sheetName);
   return createDocsFromRows_(sheet, [Number(rowIdx)]);
 }
@@ -5020,12 +5338,12 @@ function processRowToDoc_(sheet, rowIdx, absIndex, holidaySet, issuedSpanKeys) {
 
   // A) 날짜
   let date = toDate_(rowVals[0]);
-  if (!date) throw new Error('A열(날짜) 없음/형식 오류');
+  if (!date) throw new Error(rowIdx + '행 A열에 날짜를 입력해 주세요. 예: 2026-09-09');
 
   // B) 번호+이름
   const studentInfoRaw = String(rowVals[1] || '').trim().replace(/\s+/g, '');
   const m = studentInfoRaw.match(/^(\d{1,2})(.+)$/);
-  if (!m) throw new Error('B열 형식 오류(예: 23최예향 / 3김가온)');
+  if (!m) throw new Error(rowIdx + '행 B열의 목록에서 학생을 골라 주세요.');
   const studentNumber = m[1];
   const studentName   = m[2];
 
@@ -5043,9 +5361,9 @@ function processRowToDoc_(sheet, rowIdx, absIndex, holidaySet, issuedSpanKeys) {
     /조퇴/.test(kind) ? '조퇴' :
     /결과/.test(kind) ? '결과' : null;
 
-  if (!kindLabel) throw new Error('D열(종류) 오류: 결석/지각/조퇴/결과 중 하나가 필요합니다.');
+  if (!kindLabel) throw new Error(rowIdx + '행 D열에서 결석·지각·조퇴·결과 중 하나를 골라 주세요.');
   if ((kindLabel === '지각' || kindLabel === '조퇴' || kindLabel === '결과') && !periodNum) {
-    throw new Error('F열(교시) 오류: 지각/조퇴/결과는 교시 숫자가 필요합니다.');
+    throw new Error(rowIdx + '행 F열에서 해당 교시를 골라 주세요.');
   }
 
   // === 기간/일수 계산 ===
@@ -5135,9 +5453,8 @@ function addSelectedRowToTasks() {
 
     if (typeof Tasks === 'undefined') {
       SpreadsheetApp.getUi().alert(
-        'Google Tasks API 고급 서비스가 켜져 있지 않습니다.\n\n' +
-        'Apps Script 편집기 왼쪽 [서비스 +] → Google Tasks API 추가 후 다시 실행하세요.\n' +
-        '이 설정은 Tasks 기능을 쓰는 사용자/스크립트마다 한 번 필요합니다.'
+        '출석부의 할 일 등록 기능이 준비되지 않았어요.\n\n' +
+        'Teacher Manager의 [Google 연결 → 출결]에서 출결 기능 상태를 확인해 주세요.'
       );
       return;
     }
@@ -5151,18 +5468,15 @@ function addSelectedRowToTasks() {
 
     const result = addRowsToTasks_(sheet, selectedRows);
 
-    if (result.created === 0) {
-      SpreadsheetApp.getUi().alert('추가된 Task가 없습니다.\n- G/H열이 ‘미제출’인지 확인\n- 같은 제목(같은 날짜)이 이미 미완료로 있을 수 있습니다.');
-    } else {
-      SpreadsheetApp.getActive().toast(`Tasks ${result.created}건 추가됨`, '완료', 3);
-    }
+    SpreadsheetApp.getUi().alert(taskCreationResultMessage_(result));
   } catch (err) {
-    SpreadsheetApp.getActive().toast('Tasks 추가 오류: ' + err, '오류', 6);
+    SpreadsheetApp.getActive().toast('출결 미제출 할 일을 추가하지 못했어요. Teacher Manager의 [Google 연결 → 출결]에서 할 일 목록을 확인해 주세요.', '오류', 6);
   }
 }
 
 function addRowToTasksForAutomation(sheetName, rowIdx) {
   requireGoeduTeacherAccount_();
+  authorizeAttendanceOperation_('automatic', '');
   const sheet = getSheetForAutomation_(sheetName);
   return addRowsToTasks_(sheet, [Number(rowIdx)]);
 }
@@ -5174,7 +5488,7 @@ function addRowsToTasks_(sheet, selectedRows) {
   const dataRows = (selectedRows || [])
     .map(rowIdx => Number(rowIdx))
     .filter(rowIdx => Number.isInteger(rowIdx) && rowIdx >= MONTHLY_ATTENDANCE_DATA_START_ROW);
-  if (!dataRows.length) return { created: 0, titles: [] };
+  if (!dataRows.length) return { created: 0, requested: 0, skippedExisting: 0, titles: [] };
   const taskListId = getTaskListId_();
 
   // 기존 미완료 Task 제목들 수집 (페이지네이션)
@@ -5235,8 +5549,21 @@ function addRowsToTasks_(sheet, selectedRows) {
 
   return {
     created,
+    requested: titlesToCreate.size,
+    skippedExisting: titlesToCreate.size - created,
     titles: Array.from(titlesToCreate)
   };
+}
+
+function taskCreationResultMessage_(result) {
+  const created = Number(result && result.created || 0);
+  const requested = Number(result && result.requested || 0);
+  const skippedExisting = Number(result && result.skippedExisting || 0);
+  if (!requested) return '선택한 행에 ‘미제출’ 서류가 없어요.';
+  if (!created) return '이미 등록된 할 일 ' + skippedExisting + '건은 다시 만들지 않았어요.';
+  let message = '할 일 ' + created + '건을 추가했어요.';
+  if (skippedExisting) message += '\n이미 등록된 할 일 ' + skippedExisting + '건은 다시 만들지 않았어요.';
+  return message;
 }
 
 /*************************************************
@@ -5287,24 +5614,25 @@ function sendSelectedRowsChatNow() {
       return;
     }
 
-    if (!result.sent && !result.failed) {
+    if (!result.sent && !result.failed && !result.skipped) {
       SpreadsheetApp.getUi().alert(
         '보낼 개인톡이 없습니다.\n- G열(신고서)/H열(첨부)이 "미제출"인지 확인\n- 이미 발송된 내용이면 다시 보내지 않습니다.'
       );
     } else {
-      SpreadsheetApp.getActive().toast(`개인톡 성공 ${result.sent}명, 실패/건너뜀 ${result.failed}명`, '완료', 5);
+      SpreadsheetApp.getActive().toast('개인톡 ' + personalSendResultSummary_(result), '완료', 5);
     }
   } catch (err) {
     if (isChatAppConfigurationError_(err)) {
       showChatApiSetupRequired_(SpreadsheetApp.getUi());
       return;
     }
-    SpreadsheetApp.getActive().toast('개인톡 발송 오류: ' + err, '오류', 6);
+    SpreadsheetApp.getActive().toast('개인톡을 보내지 못했어요. ' + centralChatErrorMessage_(err), '오류', 6);
   }
 }
 
 function sendSelectedRowChatForAutomation(sheetName, rowIdx) {
   requireGoeduTeacherAccount_();
+  authorizeAttendanceOperation_('automatic', '');
   const sheet = getSheetForAutomation_(sheetName);
   return sendSelectedRowsPersonalMessagesNow_(sheet, [Number(rowIdx)]);
 }
@@ -5332,7 +5660,9 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
   }
   const result = {
     sent: 0,
+    skipped: 0,
     failed: 0,
+    sentButRecordUnconfirmed: 0,
     rows: 0,
     failures: [],
     chatApiSetupBlocked: false
@@ -5363,6 +5693,7 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
 
     if (!claimAttendanceChatRow_(sheet, group)) {
       // 다른 실행이 이미 이 행을 보내는 중이거나 방금 보냈다 — 건너뛴다.
+      result.skipped++;
       result.rows++;
       continue;
     }
@@ -5382,7 +5713,7 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
         rowIdx: group.rowIdx
       });
     } catch (err) {
-      const error = errorMessage_(err);
+      const error = centralChatErrorMessage_(err);
       const status = isCentralChatConnectionError_(err) ? '연결필요' : '실패';
       setMonthlyChatResult_(sheet, group.rowIdx, status, error);
       appendChatLog_('출결 개인톡', group.target || group.email, '', text, status, error);
@@ -5401,11 +5732,16 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
     try {
       setMonthlyChatResult_(sheet, group.rowIdx, '보냄', success, group.signature);
       const logWarning = safeAppendChatLog_(['출결 개인톡', group.target || group.email, sendResult.spaceId || '', text, success, '']);
-      if (logWarning) setMonthlyChatResult_(sheet, group.rowIdx, '보냄', success + '\n' + logWarning, group.signature);
+      if (logWarning) {
+        setMonthlyChatResult_(sheet, group.rowIdx, '보냄', success + '\n' + logWarning, group.signature);
+        result.sentButRecordUnconfirmed++;
+        result.failures.push((group.target || group.email || group.rowIdx) + ': ' + logWarning);
+      }
     } catch (err) {
-      const warning = '메시지는 발송됐지만 발송 기록 저장에 실패했습니다: ' + errorMessage_(err);
+      const warning = '메시지는 보냈어요. 다시 보내지 말고 발송 결과를 확인해 주세요.';
       safeAppendChatLog_(['출결 개인톡', group.target || group.email, sendResult.spaceId || '', text, '기록주의', warning]);
       result.failures.push((group.target || group.email || group.rowIdx) + ': ' + warning);
+      result.sentButRecordUnconfirmed++;
     }
     result.sent++;
     result.rows++;
@@ -5414,12 +5750,12 @@ function sendSelectedRowsPersonalMessagesNow_(sheet, selectedRows) {
 }
 
 function getSheetForAutomation_(sheetName) {
-  const name = String(sheetName || '').trim();
-  if (!name) throw new Error('sheetName이 비어 있습니다.');
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(name);
-  if (!sheet) throw new Error(`시트를 찾을 수 없습니다: ${name}`);
-  return sheet;
+  const sheets = attendanceMonthSheetsFor_(ss, readAttendanceConfigStrict_(ss));
+  const matches = sheets.filter(item => Number.isSafeInteger(sheetName)
+    ? item.sheet.getSheetId() === sheetName : item.sheet.getName() === String(sheetName || '').trim());
+  if (matches.length !== 1) throw new Error('연결된 월별 출결표를 확인하지 못했습니다. 다른 탭으로 대신 처리하지 않았습니다.');
+  return matches[0].sheet;
 }
 
 /*************************************************

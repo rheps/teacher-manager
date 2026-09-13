@@ -17,6 +17,7 @@ const S = {
   attachmentFolderStatus: null,
   lists: { calendars: [], tasklists: [] },
   linkLoading: false,
+  listReads: {},
   listsLoaded: false,
   listsError: false,
   maps: { calendars: {}, tasklists: {} },
@@ -52,8 +53,9 @@ const S = {
   connectTab: "messenger",   // messenger | attendance
   attendance: null,          // attendance_status/ensure_attendance 응답
   firstSetupDone: false,     // 시트 [처음 설정 한 번에 끝내기] 완료 확인 (마법사 출결 탭)
+  firstSetupReadState: null, // checking / ready / unavailable are not completion values
   firstSetupConnectionCode: "", // 완료 표시가 어느 출석부 확인번호에 묶였는지
-  attendanceStaleNotice: false, // 준비가 끝난 뒤 3~5단계를 다녀오면 출결 탭에 한 줄 안내
+  attendanceStaleNotice: false, // 준비 뒤 실제로 바꾼 출석부 설정/로컬 화면 묶음만 기록
   attendanceSaving: false,   // 탭을 오가며 다시 그려도 출결 준비 중복 클릭을 막는다
   attendanceScriptUpdate: null, // 사용자가 눌러 확인한 기존 출결 Apps Script 상태
   attendanceScriptDialog: null, // null | "update"
@@ -66,7 +68,6 @@ const S = {
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
-  studentChatGuideOpen: false,
   chatNewSpaceBrowserOpen: false, // 새 단톡방을 만들려고 Google Chat을 열었는지
   chatNewSpaceBrowserBlurred: false, // 실제로 브라우저로 자리를 옮겼다가 돌아왔는지
   helperRestartPending: false, // 설정은 확인했지만 도우미 시작만 다시 확인할 상태
@@ -77,7 +78,7 @@ let aiToolsRequestToken = 0;
 
 const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
-  "이 컴퓨터 설정", "Google 연결", "모두 저장",
+  "담임학급 학생명단", "이 컴퓨터 설정", "Google 연결", "모두 저장",
 ];
 const GOEDU_REQUIRED_MESSAGE = "Google 계정으로 다시 로그인해 주세요.";
 function isGoeduGoogleStatus(status) {
@@ -87,6 +88,7 @@ function isGoogleReady(status) {
   return isGoeduGoogleStatus(status) && status.authorization_state === "ready";
 }
 function googleAuthorizationMessage(status) {
+  if (googleAuthCheckFailed(status)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!isGoeduGoogleStatus(status)) return status?.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
   return status.authorization_detail || "Google 권한을 다시 승인해야 해요. 다시 로그인하고 승인해 주세요.";
 }
@@ -101,11 +103,138 @@ class AppIssueError extends Error {
     this.issue = issue || null;
   }
 }
+let accountWireToken = null;
+let accountUiEpoch = 0;
+let accountProfileNeedsReload = false;
+let accountProfileReloadPromise = null;
+class StaleAccountResponse extends Error {}
+const googleAccountReads = new Map();
 function call(name, ...args) {
-  return window.pywebview.api[name](...args).then((res) => {
+  if (name === "google_status" || name === "gws_login_status") {
+    const epoch = googleLoginEpoch, accountEpoch = accountUiEpoch;
+    const key = JSON.stringify([name, epoch, accountEpoch]);
+    if (googleAccountReads.has(key)) return googleAccountReads.get(key);
+    const result = callBridge(name, ...args).catch(error => {
+      if (!(error instanceof StaleAccountResponse) && name === "google_status"
+          && epoch === googleLoginEpoch && accountEpoch === accountUiEpoch) {
+        adoptGoogleStatus({ ...S.google, logged_in: false, account_allowed: false, user: "",
+          login_state: "error", error_code: "GWS_AUTH_STATUS_FAILED", authorization_state: "check_failed",
+          authorization_reason: "", authorization_detail: GOOGLE_AUTH_CHECK_MESSAGE });
+        render();
+      }
+      throw error;
+    }).finally(() => { if (googleAccountReads.get(key) === result) googleAccountReads.delete(key); });
+    googleAccountReads.set(key, result);
+    return result;
+  }
+  if (!ATTENDANCE_READ_METHODS.has(name)) return callBridge(name, ...args);
+  const epoch = accountUiEpoch;
+  const contextForRead = () => ["attendance_status", "attendance_status_cached"].includes(name)
+    ? googleReadContext() : chatReadContext();
+  const context = contextForRead();
+  const captured = JSON.parse(JSON.stringify(args));
+  const key = JSON.stringify([epoch, context, name, captured]);
+  if (attendanceReads.has(key)) return attendanceReads.get(key);
+  // Share identical reads, but let independent panels obtain their own result.
+  const result = callBridge(name, ...captured).finally(() => {
+    if (attendanceReads.get(key) === result) attendanceReads.delete(key);
+  });
+  attendanceReads.set(key, result);
+  return result;
+}
+const ATTENDANCE_READ_METHODS = new Set([
+  "attendance_status_cached", "attendance_status", "attendance_chat_status",
+  "attendance_first_setup_status", "attendance_roster_status", "attendance_chat_spaces",
+]);
+const ATTENDANCE_TIMED_READS = new Set(["attendance_roster_status", "attendance_chat_spaces"]);
+const attendanceReads = new Map();
+function callBridge(name, ...args) {
+  const epoch = accountUiEpoch;
+  const loginEpoch = googleLoginEpoch;
+  const currentReadContext = () => ["attendance_status", "attendance_status_cached"].includes(name)
+    ? googleReadContext() : chatReadContext();
+  const readContext = ATTENDANCE_READ_METHODS.has(name) ? currentReadContext() : null;
+  const api = window.pywebview.api;
+  const expectedToken = accountWireToken ? [...accountWireToken] : null;
+  const requestArgs = JSON.parse(JSON.stringify(args));
+  const send = async () => {
+    const response = typeof api.account_call === "function"
+      ? api.account_call(name, requestArgs, expectedToken) : api[name](...requestArgs);
+    let timer;
+    try {
+      return await (ATTENDANCE_TIMED_READS.has(name) ? Promise.race([response,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("목록 응답을 기다리는 시간이 지났어요.")), 120000);
+        }),
+      ]) : response);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  return send().then((res) => {
+    if (["google_status", "gws_login_status", "gws_login_start"].includes(name)
+        && loginEpoch !== googleLoginEpoch) throw new StaleAccountResponse();
+    if (epoch !== accountUiEpoch) throw new StaleAccountResponse("계정이 바뀌어 이전 화면의 작업을 멈췄어요.");
+    if (readContext !== null && readContext !== currentReadContext()) throw new StaleAccountResponse();
     if (!res || res.ok !== true) throw new AppIssueError(res?.issue);
+    if (Array.isArray(res.session)) {
+      const previous = accountWireToken;
+      accountWireToken = res.session;
+      if (previous && JSON.stringify(previous) !== JSON.stringify(res.session)) {
+        accountUiEpoch += 1;
+        if (previous[0] !== res.session[0]) {
+          accountProfileNeedsReload = true;
+          clearAccountScreen();
+        }
+      }
+    }
     return res.data;
   });
+}
+
+function callForAccount(epoch, name, ...args) {
+  if (epoch !== accountUiEpoch) throw new StaleAccountResponse();
+  return call(name, ...args);
+}
+
+function clearAccountScreen() {
+  S.rosterEditor = null; S.timetableTab = "timetable"; rosterEditorRequest += 1;
+  clearTimeout(editAutoSaveTimer);
+  editAutoSavePending = false;
+  settingsAutoSavePending = false;
+  editDirtyFields.clear();
+  stopCapturePoll();
+  clearGoogleDependentState();
+  S.draft = { profile: {}, grid: null, bridge: {} };
+  S.profileCache = null;
+  S.caps = null;
+  S.capsOpen = {};
+  S.progress = null;
+  S.doneShown = "";
+  S.applyResults = null;
+  S.fieldIssues = {};
+  S.attendanceConnection = null;
+  S.attendanceConnectionBusy = false;
+  S.helperRestartPending = false;
+  S.attendanceTransitioning = false;
+  S.maps = { calendars: {}, tasklists: {} };
+  rosterReadVersion += 1;
+  rosterInFlight = "";
+  rosterStatus = null;
+  rosterContext = "";
+}
+
+function reloadAccountProfile() {
+  if (!accountProfileNeedsReload) return Promise.resolve(false);
+  if (accountProfileReloadPromise) return accountProfileReloadPromise;
+  const epoch = accountUiEpoch;
+  accountProfileReloadPromise = (async () => {
+    const info = await call("get_app_info");
+    if (epoch !== accountUiEpoch) return false;
+    adoptAppInfo(info);
+    accountProfileNeedsReload = false;
+    render();
+    return true;
+  })().finally(() => { accountProfileReloadPromise = null; });
+  return accountProfileReloadPromise;
 }
 async function callWithLocalRecovery(action) {
   // 실제 파일 읽기·저장 재시도는 브리지의 세 번 확인 경계에서 끝난다.
@@ -142,7 +271,7 @@ function badge(kind, label) {
 }
 function root() { return document.getElementById("app"); }
 
-function setBanner(kind, text) { S.banner = text ? { kind, text } : null; render(); }
+function setBanner(kind, text, topic = "") { S.banner = text ? { kind, text, topic } : null; render(); }
 function showToast(text) {
   S.toast = text; render();
   setTimeout(() => { S.toast = null; render(); }, 2200);
@@ -171,6 +300,9 @@ function ownsIssueRequest(request) {
 function completeIssueRequest(request) {
   if (ownsIssueRequest(request)) clearProblemIssue(true);
 }
+function clearResolvedReadIssue(operation) {
+  if (problemIssueOwner === screenKey() && S.problemIssue?.operation === operation) clearProblemIssue(false);
+}
 // 문제 화면에 나올 수 있는 버튼은 모두 '단계로 바로 가는' 것뿐이다. 문의·복사 단추는 없다.
 const DIRECT_ISSUE_ACTIONS = {
   "google-login": "Google 로그인 설정 열기",
@@ -183,7 +315,7 @@ const DIRECT_ISSUE_ACTIONS = {
   "attendance-tab": "출결 탭으로",
   "open-download-page": "다운로드 페이지 열기",
   "open-current-attendance": "현재 출석부 열기",
-  "open-script-api-settings": "Google 자동화 사용 설정 열기",
+  "open-script-api-settings": "Apps Script API 사용",
   "settings": "설정 열기",
 };
 const GOOGLE_TARGET_ID_FIELDS = [
@@ -219,6 +351,7 @@ function directIssueActionHtml(issue) {
 }
 function problemPanelHtml(issue) {
   if (!issue || !["needs_user", "failed"].includes(issue.state)) return "";
+  const readUncertain = ATTENDANCE_READ_METHODS.has(issue.operation) || issue.operation === "attendance_prepare_status";
   // 교사가 지금 할 수 있는 일만 보여 준다. 진단용 값(코드·횟수·판·식별번호)은
   // 로컬 기록과 개발자 보고에만 남는다 (2026-09-02 사용자 결정).
   const steps = (Array.isArray(issue.steps) ? issue.steps : []).map((s) => String(s || "")).filter(Boolean);
@@ -228,14 +361,18 @@ function problemPanelHtml(issue) {
   const stepsHtml = steps.length
     ? `<div class="problem-steps"><b>지금 할 수 있는 일</b><ol>${steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol></div>`
     : "";
-  const reported = issue.reported === true ? "이 문제는 개발자에게 자동으로 보고됐어요." : "";
-  return `<section class="problem-panel" role="alert">
-    <h2>${esc(issueValue(issue, "title", "작업을 마치지 못했어요."))}</h2>
+  const reportStatus = issue.reported === true
+    ? "오류 내용을 개발자에게 보냈어요."
+    : issue.report_queued === true
+      ? "오류 내용을 이 컴퓨터에 저장했어요. 개발자에게 전달됐는지는 아직 확인하지 못했습니다."
+      : "";
+  return `<section class="problem-panel${readUncertain ? " read-uncertain" : ""}" role="alert">
+    <h2>${esc(readUncertain ? "현재 상태를 확인하지 못했어요." : issueValue(issue, "title", "작업을 마치지 못했어요."))}</h2>
     <p class="problem-reason">${esc(reason || "다시 확인해 주세요.")}</p>
     ${stepsHtml}
-    <p class="problem-status">${esc(issueValue(issue, "change_status", "확인된 자료는 바꾸지 않았습니다."))}</p>
+    <p class="problem-status">${esc(issueValue(issue, "change_status", "작업 결과를 확인하지 못했어요. 같은 작업을 다시 하기 전에 현재 자료를 확인해 주세요."))}</p>
     <div class="problem-actions action-line">${directIssueActionHtml(issue)}</div>
-    <p class="problem-footer">${esc(reported)}${reported ? " · " : ""}<button type="button" class="text-link" data-action="issue-help" data-preserve-issue="true">도움 요청</button></p>
+    ${reportStatus ? `<p class="problem-footer">${esc(reportStatus)}</p>` : ""}
   </section>`;
 }
 function showProblemIssue(error, request) {
@@ -243,7 +380,7 @@ function showProblemIssue(error, request) {
   if (!ownsIssueRequest(request)) return true;
   const issue = error.issue;
   if (!issue || !["needs_user", "failed"].includes(issue.state)) return false;
-  if (["ensure_attendance", "attendance_prepare_start", "attendance_prepare_status"].includes(issue.operation)
+  if (["ensure_attendance", "attendance_prepare_start"].includes(issue.operation)
       && S.attendance?.state === "installing") {
     S.attendance = { ...S.attendance, state: "failed", failed_service: "setup" };
   }
@@ -256,11 +393,19 @@ function showProblemIssue(error, request) {
   return true;
 }
 function handleCaughtError(error, request) {
+  if (error instanceof StaleAccountResponse) return true;
   if (showProblemIssue(error, request)) return true;
-  if (!request || ownsIssueRequest(request)) setBanner("error", error?.message || "작업을 마치지 못했어요.");
+  if (!request || ownsIssueRequest(request)) {
+    const topic = ["attendance-script-update-resolve", "attendance-script-dialog-confirm"].includes(request?.action)
+      ? "attendance-script-update" : "";
+    setBanner("error", error?.message || "작업을 마치지 못했어요.", topic);
+  }
   return false;
 }
 function bannerHtml() {
+  const localSettings = S.google?.local_settings_error
+    ? `<div class="banner error"><span><b>이 컴퓨터의 설정을 확인해 주세요.</b> ${esc(S.google.local_settings_error)}</span>${settingsRefreshButtonHtml()}</div>`
+    : "";
   // 기록 폴더를 여는 단추는 두지 않는다. 폴더만 열릴 뿐 거기서 뭘 하라는 안내가 없고,
   // 그 폴더에 보이는 파일은 Gemini API key가 든 settings.json이다 (2026-07-30 사용자 결정).
   const banner = S.banner
@@ -276,7 +421,7 @@ function bannerHtml() {
       </div>`
     : "";
   const currentIssue = problemIssueOwner === screenKey() ? S.problemIssue : null;
-  return (isClassSpaceIssue(currentIssue) ? "" : problemPanelHtml(currentIssue)) + networkWaitNoticeHtml() + banner + fallback;
+  return localSettings + (isClassSpaceIssue(currentIssue) ? "" : problemPanelHtml(currentIssue)) + networkWaitNoticeHtml() + banner + fallback;
 }
 function toastHtml() { return S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ""; }
 
@@ -386,11 +531,18 @@ async function busyWrap(el, fn) {
   const original = hasBusyText ? el.textContent : "";
   el.disabled = true;
   if (hasBusyText) el.textContent = el.dataset.busyText;
-  const preserveIssue = el.dataset.preserveIssue === "true";
-  const request = beginIssueRequest(preserveIssue, el.dataset.action);
+  const preserveIssue = el.dataset.preserveIssue === "true"
+    || (el.dataset.action === "back-home" && Boolean(settingsAutoSavePromise || editAutoSavePromise));
+  let request = beginIssueRequest(true, el.dataset.action);
   try {
-    await fn(el, request);
-    if (!preserveIssue) completeIssueRequest(request);
+    if (S.mode === "edit" && S.edit === "settings" && settingsAutoSavePromise
+        && ["attachment-folder-choose", "hk-record"].includes(el.dataset.action)) {
+      const owner = screenKey(), epoch = accountUiEpoch;
+      if (!(await settingsAutoSavePromise) || owner !== screenKey() || epoch !== accountUiEpoch) return false;
+    }
+    request = beginIssueRequest(preserveIssue, el.dataset.action);
+    const result = await fn(el, request);
+    if (!preserveIssue && result !== false) completeIssueRequest(request);
   }
   catch (error) {
     handleCaughtError(error, request);
@@ -433,23 +585,13 @@ function linkRow(url) {
     `</span></div>`;
 }
 bindActions({
-  "issue-help": async () => {
-    // 메일 본문은 프로그램이 채운다(판 번호·식별번호·작업). 교사가 코드를 옮겨 적지 않는다.
-    const issue = S.problemIssue || (S.attendanceScriptUpdate?.state === "customized" ? {
-      operation: "attendance_script_update_status",
-      title: "출결 기능 확인이 필요해요.",
-      message: attendanceScriptProtectedMessage(S.attendanceScriptUpdate),
-      change_status: "기존 출결 자료와 현재 연결은 그대로입니다.",
-    } : null);
-    await call("open_support_email", issue);
-  },
   "issue-direct": async (el, request) => {
     const key = String(el.dataset.issueAction || "");
     if (key === "open-download-page") { await call("open_url", LATEST_RELEASE_URL); return; }
-    if (key === "open-script-api-settings") { await call("open_attendance_script_settings"); return; }
+    if (key === "open-script-api-settings") { await openAttendanceScriptSettings(); return; }
     if (key === "settings") { await actions["goto-settings"](); return; }
     if (key === "attendance-tab") {
-      if (S.mode === "wizard") { await goStepAsync(7); } else { await openCard("connect"); }
+      if (S.mode === "wizard") { await goStepAsync(8); } else { await openCard("connect"); }
       S.connectTab = "attendance"; S.attendance = null; S.chatStatus = null;
       render();
       return;
@@ -479,11 +621,15 @@ bindActions({
   },
   "link-copy": (el) => { copyText(el.dataset.url); },
   "attendance-open": async () => {
+    const context = chatReadContext(), owner = screenKey();
     try {
-      await call("open_current_attendance");
+      const expected = attendanceExpectedWorkbookOpen(S.attendance);
+      if (!expected) throw new Error("현재 출석부 연결을 다시 확인한 뒤 열어 주세요.");
+      await call("open_current_attendance", expected, false);
+      if (context !== chatReadContext() || owner !== screenKey()) return;
       if (S.mode === "edit" && S.edit === "connect" && S.connectTab === "attendance") startChatConnectPoll(true);
-    } catch (_error) {
-      showToast("현재 출석부 연결을 먼저 바로잡아 주세요");
+    } catch (error) {
+      if (context === chatReadContext() && owner === screenKey()) setBanner("warn", error.message || "출석부를 열지 못했어요. 다시 눌러 주세요.");
     }
   },
   "show-workspace-guide": () => { S.workspaceGuideOpen = true; render(); },
@@ -501,7 +647,8 @@ function railHtml() {
     const cls = n < S.step ? "done" : n === S.step ? "active" : "";
     const mark = n < S.step ? "✓" : String(n);
     // 한 번이라도 지나간 단계는 앞뒤 어디로든 바로 이동할 수 있다.
-    const attr = n !== S.step && n <= reached ? ` data-action="go-step" data-step="${n}"` : "";
+    const skipped = n === 6 && !isHomeroomTeacher();
+    const attr = skipped ? " disabled" : n !== S.step && n <= reached ? ` data-action="go-step" data-step="${n}"` : "";
     const current = n === S.step ? ' aria-current="step"' : "";
     return `<button class="step ${cls}"${attr}${current}><span class="n">${mark}</span><span class="step-label">${esc(title)}</span></button>`;
   }).join("");
@@ -513,6 +660,7 @@ function railHtml() {
 /* ---------- 로그인 상시 감시 — 끊어지면 끊어졌다고 말한다 ---------- */
 const LOGIN_WATCH_INTERVAL_MS = 3 * 60 * 1000;  // 검증 전 앱은 토큰이 수시로 회수된다
 let loginWatchTimer = null;
+let loginWatchChecking = false;
 let googleLoginEpoch = 0;
 let googleContextVersion = 0;
 let linkListsReadVersion = 0;
@@ -525,14 +673,40 @@ function googleReadContext() {
   return JSON.stringify([screenKey(), googleContextVersion, googleLoginEpoch, verifiedGoogleAccount(S.google)]);
 }
 function adoptGoogleStatus(status) {
+  const previousAuthorizationMessage = S.google?.authorization_detail;
   // An unknown check cannot replace the last confirmed account identity.
   const previousAccount = S.lastVerifiedGoogleAccount || verifiedGoogleAccount(S.google);
   const nextAccount = verifiedGoogleAccount(status);
   const accountChanged = Boolean(previousAccount && nextAccount && previousAccount !== nextAccount);
   const changed = S.google && googleStatusKey(S.google) !== googleStatusKey(status);
+  const checkUnavailable = googleAuthCheckFailed(status);
+  const sameAccountRechecked = googleAuthCheckFailed(S.google) && nextAccount === previousAccount;
   S.lastVerifiedGoogleAccount = nextAccount || previousAccount;
-  if (changed || accountChanged) clearGoogleDependentState({ preserveResume: true, accountChanged });
+  if (accountChanged && status?.local_settings_error) {
+    // Failed local activation may leave the old wire token; discard its screen anyway.
+    accountUiEpoch += 1;
+    clearAccountScreen();
+    accountProfileNeedsReload = true;
+  }
+  if (accountChanged || (changed && !checkUnavailable && !sameAccountRechecked)) {
+    clearGoogleDependentState({ preserveResume: true, accountChanged });
+  } else if (checkUnavailable) {
+    // A failed check cannot erase a workbook or a completed setup. Keep its
+    // identity, while requiring an actual successful read to mark it current.
+    S.firstSetupReadState = "unavailable";
+    if (S.chatStatus && typeof S.chatStatus === "object") {
+      S.chatStatus = { ...S.chatStatus, connected: null, read_failed: true };
+    }
+  }
   S.google = status;
+  if (isGoogleReady(status)) {
+    delete S.fieldIssues["google-login"];
+    const oldLoginWarnings = [FIELD_MESSAGES["google-login"], GOEDU_REQUIRED_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE, previousAuthorizationMessage,
+      "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요."];
+    if (S.banner && (S.banner.topic === "google-login" || oldLoginWarnings.includes(S.banner.text))) S.banner = null;
+    if (["google_status", "gws_login_start", "gws_login_status"].includes(S.problemIssue?.operation)) clearProblemIssue();
+  }
+  if (accountProfileNeedsReload) reloadAccountProfile().catch(() => {});
 }
 function googleStatusKey(status) {
   if (!status) return "";
@@ -540,6 +714,11 @@ function googleStatusKey(status) {
 }
 function clearGoogleDependentState(options) {
   const preserveResume = options?.preserveResume === true;
+  stopAttendanceBoundaryCheck();
+  if (S.banner?.topic === "attendance-gate") S.banner = null;
+  attendanceAccountAuthorizationVersion += 1;
+  S.attendanceAccountAuthorizing = false;
+  rosterAuthorizationRetry = null;
   googleContextVersion += 1;
   linkListsReadVersion += 1;
   targetStatusReadVersion += 1;
@@ -547,10 +726,14 @@ function clearGoogleDependentState(options) {
   checksReadVersion += 1;
   checksRetry.inflight = false;
   S.linkLoading = false;
+  S.listReads = {};
   S.attendanceLoading = false;
+  S.attendanceReadFailed = false;
   S.googleTargetStatuses = {};
   checksRetry.lastGood = [];
+  checksRetry.dirtyCards.clear();
   clearAttendanceScriptDialogState();
+  stopAttendancePermissionReturn();
   stopAttendancePreparePoll();
   stopChatConnectPoll();
   chatStatusReadVersion += 1;
@@ -560,11 +743,13 @@ function clearGoogleDependentState(options) {
   S.chatSpacesContext = "";
   S.chatStatusContext = "";
   S.chatSpacesError = false;
+  S.chatSpacesLoading = false;
   S.spaceCreate = null;
   S.spaceDraftName = "";
   S.attendance = null;
   S.attendanceScriptUpdate = null;
-  S.firstSetupDone = false;   // 계정이 바뀌면 다른 시트의 완료 표시일 수 있다
+  S.firstSetupDone = false; S.firstSetupReason = "";   // 계정이 바뀌면 다른 시트의 완료 표시일 수 있다
+  S.firstSetupReadState = null;
   S.firstSetupConnectionCode = "";
   S.attendanceStaleNotice = false;
   S.chatStatus = null;
@@ -591,61 +776,56 @@ function clearGoogleDependentState(options) {
     invalidateIssueResume();
   }
 }
+async function checkGoogleOnReturn() {
+  if (S.login || loginWatchChecking || hasCurrentSettingsStatusRequest()) return;
+  loginWatchChecking = true;
+  const epoch = googleLoginEpoch;
+  try {
+    const displayState = () => JSON.stringify([S.google, S.banner, S.problemIssue, S.fieldIssues["google-login"]]);
+    const beforeDisplay = displayState();
+    const before = S.google;
+    const status = await call("google_status");
+    if (epoch !== googleLoginEpoch || S.login || hasCurrentSettingsStatusRequest()) return;
+    adoptGoogleStatus(status);
+    if (googleAuthCheckFailed(status)) { render(); return; }
+    if (before?.logged_in && !status.logged_in) {
+      setBanner("warn", "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.");
+    } else if (beforeDisplay !== displayState()) {
+      render();
+    }
+  } catch (error) { /* A failed actual check is marked unknown by call(); never infer logout. */ }
+  finally { loginWatchChecking = false; }
+}
 function startLoginWatch() {
   if (loginWatchTimer) return;
-  const LOGIN_DROPPED_MESSAGE = "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.";
   const tick = async () => {
-    loginWatchTimer = setTimeout(tick, LOGIN_WATCH_INTERVAL_MS);
-    if (S.login) return;  // 로그인 진행 중에는 전용 폴링이 따로 본다
-    try {
-      const epoch = googleLoginEpoch;
-      const status = await call("google_status");
-      if (epoch !== googleLoginEpoch || S.login || hasCurrentSettingsStatusRequest()) {
-        // 응답을 기다리는 사이 로그인 완료 처리나 설정 점검이 시작됐으면 그쪽이 상태를
-        // 갱신하고 복귀까지 맡는다. 여기서 「로그아웃 → 로그인」을 계정 변화로 보고
-        // 복귀 정보를 지우면 로그인 뒤 연결 화면으로 돌아가지 못한다.
-        return;
-      }
-      const before = S.google;
-      const beforeKey = googleStatusKey(before);
-      adoptGoogleStatus(status);
-      if (googleAuthCheckFailed(status)) {
-        // Do not retain a green badge when the current check failed; keep saved choices.
-        render();
-        return;
-      }
-      const changed = beforeKey && beforeKey !== googleStatusKey(status);
-      if (before && before.logged_in && !status.logged_in) {
-        // 끊김 감지 — 화면 곳곳이 실상을 다시 읽게 비우고 알린다
-        setBanner("warn", LOGIN_DROPPED_MESSAGE);
-      } else if (changed) {
-        S.checks = [];
-        checksRetry.lastGood = [];
-        // 끊겼다고 알린 뒤 로그인이 돌아오면 그 배너부터 걷는다 — 3분 뒤에도 남지 않게.
-        if (status.logged_in && S.banner && S.banner.text === LOGIN_DROPPED_MESSAGE) S.banner = null;
-        if (status.logged_in && !isGoeduGoogleStatus(status)) {
-          setBanner("warn", GOEDU_REQUIRED_MESSAGE);
-          return;
-        }
-        render();
-      }
-      if (!beforeKey) render();
-    } catch (error) { /* 다음 틱에 다시 */ }
+    try { await checkGoogleOnReturn(); }
+    finally { loginWatchTimer = setTimeout(tick, LOGIN_WATCH_INTERVAL_MS); }
   };
   loginWatchTimer = setTimeout(tick, 0);
 }
+window.addEventListener("focus", () => {
+  if (!window.pywebview?.api) return;
+  if (S.login?.logging_out) return;
+  if (S.login) { if (!loginPollRunning) pollLogin(0); }
+  else checkGoogleOnReturn();
+});
 
 function stepStub(n) {
   return `<h1>${esc(WIZARD_STEPS[n - 1])}</h1><p class="sub">이 화면을 불러오지 못했어요. 프로그램을 다시 열어 주세요.</p>`;
 }
 
+let wizardNextPending = null;
+function hasPendingWizardNext() {
+  return wizardNextPending?.screen === screenKey() && wizardNextPending.epoch === accountUiEpoch;
+}
 function wizardFootHtml() {
   const back = S.step > 1 ? `<button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>` : "<span></span>";
   const nextLabel = S.step === WIZARD_STEPS.length ? ""
     : S.step === 1 ? "준비됐어요, 시작하기"
-      : "다음";
-  const nextLocked = (S.step === 2 && !isGoogleReady(S.google))
-    || (attendanceUiEnabled() && S.step === 7 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
+      : hasPendingWizardNext() ? "확인 중…" : "다음";
+  const nextLocked = (S.step === 6 && !rosterSavedForNext()) || hasPendingWizardNext() || (S.step === 2 && (Boolean(S.login) || !isGoogleReady(S.google) || Boolean(S.google?.local_settings_error)))
+    || (attendanceUiEnabled() && S.step === 8 && S.connectTab === "attendance" && !attendanceWizardGateOpen());
   const disabled = nextLocked ? " disabled" : "";
   const nextClass = "btn";
   const next = nextLabel ? `<button class="${nextClass}" data-action="go-next" data-busy-text="확인 중…"${disabled}>${nextLabel}</button>` : "";
@@ -655,13 +835,28 @@ function wizardFootHtml() {
 function renderWizard() {
   const body = (stepBodies[S.step] || (() => stepStub(S.step)))();
   const foot = S.step === WIZARD_STEPS.length ? "" : wizardFootHtml();
+  const currentBody = document.querySelector(".shell > .body > .body-inner");
+  const currentFoot = document.querySelector(".shell > .body > .foot");
+  if (lastScreenKey === screenKey() && currentBody && currentFoot && foot) {
+    // A background result may arrive between pointer-down and pointer-up. Keep
+    // unchanged navigation buttons attached so that click is not discarded.
+    currentBody.innerHTML = `<div class="page">${bannerHtml()}${body}</div>`;
+    document.querySelector(".shell > .rail").outerHTML = railHtml();
+    const template = document.createElement("template");
+    template.innerHTML = foot;
+    const nextFoot = template.content.firstElementChild;
+    if (!currentFoot.isEqualNode(nextFoot)) currentFoot.replaceWith(nextFoot);
+    root().querySelector(":scope > .toast")?.remove();
+    root().insertAdjacentHTML("beforeend", toastHtml());
+    return;
+  }
   root().innerHTML =
     `<div class="shell">${railHtml()}` +
     `<div class="body"><div class="body-inner"><div class="page">${bannerHtml()}${body}</div></div>${foot}</div></div>` + toastHtml();
 }
 
 function currentState() {
-  return { version: 2, completed: false, step: S.step, max_step: S.maxStep, draft: S.draft };
+  return { version: 3, completed: false, step: S.step, max_step: S.maxStep, draft: S.draft };
 }
 function saveDraft() { return call("save_setup_state", currentState()); }
 
@@ -671,11 +866,14 @@ function saveDraft() { return call("save_setup_state", currentState()); }
    유일한 방어라 느슨하게 만들면 안 된다. */
 function attendanceWizardGateOpen() {
   const chat = S.chatStatus;
-  return Boolean(!S.classSpaceSaving && attendanceSheetSetupDone() && chat && chat.connected
-    && chat.class_space_id && S.chatStatusContext === chatReadContext() && attendanceRosterReady());
+  return Boolean(!S.classSpaceSaving && attendanceSheetSetupDone() && chat && chat.connected && !chat.read_failed
+    && S.chatStatusContext === chatReadContext()
+    && ((S.draft.profile["담임여부"] || S.profileCache?.["담임여부"]) === "아니오"
+      || (classRoomReadiness() === "ready" && attendanceRosterReady())));
 }
 function attendanceRosterReady() {
   return rosterContext === chatReadContext() && rosterStatus?.state === "ready"
+    && !(S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending)
     && Number.isInteger(rosterStatus.count) && rosterStatus.count > 0;
 }
 function attendanceSheetSetupDone() {
@@ -683,6 +881,7 @@ function attendanceSheetSetupDone() {
     S.attendance
     && S.attendance.state === "ready"
     && S.firstSetupDone
+    && !["checking", "unavailable"].includes(S.firstSetupReadState)
     && S.firstSetupConnectionCode
     && S.firstSetupConnectionCode === String(S.attendance.connection_code || "").trim().toUpperCase()
   );
@@ -691,57 +890,111 @@ function firstSetupCodeFromValue(value) {
   const match = String(value || "").trim().match(/^(TM-[0-9A-F]{6}-[0-9A-F]{6})(?:\s|$)/i);
   return match ? match[1].toUpperCase() : "";
 }
+function applyFirstSetupRead(first) {
+  if (typeof first?.done !== "boolean") {
+    S.firstSetupReadState = "unavailable";
+    return;
+  }
+  const code = firstSetupCodeFromValue(first.value);
+  S.firstSetupReason = first.reason || "";
+  S.firstSetupConnectionCode = code;
+  S.firstSetupDone = Boolean(first.done && code && code === String(S.attendance?.connection_code || "").trim().toUpperCase());
+  S.firstSetupReadState = "ready";
+  clearResolvedReadIssue("attendance_first_setup_status");
+  clearResolvedAttendanceGateBanner();
+}
+function firstSetupProblemMessage() {
+  return {
+    account_mismatch: "프로그램에 연결한 계정과 출석부 설정 계정이 달라요. 출석부에 설정한 Google 계정으로 로그인해 주세요.",
+    account_missing: "출석부에 연결한 계정을 확인하지 못했어요. Google 로그인 상태를 확인해 주세요.",
+    connection_mismatch: "현재 출석부와 저장된 확인 표시가 달라요. 설정을 다시 실행하지 말고 연결 상태를 확인해 주세요.",
+    connection_invalid: "저장된 출석부 연결을 확인하지 못했어요. 현재 출결 연결을 확인해 주세요.",
+    marker_invalid: "출석부의 설정 완료 표시를 확인할 수 없어요. 설정을 다시 실행하지 말고 연결 상태를 확인해 주세요.",
+  }[S.firstSetupReason] || "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
+}
 async function refreshAttendanceWizardGate() {
   // 준비 중이라고 이미 확인한 화면에서 단계 건너뛰기를 누르면, 일반 상태 조회가
   // 먼저 완성된 옛 연결 기록을 돌려주더라도 준비 스레드가 끝난 것으로 보지 않는다.
   if (S.attendance?.state === "installing") return false;
+  let context = chatReadContext();
+  const owner = screenKey();
+  const current = () => context === chatReadContext() && owner === screenKey();
   // 다른 창이 현재 출석부를 바꿨을 수 있으므로 7단계를 넘기 직전에 실제 상태와
-  // 그 Sheet에 묶인 완료 표시를 다시 읽는다. 옛 창의 true 값은 먼저 버린다.
-  S.firstSetupDone = false;
-  S.firstSetupConnectionCode = "";
+  // 그 Sheet에 묶인 완료 표시를 다시 읽는다. 확인 중에는 다음 단계를 막되,
+  // 읽기 실패를 이미 마친 설정의 취소로 취급하지 않는다.
+  S.firstSetupReadState = "checking";
+  let attendanceChecked = false;
   try {
-    S.attendance = await call("attendance_status");
+    const attendance = await call("attendance_status");
+    if (!current()) return false;
+    attendanceChecked = true;
+    S.attendanceReadFailed = false;
+    S.attendance = attendance;
+    context = chatReadContext();
     if (!S.attendance || S.attendance.state !== "ready") return false;
     const first = await call("attendance_first_setup_status");
-    const completionCode = firstSetupCodeFromValue(first && first.value);
-    const currentCode = String(S.attendance.connection_code || "").trim().toUpperCase();
-    S.firstSetupConnectionCode = completionCode;
-    S.firstSetupDone = Boolean(
-      first && first.done === true && completionCode && completionCode === currentCode
-    );
+    if (!current()) return false;
+    applyFirstSetupRead(first);
     await loadChatStatus(true);
+    if (current() && S.chatStatus?.connected && !S.chatStatus.read_failed && isHomeroomTeacher()) await loadChatSpaces(true);
+    if (!current()) return false;
     await loadAttendanceRosterStatus(true);
   } catch (_error) {
-    S.firstSetupDone = false;
-    S.firstSetupConnectionCode = "";
+    if (!current()) return false;
+    if (!attendanceChecked) S.attendanceReadFailed = true;
+    S.firstSetupReadState = "unavailable";
   }
   return attendanceWizardGateOpen();
 }
 function attendanceWizardGateMessage() {
   const state = S.attendance ? S.attendance.state : "";
-  if (state === "connection-repair-required") return "출결 탭에서 사용할 기존 출석부를 먼저 골라 주세요.";
+  if (state === "connection-repair-required") return "출결 탭에서 저장된 출석부의 연결을 확인해 주세요.";
   if (state === "installing") return "출결 준비가 끝나야 다음으로 갈 수 있어요";
+  if (state === "initial-setup-required") return "출석부의 [설정하러 가기]에서 처음 설정을 마쳐 주세요.";
   if (state === "ready") {
-    if (!attendanceSheetSetupDone()) return "시트의 처음 설정이 끝나야 다음으로 갈 수 있어요";
-    if (!S.chatStatus?.connected) return "Google Chat의 [연결하기]에서 권한 허용을 마쳐 주세요.";
-    if (!S.chatStatus?.class_space_id || S.chatStatusContext !== chatReadContext()) return "Google Chat에서 사용할 학급 단톡방을 만든 뒤, 이 화면의 목록에서 골라 주세요.";
-    return "학생명단의 [명단 입력하기]에서 번호·이름·이메일을 입력해 주세요. 이 화면으로 돌아오면 확인한 뒤 다음으로 갈 수 있어요.";
+    if (["checking", "unavailable"].includes(S.firstSetupReadState)) return "출석부의 설정 완료 여부를 확인해야 해요. 설정을 다시 실행할 필요는 없어요.";
+    if (!attendanceSheetSetupDone()) return firstSetupProblemMessage();
+    if (!S.chatStatus || S.chatStatus === "loading" || S.chatStatus.read_failed || typeof S.chatStatus.connected !== "boolean") return "Google Chat 연결 상태를 확인해야 해요. 잠시 뒤 다시 확인해 주세요.";
+    if (!S.chatStatus?.connected) return "Google Chat의 [연결(권한 승인)하러 가기]에서 권한 승인을 마쳐 주세요.";
+    if (isHomeroomTeacher() && classRoomReadiness() !== "ready") return classRoomReadinessMessage();
+    if (S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending) return S.rosterEditor.detail || "저장한 학생명단을 출석부에 반영하고 있어요.";
+    if (!rosterStatus || rosterContext !== chatReadContext() || ["checking", "unavailable"].includes(rosterStatus.state)) return "학생명단을 아직 확인하지 못했어요. 학생명단 화면에서 저장 상태를 확인해 주세요.";
+    return "학생명단 화면에서 번호·이름·이메일을 입력하고 [명단 저장]을 눌러 주세요.";
   }
   if (state === "failed") return "출결 준비가 실패했어요. 출결 탭에서 [다시 시도]를 눌러 주세요.";
   return "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요.";
 }
+function setAttendanceGateBanner(message = attendanceWizardGateMessage()) {
+  S.banner = { kind: "warn", text: message, topic: "attendance-gate",
+    context: chatReadContext(), owner: screenKey(),
+    reason: !attendanceSheetSetupDone() ? "first-setup" : "remaining-setup" };
+  render();
+}
+function clearResolvedAttendanceGateBanner() {
+  const banner = S.banner;
+  if (banner?.topic !== "attendance-gate") return;
+  if (banner.context !== chatReadContext() || banner.owner !== screenKey()
+      || (banner.reason === "first-setup" && attendanceSheetSetupDone())
+      || attendanceWizardGateOpen()) S.banner = null;
+}
 async function goStepAsync(n) {
-  const target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
-  if (attendanceUiEnabled() && S.mode === "wizard" && S.step <= 7 && target > 7 && !(await refreshAttendanceWizardGate())) {
-    setBanner("warn", attendanceWizardGateMessage());
+  const owner = screenKey(), epoch = accountUiEpoch;
+  const current = () => owner === screenKey() && epoch === accountUiEpoch;
+  let target = Math.max(1, Math.min(WIZARD_STEPS.length, n));
+  if (target === 6 && !isHomeroomTeacher()) target = S.step > 6 ? 5 : 7;
+  if (attendanceUiEnabled() && S.mode === "wizard" && S.step <= 8 && target > 8 && !(await refreshAttendanceWizardGate())) {
+    if (!current()) return;
+    setAttendanceGateBanner();
     return;
   }
+  if (!current()) return;
   await stopHotkeyRecording();
+  if (!current()) return;
   if (S.connectTab === "attendance") clearAttendanceScriptDialogState();
   S.banner = null;
   S.step = target;
   S.maxStep = Math.max(S.maxStep || 1, S.step);
-  if (attendanceUiEnabled() && S.mode === "wizard" && S.step === 7 && S.connectTab === "attendance") {
+  if (attendanceUiEnabled() && S.mode === "wizard" && S.step === 8 && S.connectTab === "attendance") {
     // 단계 목록으로 출결 탭에 곧장 돌아와도 진행 표시와 완료 자동 확인이 다시 돈다.
     startAttendancePreparePoll();
   }
@@ -749,30 +1002,61 @@ async function goStepAsync(n) {
   render();
 }
 async function goNextAsync() {
+  // A status panel can repaint the footer while this operation is awaiting Google.
+  // Keep the pending action in state, rather than only on the replaced button.
+  if (hasPendingWizardNext()) return;
+  const pending = { screen: screenKey(), epoch: accountUiEpoch };
+  wizardNextPending = pending;
+  try { return await advanceWizardNext(); }
+  finally {
+    if (wizardNextPending === pending) {
+      const current = hasPendingWizardNext();
+      wizardNextPending = null;
+      if (current) render();
+    }
+  }
+}
+async function advanceWizardNext() {
+  const owner = screenKey(), epoch = accountUiEpoch;
+  const mode = S.mode, step = S.step, edit = S.edit;
+  const current = () => owner === screenKey() && epoch === accountUiEpoch;
   const validate = validators[S.step];
   const problem = validate ? await validate() : "";
-  if (problem) { setBanner("warn", problem); return; }
-  if (S.step === 7 && S.connectTab === "messenger") {
+  if (problem) {
+    // Validation may intentionally reveal the messenger tab's offending field.
+    if (epoch === accountUiEpoch && mode === S.mode && step === S.step && edit === S.edit) setBanner("warn", problem);
+    return;
+  }
+  if (!current()) return;
+  if (S.step === 8 && S.connectTab === "messenger") {
+    // Persist the screen before the background worker takes the account lock.
+    await saveDraft();
+    if (!current()) return;
     // 공개용은 출결 안내만 보여 주고, 별도 시험 설치본만 기존 준비 흐름을 실행한다.
+    let startReply = null;
     if (attendanceUiEnabled()) {
-      const startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
-      if (!startReply.started) { setBanner("warn", startReply.reason); return; }
+      startReply = await call("attendance_prepare_start", S.draft.profile, S.draft.grid, S.draft.bridge);
+      if (!current()) return;
+      if (!startReply.started && !startReply.status) { setBanner("warn", startReply.reason); return; }
       S.banner = null;  // 이전에 띄운 게이트 안내가 남아 있으면 걷는다 (검토 C2)
     }
     S.connectTab = "attendance";
     S.chatStatus = null;
-    S.attendance = null;  // 탭 클릭 경로와 동일하게 새로 확인 — 오래된 상태 재사용 방지
-    if (attendanceUiEnabled()) startAttendancePreparePoll();
-    await saveDraft();
+    S.attendance = startReply?.status || null;
+    if (attendanceUiEnabled() && startReply?.started) startAttendancePreparePoll();
     render();
     return;
   }
-  if (S.step === 7 && S.connectTab === "attendance") {
+  if (S.step === 8 && S.connectTab === "attendance") {
     if (attendanceUiEnabled() && S.mode === "wizard" && !(await refreshAttendanceWizardGate())) {
+      if (!current()) return;
       // 게이트 판정과 문구는 goStepAsync의 7단계 경계와 같은 함수 하나를 쓴다 (검토 C1).
-      setBanner("warn", attendanceWizardGateMessage());
+      setAttendanceGateBanner();
       return;
     }
+    if (!current()) return;
+    await saveDraft();
+    if (!current()) return;
     S.banner = null;  // 게이트 통과 — 남은 안내 배너를 걷고 다음 탭으로 (검토 C2)
     stopAttendancePreparePoll();
     clearAttendanceScriptDialogState();
@@ -780,7 +1064,6 @@ async function goNextAsync() {
     S.aiTools = null;
     S.aiInstall = null;
     stopChatConnectPoll();
-    await saveDraft();
     render();
     return;
   }
@@ -789,7 +1072,7 @@ async function goNextAsync() {
 
 bindActions({
   "go-prev": () => {
-    if (S.step === 7 && S.connectTab === "ai") {
+    if (S.step === 8 && S.connectTab === "ai") {
       S.connectTab = "attendance";
       S.chatStatus = null;
       S.attendance = null;
@@ -797,7 +1080,7 @@ bindActions({
       render();
       return;
     }
-    if (S.step === 7 && S.connectTab === "attendance") {
+    if (S.step === 8 && S.connectTab === "attendance") {
       clearAttendanceScriptDialogState();
       stopAttendancePreparePoll();
       S.connectTab = "messenger";
@@ -858,27 +1141,35 @@ function workspaceGuideOverlayHtml() {
 
 /* ---------- 구글 로그인 폴링 ---------- */
 let loginTimer = null;
+let loginPollRunning = false;
 function stopLoginPoll() {
   if (loginTimer) { clearTimeout(loginTimer); loginTimer = null; }
 }
 async function pollLoginOnce(request) {
+  if (loginPollRunning) return true;
+  loginPollRunning = true;
+  const epoch = googleLoginEpoch;
+  const requestScreen = request?.screen || screenKey();
+  const current = () => epoch === googleLoginEpoch && requestScreen === screenKey();
+  try {
   const snap = await call("gws_login_status");
-  if (!ownsIssueRequest(request)) return false;
+  if (!current()) return false;
   if (snap.ok === true) {
-    S.login = null;
+    request = beginIssueRequest(false);
     delete S.fieldIssues["google-login"];
     clearGoogleDependentState({ preserveResume: true });  // 재승인은 선택을 보존하고 상태만 새로 읽는다
-    await refreshSettingsStatus(request);
+    await refreshSettingsStatus(request, { loginComplete: true, loginEpoch: epoch, googleStatus: snap.google_status });
     if (!ownsIssueRequest(request)) return false;
     if (isGoogleReady(S.google)) {
       if (!(await resumeInterruptedGoogleScreen(request))) showToast("Google 계정으로 로그인했어요");
       refreshChecks().catch(() => {});
-    } else setBanner("warn", googleAuthorizationMessage(S.google));
+    } else setBanner("warn", googleAuthorizationMessage(S.google), "google-login");
     return false;
   }
   if (snap.ok === false) {
     S.login = null;
-    setBanner("error", "로그인이 끝나지 않았어요. " + (snap.detail || "다시 시도해 주세요."));
+    if (snap.google_status) adoptGoogleStatus(snap.google_status);
+    setBanner("error", snap.detail || "Google 로그인을 끝내지 못했어요. 실패 원인은 아직 확인하지 못했습니다.", "google-login");
     return false;
   }
   const viewChanged = !S.login
@@ -887,26 +1178,33 @@ async function pollLoginOnce(request) {
   S.login = snap;
   if (viewChanged) render();
   return true;
+  } catch (error) {
+    // A parallel status read can advance the account generation during this
+    // same login. Discard its old result, but keep observing the current login.
+    if (error instanceof StaleAccountResponse) return Boolean(current() && S.login && !S.login.logging_out);
+    throw error;
+  } finally { loginPollRunning = false; }
 }
-function pollLogin() {
+function pollLogin(delay = 1000) {
   stopLoginPoll();
+  const epoch = googleLoginEpoch;
   loginTimer = setTimeout(async () => {
-    if (!S.login) return;
+    if (!S.login || epoch !== googleLoginEpoch) return;
     const request = beginIssueRequest(false);
     try {
-      if (await pollLoginOnce(request) && ownsIssueRequest(request)) pollLogin();
+      if (await pollLoginOnce(request)) pollLogin();
     } catch (error) {
-      if (!ownsIssueRequest(request)) return;
+      if (epoch !== googleLoginEpoch || request.screen !== screenKey()) return;
       S.login = null;
       handleCaughtError(error, request);
     }
-  }, 1000);
+  }, delay);
 }
 bindActions({
   "install-gws-update": async (_el, request) => {
     if (S.gwsUpdateInstalling) return;
     const offer = S.gwsUpdate && S.gwsUpdate.offer;
-    if (!offer) throw new Error("승인된 Google 도구 새 판을 다시 점검해 주세요.");
+    if (!offer) throw new Error("Google 연결 기능 업데이트를 다시 확인해 주세요.");
     const offerNote = safeGwsOfferText(offer.notes);
     const offerDate = safeGwsOfferDate(offer.verified_on);
     const offerDetails = [
@@ -914,9 +1212,9 @@ bindActions({
       offerNote ? `변경 설명: ${offerNote}` : "",
     ].filter(Boolean).join("\n");
     if (!window.confirm(
-      `승인된 Google 도구 ${offer.version}로 갱신할까요?\n` +
+      `Google 연결 기능을 ${offer.version} 버전으로 업데이트할까요?\n` +
       (offerDetails ? `\n${offerDetails}\n` : "\n") +
-      "공식 파일을 받아 두 확인값이 모두 맞을 때만 적용해요."
+      "받은 파일이 공식 파일과 같은지 확인한 뒤 적용합니다."
     )) return;
     S.gwsUpdateInstalling = true;
     render();
@@ -933,18 +1231,34 @@ bindActions({
     if (!ownsIssueRequest(request)) return;
     if (!result.success) {
       const fallback = result.can_continue
-        ? "현재 기본판으로 계속 쓸 수 있어요."
-        : "설치 파일이 손상됐어요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+        ? "현재 Google 연결 기능을 계속 쓸 수 있어요."
+        : "Google 연결 기능을 업데이트하지 못했어요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
       throw new Error(result.detail || fallback);
     }
-    showToast(`새 Google 도구 ${result.current_version || offer.version}을 적용했어요`);
+    showToast("Google 연결 기능을 업데이트했어요");
   },
   "gws-login": async () => {
-    googleLoginEpoch += 1;
+    if (S.login) return;
+    const epoch = ++googleLoginEpoch;
     S.banner = null;
-    S.login = await call("gws_login_start");
+    S.login = { running: true };
     render();
-    pollLogin();
+    try {
+      const snapshot = await call("gws_login_start");
+      if (epoch !== googleLoginEpoch) return;
+      S.login = snapshot;
+      render();
+      pollLogin();
+    } catch (error) {
+      if (epoch !== googleLoginEpoch) return;
+      if (error instanceof StaleAccountResponse) {
+        if (S.login) pollLogin(0);
+        return;
+      }
+      S.login = null;
+      render();
+      throw error;
+    }
   },
   "google-targets-recheck": async () => {
     syncConnectFields();
@@ -959,21 +1273,68 @@ bindActions({
     await actions["gws-login"]();
   },
   "gws-logout": async () => {
-    if (!window.confirm("현재 구글 계정에서 로그아웃할까요?")) return;
+    if (S.login?.logging_out) return;
+    if (!window.confirm("Teacher Manager에서 로그아웃할까요? 기존 자료는 보존됩니다. 다른 계정으로 로그인하면 연결을 다시 선택해야 합니다. Google 시트의 자동 발송은 별도로 관리됩니다.")) return;
+    if (!(await flushEditSave())) return;
+    if (S.login?.logging_out) return;
+    const epoch = ++googleLoginEpoch;
+    stopLoginPoll();
+    S.login = { running: true, logging_out: true };
+    render();
+    try {
     const result = await call("gws_logout");
-    if (!result.success) throw new Error(result.detail || "로그아웃하지 못했어요");
+    if (epoch !== googleLoginEpoch) return;
     S.login = null;
-    S.lists = { calendars: [], tasklists: [] };
-    S.listsLoaded = false;
-    S.listsError = false;
-    await refreshSettingsStatus();
+    if (!result.success) {
+      clearGoogleDependentState();
+      S.google = { ...S.google, account_allowed: false, authorization_state: "check_failed" };
+      render();
+      throw new Error(result.detail || "로그아웃하지 못했어요");
+    }
+    S.login = null;
+    clearAccountScreen();
+    S.google = { ...S.google, logged_in: false, user: "", account_allowed: false, authorization_state: "login_required",
+      login_state: "logged_out", authorization_reason: "", authorization_detail: "", local_settings_error: "" };
+    render();
+    accountProfileNeedsReload = true;
+    await reloadAccountProfile();
+    if (epoch !== googleLoginEpoch) return;
     showToast("Teacher Manager에서 로그아웃했어요");
+    } catch (error) {
+      if (epoch !== googleLoginEpoch) return;
+      S.login = null;
+      if (S.google?.login_state !== "logged_out") {
+        adoptGoogleStatus({ ...S.google, account_allowed: false, authorization_state: "check_failed" });
+      }
+      render();
+      throw error;
+    }
   },
   "login-cancel": async () => {
+    const epoch = ++googleLoginEpoch;
     stopLoginPoll();
-    await call("gws_login_cancel");
-    S.login = null;
-    setBanner("warn", "로그인을 취소했어요. 다시 시도할 수 있어요.");
+    try {
+      const result = await call("gws_login_cancel");
+      if (epoch !== googleLoginEpoch) return;
+      if (result.cancelled) {
+        S.login = null;
+        setBanner("warn", "로그인을 취소했어요. 다시 시도할 수 있어요.", "google-login");
+      } else {
+        // Completion may beat Cancel. Display the actual account result rather
+        // than claiming that a completed login was cancelled.
+        const status = await call("google_status");
+        if (epoch !== googleLoginEpoch) return;
+        S.login = null;
+        adoptGoogleStatus(status);
+        render();
+      }
+    } catch (error) {
+      if (epoch !== googleLoginEpoch) return;
+      S.login = null;
+      adoptGoogleStatus({ ...S.google, account_allowed: false, authorization_state: "check_failed" });
+      render();
+      throw error;
+    }
   },
   "gws-repair-oauth": async () => {
     // 로그인이 중간에 끊겨 gws가 남긴 깨진 준비 파일을 치우고 다시 점검한다.
@@ -1001,6 +1362,16 @@ function readRadio(name) {
   const el = document.querySelector(`[name="${name}"]:checked`);
   return el ? el.value : "";
 }
+function displayedSchoolYear(now = new Date()) {
+  if (S.attendance?.year_verified && S.attendance.current_school_year) return S.attendance.current_school_year;
+  // Display only: workbook creation and binding still require the server-verified year.
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul", year: "numeric", month: "numeric",
+  }).formatToParts(now);
+  const year = Number(parts.find(part => part.type === "year").value);
+  const month = Number(parts.find(part => part.type === "month").value);
+  return month >= 3 ? year : year - 1;
+}
 function stepIdentity() {
   const p = S.draft.profile;
   const homeroom = p["담임여부"] || "";
@@ -1015,30 +1386,19 @@ function stepIdentity() {
       ${fieldInner("담임반", locked ? "" : p["담임반"], { placeholder: "3", disabled: locked })}<span class="suffix">반</span>
       ${locked ? `<span class="cell-hint">담임일 때만 입력해요</span>` : ""}
     </span>`);
-  const year = p["학년도"] || currentSchoolYearJs();
-  const yearOptions = schoolYearChoices().map((y) =>
-    `<option value="${y}" ${y === year ? "selected" : ""}>${y}학년도</option>`).join("");
+  const year = displayedSchoolYear();
   return `
     <h1>선생님을 알려주세요</h1>
     <p class="sub">캘린더 제목과 안내 문구에 쓰여요</p>
     ${formTable(
       fieldRow("선생님이름", "이름", p["선생님이름"]) +
-      rawRow("학년도", `<div class="field"><select name="학년도">${yearOptions}</select></div>`) +
+      rawRow("학년도", `<div class="field"><span data-school-year="automatic">${esc(year)}학년도</span><span class="hint">한국 시간 기준으로 자동 적용</span></div>`) +
       fieldRow("학교명", "학교 이름", p["학교명"], { placeholder: "예: OO고등학교" }) +
       rawRow("학교급 (수업 시간을 자동 계산해요)",
         choiceCell("학교급", [["초", "초등 (40분)"], ["중", "중학 (45분)"], ["고", "고등 (50분)"]])) +
       rawRow("담임을 맡고 있나요?", choiceCell("담임여부", [["예", "예"], ["아니오", "아니오"]])) +
       homeroomRow
     )}`;
-}
-/* 한국 학년도 — 3월 1일에 새 학년도가 시작한다. getMonth()는 0부터라 3월이 2다. */
-function currentSchoolYearJs() {
-  const now = new Date();
-  return String(now.getMonth() >= 2 ? now.getFullYear() : now.getFullYear() - 1);
-}
-function schoolYearChoices() {
-  const base = Number(currentSchoolYearJs());
-  return [String(base - 1), String(base), String(base + 1)];
 }
 function syncProfileFields() {
   Object.assign(S.draft.profile, readFields(IDENTITY_FIELDS));
@@ -1047,9 +1407,55 @@ function syncProfileFields() {
   if (S.draft.profile["담임여부"] === "예") {
     Object.assign(S.draft.profile, readFields(["담임학년", "담임반"]));
   }
-  const yearSelect = document.querySelector('select[name="학년도"]');
-  if (yearSelect) S.draft.profile["학년도"] = yearSelect.value;
+  // A stored historical year is never submitted as an editable profile value.
+  delete S.draft.profile["학년도"];
 }
+
+const ATTENDANCE_SHEET_PROFILE_FIELDS = {
+  "선생님이름": "선생님 이름",
+  "학교명": "학교 이름",
+  "담임학년": "담임 학년",
+  "담임반": "담임 반",
+};
+function recordAttendanceStaleChange(box) {
+  if (!box || S.mode !== "wizard" || S.step < 3 || S.step > 5 || !S.attendance
+      || !["ready", "installing"].includes(S.attendance.state)) return;
+  const data = box.dataset || {};
+  let previous;
+  let current = String(box.value == null ? "" : box.value);
+  let sheetField = "";
+  let localGroup = "";
+  if (S.step === 3 && box.name) {
+    previous = String((S.draft.profile || {})[box.name] || "");
+    sheetField = ATTENDANCE_SHEET_PROFILE_FIELDS[box.name] || "";
+    localGroup = sheetField ? "" : "내 정보";
+  } else if (S.step === 4) {
+    const dayName = data.dayHour !== undefined ? data.dayHour
+      : data.dayMinute !== undefined ? data.dayMinute : box.name;
+    if (!dayName) return;
+    const saved = String((S.draft.profile || {})[dayName] || "");
+    if (data.dayHour !== undefined) previous = saved.split(":")[0] || "";
+    else if (data.dayMinute !== undefined) previous = saved.split(":")[1] || "";
+    else previous = saved;
+    localGroup = "하루 일과";
+  } else if (S.step === 5 && data.grid !== undefined) {
+    const [row, column] = String(data.grid).split(":").map(Number);
+    previous = String((((S.draft.grid || [])[row] || [])[column]) || "");
+    current = current.trim();
+    localGroup = "시간표";
+  } else {
+    return;
+  }
+  if (current === previous) return;
+  const notice = S.attendanceStaleNotice && typeof S.attendanceStaleNotice === "object"
+    ? S.attendanceStaleNotice : { sheet_fields: [], local_groups: [] };
+  if (sheetField && !notice.sheet_fields.includes(sheetField)) notice.sheet_fields.push(sheetField);
+  if (localGroup && !notice.local_groups.includes(localGroup)) notice.local_groups.push(localGroup);
+  S.attendanceStaleNotice = notice;
+}
+// 변경값이 draft에 복사되기 전에 이전 값과 비교한다.
+document.addEventListener("input", (event) => recordAttendanceStaleChange(event.target));
+document.addEventListener("change", (event) => recordAttendanceStaleChange(event.target));
 function validateIdentity() {
   syncProfileFields();
   const rows = identityIssues();
@@ -1153,6 +1559,7 @@ function stepTimetable() {
   return `
     <h1>시간표를 채워주세요</h1>
     <p class="sub">공강 시간을 중심으로 행정업무 일정을 등록해 드려요. 입력 형식은 자유로워요 (예: 2-1, 2학년 1반, 201…)</p>
+    <p class="sub">엑셀에서 요일·교시 제목을 제외한 칸을 복사한 뒤, 시작할 칸에 붙여넣으세요. 가로는 월~금, 세로는 1~7교시예요. 빈칸도 그대로 반영돼요.</p>
     <table class="grid-table">${head}${rows}</table>`;
 }
 function syncGridFields() {
@@ -1163,17 +1570,269 @@ function syncGridFields() {
 }
 function validateTimetable() { syncGridFields(); return ""; }
 
+document.addEventListener("paste", event => {
+  const key = event.target.dataset?.grid;
+  if (!key || !S.draft.grid?.length || event.target.disabled || event.target.readOnly) return;
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (!/[\t\r\n]/.test(text)) return; // 한 칸 붙여넣기는 기존 입력 동작을 유지한다.
+  event.preventDefault();
+  const [start, column] = key.split(":").map(Number);
+  const pasted = text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").map(line => line.split("\t"));
+  if (!Number.isInteger(start) || !Number.isInteger(column) || start < 0 || column < 1
+      || start + pasted.length > S.draft.grid.length
+      || pasted.some(row => row.length + column > GRID_DAYS.length + 1)) {
+    setBanner("warn", "시간표 범위를 넘어서 붙여넣지 않았어요. 월~금, 1~7교시 안에 들어오도록 복사 범위나 시작 칸을 확인해 주세요.");
+    return;
+  }
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+    setBanner("warn", "붙여넣을 내용에 사용할 수 없는 제어 문자가 있어요. 엑셀의 시간표 칸만 다시 복사해 주세요.");
+    return;
+  }
+  syncGridFields();
+  pasted.forEach((row, offset) => row.forEach((value, c) => {
+    S.draft.grid[start + offset][column + c] = value.trim();
+  }));
+  document.querySelectorAll("[data-grid]").forEach(el => {
+    const [r, c] = el.dataset.grid.split(":").map(Number);
+    el.value = S.draft.grid[r][c];
+  });
+  if (S.mode === "edit" && S.edit === "timetable") {
+    markEditDirtyField("__timetable__");
+    scheduleEditAutoSave();
+  }
+});
+
+/* Homeroom roster stays inside the timetable window and the setup wizard. */
+let rosterEditorRequest = 0;
+let rosterEditorPending = null;
+function isHomeroomTeacher() { return (S.draft.profile["담임여부"] || S.profileCache?.["담임여부"]) === "예"; }
+function rosterEditorContext() { return JSON.stringify([accountUiEpoch, accountWireToken?.[0] || S.google?.user || ""]); }
+function rosterEditableRows(rows = [], minimum = 30) {
+  const result = rows.map(row => [...row]);
+  let next = Math.max(0, ...result.map(row => Number(row[0]) || 0)) + 1;
+  while (result.length < minimum) result.push([String(next++), "", ""]);
+  return result;
+}
+function rosterRowHasStudent(row) { return row.slice(1).some(value => String(value || "").trim()); }
+async function loadRosterEditor(refresh = false) {
+  if (!isHomeroomTeacher()) return;
+  const context = rosterEditorContext();
+  const owner = screenKey();
+  if (rosterEditorPending?.context === context && rosterEditorPending.owner === owner) return rosterEditorPending.promise;
+  if (!refresh && S.rosterEditor?.context === context && S.rosterEditor.state !== "loading") return;
+  const version = ++rosterEditorRequest;
+  let finishPending;
+  rosterEditorPending = { context, owner, promise: new Promise(resolve => { finishPending = resolve; }) };
+  S.rosterEditor = { rows: [], revision: "", state: "loading", context };
+  try {
+    const data = await call("read_roster_editor", refresh);
+    if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
+    S.rosterEditor = { ...data, rows: rosterEditableRows(data.rows), context, dirty: false };
+    if (data.state !== "unavailable" && S.banner?.topic === "roster-validation") S.banner = null;
+  } catch (_) {
+    if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
+    S.rosterEditor = { rows: [], revision: "", state: "unavailable", context, detail: "명단을 불러오지 못했어요. 다시 불러오기를 눌러 주세요." };
+  } finally {
+    if (version === rosterEditorRequest) {
+      rosterEditorPending = null;
+      if (context === rosterEditorContext() && owner !== screenKey() && S.rosterEditor?.state === "loading") S.rosterEditor = null;
+    }
+    finishPending();
+    if (version === rosterEditorRequest && context === rosterEditorContext() && owner === screenKey()) render();
+  }
+}
+function rosterInputProblem() {
+  const rows = S.rosterEditor?.rows || [];
+  if (!rows.some(rosterRowHasStudent) || rows.length > 199) return "학생명단은 1명부터 199명까지 입력해 주세요.";
+  const numbers = new Set(), emails = new Set();
+  for (let i = 0; i < rows.length; i++) {
+    if (!rosterRowHasStudent(rows[i])) continue;
+    const [number, name, email] = rows[i].map(v => String(v || "").trim());
+    if (!/^[0-9]{1,4}$/.test(number) || Number(number) < 1) return `${i + 1}번째 학생 번호를 확인해 주세요.`;
+    if (!name) return `${i + 1}번째 학생 이름을 입력해 주세요.`;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return `${i + 1}번째 학생 이메일을 빠짐없이 입력해 주세요.`;
+    if (numbers.has(Number(number)) || emails.has(email.toLowerCase())) return `${i + 1}번째 학생 번호 또는 이메일이 중복돼요.`;
+    numbers.add(Number(number)); emails.add(email.toLowerCase());
+  }
+  return "";
+}
+let rosterAuthorizationRetry = null;
+async function saveRosterEditor(sync = false, authorize = true, explicitConnect = false) {
+  let editor = S.rosterEditor;
+  if (!editor || editor.busy || S.attendanceAccountAuthorizing || editor.context !== rosterEditorContext()) return false;
+  const problem = rosterInputProblem();
+  if (problem) { setBanner("warn", problem, "roster-validation"); return false; }
+  const context = editor.context, owner = screenKey();
+  const connection = attendanceScopeKey(S.attendance) || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || "";
+  let requestedRevision = editor.revision;
+  // The saved editor can outlive its screen; a replacement editor cannot inherit this request.
+  const current = () => context === rosterEditorContext() && S.rosterEditor === editor;
+  const visible = () => owner === screenKey();
+  const rows = editor.rows.filter(rosterRowHasStudent).map(row => row.map(value => String(value).trim()));
+  editor.busy = true; render();
+  try {
+    if (sync && explicitConnect && !editor.dirty && editor.revision) {
+      const pending = editor.pending, linked = Boolean(editor.linked);
+      const fresh = await call("read_roster_editor", false, true, requestedRevision);
+      if (!current() || !visible() || connection !== (attendanceScopeKey(S.attendance)
+          || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || "")) return false;
+      const unchanged = !editor.dirty && editor.revision === requestedRevision
+        && editor.pending === pending && Boolean(editor.linked) === linked
+        && JSON.stringify(editor.rows.filter(rosterRowHasStudent).map(row => row.map(value => String(value).trim()))) === JSON.stringify(rows);
+      if (!unchanged || fresh?.revision_accepted !== true || !fresh.revision
+          || fresh.pending !== pending || Boolean(fresh.linked) !== linked
+          || JSON.stringify(fresh.rows) !== JSON.stringify(rows)) {
+        editor.state = "conflict";
+        editor.detail = "저장된 명단이 바뀌었어요. 현재 명단을 확인한 뒤 연결해 주세요.";
+        setBanner("warn", editor.detail);
+        return false;
+      }
+      // Only the verified local protection record may advance this saved revision.
+      editor.revision = fresh.revision;
+    }
+    let saved = editor;
+    if (editor.dirty || !editor.revision) saved = await call("save_roster_editor", rows, editor.revision || "");
+    if (!current()) return false;
+    S.rosterEditor = editor = { ...saved, rows: rosterEditableRows(saved.rows), context, dirty: false, busy: true };
+    if (sync) {
+      requestedRevision = editor.revision;
+      const result = explicitConnect
+        ? await call("sync_roster_editor", requestedRevision)
+        : await call("sync_roster_editor");
+      if (!current()) return false;
+      S.rosterEditor = editor = { ...result, rows: rosterEditableRows(result.rows), context, dirty: false, busy: true };
+      rosterStatus = null;
+    }
+    if (["unavailable", "conflict"].includes(S.rosterEditor.state)) {
+      if (visible()) setBanner("warn", S.rosterEditor.detail || "출석부에 명단을 저장하지 못했어요. 명단 저장을 다시 눌러 주세요.");
+      if (authorize && visible() && S.rosterEditor.failure_code === "ATTENDANCE_AUTH_REQUIRED") {
+        rosterAuthorizationRetry = {context, owner, revision: requestedRevision, explicitConnect, connection};
+        await actions["attendance-account-authorize"]();
+      }
+      return false;
+    }
+    if (visible()) S.banner = null;
+    return true;
+  } catch (_) {
+    if (current()) {
+      S.rosterEditor.detail = "명단 저장 결과를 확인하지 못했어요. 입력한 내용은 이 화면에 남아 있어요. 다시 저장해 주세요.";
+      S.rosterEditor.state = "unavailable";
+      if (visible()) setBanner("warn", S.rosterEditor.detail);
+    }
+    return false;
+  } finally {
+    // Cleanup belongs to this editor, even when its response was fenced out.
+    // A same-account epoch change repaints into the existing read-only reload path.
+    editor.busy = false;
+    if (S.rosterEditor === editor && visible()) render();
+  }
+}
+function rosterSavedForNext() {
+  if (!isHomeroomTeacher()) return true;
+  const editor = S.rosterEditor;
+  return Boolean(editor?.context === rosterEditorContext() && editor.revision && !editor.dirty && !editor.busy
+    && !["loading", "unavailable", "conflict"].includes(editor.state) && !rosterInputProblem());
+}
+async function validateRoster() {
+  if (!isHomeroomTeacher()) return "";
+  await loadRosterEditor();
+  const problem = rosterInputProblem();
+  if (problem) return problem;
+  const editor = S.rosterEditor;
+  if (editor?.revision && !editor.dirty && !editor.busy && ["conflict", "unavailable"].includes(editor.state)) {
+    return editor.detail || "명단은 이 컴퓨터에 저장되어 있어요. 출석부 연결 상태를 확인해 주세요.";
+  }
+  return rosterSavedForNext() ? "" : "명단 저장을 먼저 눌러 주세요. 저장한 뒤 다음으로 진행할 수 있어요.";
+}
+function stepRoster() {
+  if (!isHomeroomTeacher()) return `<h1>담임학급 학생명단</h1><p class="sub">담임을 맡지 않아 이 단계는 사용하지 않아요.</p>`;
+  if (S.rosterEditor?.context !== rosterEditorContext()) loadRosterEditor();
+  const editor = S.rosterEditor || { state: "loading", rows: [] };
+  if (editor.state === "loading") return `<h1>담임학급 학생명단</h1><p class="sub">명단을 불러오고 있어요…</p>`;
+  const disabled = editor.busy ? " disabled" : "";
+  const rows = editor.rows.map((row, index) => `<tr>${row.map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}</tr>`).join("");
+  return `<h1>담임학급 학생명단</h1>
+    <p class="sub">학생 이메일은 경기도교육청 클라우드 계정(@goedu.kr)을 권장합니다.<br>엑셀·구글시트에서 복사·붙여넣기 가능합니다.</p>
+    <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="roster-actions"><button class="btn-tonal" data-action="roster-add"${editor.busy || editor.rows.length >= 199 ? " disabled" : ""}>행 추가</button>
+      ${editor.state === "conflict" || (editor.state === "unavailable" && !editor.dirty && !editor.pending) ? `<button class="btn-quiet" data-action="roster-reload"${disabled}>${editor.state === "conflict" ? "시트 명단 다시 불러오기" : "다시 불러오기"}</button>` : ""}
+      <button class="btn" data-action="roster-save"${disabled}>${editor.busy ? "저장 중…" : "명단 저장"}</button>
+    </div>
+    <p class="sub" role="status">${esc(editor.busy ? "명단 저장 결과를 확인하고 있어요." : editor.state === "unavailable" ? editor.detail : editor.dirty ? "수정한 명단을 저장해 주세요." : editor.detail || "출석부 연결 전에 입력해 둘 수 있어요.")}</p>`;
+}
+function timetableEditBody() {
+  const active = S.timetableTab || "timetable";
+  return `<div class="connect-tabs timetable-tabs" role="tablist" aria-label="시간표와 명단"><button role="tab" aria-selected="${active === "timetable"}" class="connect-tab ${active === "timetable" ? "active" : ""}" data-action="timetable-tab" data-tab="timetable"><span class="tab-title">시간표</span></button><button role="tab" aria-selected="${active === "roster"}" class="connect-tab ${active === "roster" ? "active" : ""}" data-action="timetable-tab" data-tab="roster" ${isHomeroomTeacher() ? "" : "disabled"}><span class="tab-title">담임학급 학생명단</span></button></div>${active === "roster" ? stepRoster() : stepTimetable()}`;
+}
+document.addEventListener("input", event => {
+  const key = event.target.dataset?.rosterCell;
+  if (!key || !S.rosterEditor || S.rosterEditor.busy) return;
+  const [row, column] = key.split(":").map(Number);
+  S.rosterEditor.rows[row][column] = event.target.value;
+  S.rosterEditor.dirty = true;
+  if (S.mode === "wizard" && S.step === 6) {
+    const next = document.querySelector('[data-action="go-next"]');
+    if (next) next.disabled = true;
+  }
+});
+document.addEventListener("paste", event => {
+  const key = event.target.dataset?.rosterCell;
+  if (!key || !S.rosterEditor || S.rosterEditor.busy) return;
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (!/[\t\r\n]/.test(text)) return;
+  event.preventDefault();
+  const [start, column] = key.split(":").map(Number);
+  const pasted = text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").map(line => line.split("\t"));
+  if (pasted.length + start > 199 || pasted.some(row => row.length + column > 3)) {
+    setBanner("warn", "번호·이름·이메일 세 열만 복사해 주세요. 최대 199명까지 입력할 수 있어요."); return;
+  }
+  S.rosterEditor.rows = rosterEditableRows(S.rosterEditor.rows, Math.max(30, start + pasted.length));
+  pasted.forEach((row, offset) => {
+    const target = S.rosterEditor.rows[start + offset];
+    row.forEach((value, c) => { target[column + c] = value.trim(); });
+  });
+  S.rosterEditor.dirty = true; render();
+  document.querySelector(`[data-roster-cell="${key}"]`)?.focus();
+});
+bindActions({
+  "roster-add": () => {
+    if (!S.rosterEditor || S.rosterEditor.busy || S.rosterEditor.rows.length >= 199) return;
+    const next = Math.max(0, ...S.rosterEditor.rows.map(row => Number(row[0]) || 0)) + 1;
+    S.rosterEditor.rows.push([String(next), "", ""]); S.rosterEditor.dirty = true; render();
+    document.querySelector(`[data-roster-cell="${S.rosterEditor.rows.length - 1}:1"]`)?.focus();
+  },
+  "roster-save": () => saveRosterEditor(S.mode === "edit" || S.rosterEditor?.linked === true || attendanceSheetSetupDone(), true, true),
+  "roster-reload": async () => {
+    if (S.rosterEditor?.busy) return;
+    if ((S.rosterEditor?.dirty || S.rosterEditor?.pending || S.rosterEditor?.state === "conflict") && !window.confirm("이 화면에 입력한 명단 대신 현재 시트의 명단을 불러올까요?")) return;
+    await loadRosterEditor(true);
+  },
+  "timetable-tab": async el => {
+    if (el.dataset.tab === "roster" && !isHomeroomTeacher()) return;
+    if (S.rosterEditor?.busy) return;
+    const context = rosterEditorContext(), owner = screenKey();
+    if (S.timetableTab === "roster" && S.rosterEditor?.dirty && !(await saveRosterEditor(true))) return;
+    if (!(await flushEditSave())) return;
+    if (context !== rosterEditorContext() || owner !== screenKey()) return;
+    S.timetableTab = el.dataset.tab; render();
+  },
+});
+
 /* ---------- 연결·설정 공통 ---------- */
 const KEY_MESSAGES = {
   ok: "연결 키가 정상이에요",
   missing: "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
   invalid: "Gemini 연결 키가 맞지 않아요. Google AI Studio에서 다시 복사해 주세요.",
-  "rate-limited": "현재 사용 한도에 도달했어요. 잠시 뒤 다시 확인해 주세요.",
-  network: "인터넷 연결을 확인한 뒤 Gemini 연결 키를 다시 확인해 주세요.",
+  "rate-limited": "Gemini 사용 한도에 도달했어요. 한도가 언제 다시 열리는지는 확인하지 못했습니다. Google AI Studio에서 사용량을 확인해 주세요.",
+  network: "Gemini 응답을 받지 못했어요. 잠시 후 다시 확인해 주세요.",
+  "service-unavailable": "Google Gemini가 일시적으로 응답하지 못했어요. 키를 바꾸지 말고 잠시 후 다시 확인해 주세요.",
+  "model-unavailable": "선택한 AI 모델을 사용할 수 없어요. 다른 모델을 선택해 확인해 주세요.",
+  forbidden: "Google에서 이 키의 사용을 허용하지 않았어요. Google AI Studio에서 키의 사용 권한을 확인해 주세요.",
+  "request-rejected": "Google이 키 확인 요청을 처리하지 못했어요. 키 오류로 확인된 것은 아닙니다. 잠시 후 다시 확인해 주세요.",
 };
 const PROBE_MESSAGES = {
   available: "사용할 수 있어요",
-  taken: "다른 프로그램이 쓰고 있어요 (도우미가 이미 이 단축키로 실행 중이면 정상이에요)",
+  taken: "이 단축키를 사용할 수 없어요. [다른 조합 직접 누르기]에서 다른 조합을 눌러 주세요.",
   invalid: "보조키 두 개 이상 또는 보조키와 일반 키를 함께 눌러 주세요",
 };
 const DEFAULT_HOTKEY = "ctrl+alt+win";
@@ -1253,6 +1912,11 @@ async function finishHotkeyRecording() {
       S.hk.status = { kind: "ok", text: "지금 쓰는 단축키예요" };
       return;
     }
+    if (settingsAutoSavePromise) {
+      const owner = screenKey(), epoch = accountUiEpoch;
+      if (!(await settingsAutoSavePromise) || owner !== screenKey() || epoch !== accountUiEpoch
+          || hotkeyCapture.generation !== generation) return;
+    }
     request = beginIssueRequest(false);
     const result = await call("probe_hotkey", text);
     if (hotkeyCapture.generation !== generation || !ownsIssueRequest(request)) return;
@@ -1267,7 +1931,7 @@ async function finishHotkeyRecording() {
         S.hk.status = { kind: "ok", text: `${prettyHotkey(text)} · 저장할 수 있어요` };
       }
     } else if (result.status === "taken") {
-      S.hk.status = { kind: "bad", text: "다른 프로그램이 이 조합을 쓰고 있어요" };
+      S.hk.status = { kind: "bad", text: PROBE_MESSAGES.taken };
     } else {
       S.hk.status = { kind: "bad", text: PROBE_MESSAGES.invalid };
     }
@@ -1322,7 +1986,7 @@ document.addEventListener("keyup", (event) => {
 const API_KEY_URL = "https://aistudio.google.com/apikey";
 const API_KEY_GUIDE_URL = "https://youtube.com/shorts/FMZmdpcLlM0?si=KT-_oblorYxE5ZE4";
 function apiKeyLinkRow() {
-  return `<div class="section-note" style="margin:0 0 4px">Google API key 발급 URL</div>
+  return `<div class="section-note" style="margin:0 0 4px">Gemini 연결 키 발급받기</div>
     <div class="linkrow"><span class="url" title="${esc(API_KEY_URL)}">${esc(API_KEY_URL)}</span>
     <span class="acts">
       <button class="btn-tonal" data-action="link-open" data-url="${esc(API_KEY_URL)}">${icon("external-link", "small blue")} 열기</button>
@@ -1332,16 +1996,16 @@ function apiKeyLinkRow() {
 function geminiSectionHtml(d) {
   const keyLine = S.keyStatus ? badge(S.keyStatus.kind, S.keyStatus.text) : "";
   const model = d.gemini_model || "gemini-3.5-flash";
-  const modelRow = rawRow("Gemini model", `<div class="field"><select name="gemini_model">
+  const modelRow = rawRow("AI 모델", `<div class="field"><select name="gemini_model">
     <option value="gemini-3.5-flash" ${model === "gemini-3.5-flash" ? "selected" : ""}>Gemini 3.5 Flash · 추천</option>
     <option value="gemini-3.1-flash-lite" ${model === "gemini-3.1-flash-lite" ? "selected" : ""}>Gemini 3.1 Flash-Lite · 빠른 처리</option>
   </select></div>`);
-  return `<div class="section-h">Gemini API key</div>
-    <p class="sub" style="margin-bottom:10px">입력 내용이 제품 개선에 쓰일 수 있어요. 학생 개인정보가 담긴 메시지는 등록하지 마세요. key는 이 컴퓨터에만 저장돼요.</p>
+  return `<div class="section-h">Gemini 연결 키</div>
+    <p class="sub" style="margin-bottom:10px">AI 분석을 위해 선택한 메시지와 첨부파일 내용을 Google Gemini로 보냅니다. 이 키는 이 컴퓨터에 저장됩니다. AI 출결 입력을 사용하면 연결한 출석부의 [설정] 탭에도 저장되며, 그 출석부를 편집할 수 있는 사람도 키를 볼 수 있습니다.</p>
     ${apiKeyLinkRow()}
     <div style="margin-top:12px"></div>
     ${formTable(
-      fieldRow("gemini_api_key", "Gemini API key", d.gemini_api_key || "", { type: "password", placeholder: "붙여넣기" }) +
+      fieldRow("gemini_api_key", "Gemini 연결 키", d.gemini_api_key || "", { type: "password", placeholder: "붙여넣기" }) +
       modelRow
     )}
     <div class="action-line">${keyLine}<button class="btn-tonal" data-action="check-key" data-busy-text="확인 중…">키 확인</button></div>`;
@@ -1372,67 +2036,118 @@ function linkModes() {
 function taskLinkFields() {
   return S.draft.profile["담임여부"] === "예" ? TASK_LINK_FIELDS : TASK_LINK_FIELDS.slice(0, 1);
 }
-async function loadLinkLists() {
-  if (S.linkLoading || S.listsLoaded) return;
+function googleListContext() {
+  return JSON.stringify([accountUiEpoch, googleContextVersion, googleLoginEpoch, verifiedGoogleAccount(S.google)]);
+}
+function currentListRows(kind) {
+  const read = S.listReads[kind];
+  return read?.phase === "ready" && read.context === googleListContext() ? read.value : [];
+}
+let linkListsPending = null;
+async function loadLinkLists(force = false, owns = () => true) {
+  const context = googleReadContext();
+  if (S.linkLoading && linkListsPending?.context === context && linkListsPending.owns()) return linkListsPending.promise;
+  const promise = readLinkLists(force, owns);
+  const pending = linkListsPending = { context, promise, owns };
+  const clear = () => { if (linkListsPending === pending) linkListsPending = null; };
+  promise.then(clear, clear);
+  return promise;
+}
+async function readLinkLists(force, owns) {
+  if (!force && S.listsLoaded && ["calendars", "tasklists"].every(kind => S.listReads[kind]?.context === googleListContext())) return;
   if (!isGoogleReady(S.google)) return;
   S.linkLoading = true;
   S.listsError = false;
-  const request = beginIssueRequest(false);
+  S.listsLoaded = false;
   const context = googleReadContext();
+  const resourceContext = googleListContext();
   const version = ++linkListsReadVersion;
-  const current = () => version === linkListsReadVersion && context === googleReadContext() && ownsIssueRequest(request);
-  render();
+  const current = () => version === linkListsReadVersion && context === googleReadContext() && owns();
+  const paint = () => { if (editingCard() === "settings") paintSettingsReadiness(); else render(); };
+  S.lists = { calendars: [], tasklists: [] };
+  S.googleTargetStatuses = {};
+  for (const kind of ["calendars", "tasklists"]) {
+    S.listReads[kind] = { phase: "pending", context: resourceContext, generation: version, value: [], error: null };
+  }
+  paint();
   try {
-    const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
-    if (!current()) return;
-    S.lists = { calendars, tasklists };
-    S.listsLoaded = true;
-    S.listsError = false;
-    await refreshGoogleTargetStatuses(current);
-  } catch (error) {
-    if (!current()) return;
-    S.listsError = true; // 실제 로그인 상태는 바꾸지 않고 기존 목록과 선택 ID는 그대로 둔다
+    await Promise.all(["calendars", "tasklists"].map(async kind => {
+      try {
+        const rows = await call(kind === "calendars" ? "list_calendars" : "list_tasklists");
+        if (!current()) return;
+        if (!Array.isArray(rows) || rows.some(row => !row || typeof row.id !== "string" || !row.id.trim()))
+          throw new Error("목록 응답을 확인하지 못했어요.");
+        S.listReads[kind] = { phase: "ready", context: resourceContext, generation: version, value: rows, error: null };
+        S.lists[kind] = rows;
+        paint();
+        await refreshGoogleTargetStatuses(current, kind);
+      } catch (error) {
+        if (!current()) return;
+        S.listReads[kind] = { phase: "failed", context: resourceContext, generation: version, value: [], error: String(error.message || error) };
+        S.lists[kind] = [];
+        S.listsError = true;
+        paint();
+      }
+    }));
+    if (current()) S.listsLoaded = !S.listsError;
   } finally {
     if (version === linkListsReadVersion) S.linkLoading = false;
-    if (current()) render();
+    if (current()) paint();
   }
 }
-async function refreshGoogleTargetStatuses(owns = () => true) {
+const targetReadVersions = { calendars: 0, tasklists: 0 };
+async function refreshGoogleTargetStatuses(owns = () => true, kind = null) {
   if (!isGoogleReady(S.google)) return;
+  S.googleTargetStatuses ||= {};
   const targets = Object.fromEntries(GOOGLE_TARGET_ID_FIELDS
+    .filter(field => !kind || (field.includes("Tasks") ? "tasklists" : "calendars") === kind)
     .filter((field) => S.draft.profile[field] && (field !== "담임안내Tasks목록ID" || S.draft.profile["담임여부"] === "예"))
     .map((field) => [field, S.draft.profile[field]]));
   const context = googleReadContext();
-  const version = ++targetStatusReadVersion;
+  const kinds = kind ? [kind] : ["calendars", "tasklists"];
+  const versions = Object.fromEntries(kinds.map(key => [key, ++targetReadVersions[key]]));
+  const version = targetStatusReadVersion;
   let statuses;
   try { statuses = await call("google_target_statuses", targets); }
   catch (_) { statuses = {}; }
   if (!owns() || version !== targetStatusReadVersion || context !== googleReadContext()) return;
-  S.googleTargetStatuses = Object.fromEntries(Object.entries(targets).map(([field, id]) => {
+  for (const [field, id] of Object.entries(targets)) {
+    const key = field.includes("Tasks") ? "tasklists" : "calendars";
+    if (versions[key] !== targetReadVersions[key]) continue;
     const result = statuses?.[field];
-    return [field, result?.id === id ? result : { id, state: "check_failed", detail: "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. [연결 다시 확인]을 눌러 주세요." }];
-  }));
+    S.googleTargetStatuses[field] = result?.id === id ? result : { id, state: "check_failed", detail: "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. [연결 다시 확인]을 눌러 주세요." };
+  }
 }
-function linkSelectRow(idField, title, options, value, excludeId, savedName) {
+function linkSelectRow(idField, title, options, value, excludeId, savedName, phase = "ready") {
   const filtered = options.filter((o) => o.id && o.id !== excludeId);
-  // 목록을 못 불러온 동안에도 이미 골라 둔 값은 화면에 남긴다.
-  const keepRow = value && !filtered.some((o) => o.id === value)
-    ? `<option value="${esc(value)}" selected>${esc(savedName || "저장된 연결")}</option>` : "";
+  const savedOutsideList = value && !filtered.some((o) => o.id === value);
   const rows = filtered
     .map((o) => `<option value="${esc(o.id)}" ${o.id === value ? "selected" : ""}>${esc(o.name)}</option>`)
     .join("");
-  const empty = S.linkLoading ? "불러오는 중…" : "골라 주세요";
+  const empty = phase === "pending" ? "불러오는 중…" : phase === "failed" ? "목록 확인 필요" : "골라 주세요";
   const error = fieldError(idField);
   return rawRow(title, `<div class="field${error ? " has-error" : ""}">
-    <select name="${esc(idField)}" data-link-select${error ? ' aria-invalid="true"' : ""}>
-      <option value="">${empty}</option>${keepRow}${rows}
-    </select>${fieldNoteHtml(idField)}</div>`);
+    <select name="${esc(idField)}" data-link-select${phase !== "ready" ? " disabled" : ""}${error ? ' aria-invalid="true"' : ""}>
+      <option value="">${empty}</option>${rows}
+    </select>${savedOutsideList ? '<p class="hint">저장된 선택은 보관하고 있어요. 현재 목록에서 확인한 뒤 연결해 주세요.</p>' : ""}${fieldNoteHtml(idField)}</div>`);
+}
+function linkExistingRowsHtml(kind) {
+  const cal = kind === "cal";
+  const p = S.draft.profile;
+  const fields = cal ? CAL_LINK_FIELDS : taskLinkFields();
+  const kindKey = cal ? "calendars" : "tasklists";
+  const options = currentListRows(kindKey);
+  const phase = S.listReads[kindKey]?.context === googleListContext() ? S.listReads[kindKey].phase : "pending";
+  return fields.map(([idField, nameField, title], index) => {
+    const other = fields[index === 0 ? 1 : 0];
+    const excludeId = other ? (p[other[0]] || "") : "";
+    return linkSelectRow(idField, title, options, p[idField] || "", excludeId, p[nameField] || "", phase);
+  }).join("");
 }
 function linkGroupHtml(kind) {
   const cal = kind === "cal";
   const p = S.draft.profile;
   const fields = cal ? CAL_LINK_FIELDS : taskLinkFields();
-  const options = cal ? S.lists.calendars : S.lists.tasklists;
   const mode = linkModes()[kind];
   const choices = cal
     ? [["existing", "기존 캘린더 연결하기"], ["new", "캘린더 새로 만들기"]]
@@ -1440,11 +2155,7 @@ function linkGroupHtml(kind) {
   const segments = segChoice(`link-${kind}-mode`, mode, choices);
   let body;
   if (mode === "existing") {
-    body = formTable(fields.map(([idField, nameField, title], index) => {
-      const other = fields[index === 0 ? 1 : 0];
-      const excludeId = other ? (p[other[0]] || "") : "";
-      return linkSelectRow(idField, title, options, p[idField] || "", excludeId, p[nameField] || "");
-    }).join(""));
+    body = formTable(linkExistingRowsHtml(kind));
   } else {
     body = formTable(fields.map(([_idField, nameField, title]) => {
       const value = p[nameField] || NEW_LIST_DEFAULTS[nameField];
@@ -1456,7 +2167,7 @@ function linkGroupHtml(kind) {
   const taskRule = cal ? "" : `<span class="section-note">Google Tasks 목록 어디에 등록해도 날짜·시간은 지정하지 않아요</span>`;
   return `<div class="section-h section-head"><span>${cal ? "Calendar" : "Tasks"}</span>${taskRule}</div>
     <div style="margin-bottom:10px">${segments}</div>
-    ${body}${skipNote}`;
+    <div class="google-role-fields">${body}</div>${skipNote}`;
 }
 const NETWORK_STATUS_POLL_MS = 3000;
 const NETWORK_WAIT_SHOW_AFTER_SECONDS = 2;
@@ -1468,7 +2179,7 @@ function networkWaitNoticeHtml() {
   // 알린다. 컴퓨터의 네트워크 설정은 건드리지 않는다(사용자 결정: 고정 IP·유선 우선 유지).
   const n = S.network;
   if (!n || n.state !== "warming" || (n.elapsed_seconds || 0) < NETWORK_WAIT_SHOW_AFTER_SECONDS) return "";
-  return `<div class="banner warn" data-network-wait="true"><span>인터넷 이름 확인이 느려 첫 Google 연결에 시간이 더 걸려요. 1분 정도 기다려 주세요. 컴퓨터 설정을 바꾸지 않아도 돼요.</span></div>`;
+  return `<div class="banner warn" data-network-wait="true"><span>Google에 연결하는 데 시간이 걸리고 있어요. 현재 화면에 표시된 준비 단계를 마칠 때까지 기다려 주세요.</span></div>`;
 }
 function networkWaitVisible() { return networkWaitNoticeHtml() !== ""; }
 function watchNetworkStatus() {
@@ -1496,7 +2207,7 @@ function listsErrorNoticeHtml() {
 const CONNECT_TABS = [
   { tab: "messenger", title: "Brity 메신저", detail: "Calendar · Tasks · Chat" },
   { tab: "attendance", title: "출결", detail: "Sheet · Docs · Tasks" },
-  { tab: "ai", title: "AI 에이전트", detail: "MCP · Skill" },
+  { tab: "ai", title: "AI 프로그램", detail: "선택 기능" },
 ];
 function tabProblemCount(tab) {
   return checkSummary(checksForTab(tab)).bad;
@@ -1543,40 +2254,88 @@ function messengerTabHtml() {
     <div class="connect-section">${geminiSectionHtml(S.draft.bridge)}</div>`;
 }
 const ATTENDANCE_SERVICES = [
+  { role: "출석부", name: "Google Sheets", logo: "assets/google-sheets.svg", service: "sheet" },
+  { role: "미제출 출결서류 안내를 Google Chat으로 보내기", name: "Google Chat", logo: "assets/google-chat.svg", service: "chat" },
   { role: "결석 신고서 자동완성", name: "Google Docs", logo: "assets/google-docs.svg", service: "docs" },
   { role: "조종례시 출결서류 미제출 안내", name: "Google Tasks", logo: "assets/google-tasks.svg", service: "tasks" },
-  { role: "미제출 출결서류 지참 요청 문자 전송", name: "Google Chat", logo: "assets/google-chat.svg", service: "chat" },
-  { role: "출결 DB 관리", name: "Google Sheet", logo: "assets/google-sheets.svg", service: "sheet" },
 ];
-const ATTENDANCE_CHAT_GUIDE_URL = "";  // 유튜브 안내 영상 — 링크가 생기면 여기만 채운다
+
 let chatStatusReadVersion = 0;
 let chatSpacesReadVersion = 0;
+let chatStatusPending = null;
+let chatSpacesPending = null;
 function chatReadContext() {
-  return JSON.stringify([googleReadContext(),
+  // The account and workbook own these results; opening another screen does not.
+  return JSON.stringify([googleContextVersion, googleLoginEpoch, accountUiEpoch, verifiedGoogleAccount(S.google),
     S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || S.attendance?.connection_code || "",
-    S.attendance?.account || "", S.attendance?.connection_code || ""]);
+    S.attendance?.account || "", S.attendance?.attendance_scope?.subjectKey || "",
+    S.attendance?.attendance_scope?.currentSchoolYear || "", S.attendance?.attendance_scope?.generation || 0]);
+}
+function chatStatusReading() {
+  return Boolean(chatStatusPending?.active && chatStatusPending.context === chatReadContext()
+    && chatStatusPending.version === chatStatusReadVersion);
+}
+function classRoomReadiness() {
+  if (!isHomeroomTeacher()) return "not-applicable";
+  if (!isGoogleReady(S.google)) return "account-required";
+  const context = chatReadContext(), cs = S.chatStatus;
+  const account = String(S.attendance?.account || S.attendance?.current_user || "").trim().toLowerCase();
+  if (S.attendanceReadFailed) return "read-failed";
+  if (S.attendance?.state !== "ready"
+      || (account && account !== verifiedGoogleAccount(S.google))) return "unverified";
+  if (S.attendanceLoading || S.classSpaceSaving || chatStatusReading()) return "loading";
+  if (!cs || cs === "loading" || S.chatStatusContext !== context) return "unverified";
+  if (cs.read_failed || typeof cs.connected !== "boolean") return "read-failed";
+  if (!cs.connected) return "account-required";
+  if (S.chatSpacesLoading) return "loading";
+  if (S.chatSpacesContext !== context) return "unverified";
+  if (S.chatSpacesError) return "read-failed";
+  if (!Array.isArray(S.chatSpaces)) return "unverified";
+  if (!S.chatSpaces.length) return "empty";
+  if (!cs.class_space_id) return "not-selected";
+  return S.chatSpaces.some(room => room.name === cs.class_space_id) ? "ready" : "missing";
+}
+function classRoomReadinessMessage(state = classRoomReadiness()) {
+  return {
+    ready: "학급 단톡방 연결을 확인했어요.",
+    "account-required": "Google Chat의 연결과 권한을 확인해 주세요.",
+    unverified: "학급 단톡방 연결을 아직 확인하지 못했어요.",
+    loading: "학급 단톡방 연결을 확인하고 있어요.",
+    "read-failed": "학급 단톡방 연결을 읽지 못했어요. 기존 단톡방 선택은 그대로예요.",
+    "not-selected": "출결 탭의 목록에서 사용할 학급 단톡방을 골라 주세요.",
+    empty: "이 계정에서 참여 중인 스페이스가 없어요. [단톡방(스페이스) 만들기]에서 만든 뒤 돌아와 주세요.",
+    missing: "저장된 학급 단톡방이 현재 목록에서 확인되지 않아요. 기존 선택은 그대로예요. 출결 탭에서 확인해 주세요.",
+  }[state] || "";
 }
 function loadChatStatus(force, renderResult = true) {
   if (S.chatStatusContext !== chatReadContext()) S.chatStatus = null;
-  if (!force && S.chatStatus != null) return;  // 결과가 없을 때(null)만 새로 묻는다
+  if (chatStatusPending?.active && chatStatusPending.context === chatReadContext()) return chatStatusPending.promise;
+  if (!force && S.chatStatus != null) return chatStatusPending?.context === chatReadContext() ? chatStatusPending.promise : undefined;
   if (S.chatStatus == null) S.chatStatus = "loading";
   const context = S.chatStatusContext = chatReadContext();
   const version = ++chatStatusReadVersion;
   const current = () => version === chatStatusReadVersion && context === chatReadContext();
   const request = beginIssueRequest(true);
-  return call("attendance_chat_status")
+  const promise = call("attendance_chat_status")
     .then((data) => {
       if (!current()) return;
-      S.chatStatus = data;
+      chatStatusPending.active = false;
+      S.chatStatus = data?.read_failed || typeof data?.connected !== "boolean"
+        ? { ...(typeof S.chatStatus === "object" ? S.chatStatus : {}), connected: null, read_failed: true }
+        : data;
+      if (!S.chatStatus.read_failed) clearResolvedReadIssue("attendance_chat_status");
       if (renderResult) render();
       return data;
     })
     .catch((error) => {
       if (!current()) return;
-      S.chatStatus = { connected: false, read_failed: true, registered: false, account: "", class_space_name: "", class_space_id: "", reason: "" };
+      chatStatusPending.active = false;
+      S.chatStatus = { ...(typeof S.chatStatus === "object" ? S.chatStatus : {}), connected: null, read_failed: true };
       if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
       if (renderResult) render();
     });
+  chatStatusPending = { context, version, promise, active: true };
+  return promise;
 }
 /* 연결하기 뒤 재확인 — 출결 탭에 있는 동안 3초 간격, 최대 10분 */
 let chatPollTimer = null;
@@ -1599,12 +2358,9 @@ function startChatConnectPoll(waitForClassSpace = false) {
     if (gen !== chatPollGen || context !== chatReadContext() || !stillOnAttendanceTab() || Date.now() > chatPollUntil) return;
     const request = beginIssueRequest(true);
     try {
-      const version = ++chatStatusReadVersion;
-      const data = await call("attendance_chat_status");
-      if (gen !== chatPollGen || version !== chatStatusReadVersion || context !== chatReadContext() || !stillOnAttendanceTab() || !ownsIssueRequest(request)) return;
-      S.chatStatus = data;
-      S.chatStatusContext = context;
-      if (data.connected && (!waitForClassSpace || data.class_space_id)) {
+      const data = await loadChatStatus(true, false);
+      if (gen !== chatPollGen || context !== chatReadContext() || !stillOnAttendanceTab()) return;
+      if (data?.connected && !data.read_failed && (!waitForClassSpace || data.class_space_id)) {
         render();
         showToast("Google Chat 연결이 끝났어요");
         return;
@@ -1625,6 +2381,109 @@ function startChatConnectPoll(waitForClassSpace = false) {
 /* 마법사 7단계 출결 준비 폴링 — 준비가 도는 동안 attendance_prepare_status를 3초 간격으로
    읽어 진행을 보여주고, 준비됨 뒤에는 attendance_first_setup_status를 3초 간격으로 읽어
    시트의 처음 설정 완료를 자동 확인한다. 완료·실패·탭 이탈이면 스스로 멈춘다. */
+// Only resume the already-approved preparation after returning from Google's
+// settings. A definite API-disabled rejection may be retried; an uncertain
+// write or any other failure must never be replayed by this flow.
+let attendancePermissionReturn = null;
+function stopAttendancePermissionReturn() {
+  if (attendancePermissionReturn?.timer) clearTimeout(attendancePermissionReturn.timer);
+  attendancePermissionReturn = null;
+}
+function attendancePermissionRecord() {
+  return S.attendance?.spreadsheet_id || S.attendance?.progress?.spreadsheet_id
+    || String(S.attendance?.spreadsheet_url || "").match(/\/spreadsheets\/d\/([^/]+)/)?.[1] || "";
+}
+function ownsAttendancePermissionReturn(flow) {
+  return Boolean(flow && flow === attendancePermissionReturn && flow.context === googleReadContext()
+    && (!flow.record || !attendancePermissionRecord() || flow.record === attendancePermissionRecord())
+    && !S.attendanceTransitioning && !S.attendanceConnectionBusy && !S.attendanceScriptUpdating
+    && isGoogleReady(S.google) && S.connectTab === "attendance"
+    && ((S.mode === "wizard" && S.step === 8) || (S.mode === "edit" && S.edit === "connect")));
+}
+async function openAttendanceScriptSettings() {
+  if (attendancePermissionReturn?.phase === "opening") return;
+  stopAttendancePermissionReturn();
+  const flow = S.attendance?.state === "script-permission-required"
+    ? { context: googleReadContext(), record: attendancePermissionRecord(), phase: "opening", blurred: false, attempts: 0, timer: null } : null;
+  attendancePermissionReturn = flow;
+  render();
+  try {
+    await call("open_attendance_script_settings");
+    if (!ownsAttendancePermissionReturn(flow)) return;
+    flow.phase = "waiting";
+    render();
+    if (flow.blurred && document.hasFocus()) await resumeAttendanceAfterPermission(flow);
+  } catch (error) {
+    if (attendancePermissionReturn === flow) stopAttendancePermissionReturn();
+    render();
+    throw error;
+  }
+}
+async function resumeAttendanceAfterPermission(flow) {
+  if (!ownsAttendancePermissionReturn(flow) || flow.phase === "checking"
+      || flow.phase === "opening" || S.attendance?.state !== "script-permission-required") return;
+  if (flow.timer) { clearTimeout(flow.timer); flow.timer = null; }
+  flow.phase = "checking";
+  flow.attempts += 1;
+  stopAttendancePreparePoll();
+  const request = beginIssueRequest(true);
+  render();
+  try {
+    const reply = await call("attendance_prepare_resume");
+    if (!ownsAttendancePermissionReturn(flow)) return;
+    if (!reply?.started) {
+      stopAttendancePermissionReturn();
+      setBanner("warn", reply?.reason || "출결 준비를 시작하지 못했어요.");
+      return;
+    }
+    if (S.problemIssue?.actions?.some(action => action.key === "open-script-api-settings")) clearProblemIssue(false);
+    S.banner = null;
+    S.attendance = { ...S.attendance, state: "installing" };
+    startAttendancePreparePoll();
+    render();
+  } catch (error) {
+    if (!ownsAttendancePermissionReturn(flow)) return;
+    stopAttendancePermissionReturn();
+    handleCaughtError(error, request);
+    render();
+  }
+}
+function observeAttendancePermissionResult(data) {
+  const flow = attendancePermissionReturn;
+  if (!ownsAttendancePermissionReturn(flow) || flow.phase !== "checking" || data?.running) return;
+  if (data?.status?.state !== "script-permission-required") {
+    stopAttendancePermissionReturn();
+    return;
+  }
+  flow.phase = flow.attempts < 3 ? "propagating" : "waiting";
+  if (flow.phase === "propagating") {
+    flow.timer = setTimeout(() => {
+      flow.timer = null;
+      if (document.hasFocus()) resumeAttendanceAfterPermission(flow);
+    }, flow.attempts === 1 ? 15000 : 45000);
+  }
+}
+function attendanceScriptPermissionHtml() {
+  const flow = ownsAttendancePermissionReturn(attendancePermissionReturn) ? attendancePermissionReturn : null;
+  const busy = flow && ["opening", "checking"].includes(flow.phase);
+  const message = flow?.phase === "checking" || flow?.phase === "propagating"
+    ? "Google의 사용 허용 반영을 확인하고 있어요. 확인되면 다음 준비 단계로 자동으로 이어집니다."
+    : flow?.attempts >= 3
+    ? "아직 사용 허용을 확인하지 못했어요. Google 설정에서 [Google Apps Script API]가 켜져 있는지 확인해 주세요. 이 창으로 돌아오면 자동으로 다시 확인합니다."
+    : "아래 버튼을 눌러 출결 준비에 쓰는 Google 계정의 [Google Apps Script API]를 켜 주세요. 이 창으로 돌아오면 다음 준비 단계로 자동으로 이어집니다.";
+  return `<div class="banner warn attendance-script-permission" role="status"><span>${esc(message)}</span>
+    <button class="btn" data-action="attendance-script-settings"${busy ? " disabled" : ""}>Apps Script API 사용</button></div>`;
+}
+window.addEventListener("blur", () => {
+  if (ownsAttendancePermissionReturn(attendancePermissionReturn)) attendancePermissionReturn.blurred = true;
+});
+window.addEventListener("focus", () => {
+  const flow = attendancePermissionReturn;
+  if (!ownsAttendancePermissionReturn(flow) || !flow.blurred || flow.phase === "opening") return;
+  flow.blurred = false;
+  if (flow.phase === "waiting") flow.attempts = 0;
+  resumeAttendanceAfterPermission(flow);
+});
 let attendancePrepareTimer = null;
 let attendancePrepareGen = 0;       // 늦게 도착한 옛 폴 결과가 새 화면을 덮지 않게 한다
 let attendancePreparePollOn = false;
@@ -1633,7 +2492,7 @@ function stopAttendancePreparePoll() {
   attendancePreparePollOn = false;
   if (attendancePrepareTimer) { clearTimeout(attendancePrepareTimer); attendancePrepareTimer = null; }
 }
-function startAttendancePreparePoll() {
+function startAttendancePreparePoll(flow = null) {
   stopAttendancePreparePoll();
   const gen = attendancePrepareGen;
   const owner = screenKey();
@@ -1653,55 +2512,74 @@ function startAttendancePreparePoll() {
     };
     const issueRequest = beginIssueRequest(true);
     const before = JSON.stringify([
-      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.chatStatus,
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.chatStatus,
     ]);
     let keepPolling = false;
     try {
       let a = S.attendance;
       if (!a || a.state !== "ready") {
-        const data = await call("attendance_prepare_status");
+        const data = flow?.action ? await call("attendance_prepare_status", flow.action) : await call("attendance_prepare_status");
         if (!current()) return;
         if (data && data.status && typeof data.status === "object") {
-          S.attendance = data.status;
-          a = data.status;
+          if (flow && !acceptAttendanceActionResult(data.status, flow)) {
+            throw new Error("출석부 작업 정보가 일치하지 않아 진행 결과를 확인하지 못했어요. 현재 작업을 다시 확인해 주세요.");
+          }
+          S.attendance = { ...data.status, preparation_running: data.running === true };
+          a = S.attendance;
           context = chatReadContext();
         }
         keepPolling = Boolean(data && data.running);
+        observeAttendancePermissionResult(data);
+        if (!flow && !keepPolling && a?.initial_preparation_allowed === true) {
+          await maybeStartInitialAttendancePreparation(a);
+          if (gen !== attendancePrepareGen) return;
+        }
+        if (flow) await maybeOpenCreatedAttendance(a, flow);
       }
       if (S.mode === "wizard" && a && a.state === "ready" && !attendanceWizardGateOpen()) {
-        const first = await call("attendance_first_setup_status");
-        if (!current()) return;
-        const completionCode = firstSetupCodeFromValue(first && first.value);
-        const currentCode = String(a.connection_code || "").trim().toUpperCase();
-        S.firstSetupConnectionCode = completionCode;
-        S.firstSetupDone = Boolean(
-          first && first.done === true && completionCode && completionCode === currentCode
-        );
+        if (!attendanceSheetSetupDone() && a.initial_setup_required !== true) {
+          await loadFirstSetupStatus(true);
+          if (!current()) return;
+        }
         // Account consent and room selection can finish after the Sheet menu has returned.
         // Read them independently, including when only the Sheet checkpoint is present.
-        await loadChatStatus(true, false);
+        if (!S.chatStatus?.connected || S.chatStatus.read_failed || !S.chatStatus.class_space_id) {
+          await loadChatStatus(true, false);
+        }
         if (!current()) return;
         if (hasCurrentFinalIssue(["attendance_chat_status"])) {
           attendancePreparePollOn = false;
           return;
         }
-        keepPolling = !attendanceWizardGateOpen();
-        if (!keepPolling) S.banner = null;
+        if (isHomeroomTeacher() && attendanceSheetSetupDone() && (!S.rosterEditor || S.rosterEditor.pending)) await loadAttendanceRosterStatus(true);
+        if (!current()) return;
+        // A missing roster does not invalidate completed setup or consent. Its
+        // own return-to-window check refreshes it when the teacher edits it.
+        keepPolling = false; // Further verification is driven by return, consent and save events.
+        clearResolvedAttendanceGateBanner();
       }
     } catch (error) {
       if (!current()) return;
+      if (flow && S.attendance?.state !== "ready") {
+        S.attendance = { ...S.attendance, state: "verification-unavailable", preparation_running: false,
+          creation_allowed: false, replacement_allowed: false,
+          recovery_action: "reconcile-attendance-operation", detail: error.message };
+      }
+      if (S.attendance?.state === "ready") S.firstSetupReadState = "unavailable";
       // 문제 화면을 그리는 동안에는 일반 상태 읽기가 끼어들어 안내를 지우지
       // 않게 폴링 소유권을 유지하고, 그린 직후에만 폴링을 끝낸다.
       if (showProblemIssue(error, issueRequest)) {
+        stopAttendancePermissionReturn();
         attendancePreparePollOn = false;
         return;
       }
-      keepPolling = true; /* 구조화되지 않은 옛 오류만 다음 틱에 다시 */
+      keepPolling = false;
+      setBanner("warn", error.message || "출석부 준비 결과를 확인하지 못했어요. 같은 작업을 다시 확인해 주세요.");
     }
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
     if (JSON.stringify([
-      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.chatStatus,
+      S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.chatStatus,
     ]) !== before) render();
     if (!keepPolling) { attendancePreparePollOn = false; return; }
     attendancePrepareTimer = setTimeout(tick, 3000);
@@ -1720,211 +2598,332 @@ function isClassSpaceIssue(issue) {
   return issue && ["attendance_chat_create_space", "attendance_chat_set_space", "attendance_chat_spaces"].includes(issue.operation)
     && (issue.actions || []).every(action => action.key === "chat-space-list");
 }
-function classSpaceSubrowHtml(a) {
-  if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
-  const content = classSpaceContentHtml(a);
-  const cs = S.chatStatus;
-  const canRead = a.state === "ready" && cs && cs !== "loading" && cs.connected;
-  const reading = canRead && S.chatSpaces === null;
-  const connected = canRead && !S.chatSpacesError && Array.isArray(S.chatSpaces)
-    && cs.class_space_id && S.chatSpaces.some(row => row.name === cs.class_space_id);
-  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : S.chatSpacesError ? "확인 필요" : reading ? "확인 중…" : "방 선택 필요";
-  const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
-  return `<section class="svc-subrow class-space-section">
-    <div class="first-setup-head"><b>학급 단톡방</b></div>
-    ${studentChatGuideHtml()}${content}
-    <div class="class-space-actions action-line">
-      <button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} 단톡방(스페이스) 만들기</button>
-      <span class="chat-space-reload-status"><button class="btn-tonal" data-action="class-space-reload" data-busy-text="불러오는 중…"${!canRead || reading || S.classSpaceSaving ? " disabled" : ""}>${icon("refresh", "small")} 다시 불러오기</button>
-      <span class="chat-space-status ${reading || S.classSpaceSaving ? "muted" : connected ? "connected" : "warn"}">${label}</span></span>
-    </div>${localIssue}</section>`;
-}
-function classSpaceContentHtml(a) {
-  const cs = S.chatStatus;
-  if (a.state !== "ready" || !cs || cs === "loading" || !cs.connected) return `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>`;
-  if ((S.draft.profile["담임여부"] || (S.profileCache || {})["담임여부"]) !== "예") return "";
-  if (S.chatSpacesContext !== chatReadContext()) {
+function loadChatSpaces(force = false, renderResult = true) {
+  const context = chatReadContext();
+  if (S.chatSpacesContext !== context) {
     S.chatSpaces = undefined;
     S.chatSpaceName = undefined;
+    S.chatSpacesLoading = false;
   }
-  if (S.chatSpaces === undefined) {
-    S.chatSpaces = null;
-    S.chatSpacesError = false;
-    const context = S.chatSpacesContext = chatReadContext();
-    const version = ++chatSpacesReadVersion;
-    const ownsRoomRead = () => version === chatSpacesReadVersion && context === chatReadContext();
-    const request = beginIssueRequest(true);
-    let timeout;
-    const deadline = new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("방 목록 응답을 기다리는 시간이 지났어요.")), 120000);
+  if (S.chatSpacesLoading) return chatSpacesPending?.context === context ? chatSpacesPending.promise : undefined;
+  if (!force && S.chatSpaces !== undefined) return;
+  // Saved room identity lives in chatStatus; only current rows are selectable.
+  S.chatSpaces = null;
+  S.chatSpacesLoading = true;
+  S.chatSpacesError = false;
+  S.chatSpacesContext = context;
+  const version = ++chatSpacesReadVersion;
+  const ownsRoomRead = () => version === chatSpacesReadVersion && context === chatReadContext();
+  const request = beginIssueRequest(true);
+  const promise = call("attendance_chat_spaces")
+    .then((rows) => {
+      if (!ownsRoomRead()) return;
+      if (!Array.isArray(rows)) throw new Error("방 목록 응답을 확인하지 못했어요.");
+      S.chatSpaces = rows;
+      S.chatSpacesLoading = false;
+      clearResolvedReadIssue("attendance_chat_spaces");
+      if (renderResult) render();
+    })
+    .catch((error) => {
+      if (!ownsRoomRead()) return;
+      S.chatSpaces = [];
+      S.chatSpacesLoading = false;
+      S.chatSpacesError = true;
+      if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
+      if (renderResult) render();
     });
-    Promise.race([call("attendance_chat_spaces"), deadline])
-      .then((rows) => {
-        if (!ownsRoomRead()) return;
-        if (!Array.isArray(rows)) throw new Error("방 목록 응답을 확인하지 못했어요.");
-        S.chatSpaces = rows;
-        render();
-      })
-      .catch((error) => {
-        if (!ownsRoomRead()) return;
-        S.chatSpaces = [];
-        S.chatSpacesError = true;
-        // 최종 실패 안내를 그리더라도 목록 상태부터 끝낸다. null을 남기면 안내를
-        // 닫거나 다시 들어왔을 때도 "방 목록을 가져오는 중"에 영구 정지한다.
-        if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
-        render();
-      }).finally(() => clearTimeout(timeout));
-  }
-  const current = S.chatSpaceName !== undefined ? S.chatSpaceName : (cs.class_space_name || "");
-
-  // ㄷ. 학교가 막아 두었다 — 손으로 만드는 순서를 보여준다.
-  if (S.spaceCreate === "blocked") {
-    return `<div class="svc-subrow">
-      <span class="nameblock"><small>이 Google 계정으로는 프로그램이 방을 만들 수 없어요.
-        Google Chat에서 직접 만들어 주세요.<br>
-        1. Google Chat을 엽니다<br>
-        2. [새 채팅] → [한 명 이상을 추가하세요]에 학생 이메일을 한꺼번에 붙여 넣습니다<br>
-        3. 메시지를 한 번 보낸 뒤 위쪽 대화 이름 → [이 채팅을 스페이스로 전환]을 누릅니다<br>
-        4. 방 이름을 "${esc(S.spaceDraftName || defaultClassSpaceName())}"처럼 짧게 정합니다<br>
-        5. 이 화면으로 돌아오면 방 목록을 자동으로 다시 읽습니다</small></span>
-    </div>`;
-  }
-
-  // 방금 만들었다 — 학생 초대 안내를 그 자리에 이어 붙인다.
-  const madeNote = S.spaceCreate === "ok"
-    ? `<div class="svc-subrow">
-        <span class="nameblock"><small>학생이 사용하는 Google 계정 이메일로 직접 초대해 주세요.<br>
-          (Teacher Manager에서 단체 톡방 인원 초대는 불가능합니다. 직접 진행해 주세요.)</small></span>
-        </div>`
-    : "";
-
-  if (S.chatSpaces === null) {
-    return `<div class="svc-subrow">
-      <span class="nameblock"><small>방 목록을 가져오는 중이에요…</small></span></div>${madeNote}`;
-  }
-
-  // 목록을 못 읽었다 — "방이 없다"와 다르다. 못 읽은 것을 없는 것으로 보고 만들기를 권하면,
-  // 이미 있는 방을 두고 같은 이름으로 또 만들려다 SPACE_NAME_TAKEN을 만난다.
-  if (S.chatSpacesError) {
-    return `<div class="svc-subrow">
-      <span class="nameblock"><small>방 목록을 가져오지 못했어요.
-        인터넷 연결을 확인한 뒤 다시 불러와 주세요</small></span>
-    </div>`;
-  }
-
-  // 방은 Google Chat에서 만들고 학생을 초대한 뒤 이곳에서 선택한다.
-  if (!S.chatSpaces.length) {
-    return `<div class="svc-subrow">
-      <span class="nameblock"><small>아직 만든 방이 없어요.
-        아래 [단톡방(스페이스) 만들기]에서 방을 만든 뒤 돌아와 주세요.</small></span>
-    </div>${madeNote}`;
-  }
-
-  // ㄱ. 방이 있다 — 실제 방 이름을 그대로 드롭다운에 나열한다. 같은 이름도 빼지 않는다.
-  const options = S.chatSpaces.map((s) => {
-    const selected = String(cs.class_space_id || "") === String(s.name || "");
-    return `<option value="${esc(s.name)}"${selected ? " selected" : ""}>${esc(s.displayName)}</option>`;
-  }).join("");
-  const placeholder = current && !S.chatSpaces.some((s) => String(s.name || "") === String(cs.class_space_id || ""))
-    ? `<option value="">${esc(current)}</option>`
-    : `<option value="">학급 단톡방을 골라 주세요</option>`;
-  return `<div class="svc-subrow chat-space-existing">
-    <span class="nameblock"><small>단체 문자를 보낼 방이에요</small></span>
-    <div class="chat-space-controls action-line">
-      <select name="class-space-select" data-action-change="class-space-pick"
-        data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}>${placeholder}${options}</select>
-    </div>
-    <div class="chat-new-space-guide" data-purpose="create-another-room">
-      <small>지금 목록에 없는 새 단톡방을 만들고 싶으면 Google Chat에서 만든 뒤 돌아오세요.<br>돌아오면 목록을 자동으로 다시 읽어요. 새 방은 이 드롭다운에서 고르면 됩니다.</small>
-    </div>
-  </div>${madeNote}`;
+  chatSpacesPending = { context, promise };
+  return promise;
 }
-/* 서비스 줄 오른쪽 단추 묶음(.svc-acts) — 그 서비스에서 선생님이 누를 수 있는 일을 모은다.
-   Tasks는 특정 목록으로 가는 브라우저 주소가 없어 [열기]를 넣지 않는다. */
-function serviceOpenButtonHtml(entry, a) {
-  // 기존 코드 확인이 끝나지 않아 Chat 쓰기를 잠가도, 선생님이 이미 가진
-  // Sheet와 안내장 서식은 읽어 볼 수 있어야 한다.
-  const resourcesAvailable = [
-    "ready", "script-check-required", "script-update-required",
-    "connection-repair-required", "ai-action-required",
-  ].includes(a.state);
-  if (!resourcesAvailable) return "";
-  if (entry.service === "sheet") {
-    // 평상시에는 선택한 정본 번호만 쓴다. 여러 파일을 합치려고 새 Sheet를 만드는
-    // 옛 정리 단추는 두지 않고, 새 생성은 사용자가 누른 새 학년도 시작만 허용한다.
-    const transitionDisabled = S.attendanceTransitioning ? "disabled" : "";
-    const make = S.mode === "edit" && resourcesAvailable
-      ? `<button class="btn-tonal" data-action="new-attendance-go"
-      data-busy-text="만드는 중… (1~2분 걸릴 수 있어요)" ${a.year_mismatch && !S.attendanceTransitioning ? "" : "disabled"}>새 학년도 출석부 시작</button>`
-      : "";
-    const reconnect = S.mode === "edit"
-      ? `<button class="btn-tonal" data-action="attendance-connection-choose" ${S.attendanceConnectionBusy || transitionDisabled ? "disabled" : ""}>연결 확인/바꾸기</button>`
-      : "";
-    return make + reconnect;
+
+function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
+  if (!isHomeroomTeacher()) return "";
+  const content = classSpaceContentHtml(a, view);
+  const state = classRoomReadiness();
+  const reading = state === "loading" || (state === "unverified" && S.attendanceLoading);
+  const connected = state === "ready";
+  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : reading ? "확인 중…" : state === "empty" ? "스페이스 없음" : state === "not-selected" ? "방 선택 필요" : "확인 필요";
+  const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
+  const open = view === "installation" ? `<button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} 단톡방(스페이스) 만들러 가기</button>` : "";
+  const retry = state === "read-failed" && S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed
+    ? `<button class="btn-tonal" data-action="class-space-reload">다시 확인</button>` : "";
+  return `<section class="svc-subrow class-space-section">
+    <div class="first-setup-head"><b>학급 단톡방</b><span class="chat-space-reload-status">${open}${retry}
+      <span class="chat-space-status ${S.classSpaceSaving || reading ? "muted" : connected ? "connected" : "warn"}">${S.classSpaceSaving ? "저장 중…" : label}</span></span></div>
+    ${content}${view === "installation" ? studentChatGuideHtml() : ""}${localIssue}</section>`;
+}
+
+function classSpaceContentHtml(a, view = attendanceViewKind()) {
+  if (S.attendanceLoading) return `<p class="hint">출결 연결 상태를 확인하고 있어요.</p>`;
+  if (S.attendanceReadFailed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
+  if (a.state === "initial-setup-required") return `<p class="hint">출석부 설정 후 Google Chat을 연결해 주세요.</p>`;
+  if (a.state !== "ready") return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
+  const cs = S.chatStatus;
+  if (chatStatusReading()) return `<p class="hint">Google Chat 연결 상태를 확인하고 있어요.</p>`;
+  if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return `<p class="hint">Google Chat 연결 상태를 아직 확인하지 못했어요.</p>`;
+  if (cs.read_failed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
+  if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
+  loadChatSpaces();
+  if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">방 목록을 가져오는 중이에요…</p>`;
+  if (S.chatSpacesError) return `<p class="hint">방 목록을 가져오지 못했어요. 기존 선택은 그대로예요.</p>`;
+  if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>`;
+  const rooms = S.chatSpaces || [];
+  const savedOutsideList = cs.class_space_id && !rooms.some(s => String(s.name || "") === String(cs.class_space_id));
+  const options = rooms.map(s => `<option value="${esc(s.name)}"${String(cs.class_space_id || "") === String(s.name || "") ? " selected" : ""}>${esc(s.displayName)}</option>`).join("");
+  return `<div class="chat-space-existing">
+    <select name="class-space-select" aria-label="학급 단톡방" data-action-change="class-space-pick" data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}><option value="">학급 단톡방</option>${options}</select>
+    ${savedOutsideList ? `<p class="hint">저장된 단톡방이 현재 목록에 없어요. 기존 선택은 그대로예요.</p>` : ""}</div>`;
+}
+
+let attendanceReplacementAttempt = null;
+function attendanceReplacementScope(a) {
+  const scope = a?.attendance_scope;
+  if (a?.replacement_allowed !== true || !["replace-trashed", "replace-unavailable"].includes(a.creation_reason)
+      || !a.replacement_previous_spreadsheet_id || !scope?.subjectKey
+      || !Number.isInteger(scope.currentSchoolYear) || !Number.isInteger(scope.generation)
+      || scope.generation < 0) return null;
+  return {
+    reason: a.creation_reason,
+    ...(a.creation_reason === "replace-unavailable" ? { explicitConfirmation: true, failureCode: scope.replacement?.failureCode, failureStage: scope.replacement?.failureStage } : {}),
+    previousSpreadsheetId: a.replacement_previous_spreadsheet_id,
+    ...(scope.replacement?.previousOperationId ? { previousOperationId: scope.replacement.previousOperationId } : {}),
+    expectedSchoolYear: scope.currentSchoolYear,
+    expectedGeneration: scope.generation,
+    subjectKey: scope.subjectKey,
+  };
+}
+function attendanceReplacementContext(a) {
+  const scope = attendanceReplacementScope(a);
+  return scope ? JSON.stringify([googleReadContext(), scope]) : "";
+}
+function attendanceReplacementResultIsCurrent(intent, data) {
+  const operationId = data?.replacement_operation_id;
+  if (!operationId || data.replacement_request_key !== intent.idempotencyKey) return false;
+  const belongs = scope => scope?.subjectKey === intent.subjectKey
+    && scope.currentSchoolYear === intent.expectedSchoolYear && scope.operationId === operationId;
+  const pending = scope => belongs(scope)
+    && ["PREPARING", "CREATE_RESULT_UNKNOWN", "RECOVERY_REQUIRED"].includes(scope.bindingState)
+    && scope.generation === intent.expectedGeneration && !scope.spreadsheetId
+    && scope.operationReason === intent.reason && scope.previousSpreadsheetId === intent.previousSpreadsheetId
+    && (scope.previousOperationId || null) === (intent.previousOperationId || null);
+  const published = scope => belongs(scope) && scope.bindingState === "ACTIVE"
+    && scope.verificationState === "VERIFIED" && scope.generation === intent.expectedGeneration + 1
+    && scope.workbookSchoolYear === intent.expectedSchoolYear
+    && Boolean(scope.spreadsheetId) && scope.spreadsheetId !== intent.previousSpreadsheetId;
+  const result = data.attendance_scope, current = S.attendance?.attendance_scope;
+  if (!pending(result) && !published(result)) return false;
+  const original = attendanceReplacementScope(S.attendance);
+  if (original && Object.keys(original).every(key => original[key] === intent[key])) return true;
+  if (pending(current)) return true;
+  return published(current) && published(result) && current.spreadsheetId === result.spreadsheetId;
+}
+let attendanceActionFlow = null;
+let attendanceInitialAttempt = null;
+function attendanceScopeKey(a) {
+  const s = a?.attendance_scope;
+  return s ? JSON.stringify([s.subjectKey, s.currentSchoolYear, s.generation, s.spreadsheetId || "", s.operationId || ""]) : "";
+}
+function attendanceActionMatches(action, a) {
+  const s = a?.attendance_scope;
+  if (!action || !s || action.subjectKey !== s.subjectKey || action.expectedSchoolYear !== s.currentSchoolYear) return false;
+  // A saved replacement request precedes admission: its scope still names
+  // the old active workbook, not a newly published replacement.
+  if (action.phase === "requested" && !action.operationId && ["replace-trashed", "replace-unavailable"].includes(action.reason)
+      && s.bindingState === "ACTIVE") {
+    const replacement = s.replacement;
+    return replacement?.eligible === true && s.generation === action.expectedGeneration
+      && replacement.reason === action.reason
+      && s.spreadsheetId === action.previousSpreadsheetId
+      && replacement.previousSpreadsheetId === action.previousSpreadsheetId
+      && replacement.expectedGeneration === action.expectedGeneration
+      && replacement.currentSchoolYear === action.expectedSchoolYear
+      && (action.reason === "replace-trashed"
+        ? s.verificationState === "ATTENDANCE_FILE_TRASHED" && !action.previousOperationId && !replacement.previousOperationId
+        : action.explicitConfirmation === true && Boolean(action.previousOperationId)
+          && s.operationId === action.previousOperationId && replacement.previousOperationId === action.previousOperationId
+          && s.verificationState === action.failureCode && replacement.failureCode === action.failureCode
+          && Boolean(action.failureStage) && replacement.failureStage === action.failureStage);
   }
-  if (entry.service === "docs" && a.template_doc_url) {
-    return `<button class="btn-tonal" data-action="link-open" data-url="${esc(a.template_doc_url)}">${icon("external-link", "small")} 서식 열기</button>`;
+  if (s.bindingState === "ACTIVE") return s.verificationState === "VERIFIED"
+    && s.workbookSchoolYear === action.expectedSchoolYear && s.generation === action.expectedGeneration + 1
+    && Boolean(action.operationId) && s.operationId === action.operationId
+    && s.spreadsheetId === action.publishedSpreadsheetId && s.generation === action.publishedGeneration
+    && (!["replace-trashed", "replace-unavailable"].includes(action.reason) || s.spreadsheetId !== action.previousSpreadsheetId);
+  return s.generation === action.expectedGeneration && (!action.operationId || s.operationId === action.operationId)
+    && (!["replace-trashed", "replace-unavailable"].includes(action.reason) || !action.operationId
+      || (s.operationReason === action.reason && s.previousSpreadsheetId === action.previousSpreadsheetId));
+}
+function acceptAttendanceActionResult(data, flow) {
+  const action = data?.attendance_action;
+  if (!flow.active || flow.account !== googleReadContext() || flow.owner !== screenKey() || !action
+      || action.provenance !== "saved-request" || action.origin !== flow.origin
+      || !attendanceActionMatches(action, data)) return false;
+  if (flow.before && (action.subjectKey !== flow.before.subjectKey
+      || action.expectedSchoolYear !== flow.before.currentSchoolYear
+      || action.expectedGeneration !== flow.before.generation)) return false;
+  if (flow.action && (flow.action.idempotencyKey !== action.idempotencyKey
+      || (flow.action.operationId && flow.action.operationId !== action.operationId))) return false;
+  if (flow.requestKey && flow.requestKey !== action.idempotencyKey) return false;
+  if (flow.replacementIntent && (action.reason !== flow.replacementIntent.reason
+      || action.previousSpreadsheetId !== flow.replacementIntent.previousSpreadsheetId
+      || (action.previousOperationId || null) !== (flow.replacementIntent.previousOperationId || null))) return false;
+  if (flow.beforeKey !== attendanceScopeKey(S.attendance) && !attendanceActionMatches(action, S.attendance)) return false;
+  flow.action = action;
+  return true;
+}
+function attendanceExpectedWorkbookOpen(a) {
+  const s = a?.attendance_scope;
+  const spreadsheetId = a?.spreadsheet_id || String(a?.spreadsheet_url || "")
+    .match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1];
+  if (!attendanceHasConnectedWorkbook(a) || !s || s.bindingState !== "ACTIVE" || s.verificationState !== "VERIFIED"
+      || !s.subjectKey || !s.spreadsheetId || s.workbookSchoolYear !== s.currentSchoolYear
+      || !Number.isInteger(s.generation) || s.generation < 1 || spreadsheetId !== s.spreadsheetId) return null;
+  return { subjectKey: s.subjectKey, currentSchoolYear: s.currentSchoolYear, generation: s.generation,
+    operationId: s.operationId || null, spreadsheetId: s.spreadsheetId };
+}
+async function maybeOpenCreatedAttendance(data, flow) {
+  if (!flow || !flow.active || flow.openAttempted || flow.origin !== "explicit-create"
+      || flow.account !== googleReadContext() || flow.owner !== screenKey()
+      || flow.action?.provenance !== "saved-request" || flow.action.origin !== "explicit-create"
+      || !attendanceActionMatches(flow.action, data) || !attendanceActionMatches(flow.action, S.attendance)) return;
+  const expected = attendanceExpectedWorkbookOpen(data);
+  if (!expected || flow.action.phase !== "published") return;
+  flow.openAttempted = true;
+  showToast("출석부를 새로 만들었어요");
+  try { await call("open_current_attendance", expected, true); }
+  catch (error) {
+    if (flow.account === googleReadContext() && flow.owner === screenKey()) setBanner("warn", error.message || "출석부를 열지 못했어요. 설정 버튼을 눌러 주세요.");
   }
+}
+async function maybeStartInitialAttendancePreparation(a) {
+  if (S.mode !== "wizard" || S.step !== 8 || S.connectTab !== "attendance" || !isGoogleReady(S.google)
+      || S.attendanceReadFailed || a !== S.attendance || a?.initial_preparation_allowed !== true
+      || a.attendance_scope?.bindingState !== "UNBOUND_CONFIRMED" || a.attendance_scope.verificationState !== "VERIFIED"
+      || a.creation_allowed !== true) return;
+  const key = JSON.stringify([googleReadContext(), attendanceScopeKey(a)]);
+  if (attendanceInitialAttempt?.key === key) return;
+  const flow = { key, origin: "initial-auto", account: googleReadContext(), owner: screenKey(), active: true,
+    before: a.attendance_scope, beforeKey: attendanceScopeKey(a), action: null, requesting: true };
+  attendanceInitialAttempt = attendanceActionFlow = flow;
+  render();
+  try {
+    const reply = await call("attendance_prepare_start");
+    if (flow.account !== googleReadContext() || flow.owner !== screenKey()) return;
+    const data = reply?.status;
+    if (data && acceptAttendanceActionResult(data, flow)) {
+      S.attendance = { ...data, preparation_running: reply.started === true };
+      if (["preparing", "installing"].includes(data.state)) startAttendancePreparePoll(flow);
+    } else if (data) {
+      // A denied admission may return a newer diagnosis, never permission to make a second request.
+      if (attendanceScopeKey(S.attendance) === flow.beforeKey) S.attendance = data;
+    } else setBanner("warn", reply?.reason || "출석부 준비 결과를 확인하지 못했어요. 현재 작업을 다시 확인해 주세요.");
+  } catch (error) {
+    if (flow.account === googleReadContext() && flow.owner === screenKey()) setBanner("warn", error.message || "출석부 준비 결과를 확인하지 못했어요.");
+  } finally {
+    flow.requesting = false;
+    if (flow.account === googleReadContext() && flow.owner === screenKey()) render();
+  }
+}
+function attendancePresentation(a) {
+  const flow = attendanceActionFlow?.account === googleReadContext() && attendanceActionFlow?.owner === screenKey()
+    && (attendanceActionFlow.beforeKey === attendanceScopeKey(a) || attendanceActionMatches(attendanceActionFlow.action, a)) ? attendanceActionFlow : null;
+  const action = a?.attendance_action || flow?.action;
+  const initial = !attendanceReplacementScope(a) && (action?.origin === "initial-auto" || flow?.origin === "initial-auto"
+    || (attendanceViewKind() === "installation" && a?.initial_preparation_allowed === true));
+  const pendingState = ["preparing", "installing"].includes(a?.state);
+  const running = pendingState && (a?.preparation_running === true || a?.attendance_scope?.preparationRunning === true)
+    && !["requested", "blocked", "reconciling"].includes(action?.phase);
+  const requesting = Boolean(flow?.requesting || S.attendanceTransitioning
+    || (a?.preparation_running === true && action?.phase === "requested"));
+  if (requesting || running) return { phase: "pending", tone: "muted", initial,
+    text: initial ? "출석부 준비 중…" : running ? "만드는 중…" : "요청 중…", pending: true };
+  if (pendingState && S.attendanceLoading) return {phase:"checking", tone:"muted", text:"결과 확인 중…", initial, pending:true};
+  if (pendingState) return { phase: "required", tone: "warn", text: "확인 필요", initial };
+  if (S.attendanceLoading || a?.state === "checking") return {phase:"checking", tone:"muted", text:"확인 중…", initial};
+  if (a?.account_authorization_required) return {phase:"required", tone:"warn", text:"권한 승인 필요", initial};
+  if (S.attendanceReadFailed || ["verification-unavailable", "recovery-required", "binding-required"].includes(a?.state)) {
+    return {phase:"required", tone:"warn", text:a?.creation_allowed ? "생성 필요" : "확인 필요", initial};
+  }
+  if (a?.state === "initial-setup-required" || a?.initial_setup_required === true) return {phase:"setup", tone:"warn", text:"설정 필요", initial};
+  if (a?.state === "ready") return {phase:"connected", tone:"ok", text:"연결됨", initial};
+  return {phase:"required", tone:"warn", text:"생성 필요", initial};
+}
+function attendanceInstallationHasExplicitCreation(a) {
+  const scope = a?.attendance_scope;
+  return Boolean(attendanceReplacementScope(a) || a?.creation_reason === "new-school-year"
+    || (a?.creation_allowed === true && scope?.initialPreparationAllowed === false
+      && scope.bindingState === "UNBOUND_CONFIRMED" && scope.verificationState === "VERIFIED")
+    || (a?.attendance_action?.origin === "explicit-create" && attendanceActionMatches(a.attendance_action, a)));
+}
+function serviceOpenButtonHtml(entry, a, view = attendanceViewKind()) {
+  if (entry.service !== "sheet") return "";
+  const presentation = attendancePresentation(a);
+  const allowed = a.creation_allowed === true || Boolean(attendanceReplacementScope(a));
+  if (view === "installation" && (presentation.initial
+      || !attendanceInstallationHasExplicitCreation(a)
+      || (!allowed && !presentation.pending))) return "";
+  const enabled = allowed && !S.attendanceTransitioning && !S.attendanceLoading && !S.attendanceReadFailed;
+  return `<button class="btn-tonal" data-action="new-attendance-go" data-busy-text="요청 중…"${enabled && !presentation.pending ? "" : " disabled"}>${presentation.pending ? presentation.text : "출석부 새로 만들기"}</button>`;
+}
+
+function attendanceViewKind() {
+  // Explicit navigation context, independent of cloud setup completion.
+  return S.mode === "wizard" ? "installation" : "management";
+}
+function renderInstallationAttendance(a) {
+  return `<div class="promise attendance-installation" data-attendance-view="installation">${ATTENDANCE_SERVICES.map(entry => attendanceServiceRow(entry, a, "installation")).join("")}</div>`;
+}
+function renderManagedAttendance(a) {
+  return `<div class="promise attendance-management" data-attendance-view="management">${ATTENDANCE_SERVICES.map(entry => attendanceServiceRow(entry, a, "management")).join("")}</div>`;
+}
+function attendanceHasConnectedWorkbook(a) {
+  return a?.state === "ready" || a?.state === "initial-setup-required";
+}
+function serviceSubrowsHtml(entry, a, view = attendanceViewKind()) {
+  if (entry.service === "chat") return classSpaceSubrowHtml(a, view);
+  if (entry.service === "sheet" && attendanceHasConnectedWorkbook(a)) return firstSetupCardHtml(a, view) + studentRosterSubrowHtml(a, view);
   return "";
 }
-/* 서비스 칸 안 딸림 줄 — 학급 단톡방(Chat)만 남는다. Sheet의 "새 출석부 만들기"는
-   서비스 줄 단추로 옮겼다(설계 2026-07-31 — serviceOpenButtonHtml 참고). */
-function serviceSubrowsHtml(entry, a) {
-  if (entry.service === "chat") {
-    return classSpaceSubrowHtml(a);
-  }
-  if (entry.service === "sheet" && a.state === "ready") {
-    return firstSetupCardHtml(a) + studentRosterSubrowHtml(a);
-  }
-  return "";
-}
-/* 서비스 줄 맨 오른쪽 상태 칸 — 글자 색만, 모든 줄 같은 폭(.svc-status, 설계 2026-07-31).
-   배경·테두리·둥근 모서리는 칠하지 않는다 — 알약 모양은 2026-07-30에 질책받았다. */
 function attendanceTransitionNeedsAttention(state) {
   return [
     "connection-repair-required", "ai-action-required",
   ].includes(state);
 }
 function serviceStatusHtml(entry, a) {
+  const presentation = attendancePresentation(a);
+  if (presentation.pending) return `<span class="svc-status muted">${entry.service === "sheet" ? presentation.text : presentation.phase === "waiting" ? "출석부 확인 대기" : "출석부 준비 중…"}</span>`;
+  if (["preparing", "installing"].includes(a.state)) return `<span class="svc-status warn">${entry.service === "sheet" ? "확인 필요" : "출석부 준비 필요"}</span>`;
+  if (S.attendanceLoading) return `<span class="svc-status muted">확인 중…</span>`;
+  if (S.attendanceReadFailed) return `<span class="svc-status warn">확인 필요</span>`;
   if (a.state === "checking") return `<span class="svc-status muted">확인 중…</span>`;
+  if (["verification-unavailable", "recovery-required", "binding-required"].includes(a.state)) return `<span class="svc-status warn">확인 필요</span>`;
+  if (a.account_authorization_required) return `<span class="svc-status warn">권한 승인 필요</span>`;
   const scriptCheck = a.state === "script-check-required";
   const scriptUpdate = a.state === "script-update-required";
   const scriptAttention = scriptCheck || scriptUpdate;
   if (scriptAttention) return `<span class="svc-status" aria-hidden="true"></span>`;
+  if (a.state === "connection-repair-required") {
+    return `<span class="svc-status warn">${entry.service === "sheet" ? "복구 확인 필요" : "출석부 연결 후 사용 가능"}</span>`;
+  }
   if (attendanceTransitionNeedsAttention(a.state)) {
-    return `<span class="svc-status warn">확인 필요</span>`;
+    return `<span class="svc-status warn">다음 단계 확인 필요</span>`;
   }
-  // 뒤에서 준비가 도는 동안에도 이미 만들어진 자료는 그 줄부터 바로 켠다.
-  // engine이 progress에 실제 Google 자료 번호를 하나씩 남기므로 화면에서 추측하지 않는다.
-  if (["installing", "script-recovery-required", "script-permission-required"].includes(a.state)
+  if (["script-recovery-required", "script-permission-required"].includes(a.state)
       || (a.state === "failed" && Object.keys(a.progress || {}).length)) {
-    const progress = a.progress && typeof a.progress === "object" ? a.progress : {};
-    if (entry.service === "sheet" && progress.spreadsheet_id) {
-      return progress.workbook_layout_ready === "monthly-ai-chat-1"
-        ? `<span class="svc-status ok">준비됨</span>`
-        : `<span class="svc-status muted">${a.state === "installing" ? "서식 확인 중…" : "서식 확인 필요"}</span>`;
-    }
-    if (entry.service === "docs" && progress.template_doc_id) {
-      return `<span class="svc-status ok">연결됨</span>`;
-    }
-    if (entry.service === "tasks" && progress.task_list_id) {
-      return `<span class="svc-status ok">연결됨</span>`;
-    }
-    if (a.state === "failed" && a.failed_service === entry.service) {
-      return `<span class="svc-status bad">준비 실패</span>`;
-    }
-    return `<span class="svc-status muted">${a.state === "installing" ? "준비 중…" : "준비 중단"}</span>`;
+    return `<span class="svc-status warn">${a.state === "script-permission-required" ? "권한 승인 필요" : "확인 필요"}</span>`;
   }
+  if (presentation.phase === "setup" && entry.service !== "sheet") return `<span class="svc-status warn">출석부 설정 필요</span>`;
   if (entry.service === "chat") {
     const cs = S.chatStatus;
-    if (a.state === "ready" && (cs?.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]))) {
+    if (a.state === "ready" && chatStatusReading()) {
+      return `<span class="svc-status muted">확인 중…</span>`;
+    }
+    if (a.state === "ready" && (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading"
+        || cs.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]))) {
       return `<span class="svc-status warn">확인 필요</span>`;
     }
     if (a.state === "ready" && cs && cs !== "loading" && cs.connected) {
       return `<span class="svc-status ok">연결됨</span>`;
-    }
-    if (a.state === "ready" && (!cs || cs === "loading")) {
-      return `<span class="svc-status muted">확인 중…</span>`;
     }
     if (a.state === "ready" && cs && cs.moved) {
       return `<span class="svc-status warn">이동됨</span>`;
@@ -1932,19 +2931,18 @@ function serviceStatusHtml(entry, a) {
     if (a.state === "ready") {
       return `<span class="svc-status warn">연결 필요</span>`;
     }
-    return `<span class="svc-status muted">준비 전</span>`;
+    return `<span class="svc-status warn">출석부 준비 필요</span>`;
   }
   if (entry.service === "sheet") {
-    if (a.state === "ready" && S.mode === "wizard" && !attendanceSheetSetupDone()) return `<span class="svc-status warn">처음 설정 필요</span>`;
-    if (a.state === "ready" && !a.year_mismatch) return `<span class="svc-status ok">준비됨</span>`;
+    if (attendanceHasConnectedWorkbook(a) && !a.year_mismatch) return `<span class="svc-status ok">연결됨</span>`;
     if (a.state === "ready" && a.year_mismatch) return `<span class="svc-status warn">준비 필요</span>`;
     if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
-    return `<span class="svc-status muted">준비 전</span>`;
+    return `<span class="svc-status warn">${presentation.text}</span>`;
   }
   // docs · tasks
   if (a.state === "ready") return `<span class="svc-status ok">연결됨</span>`;
   if (a.state === "failed" && a.failed_service === entry.service) return `<span class="svc-status bad">준비 실패</span>`;
-  return `<span class="svc-status muted">준비 전</span>`;
+  return `<span class="svc-status warn">출석부 준비 필요</span>`;
 }
 function attendanceChatOpenBlockReason() {
   if (!S.google) return "Google 로그인을 확인하고 있어요.";
@@ -1958,33 +2956,40 @@ function attendanceChatConnectBlockReason(a = S.attendance) {
   const loginReason = attendanceChatOpenBlockReason();
   if (loginReason) return loginReason;
   if (S.chatConnectOpening) return "Google 권한 승인 창을 열고 있어요.";
-  if (!a || a.state === "checking") return "출결 자료의 준비 상태를 확인하고 있어요.";
-  if (a.state === "installing" || S.attendanceSaving) return "출결 자료를 만들고 있어요. 준비가 끝나면 연결할 수 있어요.";
+  if (S.attendanceLoading || !a || a.state === "checking") return "출결 자료의 준비 상태를 확인하고 있어요.";
+  if (S.attendanceReadFailed) return "출결 연결 상태를 확인하지 못했어요. 다시 확인해 주세요.";
+  const presentation = attendancePresentation(a);
+  if (presentation.phase === "pending") return "출석부 준비가 끝나면 연결할 수 있어요.";
+  if (presentation.phase === "waiting") return "기존 출석부 준비 결과를 확인한 뒤 연결할 수 있어요.";
+  if (["preparing", "installing"].includes(a.state)) return "출석부 준비에 필요한 확인을 먼저 마쳐 주세요.";
+  if (S.attendanceSaving) return "출결 자료의 저장이 끝나면 연결할 수 있어요.";
   if (S.attendanceScriptUpdating || S.attendanceTransitioning) return "출결 자료를 변경하고 있어요. 끝나면 연결할 수 있어요.";
   if (["script-check-required", "script-update-required"].includes(a.state)) return "위의 출결 기능 확인·업데이트를 먼저 마쳐 주세요.";
   if (a.state !== "ready") return "출결 자료 준비를 먼저 마쳐 주세요.";
   const cs = S.chatStatus;
-  if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return "Google Chat 연결 상태를 확인하고 있어요.";
+  if (chatStatusReading()) return "Google Chat 연결 상태를 확인하고 있어요.";
+  if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return "Google Chat 연결 상태를 아직 확인하지 못했어요.";
   if (cs.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]) || typeof cs.connected !== "boolean") return "Google Chat 연결 상태를 확인하지 못했어요.";
   if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
   if (cs.connected) {
+    if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Google Chat 연결은 끝났어요. 위 출석부에서 [처음 설정 한 번에 끝내기]를 마쳐 주세요.";
     if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [단톡방(스페이스) 만들기]에서 학생을 초대하고 방을 골라 주세요.";
-    if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Chat 준비가 끝났어요. 아래 출결 DB 관리에서 시트의 처음 설정을 마쳐 주세요.";
     return "자동발송 계정이 연결됐어요. 다시 연결할 필요가 없어요.";
   }
   // First-time Sheet setup, student invitations and a selected room are not
   // prerequisites for starting Chat authorization.
   return "";
 }
-function attendanceServiceRow(entry, a) {
+function attendanceServiceRow(entry, a, view = attendanceViewKind()) {
   let chatActs = "";
   let chatHint = "";
   if (entry.service === "chat") {
     const reason = attendanceChatConnectBlockReason(a);
-    const connect = `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…"${reason ? ' disabled aria-describedby="attendance-chat-action-hint"' : ""}>연결하기</button>`;
-    chatActs = connect;
-    const hint = reason || S.chatStatus?.reason || "[연결하기]를 눌러 Google Chat 자동발송을 허용해 주세요.";
-    chatHint = `<p class="hint attendance-chat-action-hint" id="attendance-chat-action-hint">${esc(hint)}</p>`;
+    const connected = S.chatStatusContext === chatReadContext() && S.chatStatus?.connected && !S.chatStatus.read_failed;
+    const connect = connected ? "" : `<button class="btn-tonal" data-action="chat-connect" data-busy-text="여는 중…"${reason ? ' disabled aria-describedby="attendance-chat-action-hint"' : ""}>${icon("external-link", "small")} 연결(권한 승인)하러 가기</button>`;
+    chatActs = connect + (S.chatStatus?.read_failed ? `<button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button>` : "");
+    const hint = connected ? "" : reason || S.chatStatus?.reason || "";
+    chatHint = hint ? `<p class="hint attendance-chat-action-hint" id="attendance-chat-action-hint">${esc(hint)}</p>` : "";
   }
   const note = (a.state === "failed" && a.failed_service === entry.service)
     ? `<span class="field-error">${esc(a.detail || "")}</span>`
@@ -1993,18 +2998,49 @@ function attendanceServiceRow(entry, a) {
   const connectionCode = entry.service === "sheet" && S.mode !== "wizard" && a.connection_code
     ? `<small class="attendance-connection-code">연결 확인번호 ${esc(a.connection_code)}</small>`
     : "";
+  const layoutNotice = entry.service === "sheet" && a.layout_check === "unavailable"
+    ? `<div class="hint action-line"><span>출석부의 현재 서식을 읽지 못했어요. 연결 상태를 다시 확인해 주세요.</span><button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button></div>` : "";
   return `<div class="svc-group" data-service="${entry.service}">
     <div class="attendance-service">
       <img class="service-logo" src="${entry.logo}" alt="${esc(entry.name)} 로고">
       <span class="nameblock"><b>${esc(entry.role)}</b><small>${esc(
         entry.service === "sheet" && a.workbook_name ? a.workbook_name : entry.name)}</small>${connectionCode}${note}</span>
-      <span class="svc-acts">${serviceOpenButtonHtml(entry, a)}${chatActs}</span>
-      ${serviceStatusHtml(entry, a)}</div>${chatHint}
-    ${serviceSubrowsHtml(entry, a)}</div>`;
+      <span class="svc-acts">${serviceOpenButtonHtml(entry, a, view)}${chatActs}</span>
+      ${serviceStatusHtml(entry, a)}</div>${layoutNotice}${chatHint}
+    ${serviceSubrowsHtml(entry, a, view)}</div>`;
+}
+let attendanceBoundaryCheck = null;
+function attendanceViewVisible() {
+  return S.connectTab === "attendance" && ((S.mode === "edit" && S.edit === "connect")
+    || (S.mode === "wizard" && S.step === 8));
+}
+function stopAttendanceBoundaryCheck() {
+  if (attendanceBoundaryCheck) clearTimeout(attendanceBoundaryCheck.timer);
+  attendanceBoundaryCheck = null;
+}
+function scheduleAttendanceBoundaryCheck(a) {
+  // Only server timestamps determine the delay. The PC calendar never chooses a school year.
+  if (!attendanceViewVisible() || !a?.year_verified || S.attendanceLoading || S.attendanceReadFailed) return;
+  const scope = a.attendance_scope;
+  const serverNow = Date.parse(scope?.serverNow), boundary = Date.parse(scope?.boundaryAt);
+  if (!Number.isFinite(serverNow) || !Number.isFinite(boundary) || boundary <= serverNow) return;
+  const context = chatReadContext(), key = JSON.stringify([context, scope.boundaryAt]);
+  if (attendanceBoundaryCheck?.key === key) return;
+  stopAttendanceBoundaryCheck();
+  const pending = { key, context, timer: null };
+  attendanceBoundaryCheck = pending;
+  pending.timer = setTimeout(() => {
+    if (attendanceBoundaryCheck !== pending) return;
+    attendanceBoundaryCheck = null;
+    if (pending.context !== chatReadContext() || !attendanceViewVisible()) return;
+    // Refresh only: crossing March 1 never creates or selects a workbook by itself.
+    refreshAttendanceStatus();
+  }, Math.min(boundary - serverNow, 2147483647));
 }
 let attendanceStatusReadVersion = 0;
 let attendanceStatusReadContext = "";
 function refreshAttendanceStatus() {
+  if (S.attendanceConnectionBusy) return;
   // 화면에 이미 있는 내용은 그대로 두고 다시 읽는다. 결과가 오면 그때 갈아 끼운다.
   const context = chatReadContext();
   const record = S.attendance;
@@ -2014,28 +3050,48 @@ function refreshAttendanceStatus() {
   const version = ++attendanceStatusReadVersion;
   const current = () => version === attendanceStatusReadVersion && context === chatReadContext() && S.attendance === record;
   S.attendanceLoading = true;
-  call("attendance_status")
+  S.attendanceReadFailed = false;
+  return call("attendance_status")
     .then((data) => {
       if (!current()) return;
       S.attendance = data;
-      S.chatStatus = null;
+      if (context !== chatReadContext()) S.chatStatus = null;
+      if (data?.state === "ready") {
+        clearResolvedReadIssue("attendance_status");
+        if (googleReadContext() === googleContext && S.connectTab === "attendance"
+            && (editingCard() === "connect" || (S.mode === "wizard" && S.step === 8))) {
+          loadChatStatus(true).then(() => {
+            if (googleReadContext() === googleContext && S.chatStatus?.connected && !S.chatStatus.read_failed) {
+              loadChatSpaces(true);
+              render();
+            }
+          });
+          loadFirstSetupStatus(true);
+          loadAttendanceRosterStatus(true);
+        }
+      }
     })
-    .catch(() => { /* 앞서 읽은 상태를 그대로 둔다 — 잠깐 못 읽었다고 화면을 지우지 않는다 */ })
+    .catch(() => { if (current()) S.attendanceReadFailed = true; })
     .finally(() => {
       if (version !== attendanceStatusReadVersion) return;
       S.attendanceLoading = false;
       // A successful reply may itself change the attendance record identity.
-      if (googleReadContext() === googleContext) render();
+      if (googleReadContext() === googleContext) {
+        render();
+        if (!S.attendanceReadFailed) maybeStartInitialAttendancePreparation(S.attendance);
+      }
     });
 }
 function loadAttendanceStatus() {
-  if (S.attendance || S.attendanceLoading) return;
+  if (S.attendanceTransitioning || S.attendanceConnectionBusy) return;
+  if (S.attendance || S.attendanceLoading || S.attendanceReadFailed) return;
   S.attendanceLoading = true;
   const request = beginIssueRequest(false);
   const context = googleReadContext();
   const version = ++attendanceStatusReadVersion;
   let record = S.attendance;
-  const current = () => version === attendanceStatusReadVersion && context === googleReadContext() && ownsIssueRequest(request) && S.attendance === record;
+  let readCompleted = false;
+  const current = () => version === attendanceStatusReadVersion && context === googleReadContext() && S.attendance === record;
   // 켠 직후에는 마지막으로 확인해 둔 상태부터 즉시 보여준다 — "확인하는 중이에요…"를
   // 프로그램을 켤 때마다 보여주지 않는다(사용자 결정 2026-07-30). 저장본을 보여준 뒤에도
   // 실제 확인은 반드시 다시 한다 — 로그인이 풀린 것을 저장본은 모른다.
@@ -2045,18 +3101,20 @@ function loadAttendanceStatus() {
     })
     .catch(() => {});
   call("attendance_status")
-    .then((data) => { if (current()) S.attendance = record = data; })
+    .then((data) => { if (current()) { S.attendance = record = data; readCompleted = true; } })
     .catch((error) => {
-      if (!current() || showProblemIssue(error, request)) return;
-      S.attendance = record = {
-        state: "failed", account: "", current_user: "", spreadsheet_url: "",
-        detail: error.message, failed_service: "setup", created: false,
-      };
+      if (!current()) return;
+      S.attendanceReadFailed = true;
+      if (showProblemIssue(error, request)) return;
+      render();
     })
     .finally(() => {
       if (version !== attendanceStatusReadVersion) return;
       S.attendanceLoading = false;
-      if (current()) render();
+      if (current()) {
+        render();
+        if (readCompleted) maybeStartInitialAttendancePreparation(S.attendance);
+      }
     });
 }
 function hasCurrentAttendanceFinalIssue(operations) {
@@ -2071,8 +3129,10 @@ function attendanceScriptUpdateHtml(a) {
   if (a.state === "ready") return "";
   if (hasCurrentAttendanceFinalIssue([
     "attendance_script_update_status", "attendance_script_update_apply",
-  ])) return "";
+  ])) return `<div class="attendance-script-update warn">
+    <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 다시 확인</button></div>`;
   const update = S.attendanceScriptUpdate;
+  if (update?.state === "verification-unavailable") return `<div class="attendance-script-update warn"><span>${esc(update.detail)}</span><button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   if (update?.state === "ai-action-required") {
     const detail = String(update.detail || "").trim()
       || "출석부의 [처음 한 번 설정하기]에서 [처음 설정 한 번에 끝내기]를 눌러 주세요.";
@@ -2082,32 +3142,33 @@ function attendanceScriptUpdateHtml(a) {
   }
   if (update?.state === "permission-required") {
     const detail = String(update.detail || "").trim()
-      || "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. ‘다시 로그인하고 승인’을 눌러 같은 Google 계정으로 승인해 주세요. 기존 출석부와 감지기는 그대로입니다.";
+      || "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. [다시 로그인하고 승인]을 눌러 출석부에 연결한 Google 계정으로 승인해 주세요.";
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
-      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>`;
+      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인 (권한 승인)</button></div>`;
   }
   if (update?.state === "customized") {
     return `<div class="attendance-script-update warn"><span>${esc(attendanceScriptProtectedMessage(update))}</span>
-      <button class="btn-quiet" data-action="issue-help" data-preserve-issue="true">도움 요청</button></div>`;
+      <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 다시 확인</button>
+      </div>`;
   }
   if (update?.state === "hold") {
     const detail = String(update.detail || "").trim()
-      || "출결 기능 상태를 확인하지 못했어요. 학생 자료는 그대로입니다.";
+      || "출석부의 자동 처리 기능과 프로그램 버전이 맞는지 확인하지 못했어요. [다시 확인]을 눌러 현재 상태를 확인해 주세요.";
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       <button class="btn-quiet" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   }
-  return `<div class="attendance-script-update warn"><span>출결 기능을 최신판으로 바꿔야 해요.</span>
+  return `<div class="attendance-script-update warn"><span>출석부의 자동 처리 기능과 프로그램 버전이 맞지 않아요.</span>
     <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 업데이트</button></div>`;
 }
 function attendanceScriptProtectedMessage(update) {
   // 알려진 안전한 이유만 화면에 옮긴다. 원격 상세 정보는 그대로 표시하지 않는다.
   const reasons = {
-    "현재 편집본과 실제 배포 중인 버전이 달라요.": "저장된 출결 기능과 실제 실행되는 기능이 달라 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.",
-    "추가한 스크립트 파일이 있어 자동으로 덮어쓰지 않아요.": "출결 기능에 추가된 파일이 있어 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.",
+    "현재 편집본과 실제 배포 중인 버전이 달라요.": "출석부의 자동 처리 내용이 현재 프로그램 버전과 달라 덮어쓰지 않았어요.",
+    "추가한 스크립트 파일이 있어 자동으로 덮어쓰지 않아요.": "출석부의 자동 처리 내용에 추가 파일이 있어 덮어쓰지 않았어요.",
   };
   return Object.prototype.hasOwnProperty.call(reasons, update?.detail)
     ? reasons[update.detail]
-    : "출결 기능이 확인된 정식 버전과 달라 자동 업데이트를 멈췄어요. 기존 출석부는 그대로예요.";
+    : "출석부의 자동 처리 내용이 현재 프로그램 버전과 달라 덮어쓰지 않았어요.";
 }
 function attendanceScriptAccountKey() {
   const attendanceAccount = S.attendance?.account || S.attendance?.current_user || "";
@@ -2153,110 +3214,118 @@ function attendanceScriptUpdateDialogHtml() {
       </div>
     </section></div>`;
 }
-function attendanceConnectionModifiedText(value) {
-  const shown = String(value || "").trim();
-  if (!shown) return "최근 사용 시각 확인 안 됨";
-  const date = new Date(shown);
-  if (Number.isNaN(date.getTime())) return "최근 사용 시각 확인 안 됨";
-  return `최근 사용 ${date.toLocaleString("ko-KR", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
-}
-function attendanceConnectionDialogHtml() {
-  const flow = S.attendanceConnection;
-  if (!flow) return "";
-  const close = `<button class="btn-quiet" data-action="attendance-connection-close" ${S.attendanceConnectionBusy && flow.state !== "loading" ? "disabled" : ""}>취소</button>`;
-  let content = "";
-  if (flow.state === "loading") {
-    content = `<h3>기존 출석부 확인 중</h3><p>정식 표식이 있는 출석부만 찾고 있어요. 새 파일은 만들지 않습니다.</p>`;
-  } else if (["ready", "choose"].includes(flow.state) && Array.isArray(flow.candidates) && flow.candidates.length) {
-    const rows = flow.candidates.map((candidate) => {
-      const attendanceRows = Number(candidate.attendance_rows || 0);
-      const attendanceRowsText = attendanceRows > 0 ? ` · 출결 기록 ${attendanceRows}줄` : "";
-      return `
-        <div class="attendance-candidate-row">
-          <div><b>${esc(candidate.name || flow.expected_name || "정식 출석부")}</b>
-            <small>연결 확인번호 ${esc(candidate.connection_code || "확인 안 됨")} · ${esc(attendanceConnectionModifiedText(candidate.modified_time))}${attendanceRowsText}</small></div>
-          <button class="btn-tonal" data-action="attendance-connection-select" data-sheet-id="${esc(candidate.spreadsheet_id || "")}" ${S.attendanceConnectionBusy ? "disabled" : ""}>이 출석부 사용</button>
-        </div>`;
-    }).join("");
-    const manualError = flow.input_error
-      ? `<p class="field-error attendance-connection-code-error">${esc(flow.input_error)}</p>`
-      : "";
-    content = `<h3>사용할 출석부 고르기</h3>
-      <p>먼저 사용할 시트의 [처음 한 번 설정하기 → 연결 상태 확인]을 눌러, 아래 연결 확인번호와 같은지 눈으로 비교해 주세요. 선택하지 않은 파일은 삭제하거나 바꾸지 않습니다.</p>
-      <div class="attendance-candidate-list">${rows}</div>
-      <div class="attendance-connection-manual">
-        <label for="attendance-connection-code-input"><b>확인번호로 직접 연결</b></label>
-        <div class="attendance-connection-code-entry">
-          <input id="attendance-connection-code-input" type="text" inputmode="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="TM-XXXXXX-XXXXXX" aria-label="연결 확인번호 붙여넣기">
-          <button class="btn-tonal" data-action="attendance-connection-code-select" ${S.attendanceConnectionBusy ? "disabled" : ""}>확인번호로 직접 연결</button>
-        </div>
-        <small>복사할 때는 시트의 설정 탭에서 ATTENDANCE_CONNECTION_CODE 값을 사용해도 됩니다.</small>
-        ${manualError}
-      </div>
-      <div class="attendance-update-dialog-actions">${close}</div>`;
-  } else {
-    content = `<h3>기존 출석부를 확인하지 못했어요</h3><p>${esc(flow.detail || "현재 연결과 Google 파일은 그대로입니다. 새 파일은 만들지 않았습니다.")}</p>
-      <div class="attendance-update-dialog-actions">${close}</div>`;
-  }
-  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-connection-dialog" role="dialog" aria-modal="true" aria-label="사용할 출석부 고르기">${content}</section></div>`;
-}
-/* 마법사 7단계 "마지막 한 번" 카드 — 준비가 끝난 뒤, 시트에서 처음 설정을 끝내라는 안내.
-   기존 서비스 칸(.svc-group)과 같은 톤이고 상태는 글자 색만(.svc-status). */
-function firstSetupCardHtml(a) {
-  if (S.mode === "edit") loadFirstSetupStatusForEdit();
+function firstSetupCardHtml(a, view = attendanceViewKind()) {
+  const initialRequired = a.initial_setup_required === true
+    && (a.state === "initial-setup-required" || !S.firstSetupReadState);
+  if (!initialRequired) loadFirstSetupStatus();
   const complete = attendanceSheetSetupDone();
-  const chatReady = S.chatStatus && S.chatStatus.connected && S.chatStatus.class_space_id;
-  const detail = complete
-    ? `<p>시트 설정은 끝났어요. ${chatReady ? "아래에서 학생명단 입력도 확인해 주세요." : "위의 Google Chat 연결과 학급 단톡방 선택을 마쳐 주세요. 시트 메뉴는 다시 누르지 않아도 돼요."}</p>`
-    : `<p>[설정하러 가기]를 누른 뒤, 시트 상단의 파란 원 표시 메뉴에서 실행해 주세요.</p>
-       <p class="first-setup-menu">● 처음 한 번 설정하기 → 처음 설정 한 번에 끝내기</p>
-       <p>처음에는 Google 계정 선택과 권한 허용이 필요할 수 있어요. Chat과 단톡방은 이 화면으로 돌아와서 마쳐도 돼요.</p>`;
+  const checking = !initialRequired && S.firstSetupReadState === "checking";
+  const unavailable = !initialRequired && S.firstSetupReadState === "unavailable";
+  const label = checking ? "확인 중…" : unavailable ? "확인 필요" : complete ? "설정 완료" : "설정 필요";
+  const setupRequired = initialRequired || (S.firstSetupReadState === "ready" && S.firstSetupReason === "setup_required");
+  const open = !complete && !unavailable && setupRequired
+    ? `<button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} ${view === "installation" ? "처음 한 번 연결하러 가기" : "설정하러 가기"}</button>` : "";
+  const retry = unavailable ? `<button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button>` : "";
+  const problem = unavailable ? "설정 완료 여부를 읽지 못했어요. 설정을 다시 실행하지 말고 다시 확인해 주세요."
+    : !complete && S.firstSetupReason && S.firstSetupReason !== "setup_required" ? firstSetupProblemMessage() : "";
   return `<div class="svc-subrow first-setup-subrow">
-    <div class="first-setup-head"><b>처음 한 번 설정하기</b><span class="chat-space-reload-status">
-      <button class="btn-tonal" data-action="attendance-open">${icon("external-link", "small")} ${complete ? "시트 열기" : "설정하러 가기"}</button>
-      <span class="svc-status ${complete ? "ok" : "warn"}">${complete ? "완료 확인됨" : "실행 필요"}</span></span></div>
-    ${detail}</div>`;
+    <div class="first-setup-head"><b>${view === "installation" ? "처음 한 번 설정하기" : "출석부 설정 상태"}</b><span class="chat-space-reload-status">${open}${retry}
+      <span class="svc-status ${checking ? "muted" : complete ? "ok" : "warn"}">${label}</span></span></div>
+    ${problem ? `<p>${esc(problem)}</p>` : ""}
+    ${view === "installation" ? `<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-first-setup-guide" data-preserve-issue="true">설정 방법 그림으로 보기</button></p>` : ""}</div>`;
 }
-let firstSetupEditContext = "";
-let firstSetupEditReadVersion = 0;
-async function loadFirstSetupStatusForEdit(force = false) {
-  if (S.mode !== "edit" || S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
+let firstSetupReadContext = "";
+let firstSetupReadVersion = 0;
+let firstSetupInFlight = "";
+async function loadFirstSetupStatus(force = false) {
+  if (S.connectTab !== "attendance" || !((S.mode === "edit" && S.edit === "connect")
+      || (S.mode === "wizard" && S.step === 8))
+      || S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
   const context = chatReadContext();
-  if (!force && firstSetupEditContext === context) return;
-  firstSetupEditContext = context;
-  const version = ++firstSetupEditReadVersion;
-  const current = () => version === firstSetupEditReadVersion && context === chatReadContext();
+  if (firstSetupInFlight === context) return;
+  if (!force && firstSetupReadContext === context) return;
+  const before = JSON.stringify([S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.firstSetupReason]);
+  const previousReadState = firstSetupReadContext === context ? S.firstSetupReadState : null;
+  const requestScreen = screenKey();
+  if (firstSetupReadContext !== context) {
+    S.firstSetupDone = false; S.firstSetupReason = "";
+    S.firstSetupConnectionCode = "";
+    S.firstSetupReadState = null;
+  }
+  firstSetupReadContext = context;
+  const version = ++firstSetupReadVersion;
+  const current = () => version === firstSetupReadVersion && context === chatReadContext() && requestScreen === screenKey();
+  firstSetupInFlight = context;
+  S.firstSetupReadState = "checking";
+  if (force) render();
   try {
     const first = await call("attendance_first_setup_status");
     if (!current()) return;
-    S.firstSetupConnectionCode = firstSetupCodeFromValue(first?.value);
-    S.firstSetupDone = first?.done === true && S.firstSetupConnectionCode === String(S.attendance.connection_code || "").trim().toUpperCase();
+    applyFirstSetupRead(first);
   } catch (_) {
     if (!current()) return;
-    S.firstSetupDone = false;
-    S.firstSetupConnectionCode = "";
+    S.firstSetupReadState = "unavailable";
+  } finally {
+    if (version === firstSetupReadVersion) {
+      firstSetupInFlight = "";
+      if (context === chatReadContext() && requestScreen !== screenKey()) {
+        S.firstSetupReadState = previousReadState;
+        if (!previousReadState) firstSetupReadContext = "";
+      }
+    }
   }
-  if (current()) render();
+  if (current() && before !== JSON.stringify([S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.firstSetupReason])) render();
 }
 let rosterReadVersion = 0;
 let rosterContext = "";
 let rosterStatus = null;
+let rosterInFlight = "";
+let rosterAutoSyncAttempt = "";
+let rosterAutoSyncPending = null;
+function syncPreparedRoster() {
+  if (rosterConnecting) return Promise.resolve();
+  if (!isHomeroomTeacher() || !attendanceSheetSetupDone()) return Promise.resolve();
+  const context = chatReadContext();
+  if (rosterAutoSyncPending?.context === context) return rosterAutoSyncPending.promise;
+  const pending = { context };
+  pending.promise = (async () => {
+    if (S.rosterEditor?.context !== rosterEditorContext()) await loadRosterEditor();
+    if (context !== chatReadContext()) return;
+    const editor = S.rosterEditor;
+    if (!editor?.pending || editor.dirty || editor.busy) return;
+    const attempt = JSON.stringify([context, editor.revision]);
+    if (rosterAutoSyncAttempt === attempt) return;
+    rosterAutoSyncAttempt = attempt;
+    editor.busy = true;
+    try {
+      const result = await call("sync_roster_editor");
+      if (context !== chatReadContext()) return;
+      S.rosterEditor = { ...result, rows: rosterEditableRows(result.rows), context: rosterEditorContext(), dirty: false };
+    } catch (_) {
+      if (context === chatReadContext()) { editor.state = "unavailable"; editor.detail = "시트 반영 결과를 확인하지 못했어요. 명단 수정에서 다시 확인해 주세요."; }
+    } finally { if (context === chatReadContext()) { S.rosterEditor.busy = false; render(); } }
+  })().finally(() => { if (rosterAutoSyncPending === pending) rosterAutoSyncPending = null; });
+  rosterAutoSyncPending = pending;
+  return pending.promise;
+}
 async function loadAttendanceRosterStatus(force = false) {
+  if (isHomeroomTeacher() && attendanceSheetSetupDone()) await syncPreparedRoster();
   if (S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
   const context = chatReadContext();
-  if (rosterContext === context && (rosterStatus?.state === "checking" || (!force && rosterStatus))) return;
-  rosterContext = context;
+  if (rosterInFlight?.context === context) return rosterInFlight.promise;
+  if (rosterContext === context && !force && rosterStatus) return;
   rosterStatus = {state:"checking"};
+  rosterContext = context;
   const version = ++rosterReadVersion;
+  let finishPending;
+  const pending = { context, version, promise: new Promise(resolve => { finishPending = resolve; }) };
+  rosterInFlight = pending;
   const sheet = S.attendance.spreadsheet_id
     || String(S.attendance.spreadsheet_url || "").match(/\/spreadsheets\/d\/([^/]+)/)?.[1] || "";
   const current = () => version === rosterReadVersion && context === chatReadContext();
   if (force) render();
-  let timeout;
   try {
-    const result = await Promise.race([call("attendance_roster_status"), new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("Roster read timed out")), 120000);
-    })]);
+    const result = await call("attendance_roster_status");
     if (!current()) return;
     const validCount = Number.isInteger(result?.count) && (result.state === "empty" ? result.count === 0 : result.count > 0);
     rosterStatus = result && sheet && result.spreadsheet_id === sheet && validCount && ["empty","incomplete","ready"].includes(result.state)
@@ -2265,45 +3334,214 @@ async function loadAttendanceRosterStatus(force = false) {
     if (!current()) return;
     rosterStatus = {state:"unavailable"};
   } finally {
-    clearTimeout(timeout);
+    if (rosterInFlight === pending) rosterInFlight = "";
     if (current()) render();
+    finishPending();
   }
 }
-function studentRosterSubrowHtml(a) {
-  if (rosterContext !== chatReadContext() || !rosterStatus) {
-    loadAttendanceRosterStatus();
+let rosterConnecting = false;
+function studentRosterSubrowHtml(a, view = attendanceViewKind()) {
+  if (!isHomeroomTeacher()) return "";
+  const initialRequired = a.roster_input_required === true;
+  if (!initialRequired && (rosterContext !== chatReadContext() || !rosterStatus)) loadAttendanceRosterStatus();
+  if (view === "installation") {
+    const editor = S.rosterEditor?.context === rosterEditorContext() ? S.rosterEditor : null;
+    const complete = attendanceSheetSetupDone() && rosterContext === chatReadContext() && rosterStatus?.state === "ready" && !editor?.pending;
+    const busy = rosterConnecting || editor?.busy || S.attendanceAccountAuthorizing;
+    const detail = editor?.state === "unavailable" || editor?.state === "conflict" ? editor.detail
+      : !attendanceSheetSetupDone() ? "출석부 설정을 먼저 완료해 주세요."
+      : complete ? "저장한 학생명단을 출석부에서 확인했어요." : "6번에서 저장한 학생명단을 출석부에 연결해 주세요.";
+    return `<div class="svc-subrow student-roster-subrow"><div class="first-setup-head"><b>학생명단 연결</b><span class="chat-space-reload-status">
+      <button class="btn-tonal" data-action="attendance-roster-connect"${busy || !attendanceSheetSetupDone() || complete ? " disabled" : ""}>${busy ? "연결 중…" : "학생명단 연결"}</button>
+      <span class="svc-status ${busy ? "muted" : complete ? "ok" : "warn"}">${busy ? "연결 중…" : complete ? "연결됨" : "연결 필요"}</span></span></div><p>${esc(detail)}</p></div>`;
   }
   const status = rosterContext === chatReadContext() ? rosterStatus : null;
-  const state = status?.state || "checking";
-  const complete = state === "ready";
-  const label = complete ? "입력됨" : state === "empty" ? "입력 필요"
-    : state === "incomplete" ? "수정 필요" : state === "unavailable" ? "확인 필요" : "확인 중…";
-  let detail = "[명단 입력하기]를 눌러 번호·이름·학생 이메일을 입력해 주세요. 이 화면으로 돌아오면 자동으로 확인해요.";
-  if (complete) detail = `${Number(status.count)}명의 명단을 확인했어요. 우리 반 학생이 모두 들어 있는지도 확인해 주세요.`;
-  if (state === "unavailable") detail = "학생명단을 읽지 못했어요. 인터넷 연결을 확인한 뒤 [명단 입력하기]에서 명단을 열고 돌아와 주세요.";
+  const state = status?.state === "unavailable" ? "unavailable" : initialRequired ? "empty" : status?.state || "checking";
+  const pending = S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending;
+  const complete = state === "ready" && !pending;
+  const label = pending ? "반영 필요" : complete ? "입력됨" : state === "empty" ? "입력 필요" : state === "incomplete" ? "수정 필요" : state === "unavailable" ? "확인 필요" : "확인 중…";
+  let detail = "";
+  if (state === "unavailable") detail = "현재 출석부의 학생명단을 확인하지 못했어요. 입력한 명단은 그대로 보관하고 있어요.";
   if (state === "incomplete") {
     const missing = Object.entries(status.missing || {}).filter(([, count]) => count > 0).map(([field, count]) => `${field} ${count}명 누락`);
     if (status.invalid_rows?.length) missing.push(`${status.invalid_rows.join(", ")}행의 번호·이메일 형식 또는 중복 확인`);
-    detail = `${missing.join(" · ")}. [학생명단]에서 고쳐 주세요.`;
+    detail = missing.join(" · ");
   }
+  if (pending) detail = S.rosterEditor.detail || "저장한 학생명단을 출석부에 반영하고 있어요.";
   return `<div class="svc-subrow student-roster-subrow">
-    <div class="first-setup-head"><b>학생명단 입력</b><span class="chat-space-reload-status">
-      <button class="btn-tonal" data-action="attendance-roster-open">${icon("external-link", "small")} 명단 입력하기</button>
+    <div class="first-setup-head"><b>${view === "installation" ? "학생명단 입력" : "학생 명단"}</b><span class="chat-space-reload-status">
+      <button class="btn-tonal" data-action="attendance-roster-edit">${view === "installation" ? `${icon("external-link", "small")} 명단 입력하러 가기` : "명단 수정"}</button>
       <span class="svc-status ${complete ? "ok" : state === "checking" ? "muted" : "warn"}">${esc(label)}</span></span></div>
-    <p>${esc(detail)}</p></div>`;
+    ${detail ? `<p>${esc(detail)}</p>` : ""}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-roster-guide" data-preserve-issue="true">입력 방법 그림으로 보기</button></p></div>`;
 }
+function openAttendancePictureGuide(kind) { return call("open_picture_guide", kind); }
+let attendanceAccountAuthorizationVersion = 0;
+bindActions({"attendance-account-authorize": async () => {
+  if (S.attendanceAccountAuthorizing) return;
+  const version = ++attendanceAccountAuthorizationVersion;
+  const context = googleReadContext();
+  const current = () => version === attendanceAccountAuthorizationVersion && context === googleReadContext();
+  S.attendanceAccountAuthorizing = true;
+  render();
+  try {
+    const started = await call("attendance_account_authorize");
+    if (!current()) return;
+    if (started?.state !== "pending") throw new Error(started?.detail || "권한 승인 창을 열지 못했어요.");
+    const deadline = Date.now() + 180000;
+    const poll = async () => {
+      if (!current()) return;
+      try {
+        const result = await call("attendance_account_authorization_status");
+        if (!current()) return;
+        if (result?.state === "complete") {
+          S.attendanceAccountAuthorizing = false;
+          const rosterRetry = rosterAuthorizationRetry;
+          rosterAuthorizationRetry = null;
+          if (rosterRetry && rosterRetry.context === rosterEditorContext() && rosterRetry.owner === screenKey()
+              && rosterRetry.revision === S.rosterEditor?.revision && !S.rosterEditor?.dirty
+              && (!rosterRetry.explicitConnect || rosterRetry.connection === (attendanceScopeKey(S.attendance)
+                || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || ""))) {
+            await saveRosterEditor(true, false, rosterRetry.explicitConnect);
+          } else {
+            await refreshAttendanceStatus();
+          }
+          if (current()) render();
+          return;
+        }
+        if (result?.state !== "pending" || Date.now() >= deadline) {
+          S.attendanceAccountAuthorizing = false;
+          setBanner("warn", result?.detail || "권한 승인을 확인하지 못했어요. 연결 버튼에서 다시 시작해 주세요.");
+          return;
+        }
+        setTimeout(poll, 3000);
+      } catch (_) {
+        if (!current()) return;
+        S.attendanceAccountAuthorizing = false;
+        setBanner("warn", "권한 승인 결과를 읽지 못했어요. 연결 버튼에서 다시 확인해 주세요.");
+      }
+    };
+    setTimeout(poll, 1000);
+  } catch (error) {
+    if (current()) {
+      S.attendanceAccountAuthorizing = false;
+      setBanner("warn", error.message || "권한 승인 창을 열지 못했어요.");
+    }
+  } finally { if (current()) render(); }
+}});
+bindActions({
+  "google-login-guide": () => openAttendancePictureGuide("login"),
+  "attendance-first-setup-guide": () => openAttendancePictureGuide("setup"),
+  "attendance-chat-space-guide": () => openAttendancePictureGuide("chat"),
+  "attendance-roster-guide": () => openAttendancePictureGuide("roster"),
+});
+bindActions({"attendance-roster-connect": async () => {
+  if (rosterConnecting || !attendanceSheetSetupDone()) return;
+  const context = rosterEditorContext(), owner = screenKey();
+  const current = () => context === rosterEditorContext() && owner === screenKey();
+  rosterConnecting = true; render();
+  try {
+    await loadRosterEditor();
+    if (!current()) return;
+    rosterAutoSyncAttempt = JSON.stringify([chatReadContext(), S.rosterEditor?.revision]);
+    if (await saveRosterEditor(true, true, true)) {
+      if (current()) await loadAttendanceRosterStatus(true);
+    }
+  } finally { rosterConnecting = false; if (current()) render(); }
+}});
+bindActions({"attendance-roster-edit": async () => {
+  if (S.mode === "wizard") { await goStepAsync(6); return; }
+  const context = rosterEditorContext();
+  await openCard("timetable");
+  if (context !== rosterEditorContext() || S.mode !== "edit" || S.edit !== "timetable") return;
+  S.timetableTab = "roster"; render();
+}});
 bindActions({"attendance-roster-open": async () => {
   rosterReadVersion += 1;
+  rosterInFlight = "";
   rosterStatus = null;
   render();
   await call("open_attendance_roster");
 }});
-window.addEventListener("focus", () => {
-  if (S.connectTab === "attendance" && ((S.mode === "wizard" && S.step === 7) || (S.mode === "edit" && S.edit === "connect"))) {
-    loadAttendanceRosterStatus(true);
-    loadFirstSetupStatusForEdit(true);
+bindActions({"attendance-existing-repair": async () => {
+  if (S.attendanceRepairing || S.attendanceReadFailed || S.attendance?.recovery_action !== "repair-existing") return;
+  const context = chatReadContext();
+  const screen = screenKey();
+  const current = () => context === chatReadContext() && screen === screenKey();
+  S.attendanceRepairing = true;
+  render();
+  try {
+    const result = await call("attendance_script_update_apply");
+    if (!current()) return;
+    if (["updated", "current"].includes(result?.state)) {
+      await refreshAttendanceStatus();
+    } else {
+      setBanner("warn", result?.detail || "기존 출석부의 복구를 마치지 못했어요. 다시 확인해 주세요.");
+    }
+  } catch (error) {
+    if (current()) setBanner("warn", error.message || "기존 출석부의 복구 결과를 확인하지 못했어요.");
+  } finally {
+    S.attendanceRepairing = false;
+    if (screen === screenKey()) render();
   }
-});
+}});
+bindActions({"attendance-status-recheck": async () => {
+  S.attendanceReadFailed = false;
+  await refreshAttendanceWizardGate();
+  render();
+}});
+function attendanceRecoveryHtml(a) {
+  // A stopped preparation needs an action even when an old server omitted its diagnostic.
+  if (!a?.recovery_action && ["preparing", "installing"].includes(a?.state)
+      && !attendancePresentation(a).pending && !attendanceReplacementScope(a)) {
+    return `<div class="banner warn attendance-recovery" role="status"><span>출석부 준비가 완료되지 않았어요. 기존 작업의 결과를 다시 확인해 주세요.</span><button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button></div>`;
+  }
+  const choices = {
+    "authorize-attendance-account": ["Google 권한 승인", "출석부 연결 권한을 승인한 뒤 같은 작업을 확인해 주세요."],
+    "check-file-access": ["접근 권한 다시 확인", "해당 출석부의 접근 권한을 확인해야 해요. 새 출석부로 바꾸지 않습니다."],
+    "retry-verification": ["다시 확인", "현재 출석부의 확인을 마치지 못했어요."],
+    "update-attendance-service": ["업데이트 확인", "출석부 확인 서비스의 수정이 필요해요. 같은 Google 권한 승인을 반복해도 해결되지 않습니다."],
+    "reconcile-attendance-operation": ["같은 작업 확인", "기존 출석부 준비 작업의 결과를 확인해 주세요."],
+    "resume-attendance-preparation": ["같은 작업 이어서 확인", "기존 출석부 준비 작업의 결과를 확인해 주세요."],
+  };
+  const choice = choices[a?.recovery_action];
+  if (!choice) return "";
+  return `<div class="banner warn attendance-recovery" role="status"><span>${esc(a.detail || choice[1])}</span>
+    <button class="btn-tonal" data-action="attendance-recovery" data-attendance-context="${esc(chatReadContext())}" data-recovery-action="${esc(a.recovery_action)}">${choice[0]}</button></div>`;
+}
+bindActions({"attendance-recovery": async (el) => {
+  if (el?.dataset.attendanceContext !== chatReadContext() || el.dataset.recoveryAction !== S.attendance?.recovery_action) return;
+  const action = el.dataset.recoveryAction;
+  if (action === "authorize-attendance-account") return actions["attendance-account-authorize"]();
+  if (action === "update-attendance-service") return actions["update-check"](el, beginIssueRequest(true));
+  if (["reconcile-attendance-operation", "resume-attendance-preparation"].includes(action)) {
+    const context = chatReadContext(), owner = screenKey();
+    if (!S.attendance?.attendance_action && S.attendance?.attendance_scope?.operationId) {
+      const beforeKey = attendanceScopeKey(S.attendance);
+      const snapshot = await call("attendance_prepare_status");
+      if (context !== chatReadContext() || owner !== screenKey()) return;
+      if (!snapshot?.status || attendanceScopeKey(snapshot.status) !== beforeKey) {
+        setBanner("warn", "출석부 연결 정보가 바뀌었어요. 현재 상태를 다시 확인해 주세요.");
+        return;
+      }
+      S.attendance = { ...snapshot.status, preparation_running: snapshot.running === true };
+      if (snapshot.running) { startAttendancePreparePoll(); render(); return; }
+    }
+    const scope = S.attendance?.attendance_scope;
+    const expected = S.attendance?.attendance_action || (scope?.operationId ? {
+      provenance: "legacy-existing-operation", explicitResume: true, subjectKey: scope.subjectKey,
+      expectedSchoolYear: scope.currentSchoolYear, expectedGeneration: scope.generation, operationId: scope.operationId,
+    } : null);
+    const result = await call("attendance_prepare_resume", expected);
+    if (context !== chatReadContext() || owner !== screenKey()) return;
+    if (result?.status) S.attendance = result.status;
+    if (result?.started) startAttendancePreparePoll();
+    else if (result?.reason) setBanner("warn", result.reason);
+    render();
+    return;
+  }
+  return actions["attendance-status-recheck"]();
+}});
+
 function attendanceComingSoonHtml() {
   return `<div class="attendance-head"><div>
     <h2>출결</h2>
@@ -2316,9 +3554,25 @@ function attendanceTabHtml() {
   if (!attendancePreparePollOn) loadAttendanceStatus();
   if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
   const a = S.attendance && typeof S.attendance === "object" ? S.attendance : { state: "checking" };
+  scheduleAttendanceBoundaryCheck(a);
+  if (attendanceReplacementAttempt?.context !== attendanceReplacementContext(a)) attendanceReplacementAttempt = null;
   const account = a.account || a.current_user || "";
   let statusArea = "";
-  if (a.state === "account-required") {
+  const presentation = attendancePresentation(a);
+  const recovery = attendanceRecoveryHtml(a);
+  if (S.attendanceReadFailed && !presentation.pending) {
+    statusArea = `<div class="banner warn" role="status"><span>출석부의 현재 상태를 확인하지 못했어요. [다시 확인]을 눌러 주세요.</span><button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button></div>`;
+  } else if (recovery && !presentation.pending) {
+    statusArea = recovery;
+  } else if (presentation.pending) {
+    statusArea = "";
+  } else if (a.account_authorization_required) {
+    statusArea = `<div class="banner warn attendance-account-consent"><span>출석부 연결을 확인하려면 Google 권한 승인이 필요해요.</span><button class="btn-tonal" data-action="attendance-account-authorize"${S.attendanceAccountAuthorizing ? " disabled" : ""}>${icon("external-link", "small")} ${S.attendanceAccountAuthorizing ? "승인 기다리는 중…" : "연결(권한 승인)하러 가기"}</button></div>`;
+  } else if (S.attendanceReadFailed) {
+    statusArea = `<div class="banner" role="status"><span>출석부의 현재 상태를 확인하지 못했어요. 잠시 후 [다시 확인]을 눌러 주세요.</span><button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button></div>`;
+  } else if (attendanceReplacementScope(a)) {
+    statusArea = "";
+  } else if (a.state === "account-required") {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || GOEDU_REQUIRED_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
   } else if (a.state === "login-required" || a.state === "gws-required") {
@@ -2327,67 +3581,66 @@ function attendanceTabHtml() {
   } else if (a.state === "auth-error") {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
-  } else if (a.state === "connection-repair-required") {
-    statusArea = `<div class="banner warn"><span>${esc(a.detail || "현재 연결이 옛 출석부를 가리키고 있어요.")}</span>
-      <button class="btn-tonal" data-action="attendance-connection-choose" ${S.attendanceConnectionBusy ? "disabled" : ""}>사용할 출석부 고르기</button></div>`;
+  } else if (["connection-repair-required", "verification-unavailable", "recovery-required", "binding-required"].includes(a.state)) {
+    statusArea = `<div class="banner warn"><span>${esc(a.detail || "출석부의 현재 연결을 확인하지 못했어요.")}</span>
+      ${a.recovery_action === "repair-existing" ? `<button class="btn-tonal" data-action="attendance-existing-repair"${S.attendanceRepairing ? " disabled" : ""}>${S.attendanceRepairing ? "복구 중…" : "기존 출석부 복구"}</button>` : `<button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button>`}</div>`;
   } else if (a.state === "profile-required"
       && (identityIssues().length || dayIssues().length)) {
     // 초안이 진짜 비어 있을 때만 안내한다.
     statusArea = `<div class="banner warn"><span>${esc(a.detail || "내 정보와 하루 일과를 먼저 입력해 주세요.")}</span>
       <button class="btn-quiet" data-action="goto-identity">내 정보 열기</button></div>`;
   } else if (a.state === "script-permission-required") {
-    statusArea = `<div class="banner warn"><span>로그인한 Google 계정에서 자동화 사용을 한 번 허용해야 해요. 설정에서 [Google Apps Script API]를 켠 뒤 돌아와 계속해 주세요. 기존 출결 자료는 그대로입니다.</span>
-      <button class="btn-quiet" data-action="attendance-script-settings">Google 자동화 사용 설정 열기</button>
-      <button class="btn-tonal" data-action="attendance-prepare-retry" data-busy-text="확인 중…">허용 후 계속</button></div>`;
+    statusArea = attendanceScriptPermissionHtml();
   } else if (a.state === "script-recovery-required") {
     statusArea = `<p class="field-error" style="margin:0 0 13px">${esc(a.detail || "출결 자동화 연결을 확인하지 못해 준비를 멈췄어요. 기존 출결 자료는 그대로입니다.")}</p>`;
   } else if (a.state === "failed" && (!a.failed_service || a.failed_service === "setup")) {
     statusArea = `<p class="field-error" style="margin:0 0 13px">${esc(a.detail || "출결 자료를 준비하지 못했어요. 설정에서 Google 연결을 다시 점검한 뒤 다시 시도해 주세요.")}</p>`;
   }
-  const ready = a.state === "ready";
+  const ready = attendanceHasConnectedWorkbook(a);
   const scriptCheckRequired = a.state === "script-check-required";
   const scriptUpdateRequired = a.state === "script-update-required";
   const scriptAttentionRequired = scriptCheckRequired || scriptUpdateRequired;
   const transitionAttentionRequired = attendanceTransitionNeedsAttention(a.state);
-  const pendingGuide = a.state === "checking" ? "출결 준비 상태를 확인하는 중이에요…" : S.mode === "wizard"
-    ? a.state === "installing"
-      ? "지금 선생님 계정에 출결 자료를 만들고 있어요 (1~2분)"
-      : ["failed", "script-permission-required"].includes(a.state)
-        ? ""  // 실패 줄(field-error)과 [다시 시도]가 그 자리에서 안내한다 (검토 C5)
-        : "Brity 메신저 탭에서 [다음]을 누르면 여기에서 준비가 시작돼요."
-    : "아래 버튼을 누르면 로그인한 계정에 자동으로 준비해요.";
+  const pendingGuide = presentation.pending ? presentation.text
+    : presentation.phase === "checking" ? "출결 준비 상태를 확인하는 중이에요…" : "";
   const chip = account ? `<span class="account-chip">${esc(account)}</span>` : "";
-  const rows = ATTENDANCE_SERVICES.map((entry) => attendanceServiceRow(entry, a)).join("");
-  const staleNotice = S.mode === "wizard" && S.attendanceStaleNotice
-    ? `<p class="hint" style="margin:0 0 12px">이미 만든 출결 시트에는 새 값이 자동으로 들어가지 않아요.</p>`
-    : "";
+  const rows = attendanceViewKind() === "installation" ? renderInstallationAttendance(a) : renderManagedAttendance(a);
+  const staleNotice = attendanceStaleNoticeHtml();
   return `${statusArea}${attendanceScriptUpdateHtml(a)}
     <div class="attendance-head">
-      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready || scriptAttentionRequired || a.state === "script-recovery-required" || !pendingGuide ? "" : `<p>${pendingGuide}</p>`}</div>
+      <div><h2>출결 업무에 필요한 Google 항목</h2>${ready || scriptAttentionRequired || a.state === "script-recovery-required" || !pendingGuide ? "" : `<p>${pendingGuide}</p>${presentation.text === "만드는 중…" ? `<small class="muted">출석부 준비에는 약 2~3분이 걸릴 수 있어요. 잠시만 기다려 주세요.</small>` : ""}`}</div>
       <span class="attendance-head-right">${chip}</span>
     </div>
     ${staleNotice}
-    <div class="promise">
-      ${rows}
-    </div>
+    ${rows}
     ${S.mode === "wizard" && a.state === "failed" && !hasCurrentAttendanceFinalIssue([
       "ensure_attendance", "attendance_prepare_start", "attendance_first_setup_status",
     ])
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
       : ""}
-    ${ready
-      ? ""
-      : scriptAttentionRequired || transitionAttentionRequired || ["checking", "script-recovery-required", "script-permission-required"].includes(a.state) || S.mode === "wizard" ? ""
-      : `<div class="attendance-action"><button class="btn" data-action="save-attendance" data-busy-text="준비 중…" ${S.attendanceSaving ? "disabled" : ""}>${S.attendanceSaving ? "준비 중…" : "출결 준비 시작하기"}</button></div>`}
-    ${attendanceScriptUpdateDialogHtml()}
-    ${attendanceConnectionDialogHtml()}`;
+    ${attendanceScriptUpdateDialogHtml()}`;
+}
+function attendanceStaleNoticeHtml() {
+  if (S.mode !== "wizard" || !S.attendanceStaleNotice
+      || typeof S.attendanceStaleNotice !== "object") return "";
+  const sheetFields = S.attendanceStaleNotice.sheet_fields || [];
+  const localGroups = S.attendanceStaleNotice.local_groups || [];
+  const messages = [];
+  if (sheetFields.length) {
+    messages.push(`기존 출석부의 [설정] 탭에 아직 반영되지 않은 항목: ${sheetFields.join(", ")}.`);
+  }
+  if (localGroups.length) {
+    messages.push(`Teacher Manager에만 저장되고 기존 출석부 값은 바뀌지 않습니다: ${localGroups.join(", ")}.`);
+  }
+  if (!messages.length) return "";
+  return `<p class="hint" style="margin:0 0 12px">${esc(messages.join(" "))} </p>`;
 }
 /* ---------- 연결 3탭: AI 에이전트 ---------- */
 function aiTabHtml() {
   if (!S.info?.features?.ai_skill_install_enabled) {
     return `<div class="attendance-head"><div>
-      <h2>AI 에이전트 연결 <span class="tab-optional">(선택)</span></h2>
-      <p>AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요. 준비가 끝나면 업데이트로 알려드릴게요.</p>
+      <h2>AI 프로그램 연결 <span class="tab-optional">(선택)</span></h2>
+      <p>다른 AI 프로그램과 연결하는 기능은 준비 중이에요. 이 단계는 건너뛰어도 됩니다.</p>
     </div></div>`;
   }
   if (S.aiTools === null) {
@@ -2420,16 +3673,16 @@ function aiTabHtml() {
   if (S.aiInstall) {
     result = S.aiInstall.success
       ? `<div class="ready-hero"><span class="check">✓</span>
-          <span><b>AI 에이전트와 연결했어요.</b> 이제 AI에게 말로 학교 업무를 시킬 수 있어요.</span></div>`
+          <span><b>AI 프로그램과 연결했어요.</b> 이제 AI에게 말로 학교 업무를 시킬 수 있어요.</span></div>`
       : `<div class="banner warn" style="margin-top:12px"><span>${esc(S.aiInstall.detail || "자동 연결을 마치지 못했어요. 잠시 뒤 다시 눌러 주세요.")}</span></div>
-        <p class="hint">Teacher Manager는 <a href="https://nodejs.org/" target="_blank" rel="noreferrer">Node 공식 주소</a>의 확인된 파일만 사용해요. 다른 기능은 그대로 사용할 수 있어요.</p>`;
+        <p class="hint">AI 연결 파일을 추가하지 못했어요. 다른 Teacher Manager 기능은 그대로 사용할 수 있어요.</p>`;
   }
   const nodeLine = S.aiNode && S.aiNode.success
-    ? `<p class="hint">AI 연결에 필요한 전용 도구 ${esc(S.aiNode.version || "")}을 준비했어요.</p>`
+    ? `<p class="hint">AI 연결에 필요한 파일을 준비했어요.</p>`
     : "";
   return `<div class="attendance-head"><div>
-      <h2>AI 에이전트와 Google을 연결할까요? <span class="tab-optional">(선택)</span></h2>
-      <p>연결하면 AI에게 말로 학교 업무(일정·결석·신고서·문자)를 시킬 수 있어요. 안 써도 프로그램 사용에는 지장 없어요.</p>
+      <h2>AI 프로그램과 Google을 연결할까요? <span class="tab-optional">(선택)</span></h2>
+      <p>연결하면 AI에게 말로 일정·결석·신고서·Google Chat 안내를 만들 수 있어요. 이 기능은 건너뛰어도 됩니다.</p>
     </div></div>
     <div class="ai-rows">${rows}</div>
     ${anyFound && !hasCurrentFinalIssue(["ai_node_status", "ai_node_prepare", "ai_skills_install"])
@@ -2467,8 +3720,6 @@ bindActions({
     } else {
       aiToolsRequestToken += 1;
     }
-    S.chatSpaces = undefined;
-    S.chatSpaceName = undefined;
     render();
   },
   "update-check": async (_el, request) => {
@@ -2498,7 +3749,7 @@ bindActions({
   "ai-connect": async (_el, request) => {
     if (S.aiConnecting) return;
     if (!S.info?.features?.ai_skill_install_enabled) {
-      showToast("AI 공개판 동기화와 안전 확인이 끝나지 않아 연결 기능을 준비 중이에요");
+      showToast("다른 AI 프로그램과 연결하는 기능은 준비 중이에요");
       return;
     }
     const keys = Array.from(document.querySelectorAll('.ai-row input:checked'))
@@ -2518,7 +3769,7 @@ bindActions({
           return;
         }
         const approved = window.confirm(
-          "AI 연결에 필요한 Teacher Manager 전용 도구를 받을까요?\nNode 공식 주소의 확인된 파일을 이 Windows 계정의 앱 폴더에만 저장해요."
+          "AI 연결에 필요한 파일을 받을까요?\n이 Windows 계정의 Teacher Manager 앱 폴더에 저장합니다."
         );
         if (!approved) return;
         const prepared = await call("ai_node_prepare");
@@ -2531,7 +3782,7 @@ bindActions({
       }
       const permissionApproved = window.confirm(
         "AI 연결 권한 안내\n\n" +
-        "검토한 GitHub 공개판의 정확한 묶음을 파일 지문으로 확인한 뒤, 고정된 npm skills 도구가 선택한 AI 설정 폴더에 복사합니다.\n" +
+        "선택한 AI 프로그램의 설정 폴더에 Teacher Manager 연결 파일을 추가합니다. 같은 이름의 Teacher Manager 연결 파일이 있으면 새 파일로 바꿉니다.\n" +
         "설치된 Teacher Manager 안내는 AI에게 다음 일을 요청할 수 있어요.\n" +
         "- 내 컴퓨터의 필요한 파일 읽기\n" +
         "- Teacher Manager 명령 실행\n" +
@@ -2575,17 +3826,40 @@ bindActions({
     startAttendancePreparePoll();
     render();
   },
-  "attendance-script-settings": async () => { await call("open_attendance_script_settings"); },
+  "attendance-script-settings": async () => { await openAttendanceScriptSettings(); },
   "attendance-script-update-resolve": async () => {
     const requestToken = ++attendanceScriptRequestToken;
     const requestScreen = screenKey();
     const requestAccount = attendanceScriptAccountKey();
-    const update = await call("attendance_script_update_status");
-    if (requestToken !== attendanceScriptRequestToken
-        || requestScreen !== screenKey()
-        || requestAccount !== attendanceScriptAccountKey()) return;
+    const requestContext = chatReadContext();
+    const current = () => requestToken === attendanceScriptRequestToken
+      && requestScreen === screenKey() && requestAccount === attendanceScriptAccountKey()
+      && requestContext === chatReadContext();
+    let update;
+    let resuming = ["ai-action-required", "verification-unavailable", "verification_required"].includes(S.attendanceScriptUpdate?.state);
+    try {
+      update = await call(resuming ? "attendance_script_update_resume" : "attendance_script_update_status");
+      if (!current()) return;
+      if (update.state === "verification_required") {
+        resuming = true;
+        update = await call("attendance_script_update_resume");
+      }
+    }
+    catch (error) { if (!current()) throw new StaleAccountResponse(); throw error; }
+    if (!current()) return;
+    if (S.banner?.topic === "attendance-script-update") S.banner = null;
     S.attendanceScriptUpdate = update;
     S.attendanceScriptDialog = null;
+    if (resuming && update.state === "current" && update.verified) {
+      const attendance = await call("attendance_status");
+      if (!current()) return;
+      S.attendance = attendance;
+      S.attendanceScriptUpdate = null;
+      if (S.mode === "wizard") startAttendancePreparePoll();
+      showToast("출석부의 남은 설정 확인이 끝났어요.");
+      render();
+      return;
+    }
     if (["update_available", "current", "finishing_required"].includes(S.attendanceScriptUpdate.state)) {
       S.attendanceScriptDialog = "update";
     }
@@ -2603,6 +3877,7 @@ bindActions({
     try {
       S.attendanceScriptUpdate = await call("attendance_script_update_apply");
       if (S.attendanceScriptUpdate.state === "updated" || S.attendanceScriptUpdate.state === "current") {
+        if (S.banner?.topic === "attendance-script-update") S.banner = null;
         S.attendanceScriptDialog = null;
         S.attendanceScriptUpdate = null;
         S.attendance = await call("attendance_status");
@@ -2627,133 +3902,69 @@ bindActions({
       focusAttendanceScriptResolve();
     }
   },
-  "attendance-connection-choose": async () => {
-    if (S.attendanceConnectionBusy) return;
-    const requestToken = ++attendanceConnectionRequestToken;
-    S.attendanceConnectionBusy = true;
-    S.attendanceConnection = { state: "loading" };
-    render();
-    try {
-      const result = await call("attendance_connection_candidates");
-      if (requestToken !== attendanceConnectionRequestToken) return;
-      S.attendanceConnection = result;
-    } catch (_error) {
-      if (requestToken !== attendanceConnectionRequestToken) return;
-      S.attendanceConnection = {
-        state: "failed",
-        detail: "기존 출석부 목록을 확인하지 못했어요. 현재 연결과 Google 파일은 그대로입니다.",
-      };
-    } finally {
-      if (requestToken === attendanceConnectionRequestToken) {
-        S.attendanceConnectionBusy = false;
-        render();
-      }
-    }
-  },
-  "attendance-connection-close": () => {
-    if (S.attendanceConnectionBusy && S.attendanceConnection?.state !== "loading") return;
-    if (S.attendanceConnection?.state === "loading") {
-      attendanceConnectionRequestToken += 1;
-      S.attendanceConnectionBusy = false;
-    }
-    S.attendanceConnection = null;
-    render();
-  },
-  "attendance-connection-select": async (el) => {
-    if (S.attendanceConnectionBusy) return;
-    const spreadsheetId = String(el.dataset.sheetId || "").trim();
-    if (!spreadsheetId) return;
-    S.attendanceConnectionBusy = true;
-    render();
-    try {
-      const result = await call("select_attendance_connection", spreadsheetId);
-      if (result?.state === "selected") {
-        // 다른 Sheet를 골랐으므로 이전 Sheet의 처음 설정 완료값을 절대 이어 쓰지 않는다.
-        S.firstSetupDone = false;
-        S.firstSetupConnectionCode = "";
-        S.attendanceConnection = null;
-        S.attendanceScriptUpdate = null;
-        S.attendance = await call("attendance_status");
-        S.chatStatus = null;
-        if (S.mode === "wizard") startAttendancePreparePoll();
-        refreshChecks().catch(() => {});
-        showToast("이 출석부를 현재 출석부로 연결했어요");
-      } else {
-        S.attendanceConnection = result || {
-          state: "failed",
-          detail: "고른 출석부 연결을 확인하지 못했어요.",
-        };
-      }
-    } finally {
-      S.attendanceConnectionBusy = false;
-      render();
-    }
-  },
-  "attendance-connection-code-select": async () => {
-    if (S.attendanceConnectionBusy) return;
-    const input = document.getElementById("attendance-connection-code-input");
-    const connectionCode = String(input?.value || "").trim();
-    const flow = S.attendanceConnection;
-    if (!/^TM-[0-9A-F]{6}-[0-9A-F]{6}$/i.test(connectionCode)) {
-      S.attendanceConnection = {
-        ...(flow || {}),
-        input_error: "시트에 나온 TM-XXXXXX-XXXXXX 확인번호를 그대로 붙여 넣어 주세요.",
-      };
-      render();
-      return;
-    }
-    S.attendanceConnectionBusy = true;
-    try {
-      const result = await call("select_attendance_connection_by_code", connectionCode);
-      if (result?.state === "selected") {
-        // 확인번호로 바꿔도 새 Sheet 자체의 완료 표시를 다시 읽어야 한다.
-        S.firstSetupDone = false;
-        S.firstSetupConnectionCode = "";
-        S.attendanceConnection = null;
-        S.attendanceScriptUpdate = null;
-        S.attendance = await call("attendance_status");
-        S.chatStatus = null;
-        if (S.mode === "wizard") startAttendancePreparePoll();
-        refreshChecks().catch(() => {});
-        showToast("확인번호와 같은 출석부를 현재 출석부로 연결했어요");
-      } else {
-        S.attendanceConnection = {
-          ...(flow || {}),
-          input_error: result?.detail || "확인번호와 같은 출석부를 찾지 못했어요.",
-        };
-      }
-    } finally {
-      S.attendanceConnectionBusy = false;
-      render();
-    }
-  },
   "new-attendance-go": async () => {
     const a = S.attendance || {};
-    const name = a.canonical_workbook_name || "새 학년도 정식 출석부";
-    if (!window.confirm(
-      `${name}\n\n새 학년도 출석부를 시작할까요?\n` +
-      "지금 출석부는 그대로 남습니다. 이전 학생·출결·쪽지·발송 기록은 새 파일에 넣지 않습니다."
-    )) return;
+    const replacement = attendanceReplacementScope(a);
+    if ((a.creation_allowed !== true && !replacement) || (attendanceViewKind() === "installation"
+        && (attendancePresentation(a).initial || !attendanceInstallationHasExplicitCreation(a)))
+        || S.attendanceTransitioning || S.attendanceLoading || S.attendanceReadFailed) return;
+    const name = a.canonical_workbook_name || "현재 학년도 출석부";
+    const context = googleReadContext();
+    const replacementContext = attendanceReplacementContext(a);
+    const message = replacement?.reason === "replace-unavailable"
+      ? "현재 계정의 기존 출석부를 확인할 수 없어요. 새 출석부를 만들까요? 기존 파일이 남아 있어도 삭제하거나 변경하지 않습니다. 이전 학생·출결·쪽지·발송 기록은 새 파일에 옮기지 않습니다."
+      : replacement
+      ? "현재 학년도 출석부를 새로 만들까요? 기존 파일은 휴지통에 그대로 남습니다. 이전 학생·출결·쪽지·발송 기록은 새 파일에 옮기지 않습니다."
+      : `${name}\n\n출석부를 새로 만들까요?\n지금 출석부는 그대로 남습니다. 이전 학생·출결·쪽지·발송 기록은 새 파일에 넣지 않습니다.`;
+    if (!window.confirm(message)) { attendanceReplacementAttempt = null; return; }
+    if (context !== googleReadContext() || replacementContext !== attendanceReplacementContext(S.attendance)) {
+      attendanceReplacementAttempt = null;
+      setBanner("warn", "출석부 연결 정보가 바뀌었어요. 현재 상태를 확인한 뒤 다시 시작해 주세요.");
+      return;
+    }
+    if (replacement && attendanceReplacementAttempt?.context !== replacementContext) {
+      attendanceReplacementAttempt = { context: replacementContext, intent: { ...replacement, idempotencyKey: crypto.randomUUID() } };
+    }
+    const intent = replacement ? attendanceReplacementAttempt.intent : null;
+    const flow = { origin: "explicit-create", account: context, owner: screenKey(), active: true,
+      before: a.attendance_scope, beforeKey: attendanceScopeKey(a), requestKey: intent?.idempotencyKey, replacementIntent: intent,
+      action: null, requesting: true };
+    attendanceActionFlow = flow;
     S.attendanceTransitioning = true;
     render();
     try {
-      const data = await call("start_new_attendance");
-      S.attendance = data;
+      const data = intent ? await call("start_new_attendance", intent) : await call("start_new_attendance");
+      if (context !== googleReadContext()) return;
+      if (!acceptAttendanceActionResult(data, flow)) {
+        if (replacementContext === attendanceReplacementContext(S.attendance)) {
+          setBanner("warn", data.detail || "새 출석부의 준비 결과를 확인하지 못했어요. 현재 상태를 다시 확인해 주세요.");
+        }
+        return;
+      }
+      S.attendance = { ...data, preparation_running: ["preparing", "installing"].includes(data.state) };
       S.attendanceScriptUpdate = null;
       S.chatStatus = null;
       S.chatSpaces = undefined;
       S.chatSpaceName = undefined;
       stopChatConnectPoll();
-      if (data.state === "ready") {
-        S.firstSetupDone = false;
+      if (attendanceHasConnectedWorkbook(data)) {
+        S.firstSetupDone = false; S.firstSetupReason = "";
         S.firstSetupConnectionCode = "";
-        if (S.mode === "wizard") startAttendancePreparePoll();
-        showToast("새 학년도 출석부를 시작했어요");
-        call("open_current_attendance").catch(() => {});
+        await maybeOpenCreatedAttendance(data, flow);
+      } else if (["preparing", "installing"].includes(data.state)) {
+        startAttendancePreparePoll(flow);
       } else {
-        setBanner("warn", data.detail || "새 학년도 출석부를 시작하지 못했어요.");
+        setBanner("warn", data.detail || "출석부를 새로 만들지 못했어요.");
       }
+    } catch (error) {
+      if (flow.account === googleReadContext() && flow.owner === screenKey()) {
+        S.attendance = { ...S.attendance, state: "verification-unavailable", creation_allowed: false,
+          replacement_allowed: false, detail: error.message || "출석부 준비 결과를 확인하지 못했어요.",
+          recovery_action: "reconcile-attendance-operation" };
+      }
+      throw error;
     } finally {
+      flow.requesting = false;
       S.attendanceTransitioning = false;
       render();
     }
@@ -2779,6 +3990,8 @@ bindActions({
     if (attendanceChatOpenBlockReason()) return;
     S.chatNewSpaceBrowserOpen = true;
     S.chatNewSpaceBrowserBlurred = false;
+    S.chatNewSpaceBrowserContext = chatReadContext();
+    S.chatNewSpaceBrowserOwner = screenKey();
     await call("open_attendance_chat");
   },
   "class-space-create": async () => {
@@ -2812,15 +4025,13 @@ bindActions({
   },
   "class-space-reload": async () => {
     S.spaceCreate = null;
-    S.chatSpacesError = false;
-    S.chatSpaces = undefined;
-    S.chatStatus = null;
+    const status = loadChatStatus(true, false);
+    const reading = loadChatSpaces(true);
+    render();
+    await Promise.all([status, reading]);
     render();
   },
-  "chat-guide": () => {
-    if (ATTENDANCE_CHAT_GUIDE_URL) { call("open_url", ATTENDANCE_CHAT_GUIDE_URL); return; }
-    showToast("안내 영상을 준비 중이에요");
-  },
+  "chat-guide": () => openAttendancePictureGuide("chat"),
   "goto-identity": async () => {
     if (S.mode === "wizard") { await goStepAsync(3); return; }
     await openCard("identity");
@@ -2829,17 +4040,18 @@ bindActions({
 function syncConnectFields() {
   const p = S.draft.profile;
   const nameById = {
-    cal: Object.fromEntries(S.lists.calendars.map((o) => [o.id, o.name])),
-    task: Object.fromEntries(S.lists.tasklists.map((o) => [o.id, o.name])),
+    cal: Object.fromEntries(currentListRows("calendars").map((o) => [o.id, o.name])),
+    task: Object.fromEntries(currentListRows("tasklists").map((o) => [o.id, o.name])),
   };
   for (const [kind, fields] of [["cal", CAL_LINK_FIELDS], ["task", taskLinkFields()]]) {
-    const known = kind === "cal" ? S.lists.calendars : S.lists.tasklists;
+    const known = currentListRows(kind === "cal" ? "calendars" : "tasklists");
     for (const [idField, nameField] of fields) {
       const select = document.querySelector(`select[name="${idField}"]`);
       if (select) {
         // 토큰이 풀려 목록을 못 불러온 동안에는, 비어 보이는 select가
         // 이미 골라 둔 값을 지우지 않게 한다.
-        if (!select.value && p[idField] && (S.listsError || !known.length)) continue;
+        if (select.disabled || (!select.value && p[idField] && !known.some(row => row.id === p[idField]))) continue;
+        if (select.value && !known.some(row => row.id === select.value)) continue;
         const chosenName = nameById[kind][select.value];
         p[idField] = select.value;
         if (chosenName !== undefined) p[nameField] = chosenName;
@@ -2855,6 +4067,17 @@ function syncConnectFields() {
 }
 document.addEventListener("change", (event) => {
   const name = event.target.name || "";
+  if (name === "attendance-workbook-choice") {
+    const flow = S.attendanceConnection;
+    if (!flow || S.attendanceConnectionBusy) return;
+    if (!flow.candidates?.some(candidate => candidate.spreadsheet_id === event.target.value)) return;
+    flow.selected_id = event.target.value;
+    delete flow.selection_error;
+    // Keep the native radio nodes/focus for arrow-key selection.
+    const footer = document.querySelector(".attendance-picker-footer");
+    if (footer) footer.innerHTML = attendanceConnectionFooterHtml(flow);
+    return;
+  }
   if (name === "link-cal-mode" || name === "link-task-mode") {
     syncConnectFields();
     linkModes()[name === "link-cal-mode" ? "cal" : "task"] = event.target.value;
@@ -2862,7 +4085,15 @@ document.addEventListener("change", (event) => {
     render();
     return;
   }
-  if (event.target.matches("[data-link-select]")) { syncConnectFields(); render(); return; }
+  if (event.target.matches("[data-link-select]")) {
+    syncConnectFields();
+    // A selection may commit during blur before the user's Next click. Update
+    // only this table; replacing the whole page would remove the clicked button.
+    const table = event.target.closest(".form-table");
+    if (table) table.innerHTML = linkExistingRowsHtml(name.includes("Tasks") ? "task" : "cal");
+    updateTabBadges();
+    return;
+  }
   if (event.target.matches('[data-action-change="class-space-pick"]')) {
     if (S.classSpaceSaving) return;
     const select = event.target;
@@ -2896,15 +4127,22 @@ window.addEventListener("blur", () => {
   if (S.chatNewSpaceBrowserOpen) S.chatNewSpaceBrowserBlurred = true;
 });
 window.addEventListener("focus", () => {
-  if (!S.chatNewSpaceBrowserOpen || !S.chatNewSpaceBrowserBlurred) return;
+  if (S.connectTab !== "attendance" || !((S.mode === "wizard" && S.step === 8)
+      || (S.mode === "edit" && S.edit === "connect"))) return;
+  if (S.chatNewSpaceBrowserOpen && (S.chatNewSpaceBrowserOwner !== screenKey()
+      || S.chatNewSpaceBrowserContext !== chatReadContext())) {
+    S.chatNewSpaceBrowserOpen = false;
+    S.chatNewSpaceBrowserBlurred = false;
+    return;
+  }
   S.chatNewSpaceBrowserOpen = false;
   S.chatNewSpaceBrowserBlurred = false;
-  if (S.connectTab !== "attendance") return;
   S.spaceCreate = null;
-  S.chatSpacesError = false;
-  S.chatSpaces = undefined;
-  render();
+  // One fresh binding read drives setup, roster and Chat reads. This also
+  // catches changes made in a browser the teacher opened independently.
+  refreshAttendanceStatus();
 });
+
 function stepConnect() {
   // Keep the Chat actions visible while first-install login is being checked,
   // without starting any attendance or Chat requests before verification.
@@ -2923,7 +4161,7 @@ function stepConnect() {
   }
   if (isGoeduGoogleStatus(S.google) && !isGoogleReady(S.google)) {
     return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(googleAuthorizationMessage(S.google))}</span>
-      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인하고 승인</button></div>${pendingChat()}`;
+      <button class="btn-tonal" data-action="reauthorize-google">다시 로그인 (권한 승인)</button></div>${pendingChat()}`;
   }
   if (!isGoeduGoogleStatus(S.google)) {
     const message = S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
@@ -2939,12 +4177,13 @@ function stepConnect() {
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
     <h1>Google 연결</h1>
-    <p class="sub">Google Workspace 안에서 각 서비스를 연결하여 학교 업무를 자동화해요.</p>
+    <p class="sub">Google 서비스를 연결하여 학교 업무를 자동화해요.</p>
     ${connectTabsHtml()}
     ${body}`;
 }
 async function validateConnect() {
   if (!S.google) adoptGoogleStatus(await call("google_status"));
+  if (S.google.local_settings_error) return S.google.local_settings_error;
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return "구글 로그인을 마쳐야 다음으로 갈 수 있어요.";
   if (!isGoogleReady(S.google)) return googleAuthorizationMessage(S.google);
@@ -3012,7 +4251,7 @@ let settingsStatusRequest = null;
 function hasCurrentSettingsStatusRequest() {
   return Boolean(settingsStatusRequest && ownsIssueRequest(settingsStatusRequest));
 }
-async function refreshSettingsStatus(request) {
+async function refreshSettingsStatus(request, options = {}) {
   const owner = request || beginIssueRequest(false);
   // 같은 요청만 막는다. 닫은 화면의 늦은 요청은 이미 소유권을 잃었으므로,
   // 다시 연 설정 화면의 새 점검을 가로막으면 안 된다.
@@ -3020,21 +4259,25 @@ async function refreshSettingsStatus(request) {
       && settingsStatusRequest.screen === owner.screen
       && settingsStatusRequest.token === owner.token) return false;
   settingsStatusRequest = owner;
-  // 컴퓨터 → Google → 로그인 시 Calendar·Tasks 목록까지 한 번에 재점검한다.
+  // 실제 계정 확인 결과를 먼저 표시하고, 나머지 컴퓨터·목록 점검을 이어 간다.
   try {
-    const computer = await call("computer_status");
-    if (!ownsIssueRequest(owner)) return false;
     const previousGoogle = S.google;
-    const nextGoogle = await call("google_status");
+    const nextGoogle = options.googleStatus || await call("google_status");
     if (!ownsIssueRequest(owner)) return false;
-    S.computer = computer;
+    if (options.loginEpoch !== undefined && options.loginEpoch !== googleLoginEpoch) return false;
+    if (options.loginComplete) S.login = null;
     adoptGoogleStatus(nextGoogle);
+    paintSettingsReadiness();
     if (previousGoogle && googleStatusKey(previousGoogle) !== googleStatusKey(nextGoogle)) {
       S.checks = [];
       checksRetry.lastGood = [];
     }
     const context = googleReadContext();
     const current = () => ownsIssueRequest(owner) && context === googleReadContext();
+    const computer = await call("computer_status");
+    if (!current()) return false;
+    S.computer = computer;
+    paintSettingsReadiness();
     // 갱신 확인은 선택 기능이다. 새 Windows에서 GitHub 인증서 검증이 실패해도 로그인
     // 상태(S.google)는 이미 채워졌으니 문제 화면 대신 줄 안에 표시만 남긴다.
     const gwsUpdate = await call("gws_update_status").catch(() => ({ unavailable: true }));
@@ -3042,23 +4285,19 @@ async function refreshSettingsStatus(request) {
     S.gwsUpdate = gwsUpdate;
     if (isGoogleReady(S.google)) {
       try {
-        const [calendars, tasklists] = await Promise.all([call("list_calendars"), call("list_tasklists")]);
-        if (!current()) return false;
-        S.lists = { calendars, tasklists };
-        S.listsLoaded = true;
-        S.listsError = false;
-        await refreshGoogleTargetStatuses(current);
+        await loadLinkLists(true, current);
       } catch (error) {
         if (!current()) return false;
-        // 목록 실패를 로그인 실패로 바꾸지 않는다. 기존 목록과 선택 ID는 그대로 둔다.
+        // List failures belong to their current read, independently of login.
         S.listsError = true;
       }
     } else {
       S.lists = { calendars: [], tasklists: [] };
+      S.listReads = {};
       S.listsLoaded = false;
       S.listsError = false;
     }
-    if (current()) render();
+    if (current()) paintSettingsReadiness();
     return true;
   } catch (error) {
     handleCaughtError(error, owner);
@@ -3079,7 +4318,22 @@ async function ensureConnectTarget(idField, apiName, name) {
     screen: screenKey(),
   };
   S.pendingGoogleTarget = pending;
-  const result = await call(apiName, name);
+  let result;
+  try {
+    result = await call(apiName, name);
+  } catch (error) {
+    const hasChoices = error instanceof AppIssueError && error.issue?.actions?.some(
+      action => String(action.key || "").startsWith(`select-${pending.kind}:`));
+    if (hasChoices && S.pendingGoogleTarget === pending && pending.screen === screenKey()) {
+      linkModes()[pending.kind === "calendar" ? "cal" : "task"] = "existing";
+      S.draft.profile[idField] = "";
+      S.focusTarget = idField;
+      replaceEditableIssues(connectIssues());
+      S.listsLoaded = false;
+      await loadLinkLists();
+    }
+    throw error;
+  }
   if (S.pendingGoogleTarget === pending) S.pendingGoogleTarget = null;
   return result;
 }
@@ -3155,7 +4409,7 @@ async function applyGoogleTargetSelection(issue, actionKey, request) {
 async function resumeGoogleTargetSelection() {
   const request = beginIssueRequest(false);
   try {
-    if (S.mode === "wizard" && S.step === 7) {
+    if (S.mode === "wizard" && S.step === 8) {
       await goNextAsync();
       return;
     }
@@ -3167,35 +4421,45 @@ async function resumeGoogleTargetSelection() {
     handleCaughtError(error, request);
   }
 }
-const GOOGLE_AUTH_CHECK_MESSAGE = "Google 로그인을 다시 점검해 주세요.";
+const GOOGLE_AUTH_CHECK_MESSAGE = "Google 계정 상태 확인을 마치지 못했어요. [다시 점검]을 눌러 주세요. 로그인이 해제된 것으로 판단하지 않았습니다.";
 function updateFailureText(reason, fallback, buttonLabel) {
   const base = String(reason || fallback || "").trim();
   if (base.includes(`'${buttonLabel}'`)) return base;
+  if (/공식|일치|지문|hash|sha/i.test(base)) {
+    return "받은 파일이 공식 파일과 달라 실행하지 않았어요.";
+  }
+  if (/저장|폴더|권한/.test(base)) {
+    return `${base} 저장하지 못한 위치와 폴더 권한을 확인해 주세요.`;
+  }
   const action = buttonLabel === "지금 업데이트"
-    ? "인터넷 연결을 확인한 뒤 '지금 업데이트'를 다시 눌러 주세요."
-    : "인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요.";
+    ? "설치 파일을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 '지금 업데이트'를 다시 눌러 주세요."
+    : "업데이트 정보를 불러오지 못했어요. 인터넷 연결을 확인한 뒤 '업데이트 다시 확인'을 눌러 주세요.";
   return `${base} ${action}`;
 }
 const OAUTH_REPAIR_MESSAGES = {
   GWS_ACCOUNT_STORAGE_OUTSIDE_USER: {
     status: "Google 로그인을 안전하게 사용할 수 없는 상태예요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
   },
   OAUTH_CLIENT_ENV_INCOMPLETE: {
-    status: "Google 로그인 준비를 확인해야 해요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
+    status: "프로그램의 Google 로그인 기능을 준비하지 못했어요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
   },
   OAUTH_CONFIG_CLIENT_INVALID: {
-    status: "기존 Google 로그인 준비 파일이 올바르지 않아요",
-    repair: "아래 '정리하고 다시 점검'을 눌러 주세요. 같은 문제가 계속되면 Teacher Manager 설치 파일을 다시 실행해 주세요.",
+    status: "저장된 Google 로그인 설정을 사용할 수 없어요",
+    repair: "[로그인 설정 복구]는 Google 도구가 만든 사용할 수 없는 로컬 로그인 설정 파일만 삭제합니다. 복구 뒤 Google 로그인을 다시 진행해 주세요.",
   },
   OAUTH_BUNDLED_CLIENT_INVALID: {
-    status: "Google 로그인 준비를 확인해야 해요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
+    status: "프로그램의 Google 로그인 설정을 읽지 못했어요",
+    repair: "최신 Teacher Manager 설치 파일을 다시 실행해 주세요.",
+  },
+  OAUTH_CLIENT_MISSING: {
+    status: "프로그램의 Google 로그인에 필요한 파일이 없습니다",
+    repair: "최신 Teacher Manager 설치 파일을 다시 실행해 주세요.",
   },
   OAUTH_CLIENT_CONFLICT: {
-    status: "Google 로그인 준비를 확인해야 해요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
+    status: "Google 로그인 설정이 서로 달라 로그인을 시작할 수 없어요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
   },
 };
 function oauthRepairMessage(g) {
@@ -3210,83 +4474,102 @@ function settingsRefreshButtonHtml() {
 }
 function computerSectionHtml(includeGoogle) {
   const c = S.computer;
-  if (!c) return `<div class="panel"><div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div></div>`;
+  const rows = c
+    ? readinessRow("프로그램 실행 기능", "Teacher Manager를 실행해요", c.python)
+      + readinessRow("문서 읽기 기능", "PDF와 첨부 문서를 읽어요", c.documents)
+      + readinessRow("화면 표시 기능", "Teacher Manager 화면을 보여줘요", c.screen)
+    : `<div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div>`;
   return `<div class="section-h section-head"><span>컴퓨터 준비</span>${settingsRefreshButtonHtml()}</div>
-    <div class="panel">
-      ${readinessRow("프로그램 실행 기능", "Teacher Manager를 실행해요", c.python)}
-      ${readinessRow("문서 읽기 기능", "PDF와 첨부 문서를 읽어요", c.documents)}
-      ${readinessRow("화면 표시 기능", "Teacher Manager 화면을 보여줘요", c.screen)}
-    </div>
+    <div class="panel">${rows}</div>
     ${includeGoogle ? googleAccountSectionHtml(false) : ""}`;
 }
+function paintSettingsReadiness() {
+  const region = S.mode === "edit" && S.edit === "settings"
+    ? document.querySelector("#settings-readiness") : null;
+  // Preserve typing only within the same account. A pending profile change must
+  // also remove the previous account's unsaved form, as clearAccountScreen intends.
+  if (region && !accountProfileNeedsReload) {
+    const messages = document.querySelector("#settings-status-messages");
+    if (messages) messages.innerHTML = bannerHtml();
+    region.innerHTML = computerSectionHtml(true);
+  } else render();
+}
+
 function googleLoginRowsHtml() {
   const g = S.google;
   if (!g) return `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요</small></span><span class="st">확인 중이에요…</span></div>
-    <div class="row"><span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
+    <div class="row"><span class="nameblock"><b>Google 로그인 사용 가능</b><small>프로그램에서 로그인을 시작할 수 있는지 확인해요</small></span><span class="st">확인 중이에요…</span></div>
     <div class="row"><span class="nameblock"><b>Google 로그인</b></span><span class="st">확인 중이에요…</span></div>`;
   const loginError = fieldError("google-login");
   const updateUnavailable = Boolean(S.gwsUpdate && S.gwsUpdate.unavailable);
   const update = updateUnavailable ? null : S.gwsUpdate;
+  const authCheckFailed = googleAuthCheckFailed(g);
+  const runtimeReadiness = update?.runtime_ready ?? g.gws_runtime_ready;
+  const runtimeReady = Boolean(runtimeReadiness);
+  const runtimeUnknown = authCheckFailed && runtimeReadiness == null;
+  const oauthUnknown = authCheckFailed && g.oauth_client_ready == null;
   const unavailableNote = updateUnavailable
-    ? `<br><span data-gws-update-unavailable="true">새 판 확인은 지금 하지 못했어요. 현재 기능은 그대로 쓸 수 있어요.</span>`
+    ? `<br><span data-gws-update-unavailable="true">새 판 확인은 지금 하지 못했어요.${runtimeReady ? " 현재 Google 연결 기능은 그대로 쓸 수 있어요." : runtimeUnknown ? " 준비 상태를 다시 점검해 주세요." : " Teacher Manager 설치 파일을 다시 실행해 주세요."}</span>`
     : "";
   const accountStorageProblem = g.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER"
     ? OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER
     : null;
-  const runtimeReady = update ? Boolean(update.runtime_ready) : Boolean(g.gws_runtime_ready);
-  const sourceLabel = update && update.current_source === "approved-update" ? "새 Google 도구" : "기본판";
-  const versionLabel = update && update.current_version ? ` · ${sourceLabel} ${esc(update.current_version)}` : "";
   const offerNote = update && update.offer ? safeGwsOfferText(update.offer.notes) : "";
   const offerDate = update && update.offer ? safeGwsOfferDate(update.offer.verified_on) : "";
-  const offerExplanation = update && update.offer && runtimeReady
-    ? [offerDate ? `승인 확인 ${esc(offerDate)}` : "", offerNote ? esc(offerNote) : ""]
+  const offerExplanation = update && runtimeReady
+    ? [update.current_version ? `현재 버전 ${esc(update.current_version)}` : "", offerDate ? `확인 날짜 ${esc(offerDate)}` : "", offerNote ? esc(offerNote) : ""]
       .filter(Boolean).join(" · ")
     : "";
   const offerExplanationHtml = offerExplanation
-    ? `<br><span data-gws-update-note="true">${offerExplanation}</span>`
+    ? `<details data-gws-update-note="true"><summary>업데이트 정보</summary><span>${offerExplanation}</span></details>`
     : "";
   const updateButton = update && update.offer && runtimeReady
     && !hasCurrentFinalIssue(["gws_update_status", "install_gws_update"])
-    ? `<button class="btn-tonal" data-action="install-gws-update" data-busy-text="갱신 중…" ${S.gwsUpdateInstalling ? "disabled" : ""}>승인된 Google 도구 ${esc(update.offer.version)}로 갱신</button>`
+    ? `<button class="btn-tonal" data-action="install-gws-update" data-busy-text="업데이트 중…" ${S.gwsUpdateInstalling ? "disabled" : ""}>Google 연결 기능 업데이트</button>`
     : "";
   const cliRight = accountStorageProblem
-    ? `<span class="st warn">Google 도구 실행을 안전하게 멈췄어요</span>`
+    ? `<span class="st warn">Google 연결 기능을 사용할 수 없어요</span>`
+    : runtimeUnknown
+    ? `<span class="st warn">Google 연결 기능의 준비 상태를 확인하지 못했어요</span>`
     : runtimeReady
-    ? `<span class="st ok">준비됐어요${versionLabel}</span>${updateButton}`
-    : `<span class="st warn">설치 파일이 손상됐어요 · 설치 파일을 다시 실행해 주세요</span>`;
+    ? `<span class="st ok">사용할 수 있어요</span>${updateButton}`
+    : `<span class="st warn">Google 연결 기능을 사용할 수 없어요 · Teacher Manager 설치 파일을 다시 실행해 주세요</span>`;
   const cliRow = `<div class="row"><span class="nameblock"><b>Google 연결 기능</b><small>일정·할 일·출결 자료를 연결해요${offerExplanationHtml}${unavailableNote}</small></span><span class="row-actions">${cliRight}</span></div>`;
-  const oauthBlock = `<span class="nameblock"><b>Google 로그인 준비</b><small>안전하게 로그인할 수 있는지 확인해요</small></span>`;
+  const oauthBlock = `<span class="nameblock"><b>Google 로그인 사용 가능</b><small>프로그램에서 로그인을 시작할 수 있는지 확인해요</small></span>`;
   // 예전 화면 다리에서 오류 글자 없이 충돌 여부만 돌려줘도 로그인은 막는다.
   const oauthProblem = oauthRepairMessage(g) || (g.oauth_client_conflict ? {
-    status: "Google 로그인 준비를 확인해야 해요",
-    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요. 같은 문제가 계속되면 학교 전산 담당자에게 문의해 주세요.",
+    status: "Google 로그인 설정이 서로 달라 로그인을 시작할 수 없어요",
+    repair: "Teacher Manager 설치 파일을 다시 실행해 주세요.",
   } : null);
   const oauthCleanable = String(g.error_code || "") === "OAUTH_CONFIG_CLIENT_INVALID";
   const oauthRight = oauthProblem
-    ? `<span class="st warn">${esc(oauthProblem.status)}</span><small>${esc(oauthProblem.repair)}</small>${oauthCleanable ? `<button class="btn-tonal" data-action="gws-repair-oauth" data-busy-text="정리 중…">정리하고 다시 점검</button>` : ""}`
+    ? `<span class="st warn">${esc(oauthProblem.status)}</span><small>${esc(oauthProblem.repair)}</small>${oauthCleanable ? `<button class="btn-tonal" data-action="gws-repair-oauth" data-busy-text="복구 중…">로그인 설정 복구</button>` : ""}`
     : g.oauth_client_ready
       ? `<span class="st ok">준비됐어요</span>`
-      : `<span class="st warn">로그인 준비 파일이 없어요</span>`;
+      : oauthUnknown
+      ? `<span class="st warn">Google 로그인의 준비 상태를 확인하지 못했어요</span>`
+      : `<span class="st warn">프로그램의 Google 로그인에 필요한 파일이 없습니다 · 최신 설치 파일을 다시 실행해 주세요</span>`;
   const oauthRow = `<div class="row">${oauthBlock}<span class="row-actions">${oauthRight}</span></div>`;
   const loginBlock = `<span class="nameblock"><b>Google 로그인</b></span>`;
-  const authCheckFailed = googleAuthCheckFailed(g);
   const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem);
-  const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인</button>`;
+  const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인 (권한 승인)</button>`;
   const blockedReason = oauthProblem
-    ? "Google 로그인 준비를 먼저 확인해 주세요"
+    ? "Google 로그인 사용 가능 상태를 먼저 확인해 주세요"
     : !runtimeReady
       ? "Google 연결 기능을 먼저 준비해 주세요"
-      : "Google 로그인 준비 파일이 필요해요";
+      : "프로그램의 Google 로그인에 필요한 파일이 없습니다";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
     : isGoeduGoogleStatus(g) && !isGoogleReady(g)
-      ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st warn">${esc(g.user)} · ${authCheckFailed ? "권한 확인 필요" : "다시 승인 필요"}</span>${canLogin ? `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">다시 로그인하고 승인</button>` : ""}</span></div>`
-    : g.logged_in
+      ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st warn">${esc(g.user)} · ${authCheckFailed ? "권한 확인 필요" : "다시 승인 필요"}</span>${canLogin ? `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">다시 로그인 (권한 승인)</button>` : ""}</span></div>`
+    : isGoogleReady(g)
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st ok">${esc(g.user || "완료")}</span><button class="btn-quiet" data-action="gws-logout">로그아웃</button></span></div>`
       : accountStorageProblem
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
       : authCheckFailed
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${GOOGLE_AUTH_CHECK_MESSAGE}</span>${canLogin ? loginButton : ""}</span></div>`
+      : g.logged_in
+        ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st warn">${esc(googleAuthorizationMessage(g))}</span>${canLogin ? loginButton : ""}</span></div>`
       : canLogin
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}${loginButton}</span></div>`
         : `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions">${loginError ? `<span class="field-error">${esc(loginError)}</span>` : ""}<span class="st warn">${esc(blockedReason)}</span></span></div>`;
@@ -3296,6 +4579,7 @@ function googleLoginRowsHtml() {
 }
 function loginWaitHtml() {
   if (!S.login) return "";
+  if (S.login.logging_out) return '<p class="sub">Teacher Manager에서 로그아웃하고 있어요…</p>';
   const url = String(S.login.url || "");
   const browserMessage = !url
     ? "로그인 주소를 준비하는 중이에요…"
@@ -3316,7 +4600,7 @@ function lockedGoogleServicesHtml() {
   const rows = [
     ["일정", "일정 (Google Calendar)", "업무 일정 등록"],
     ["할 일", "할 일 (Google Tasks)", "업무·전달사항 등록"],
-    ["출결", "학생 안내표·결석 신고서", "출결 자료 준비"],
+    ["출결", "메신저 개인톡 내용·메신저 단체톡 내용·결석 신고서", "출결 자료 준비"],
     ["단톡", "학급 단톡방 (Google Chat)", "학급 공간 연결과 메시지 발송"],
   ];
   return `<div class="locked-services" aria-label="잠긴 Google 기능">${rows.map(([mark, name, note]) =>
@@ -3325,15 +4609,17 @@ function lockedGoogleServicesHtml() {
 }
 function googleAccountDecisionHtml() {
   const g = S.google;
-  if (!g || !g.logged_in) return "";
+  if (!g || !g.logged_in || S.login) return "";
   const allowed = isGoeduGoogleStatus(g);
   const ready = isGoogleReady(g);
-  const label = !allowed ? "사용할 수 없음" : ready ? "확인 완료" : googleAuthCheckFailed(g) ? "권한 확인 필요" : "다시 승인 필요";
+  const checkFailed = googleAuthCheckFailed(g);
+  const label = checkFailed ? "계정 상태 확인 필요" : !allowed ? "사용할 수 없음" : ready ? "확인 완료" : "다시 승인 필요";
   const account = `<div class="account-box">
     <span class="avatar${ready ? " good" : ""}">${accountAvatar(g.user)}</span>
-    <span class="account-copy"><span>현재 선택한 계정</span><b>${esc(g.user || "계정 확인 필요")}</b></span>
+    <span class="account-copy"><span>${checkFailed ? "마지막으로 확인한 계정" : "현재 선택한 계정"}</span><b>${esc(g.user || "계정 확인 필요")}</b></span>
     <span class="account-state ${ready ? "good" : "bad"}">${label}</span>
   </div>`;
+  if (checkFailed) return `${account}<div class="banner warn">${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</div>`;
   if (!allowed) {
     return `${account}<div class="decision-banner error">
       <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>Google 계정으로 진행할 수 있습니다.</p>
@@ -3343,14 +4629,15 @@ function googleAccountDecisionHtml() {
   return account;
 }
 function googleAccountSectionHtml(includeRefresh) {
-  return `<div class="section-h section-head"><span>Google 계정 준비</span>${includeRefresh ? settingsRefreshButtonHtml() : ""}</div>
-    <div class="panel">${googleLoginRowsHtml()}</div>
+  return `<div class="section-h section-head google-account-section-head"><span>Google 계정 준비</span>
+    <div class="google-account-actions">${includeRefresh ? settingsRefreshButtonHtml() : ""}</div></div>
+    <div class="panel">${googleLoginRowsHtml()}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="google-login-guide" data-preserve-issue="true">Google 로그인 그림 안내</button></p></div>
     ${googleAccountDecisionHtml()}
     ${loginWaitHtml()}`;
 }
 async function refreshComputerStatus() {
   S.computer = await call("computer_status");
-  render();
+  paintSettingsReadiness();
 }
 function ensureComputerStatus() {
   if ((S.computer && S.google && S.gwsUpdate) || S.computerLoading || hasCurrentSettingsStatusRequest()) return;
@@ -3369,10 +4656,12 @@ function ensureComputerStatus() {
     .then(async ([computer, google]) => {
       if (!ownsIssueRequest(request)) return;
       S.computer = computer; adoptGoogleStatus(google);
-      S.gwsUpdate = await gwsUpdatePromise;
+      paintSettingsReadiness();
+      const update = await gwsUpdatePromise;
+      if (ownsIssueRequest(request)) S.gwsUpdate = update;
     })
     .catch((error) => handleCaughtError(error, request))
-    .finally(() => { S.computerLoading = false; if (ownsIssueRequest(request)) render(); });
+    .finally(() => { S.computerLoading = false; if (ownsIssueRequest(request)) paintSettingsReadiness(); });
 }
 function attachmentFolderRow(d) {
   const value = d.brity_download_dir || DEFAULT_ATTACHMENT_FOLDER;
@@ -3388,31 +4677,45 @@ function attachmentFolderRow(d) {
 function stepGoogleLogin() {
   ensureComputerStatus();
   const g = S.google;
-  const title = g && g.logged_in && !isGoeduGoogleStatus(g)
+  const title = S.login?.logging_out ? "Google 로그아웃을 확인하고 있어요"
+    : S.login ? "Google 로그인을 확인하고 있어요"
+    : googleAuthCheckFailed(g) ? "Google 계정 상태를 확인해 주세요"
+    : g && g.logged_in && !isGoeduGoogleStatus(g)
     ? "이 계정으로는 진행할 수 없어요"
     : isGoeduGoogleStatus(g) && !isGoogleReady(g)
       ? "Google 권한을 다시 확인해 주세요"
     : isGoogleReady(g)
       ? "Google 계정으로 확인됐어요"
       : "Google 계정으로 로그인해 주세요";
-  const lead = g && g.logged_in && !isGoeduGoogleStatus(g)
-    ? "Teacher Manager 앱은 Google 계정으로 사용할 수 있습니다."
-    : "일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 Google 계정으로 로그인해 주세요.";
+  const lead = S.login?.logging_out
+    ? "Teacher Manager의 Google 연결을 해제하고 있어요. 완료되면 이 화면에 표시돼요."
+    : S.login
+      ? "브라우저에서 Google 로그인을 마치면 이 화면에 자동으로 반영돼요."
+    : googleAuthCheckFailed(g)
+      ? "다시 점검을 눌러 현재 Google 계정 상태를 확인해 주세요."
+    : g && g.logged_in && !isGoeduGoogleStatus(g)
+      ? "Teacher Manager 앱은 Google 계정으로 사용할 수 있습니다."
+    : isGoeduGoogleStatus(g) && !isGoogleReady(g)
+      ? "현재 Google 계정에서 필요한 권한을 다시 승인해 주세요."
+    : isGoogleReady(g)
+      ? "확인된 Google 계정으로 일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 수 있어요."
+      : "일정·할 일·출결 자료·결석 신고서·학급 단톡방을 사용할 Google 계정으로 로그인해 주세요.";
   return `<h1>${title}</h1><p class="sub">${lead}</p>${googleAccountSectionHtml(true)}`;
 }
 async function validateGoogleLogin() {
   try {
     adoptGoogleStatus(await call("google_status"));
   } catch (error) {
+    if (error instanceof StaleAccountResponse) throw error;
     return GOOGLE_AUTH_CHECK_MESSAGE;
   }
   if (S.google.error_code === "GWS_ACCOUNT_STORAGE_OUTSIDE_USER") {
     const problem = OAUTH_REPAIR_MESSAGES.GWS_ACCOUNT_STORAGE_OUTSIDE_USER;
     return `${problem.status}. ${problem.repair}`;
   }
-  if (!S.google.gws_runtime_ready) return "Google 연결 기능을 준비해 주세요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
-  if (S.google.oauth_client_conflict) return "Google 로그인 준비를 확인해야 해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
-  if (!S.google.oauth_client_ready) return "Google 로그인 준비 파일이 필요해요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+  if (!S.google.gws_runtime_ready) return "Google 연결 기능을 사용할 수 없어요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+  if (S.google.oauth_client_conflict) return "Google 로그인 설정이 서로 달라 로그인을 시작할 수 없어요. Teacher Manager 설치 파일을 다시 실행해 주세요.";
+  if (!S.google.oauth_client_ready) return "프로그램의 Google 로그인에 필요한 파일이 없습니다. 최신 Teacher Manager 설치 파일을 다시 실행해 주세요.";
   if (googleAuthCheckFailed(S.google)) return GOOGLE_AUTH_CHECK_MESSAGE;
   if (!S.google.logged_in) return FIELD_MESSAGES["google-login"];
   if (!isGoogleReady(S.google)) return googleAuthorizationMessage(S.google);
@@ -3424,7 +4727,7 @@ function settingsSectionHtml(d, includeGoogle = true) {
   if (d.autostart === undefined) d.autostart = true;
   if (d.error_reports_enabled === undefined) d.error_reports_enabled = true;
   ensureHotkeyState(d);
-  return `${computerSectionHtml(includeGoogle)}
+  return `<div id="settings-readiness">${computerSectionHtml(includeGoogle)}</div>
     <div class="section-h">동작 설정</div>
     ${formTable(
       hotkeyRow(d) +
@@ -3482,10 +4785,12 @@ stepBodies[4] = stepDay;
 validators[4] = validateDay;
 stepBodies[5] = stepTimetable;
 validators[5] = validateTimetable;
-stepBodies[6] = stepSettings;
-validators[6] = validateSettings;
-stepBodies[7] = stepConnect;
-validators[7] = validateConnect;
+stepBodies[6] = stepRoster;
+validators[6] = validateRoster;
+stepBodies[7] = stepSettings;
+validators[7] = validateSettings;
+stepBodies[8] = stepConnect;
+validators[8] = validateConnect;
 
 bindActions({
   "settings-refresh": (_el, request) => refreshSettingsStatus(request),
@@ -3531,42 +4836,22 @@ bindActions({
     const r = await call(
       "verify_gemini_key", S.draft.bridge.gemini_api_key, S.draft.bridge.gemini_model
     );
-    const kind = r.status === "ok" ? "g" : r.status === "rate-limited" ? "y" : "r";
+    const kind = r.status === "ok" ? "g" : ["missing", "invalid"].includes(r.status) ? "r" : "y";
     S.keyStatus = { kind, text: KEY_MESSAGES[r.status] || r.status };
     render();
   },
 });
 
-/* Student preparation belongs before room selection, inside Google Chat. */
+/* The supplied picture guide stays below the initial setup row. */
 function studentChatGuideHtml() {
-  return `<div class="svc-subrow student-chat-guide">
-    <p><strong>학생이 사용하는 Google 계정을 준비해 주세요.</strong><br>학교별 계정이나 개인 Gmail 등 주소의 도메인에 관계없이 입력할 수 있어요.</p>
-    <details ${S.studentChatGuideOpen ? "open" : ""} data-student-chat-guide>
-      <summary>학생 계정 준비와 초대 방법</summary>
-      <ol>
-        <li><b>학생 계정 준비</b> — 이미 Google 계정이 있으면 그대로 사용하세요. 경기도교육청 학교 계정을 새로 만들 때는 아래 세 단계를 마쳐 주세요.<br>
-          <strong>① 교육디지털원패스 가입·ID 확인</strong>: 담임 선생님은 <strong>[회원 정보 → 학생 회원 가입]</strong>의 <strong>학생 회원 가입 현황</strong>에서 학생 ID를 확인할 수 있어요. 여기서 확인하는 것은 원패스 ID예요.<br>
-          <strong>② 교육용 클라우드 가입</strong>: 학생이 원패스 ID로 경기도교육청 교육용 클라우드 지원시스템에 추가로 가입해 주세요.<br>
-          <strong>③ Google Workspace 가입</strong>: 교육용 클라우드 안에서 Google Workspace 사용 신청까지 별도로 마쳐야 학교 Google 계정이 생겨요. 학교 이메일은 보통 <strong>원패스 ID@goedu.kr</strong>입니다.</li>
-        <li><b>학생 계정 초대</b> — 아래 <strong>[단톡방(스페이스) 만들기]</strong>로 선생님 Google 계정에 들어가 <strong>[새 채팅]</strong>을 누르세요. <strong>[한 명 이상을 추가하세요]</strong> 칸에 학생 이메일을 한꺼번에 붙여 넣으세요.<br>
-          이메일은 <strong>한 줄에 하나씩</strong> 또는 <strong>쉼표와 띄어쓰기</strong>로 구분해 주세요. 띄어쓰기만으로 구분하면 인식되지 않아요.<br>
-          예: student1@goedu.kr, student2@goedu.kr</li>
-        <li><b>학생 단체 톡방 만들기</b> — 메시지를 한 번 보낸 뒤, <strong>위쪽 대화 이름 → [이 채팅을 스페이스로 전환]</strong>을 누르세요. 이름은 '2학년 7반'처럼 짧게 정해 주세요.</li>
-        <li><b>이 화면으로 돌아오기</b> — 아래 목록에서 사용할 학급 단톡방을 골라 주세요. 방이 보이지 않으면 [다시 불러오기]를 눌러 주세요.</li>
-      </ol>
-      <div class="action-line"><button class="btn-tonal youtube" data-action="chat-guide"${ATTENDANCE_CHAT_GUIDE_URL ? "" : ' disabled title="안내 영상을 준비 중이에요"'}>${icon("youtube", "small")} 준비 방법</button></div>
-      <p>출결 시트는 학생에게 공유하지 않고, Google Chat 방에만 초대해 주세요.</p>
-    </details></div>`;
+  return `<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-chat-space-guide" data-preserve-issue="true">학급 단톡방 준비 방법 그림으로 보기</button></p>`;
 }
-document.addEventListener("toggle", (event) => {
-  if (event.target.matches?.("[data-student-chat-guide]")) S.studentChatGuideOpen = event.target.open;
-}, true);
 
 /* ---------- 8단계: 모두 저장 ---------- */
 function summaryRow(label, value) {
   return `<div class="row"><span class="name">${esc(label)}</span><span class="st">${esc(value || "—")}</span></div>`;
 }
-stepBodies[8] = function stepFinish() {
+stepBodies[9] = function stepFinish() {
   const p = S.draft.profile;
   return `
     <h1>설정을 저장할게요</h1>
@@ -3602,8 +4887,8 @@ bindActions({
     if (attendanceUiEnabled() && !(await refreshAttendanceWizardGate())) {
       const message = attendanceWizardGateMessage();
       S.connectTab = "attendance";
-      await goStepAsync(7);
-      setBanner("warn", message);
+      await goStepAsync(8);
+      setAttendanceGateBanner(message);
       return;
     }
     await ensureGridLoaded();
@@ -3694,6 +4979,16 @@ function connectIssues() {
     }
   }
   if (isGoogleReady(S.google)) {
+    for (const [field, id] of Object.entries(p)) {
+      if (!GOOGLE_TARGET_ID_FIELDS.includes(field) || !id || (field === "담임안내Tasks목록ID" && !homeroom)) continue;
+      const kind = field.includes("Tasks") ? "tasklists" : "calendars";
+      if (modes[kind === "tasklists" ? "task" : "cal"] !== "existing") continue;
+      const read = S.listReads[kind];
+      if (read && !currentListRows(kind).some(row => row.id === id)) {
+        const key = {"업무캘린더ID":"connect.work-calendar", "학사일정캘린더ID":"connect.school-calendar", "업무Tasks목록ID":"connect.work-tasks", "담임안내Tasks목록ID":"connect.homeroom-tasks"}[field];
+        rows.push(issue(key, field, read.phase === "pending" ? "현재 목록을 확인하고 있어요." : "저장된 선택을 현재 목록에서 확인하지 못했어요. 연결을 다시 확인해 주세요.", "messenger"));
+      }
+    }
     for (const [field, status] of Object.entries(S.googleTargetStatuses || {})) {
       if (!GOOGLE_TARGET_ID_FIELDS.includes(field) || status.id !== p[field] || !p[field]) continue;
       if (field === "담임안내Tasks목록ID" && !homeroom) continue;
@@ -3721,7 +5016,7 @@ function uniqueChecks(rows) {
   });
 }
 // 편집 중인 카드 — 그 카드의 입력칸은 저장된 점검 대신 현재 입력을 본다.
-const WIZARD_CARD_BY_STEP = { 3: "identity", 4: "identity", 5: "timetable", 6: "settings", 7: "connect" };
+const WIZARD_CARD_BY_STEP = { 3: "identity", 4: "identity", 5: "timetable", 6: "timetable", 7: "settings", 8: "connect" };
 function editingCard() {
   if (S.mode === "edit") return S.edit || "";
   if (S.mode === "wizard") return WIZARD_CARD_BY_STEP[S.step] || "";
@@ -3731,7 +5026,28 @@ function effectiveChecks() {
   const editing = editingCard();
   const saved = uniqueChecks(S.checks).filter(
     (row) => attendanceUiEnabled() || row.tab !== "attendance"
-  );
+  ).map((row) => {
+    if (checksRetry.dirtyCards.has(row.card)) return { ...row, ok: null,
+      detail: checksRetry.failedAt ? "점검에 실패했어요. 다시 확인해 주세요." : "현재 상태를 점검하고 있어요." };
+    const a = S.attendance;
+    if (row.key === "connect.attendance" && attendanceUiEnabled() && a
+        && String(a.account || a.current_user || "").trim().toLowerCase() === verifiedGoogleAccount(S.google)) {
+      const presentation = attendancePresentation(a);
+      if (presentation.phase !== "connected") return { ...row, ok: presentation.pending || presentation.phase === "checking" ? (row.ok === false ? false : null) : false,
+        detail: presentation.text, fix: presentation.tone === "warn" ? (a.detail || presentation.text) : "" };
+    }
+    if (row.key !== "connect.attendance" || !attendanceUiEnabled()
+        || !a || !isGoogleReady(S.google) || S.attendanceLoading || S.attendanceReadFailed
+        || !a.state || ["checking", "installing", "unknown", "unavailable"].includes(a.state)) return row;
+    const account = String(a.account || a.current_user || "").trim().toLowerCase();
+    if (!account || account !== verifiedGoogleAccount(S.google)) return row;
+    // Keep the backend check's meaning: workbook preparation only. Current
+    // setup, roster and Chat requirements still own their notices and Next gate.
+    const ok = a.state === "ready" ? true
+      : ["gws-required", "login-required", "account-required", "auth-error", "profile-required"].includes(a.state) ? null : false;
+    const detail = a.detail || (ok === true ? "출결 업무 준비가 끝났어요" : row.detail || "");
+    return { ...row, ok, detail, fix: ok === false ? (a.detail || row.fix || "") : "" };
+  });
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
     : saved;
@@ -3745,8 +5061,13 @@ function effectiveChecks() {
     key: row.key, label: row.target, ok: false, detail: "", fix: row.message,
     card: editing || "", tab: row.tab || "", target: row.target,
   }));
-  const rows = uniqueChecks(kept.concat(live));
-  if (!S.google || isGoogleReady(S.google)) return rows;
+  const rows = uniqueChecks(kept.concat(live)).filter(row => row.key !== "connect.class-space");
+  if (attendanceUiEnabled() && isHomeroomTeacher() && isGoogleReady(S.google)) {
+    const state = classRoomReadiness(), detail = classRoomReadinessMessage(state);
+    rows.push({key:"connect.class-space", label:"학급 단톡방", card:"connect", tab:"attendance",
+      target:"class-space-select", ok:state === "ready", detail, fix:state === "ready" ? "" : detail});
+  }
+  if (!S.google) return rows;
   // The latest shared Google result wins over a previous home snapshot.
   const withoutGoogle = rows.filter((row) => !["settings.google-login", "settings.goedu-account", "connect.google-login"].includes(row.key));
   const ready = isGoogleReady(S.google);
@@ -4102,11 +5423,14 @@ function applyProgress(p) {
 /* ---------- 홈 ---------- */
 const CARDS = [
   { key: "identity", icon: "user", title: "내 정보", detail: "이름 · 학교 · 담임 · 하루 일과" },
-  { key: "timetable", icon: "table", title: "시간표", detail: "주간 시간표 수정" },
+  { key: "timetable", icon: "table", title: "시간표 · 담임학급 학생명단", detail: "주간 시간표 수정" },
   { key: "settings", icon: "sliders", title: "설정", detail: "컴퓨터 준비 · Google 로그인 · 단축키 · 자동 실행" },
   { key: "connect", icon: "link", title: "연결", detail: "Calendar · Tasks · Gemini API key · 출결 시트" },
 ];
 function cardStatus(card) {
+  if (checksRetry.dirtyCards.has(card.key)) return checksRetry.failedAt
+    ? { kind: "y", label: "점검 실패 · 다시 확인", bad: false }
+    : { kind: "n", label: "변경 사항 점검 중…", bad: false };
   if (!S.checks.length) return { kind: "n", label: "점검 중…", bad: false };
   const summary = checkSummary(checksForCard(card.key));
   if (summary.bad) return { kind: "y", label: "확인 필요", bad: true, summary };
@@ -4123,43 +5447,89 @@ function cardDetail(card) {
   }
   return card.detail;
 }
-/* 점검 실패 → 배너 → 재렌더 → 재조회의 자기지속 루프를 끊는다:
-   진행 중이면 겹쳐 부르지 않고, 실패 뒤에는 30초 지나야 자동 재조회한다. */
-const checksRetry = { inflight: false, failedAt: 0, lastGood: [] };
+/* A failed batch ends here. Explicit recheck or edited fields can start another;
+   routine Home redraws cannot repeat a failed request indefinitely. */
+const checksRetry = { inflight: false, failedAt: 0, lastGood: [], dirtyCards: new Set(), changes: 0 };
 let checksReadVersion = 0;
+function invalidateCardChecks(...cards) {
+  cards.forEach(card => checksRetry.dirtyCards.add(card));
+  checksRetry.changes += 1;
+  checksRetry.failedAt = 0;
+}
+let homeClassRoomPending = null;
+function loadHomeClassRoom(force = false) {
+  if (!attendanceUiEnabled() || !isHomeroomTeacher() || !isGoogleReady(S.google)) return;
+  const accountContext = () => JSON.stringify([accountUiEpoch, googleContextVersion, googleLoginEpoch, verifiedGoogleAccount(S.google)]);
+  const account = accountContext();
+  const targetContext = chatReadContext();
+  if (homeClassRoomPending?.account === account && homeClassRoomPending.context === targetContext) return homeClassRoomPending.promise;
+  const promise = (async () => {
+    if (!S.attendance && !S.attendanceLoading && !S.attendanceReadFailed) await refreshAttendanceStatus();
+    if (account !== accountContext() || S.attendance?.state !== "ready" || S.attendanceLoading || S.attendanceReadFailed) return;
+    const context = chatReadContext();
+    await loadChatStatus(force, false);
+    if (context !== chatReadContext() || !S.chatStatus?.connected || S.chatStatus.read_failed) return;
+    await loadChatSpaces(force, false);
+  })();
+  const pending = homeClassRoomPending = { account, context: targetContext, promise };
+  const clear = () => { if (homeClassRoomPending === pending) homeClassRoomPending = null; };
+  promise.then(clear, clear);
+  return promise;
+}
 async function refreshChecks() {
   if (checksRetry.inflight) return;
+  // A saved-card refresh owns only that scope; an explicit full refresh owns all cards.
+  if (!checksRetry.dirtyCards.size) CARDS.forEach(card => checksRetry.dirtyCards.add(card.key));
+  checksRetry.failedAt = 0;
   checksRetry.inflight = true;
   const request = beginIssueRequest(false);
-  const context = googleReadContext();
+  // Home cards remain visible behind Settings and Connection. Navigation and
+  // unrelated notices must not discard a valid check for the same account.
+  const accountContext = () => JSON.stringify([
+    accountUiEpoch, googleContextVersion, googleLoginEpoch, verifiedGoogleAccount(S.google),
+  ]);
+  const context = accountContext();
   const version = ++checksReadVersion;
-  const current = () => version === checksReadVersion && context === googleReadContext() && ownsIssueRequest(request);
+  const changes = checksRetry.changes;
+  const current = () => version === checksReadVersion && changes === checksRetry.changes
+    && context === accountContext();
+  const paint = () => {
+    if (S.mode === "home") render();
+    else if (S.mode === "edit" || S.mode === "about") {
+      // Preserve the open form, including text not yet committed by change.
+      const background = document.querySelector("#app > .body");
+      if (background) background.outerHTML = homeHtml(true);
+    }
+    // Accepted checks must refresh the visible numbers in both wizard and edit
+    // screens without replacing fields the teacher may still be entering.
+    updateTabBadges();
+  };
   try {
-    if (S.checks.length) render();
+    if (S.checks.length) paint();
     const checks = await call("home_checks");
     if (!current()) return;
     S.checks = checks;
     checksRetry.lastGood = checks;
     checksRetry.failedAt = 0;
-    render();
+    checksRetry.dirtyCards.clear();
+    if (S.mode === "home") await loadHomeClassRoom(true);
     return;
   } catch (error) {
     if (!current()) return;
     checksRetry.failedAt = Date.now();
-    if (checksRetry.lastGood.length) S.checks = checksRetry.lastGood;
     handleCaughtError(error, request);
   } finally {
     if (version === checksReadVersion) {
       checksRetry.inflight = false;
-      // Boot can discover the account while the first home check is in flight.
-      // Discard that reply and let the home screen start a current check.
-      if (!current() && S.mode === "home") render();
+      // Clear the visible loading state too. A stale result can start a fresh
+      // check when Home is visible; modal rendering does not start another one.
+      paint();
     }
   }
 }
 function shouldAutoRefreshChecks() {
-  if (S.checks.length || checksRetry.inflight) return false;
-  return !checksRetry.failedAt || Date.now() - checksRetry.failedAt > 30000;
+  if ((S.checks.length && !checksRetry.dirtyCards.size) || checksRetry.inflight) return false;
+  return !checksRetry.failedAt;
 }
 function homeHtml(behind) {
   const info = S.info;
@@ -4167,7 +5537,8 @@ function homeHtml(behind) {
     (row) => attendanceUiEnabled() || row.tab !== "attendance"
   );
   const problems = checkSummary(visibleChecks).bad;
-  const pill = !S.checks.length ? badge("n", "점검 중…")
+  const pill = checksRetry.dirtyCards.size ? badge(checksRetry.failedAt ? "y" : "n", checksRetry.failedAt ? "변경 사항 확인 필요" : "변경 사항 점검 중…")
+    : !S.checks.length ? badge("n", "점검 중…")
     : problems ? badge("y", `확인할 항목 ${problems}개`) : badge("g", "모두 정상");
   const name = (S.profileCache && S.profileCache["선생님이름"]) ? `${S.profileCache["선생님이름"]} 선생님, ` : "";
   const tiles = CARDS.map((card) => {
@@ -4208,7 +5579,11 @@ function homeHtml(behind) {
 function renderHome() {
   root().innerHTML = homeHtml(false) + toastHtml();
   if (shouldAutoRefreshChecks()) refreshChecks();
-  if (!S.profileCache) call("read_profile").then((p) => { S.profileCache = p; render(); }).catch(() => {});
+  if (!S.profileCache) call("read_profile").then(async (p) => {
+    S.profileCache = p;
+    if (S.mode === "home") await loadHomeClassRoom();
+    render();
+  }).catch(() => {});
   if (S.caps === null) {
     loadCapturePage(1);
   }
@@ -4217,19 +5592,23 @@ function renderHome() {
 
 /* ---------- 카드 창 — 홈 위에 뜨는 창 (사용자 결정 2026-07-31, ㄱ안) ---------- */
 function windowHtml(title, body, big) {
+  const messages = S.mode === "edit" && S.edit === "settings"
+    ? `<div id="settings-status-messages">${bannerHtml()}</div>` : bannerHtml();
   return `<div class="win-overlay">
     <div class="win-modal${big ? " big" : ""}" role="dialog" aria-label="${esc(title)}">
       <div class="win-head"><h1 class="win-title">${esc(title)}</h1>
         <span class="save-state" id="save-state"></span>
         <button class="win-x" data-action="back-home" aria-label="닫기">✕</button></div>
-      <div class="win-body"><div class="page">${bannerHtml()}${body}</div></div>
+      <div class="win-body"><div class="page">${messages}${body}</div></div>
     </div></div>`;
 }
 /* 창 닫기 — ✕·어두운 바깥 클릭·Esc·다른 카드로 넘어가기 전, 모두 이 하나를 탄다.
    저장을 마친 뒤에만 닫힌다. 저장이 실패하면 창은 남고 배너에 이유가 적힌다. */
 async function closeWindow() {
+  if (S.rosterEditor?.busy) return;
+  if (S.mode === "edit" && S.edit === "timetable" && S.rosterEditor?.dirty && !(await saveRosterEditor(true))) return;
   if (S.mode !== "edit" && S.mode !== "about") return true;
-  const request = beginIssueRequest(false);
+  const request = beginIssueRequest(Boolean(settingsAutoSavePromise || editAutoSavePromise));
   clearAttendanceScriptDialogState();
   await stopHotkeyRecording();
   let saved = false;
@@ -4237,9 +5616,6 @@ async function closeWindow() {
   if (!saved) return false;  // 배너에 이유가 적혀 있다
   stopChatConnectPoll();
   S.fieldIssues = {};
-  S.chatStatus = null;
-  S.chatSpaces = undefined;
-  S.chatSpaceName = undefined;
   clearProblemIssue();
   S.mode = "home"; S.edit = null; S.banner = null; S.hk = null; render();
   return true;
@@ -4259,24 +5635,28 @@ function showSaveState(text, fadeAfter) {
    저장(도우미 재시작)이 도는 사이의 새 변경은 버리지 않고 끝난 뒤 한 번 더 저장한다. */
 let settingsAutoSaveBusy = false;
 let settingsAutoSavePending = false;
+let settingsAutoSavePromise = null;
 function isHelperStartFailure(error) {
   return error instanceof AppIssueError && error.issue?.operation === "helper_start";
 }
 async function autoSaveSettings(afterHotkey, request) {
   if (!(S.mode === "edit" && S.edit === "settings")) return; // 마법사는 마지막에 한꺼번에 적용
-  if (settingsAutoSaveBusy) { settingsAutoSavePending = true; return; }
+  syncMessengerDraft();
+  if (settingsAutoSaveBusy) { settingsAutoSavePending = true; return await settingsAutoSavePromise; }
   const owner = request || beginIssueRequest(false);
+  const sessionEpoch = accountUiEpoch;
   settingsAutoSaveBusy = true;
-  try {
+  const savePromise = (async () => {
     do {
-      if (!ownsIssueRequest(owner)) return false;
+      if (!ownsIssueRequest(owner) || sessionEpoch !== accountUiEpoch) return false;
       settingsAutoSavePending = false;
       if (S.helperRestartPending) {
         try {
           await call("restart_helper");
-          if (!ownsIssueRequest(owner)) return false;
+          if (!ownsIssueRequest(owner) || sessionEpoch !== accountUiEpoch) return false;
           S.helperRestartPending = false;
         } catch (error) {
+        if (sessionEpoch !== accountUiEpoch || error instanceof StaleAccountResponse) return false;
           handleCaughtError(error, owner);
           return false;
         }
@@ -4285,6 +5665,7 @@ async function autoSaveSettings(afterHotkey, request) {
       editDirtyFields.clear();
       syncMessengerDraft();
       const folderProblem = await validateAttachmentFolder();
+      if (sessionEpoch !== accountUiEpoch) return false;
       if (folderProblem) {
         dirtyFields.forEach((name) => editDirtyFields.add(name));
         setBanner("warn", folderProblem);
@@ -4303,6 +5684,7 @@ async function autoSaveSettings(afterHotkey, request) {
         showSaveState("저장 중…");
         result = await callWithLocalRecovery(() => call("save_messenger", updates));
       } catch (error) {
+        if (sessionEpoch !== accountUiEpoch || error instanceof StaleAccountResponse) return false;
         if (isHelperStartFailure(error)) {
           // 파일과 자동 시작 선택은 이미 확인했다. 다음 화면 동작에서는 도우미만 다시 시작한다.
           S.helperRestartPending = true;
@@ -4313,7 +5695,7 @@ async function autoSaveSettings(afterHotkey, request) {
         handleCaughtError(error, owner);
         return false;
       }
-      if (!ownsIssueRequest(owner)) return false;
+      if (!ownsIssueRequest(owner) || sessionEpoch !== accountUiEpoch) return false;
       if (!result.saved) {
         dirtyFields.forEach((name) => editDirtyFields.add(name));
         S.hk.status = { kind: "bad", text: result.reason };
@@ -4323,14 +5705,19 @@ async function autoSaveSettings(afterHotkey, request) {
       }
       S.hk.current = result.hotkey;
       if (afterHotkey) S.hk.status = { kind: "ok", text: `${prettyHotkey(result.hotkey)} · 저장했어요` };
-      S.checks = [];
-      completeIssueRequest(owner);
+      invalidateCardChecks("settings");
       showToast("저장했어요 — 도우미가 새 설정으로 실행 중이에요");
       render();
       showSaveState("저장됨", 2500);
     } while (settingsAutoSavePending || editDirtyFields.size);
+    completeIssueRequest(owner);
     return true;
+  })();
+  settingsAutoSavePromise = savePromise;
+  try {
+    return await savePromise;
   } finally {
+    if (settingsAutoSavePromise === savePromise) settingsAutoSavePromise = null;
     settingsAutoSaveBusy = false;
   }
 }
@@ -4380,8 +5767,26 @@ function dirtyValues(source, allowed, dirtyFields) {
 function autoSaveScreen() {
   return S.mode === "edit" && AUTO_SAVE_SCREENS.includes(S.edit) ? S.edit : null;
 }
+function checkedEditSaveNotice(result) {
+  const fail = message => { throw Object.assign(new Error(message), { editSaveResult: true }); };
+  if (result?.parsed === false) {
+    fail(result.detail || "이 컴퓨터에 입력을 저장했지만 설정을 적용하지 못했어요. 입력 내용을 확인해 주세요.");
+  }
+  const sync = result?.settings_sync;
+  if (sync && !["applied", "not-linked", "waiting"].includes(sync.state)) {
+    fail(sync.detail || "입력은 이 컴퓨터에 보관했지만 출석부 반영 결과를 확인하지 못했어요.");
+  }
+  const push = result?.sheet_push;
+  if (push?.state === "failed") {
+    fail(push.detail || "입력은 이 컴퓨터에 보관했지만 출석부 반영 결과를 확인하지 못했어요.");
+  }
+  if (sync && ["not-linked", "waiting"].includes(sync.state)) {
+    return "이 컴퓨터에 저장됨 · " + (sync.detail || "출석부 준비 후 반영이 필요해요.");
+  }
+  if (push?.state === "skipped" && push.detail) return "이 컴퓨터에 저장됨 · " + push.detail;
+  return "";
+}
 async function autoSaveEdit(options) {
-  const leaving = !!(options && options.leaving);
   const key = autoSaveScreen();
   if (!key) return true;
   if (editAutoSavePromise) {
@@ -4394,8 +5799,13 @@ async function autoSaveEdit(options) {
   editAutoSaveBusy = true;
   showSaveState("저장 중…");
   const request = options?.request || beginIssueRequest(false);
+  const sessionEpoch = accountUiEpoch;
+  const call = (name, ...args) => callForAccount(sessionEpoch, name, ...args);
+  let savedNotice = "";
+  const checkSaved = result => { savedNotice = checkedEditSaveNotice(result) || savedNotice; };
   const savePromise = (async () => {
     do {
+      if (sessionEpoch !== accountUiEpoch) return false;
       editAutoSavePending = false;
       const dirtyFields = new Set(editDirtyFields);
       editDirtyFields.clear();
@@ -4406,28 +5816,26 @@ async function autoSaveEdit(options) {
         const tasks = dirtyValues(S.draft.profile, SCOPED_TASK_FIELDS, dirtyFields);
         const googleSaveContext = googleContextVersion;
         const gemini = dirtyValues(S.draft.bridge, SCOPED_GEMINI_FIELDS, dirtyFields);
-        if (Object.keys(identity).length) await callWithLocalRecovery(() => call("save_identity", identity));
+        if (Object.keys(identity).length) checkSaved(await callWithLocalRecovery(() => call("save_identity", identity)));
         if (dirtyFields.has("__timetable__")) {
           if (!(await ensureGridLoaded(request))) return false;
-          await callWithLocalRecovery(() => call("save_timetable", S.draft.grid));
+          checkSaved(await callWithLocalRecovery(() => call("save_timetable", S.draft.grid)));
         }
         if (Object.keys(calendars).length) {
-          await callWithLocalRecovery(() => call("save_calendars", calendars));
+          checkSaved(await callWithLocalRecovery(() => call("save_calendars", calendars)));
           if (googleSaveContext === googleContextVersion) acknowledgeSavedGoogleTargets(calendars);
         }
         if (Object.keys(tasks).length) {
-          await callWithLocalRecovery(() => call("save_tasks", tasks));
+          checkSaved(await callWithLocalRecovery(() => call("save_tasks", tasks)));
           if (googleSaveContext === googleContextVersion) acknowledgeSavedGoogleTargets(tasks);
         }
         if (Object.keys(gemini).length) {
           const saved = await callWithLocalRecovery(() => call("save_gemini", gemini));
-          // Gemini key는 이 컴퓨터뿐 아니라 출결 시트 설정 탭에도 들어가야 시트에서 다시 묻지
-          // 않는다. 타자를 칠 때마다 경고를 띄우면 쓰던 것이 끊기므로 나갈 때만 알린다.
-          const push = saved.sheet_push;
-          if (leaving && push && push.state === "failed") setBanner("warn", "저장했어요. 다만 " + push.detail);
+          checkSaved(saved);
         }
-        // 홈 점검과 프로필 사본은 다음에 홈으로 갈 때 새로 읽는다.
-        S.checks = [];
+        // Keep unrelated cards' confirmed results while rechecking saved changes.
+        invalidateCardChecks(key);
+        if (dirtyFields.has("담임여부")) invalidateCardChecks("connect");
         S.profileCache = null;
         if (googleSaveContext === googleContextVersion && (Object.keys(calendars).length || Object.keys(tasks).length)) {
           refreshGoogleTargetStatuses(() => ownsIssueRequest(request)).then(() => {
@@ -4435,16 +5843,20 @@ async function autoSaveEdit(options) {
           });
         }
       } catch (error) {
+        if (sessionEpoch !== accountUiEpoch || error instanceof StaleAccountResponse) return false;
         // 실패한 묶음은 다음 저장에서 다시 시도한다. 저장 도중 들어온 새 변경은 이미
         // editDirtyFields에 있으므로 합치기만 하고 지우지 않는다.
         dirtyFields.forEach((name) => editDirtyFields.add(name));
-        handleCaughtError(error, request);
+        if (error.editSaveResult) setBanner("warn", error.message, `edit-save:${key}`);
+        else handleCaughtError(error, request);
+        showSaveState("저장·반영 확인 필요");
         return false;
       }
       if (!ownsIssueRequest(request)) return false;
     } while (editAutoSavePending || editDirtyFields.size);
     completeIssueRequest(request);
-    showSaveState("저장됨", 2500);
+    if (S.banner?.topic === `edit-save:${key}`) setBanner("warn", "");
+    showSaveState(savedNotice || "저장됨", savedNotice ? undefined : 2500);
     return true;
   })();
   editAutoSavePromise = savePromise;
@@ -4473,6 +5885,7 @@ async function flushEditSave() {
     // 설정도 같은 규칙 — 열어 보기만 하고 나오면 저장(도우미 재시작)도, 홈 점검
     // 다시 돌기도 없어야 한다(사용자 확인 2026-07-31). 값을 바꾸면 그 자리에서
     // 이미 저장되므로, 여기서는 저장이 미처 못 따라온 경우만 마저 저장한다.
+    if (settingsAutoSavePromise && !(await settingsAutoSavePromise)) return false;
     if (S.helperRestartPending || editDirtyFields.size) return await autoSaveSettings();
     return true;
   }
@@ -4494,17 +5907,12 @@ async function flushEditSave() {
 for (const eventName of ["input", "change"]) {
   document.addEventListener(eventName, (event) => {
     const box = event.target;
+    if (box?.dataset?.rosterCell) return;
     // 학급 단톡방 이름은 치는 즉시 상태로 보관한다 — 폴링 render가 지우지 않게 (검토 C3)
     if (box && box.name === "class-space-name") S.spaceDraftName = box.value;
     if (box && /^ai-/.test(String(box.name || ""))) {
       S.aiSelected = Array.from(document.querySelectorAll('.ai-row input:checked'))
         .map((input) => input.name.replace(/^ai-/, ""));
-    }
-    if (S.mode === "wizard" && S.step >= 3 && S.step <= 5 && S.attendance
-        && (S.attendance.state === "ready" || S.attendance.state === "installing")) {
-      // 화면을 보기만 한 것은 변경이 아니다. 이 세 단계에서 실제 input/change가 난 뒤에만
-      // 이미 만드는/만든 출결 시트에는 자동 반영되지 않는다는 안내를 켠다.
-      S.attendanceStaleNotice = true;
     }
     if (S.mode !== "edit") return;
     const changedField = editedFieldName(box);
@@ -4517,7 +5925,7 @@ for (const eventName of ["input", "change"]) {
           && (changedField === "autostart" || changedField === "brity_download_dir"
               || changedField === "error_reports_enabled")) {
         // 저장 예외(레지스트리 거부 등)가 무통지로 사라지면 화면과 실제 값이 어긋난다.
-        const request = beginIssueRequest(false);
+        const request = beginIssueRequest(settingsAutoSaveBusy);
         autoSaveSettings(false, request).catch((error) => handleCaughtError(error, request));
       }
       return;
@@ -4565,7 +5973,7 @@ function renderEdit(key) {
   let body = "";
   if (key === "connect") body = stepConnect();
   else if (key === "identity") body = stepIdentity() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepDay().replace(/^[\s\S]*?<\/p>/, "");
-  else if (key === "timetable") body = stepTimetable();
+  else if (key === "timetable") body = timetableEditBody();
   else if (key === "settings") body = settingsEditBody();
   // 화면 제목은 창 제목 줄이 맡는다 — 본문 맨 앞의 <h1>은 뗀다. 마법사는 이 길을
   // 지나지 않으므로 원래 <h1>을 그대로 쓴다.
@@ -4626,7 +6034,6 @@ async function loadForEdit(key, request) {
     }
     S.attendanceScriptUpdate = null;
     clearAttendanceScriptDialogState();
-    S.chatStatus = null;
     S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
       : "messenger";
@@ -4844,19 +6251,15 @@ registerResumeHandler("google-login", async () => {
 });
 registerResumeHandler("chat-space-list", async ({ ownsRequest }) => {
   const context = chatReadContext();
-  chatStatusReadVersion += 1;
-  chatSpacesReadVersion += 1;
-  const status = await call("attendance_chat_status");
+  // Reuse the same loading/error ownership as manual and external-return reads.
+  S.chatSpaces = undefined;
+  await loadChatStatus(true);
   if (!ownsRequest() || context !== chatReadContext()) return;
-  const spaces = await call("attendance_chat_spaces");
+  if (!S.chatStatus?.connected || S.chatStatus.read_failed) return;
+  await loadChatSpaces(true);
   if (!ownsRequest() || context !== chatReadContext()) return;
-  if (!Array.isArray(spaces)) throw new Error("방 목록 응답을 확인하지 못했어요.");
-  S.chatStatus = status;
-  S.chatStatusContext = context;
-  S.chatSpaces = spaces;
-  S.chatSpacesContext = context;
-  S.chatSpaceName = String(status?.class_space_name || "");
-  S.chatSpacesError = false;
+  if (S.chatSpacesError) return;
+  S.chatSpaceName = String(S.chatStatus.class_space_name || "");
   S.spaceCreate = null;
   clearProblemIssue();
   render();
@@ -4874,14 +6277,20 @@ async function dispatchIssueResume(issue, actionKey) {
 }
 let lastScreenKey = "";
 function render() {
+  if (attendanceActionFlow && attendanceActionFlow.owner !== screenKey()) attendanceActionFlow.active = false;
+  clearResolvedAttendanceGateBanner();
+  if (attendanceBoundaryCheck && (!attendanceViewVisible() || attendanceBoundaryCheck.context !== chatReadContext())) stopAttendanceBoundaryCheck();
+  if (attendancePermissionReturn && !ownsAttendancePermissionReturn(attendancePermissionReturn)) stopAttendancePermissionReturn();
   if (rosterContext && rosterContext !== chatReadContext()) {
     rosterReadVersion += 1;
+    rosterInFlight = "";
     rosterContext = "";
     rosterStatus = null;
   }
   if (S.problemIssue && problemIssueOwner !== screenKey()) clearProblemIssue();
   const onLoginScreen = (S.mode === "wizard" && S.step === 2) || (S.mode === "edit" && S.edit === "settings");
-  if (S.login && !onLoginScreen) {
+  if (S.login && !S.login.logging_out && !onLoginScreen) {
+    googleLoginEpoch += 1;
     stopLoginPoll();
     S.login = null;
     googleLoginResumeGeneration += 1;
@@ -4979,14 +6388,10 @@ async function askUpdateOnStart() {
 
 async function boot() {
   try {
+    // Verify identity before showing saved teacher data on app startup.
+    adoptGoogleStatus(await call("google_status"));
     const info = await call("get_app_info");
-    S.info = info;
-    S.mode = info.mode;
-    S.step = Math.min(info.step || 1, WIZARD_STEPS.length);
-    S.maxStep = Math.min(Math.max(info.max_step || S.step, S.step), WIZARD_STEPS.length);
-    if (info.draft && typeof info.draft === "object") {
-      S.draft = Object.assign({ profile: {}, grid: null, bridge: {} }, info.draft);
-    }
+    adoptAppInfo(info);
     render();
     watchNetworkStatus();
     askUpdateOnStart();
@@ -4994,6 +6399,14 @@ async function boot() {
   } catch (error) {
     root().innerHTML = `<div class="boot">${esc(error.message)}</div>`;
   }
+}
+function adoptAppInfo(info) {
+  S.info = info;
+  S.mode = info.mode;
+  S.edit = null;
+  S.step = Math.min(info.step || 1, WIZARD_STEPS.length);
+  S.maxStep = Math.min(Math.max(info.max_step || S.step, S.step), WIZARD_STEPS.length);
+  S.draft = Object.assign({ profile: {}, grid: null, bridge: {} }, info.draft || {});
 }
 if (window.pywebview && window.pywebview.api) boot();
 else window.addEventListener("pywebviewready", boot);

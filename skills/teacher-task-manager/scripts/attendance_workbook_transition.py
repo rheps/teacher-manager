@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,108 @@ from typing import Any, Callable, Mapping
 import attendance_workbook_identity
 import install_attendance_automation
 from brity_bridge.google_account import is_goedu_email
+
+
+def attendance_action_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def validate_attendance_action(value: object) -> dict:
+    """Protected receipts describe an intent; they never grant cloud authority."""
+    from attendance_binding import AttendanceBindingError
+    def fail():
+        raise AttendanceBindingError('ATTENDANCE_PROGRESS_INVALID')
+    if not isinstance(value, dict): fail()
+    item = json.loads(json.dumps(value))
+    if (item.get('schemaVersion') != 1 or item.get('reason') not in ('first-setup', 'new-school-year', 'replace-trashed', 'replace-unavailable')
+            or not isinstance(item.get('subjectKey'), str) or not item['subjectKey']
+            or type(item.get('expectedSchoolYear')) is not int or not 2000 <= item['expectedSchoolYear'] <= 2099
+            or type(item.get('expectedGeneration')) is not int or item['expectedGeneration'] < 0
+            or item.get('phase') not in ('requested', 'admitted', 'running', 'reconciling', 'blocked', 'published')): fail()
+    valid_id = lambda value: isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9_-]{1,200}', value))
+    if item.get('operationId') is not None and not valid_id(item['operationId']): fail()
+    if item['reason'] in ('replace-trashed', 'replace-unavailable'):
+        if not valid_id(item.get('previousSpreadsheetId')): fail()
+        if item.get('previousOperationId') is not None and not valid_id(item['previousOperationId']): fail()
+        if item['reason'] == 'replace-unavailable':
+            if (not valid_id(item.get('previousOperationId')) or item.get('explicitConfirmation') is not True
+                    or not isinstance(item.get('failureCode'), str) or not item['failureCode']
+                    or not isinstance(item.get('failureStage'), str) or not item['failureStage']): fail()
+    elif item.get('previousOperationId') is not None: fail()
+    elif item.get('previousSpreadsheetId') is not None: fail()
+    if item.get('provenance') == 'saved-request':
+        if (item.get('origin') not in ('initial-auto', 'explicit-create')
+                or item.get('originalRequestOwnership') != 'saved-key'
+                or not isinstance(item.get('idempotencyKey'), str)
+                or not re.fullmatch(r'[A-Za-z0-9_-]{8,100}', item['idempotencyKey'])): fail()
+        if item['origin'] == 'initial-auto' and item['reason'] != 'first-setup': fail()
+    elif item.get('provenance') == 'legacy-existing-operation':
+        if (item.get('idempotencyKey') is not None or item.get('originalRequestOwnership') != 'unproven'
+                or item.get('explicitResume') is not True or not valid_id(item.get('operationId'))
+                or not isinstance(item.get('evidence'), dict)): fail()
+    else: fail()
+    if item['phase'] == 'published':
+        if (not valid_id(item.get('publishedSpreadsheetId')) or not valid_id(item.get('operationId'))
+                or type(item.get('publishedGeneration')) is not int
+                or item['publishedGeneration'] != item['expectedGeneration'] + 1): fail()
+    return item
+
+
+def new_attendance_action(scope, reason: str, *, origin='explicit-create', intent=None) -> dict:
+    intent = intent or {}
+    return validate_attendance_action(dict(schemaVersion=1, provenance='saved-request', origin=origin,
+        reason=reason, subjectKey=scope.payload['subjectKey'], expectedSchoolYear=scope.year,
+        expectedGeneration=scope.payload['generation'], previousSpreadsheetId=intent.get('previousSpreadsheetId'),
+        previousOperationId=intent.get('previousOperationId'),
+        **({key: intent.get(key) for key in ('explicitConfirmation', 'failureCode', 'failureStage')} if reason == 'replace-unavailable' else {}),
+        idempotencyKey=intent.get('idempotencyKey') or str(uuid.uuid4()), originalRequestOwnership='saved-key',
+        operationId=None, phase='requested', publishedSpreadsheetId=None, publishedGeneration=None))
+
+
+def require_action_context(action: dict, scope, *, published=False) -> None:
+    from attendance_binding import AttendanceBindingError
+    if (action['subjectKey'] != scope.payload['subjectKey'] or action['expectedSchoolYear'] != scope.year
+            or scope.payload['generation'] != action['expectedGeneration'] + (1 if published else 0)):
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    if published and (scope.payload.get('operationId') != action.get('operationId')
+            or scope.payload.get('spreadsheetId') != action.get('publishedSpreadsheetId')):
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+
+
+def correlate_attendance_operation(action: dict, operation: dict) -> dict:
+    from attendance_binding import AttendanceBindingError
+    if (not isinstance(operation, dict) or not operation.get('operationId')
+            or action['subjectKey'] != operation.get('subjectKey')
+            or action['expectedSchoolYear'] != operation.get('schoolYear')
+            or action['expectedGeneration'] != operation.get('generation')
+            or action['reason'] != operation.get('reason')
+            or action.get('operationId') not in (None, operation['operationId'])
+            or action.get('previousSpreadsheetId') != operation.get('previousSpreadsheetId')
+            or action.get('previousOperationId') != operation.get('previousOperationId')
+            or operation.get('state') == 'SUPERSEDED'):
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    if action['reason'] == 'replace-unavailable' and any(
+            action.get(key) != operation.get(key) for key in ('explicitConfirmation', 'failureCode', 'failureStage')):
+        raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+    if action['provenance'] == 'saved-request' and hashlib.sha256(action['idempotencyKey'].encode()).hexdigest() != operation.get('idempotencyHash'):
+        raise AttendanceBindingError('ATTENDANCE_OPERATION_IN_PROGRESS')
+    return {**action, 'operationId': operation['operationId']}
+
+
+def archive_attendance_setup(config_dir: Path) -> str:
+    """Keep exact pre-migration bytes; never replace an existing history item."""
+    source = Path(config_dir) / 'attendance-setup-status.generated.json'
+    raw = source.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    history = Path(config_dir) / 'attendance-preparation-history'
+    history.mkdir(exist_ok=True)
+    target = history / (digest + '.json')
+    try:
+        with target.open('xb') as stream: stream.write(raw)
+    except FileExistsError:
+        if target.read_bytes() != raw:
+            raise ValueError('출석부 준비 기록의 보관 결과를 확인하지 못했어요.')
+    return digest
 
 
 @dataclass
@@ -34,6 +137,7 @@ class TransitionDeps:
     chat_status: Callable | None = None
     chat_prepare_candidate: Callable | None = None
     chat_move: Callable | None = None
+    binding_client: object = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +159,7 @@ NEW_SCHOOL_YEAR_FAILURE = (
 
 _INSTALL_PROGRESS_KEYS = frozenset(
     {
+        "workbook_layout_ready",
         "template_doc_id",
         "template_doc_url",
         "spreadsheet_id",
@@ -181,6 +286,24 @@ def _archive_record(record_path: Path) -> Path:
     if target.read_bytes() != record_path.read_bytes():
         raise OSError("기존 출결 연결 기록 보관본을 다시 읽은 값이 다릅니다.")
     return target
+
+
+def preserve_replacement_record(config_dir: Path) -> None:
+    """Preserve connection and protection evidence before server retirement.
+
+    Google roster and queues remain with the old full file ID. This operation
+    never reads or copies their contents into the replacement's inputs.
+    """
+    for name in ("attendance-install.generated.json", "attendance-setup-status.generated.json"):
+        source = Path(config_dir) / name
+        if not source.exists():
+            continue
+        raw = source.read_bytes()
+        target = Path(config_dir) / "attendance-replacement-history" / (source.stem + "-" + hashlib.sha256(raw).hexdigest() + ".json")
+        if not target.exists():
+            _atomic_bytes(target, raw)
+        if target.read_bytes() != raw:
+            raise OSError("기존 출석부 연결 기록의 보관본을 확인하지 못했습니다.")
 
 
 def _valid_install_progress(value: object, previous_id: str) -> bool:
@@ -610,167 +733,18 @@ def _switch_record_last(
         raise
 
 
-def start_new_school_year_workbook(
-    config_dir: Path,
-    *,
-    deps: TransitionDeps,
-) -> TransitionResult:
-    """명시적인 새 학년도 요청에서만 새 출석부를 만들고 마지막에 연결한다."""
-
-    config_dir = Path(config_dir)
-    profile_path = config_dir / "profile.generated.json"
-    record_path = config_dir / "attendance-install.generated.json"
-    state_path = config_dir / "attendance-workbook-transition.generated.json"
-    try:
-        profile = _read_dict(profile_path)
-        record = _read_dict(record_path)
-        current_id = str(record.get("spreadsheet_id", "") or "").strip()
-        if not current_id:
-            raise TransitionUserError("현재 출석부 연결을 확인하지 못했어요.")
-        school_year = str((profile.get("school") or {}).get("year", "") or "").strip()
-        record_year = str(record.get("school_year", "") or "").strip()
-        if not school_year or not record_year:
-            raise TransitionUserError("현재 학년도와 새 학년도를 모두 확인하지 못했어요.")
-        if school_year == record_year:
-            raise TransitionUserError("학년도가 같아서 새 출석부를 만들지 않았어요.")
-        if str(record.get("workbook_role", "") or "") != (
-            attendance_workbook_identity.ATTENDANCE_ROLE_VALUE
-        ):
-            raise TransitionUserError("현재 사용할 출석부 연결을 먼저 다시 골라 주세요.")
-
-        reusable = {
-            key: str(record.get(key, "") or "").strip()
-            for key in (
-                "template_doc_id",
-                "template_doc_url",
-                "folder_id",
-                "task_list_id",
-            )
-        }
-        missing = [
-            key
-            for key in ("template_doc_id", "folder_id", "task_list_id")
-            if not reusable[key]
-        ]
-        if missing:
-            labels = {
-                "template_doc_id": "결석 신고서 양식",
-                "folder_id": "출결 파일 보관 폴더",
-                "task_list_id": "할 일 목록",
-            }
-            raise TransitionUserError(
-                "기존 자료에서 다시 사용할 연결을 찾지 못해 새 학년도 출석부를 "
-                "만들지 않았어요. 확인할 항목: "
-                + ", ".join(labels[key] for key in missing)
-            )
-
-        saved_state: dict = {}
-        if state_path.exists():
-            try:
-                loaded = _read_dict(state_path)
-            except (OSError, ValueError, json.JSONDecodeError) as error:
-                raise TransitionUserError(
-                    "새 학년도 진행 기록을 안전하게 확인하지 못했어요."
-                ) from error
-            if loaded.get("reason") == (
-                install_attendance_automation.ATTENDANCE_CREATION_NEW_SCHOOL_YEAR
-            ):
-                if not _valid_new_school_year_state(loaded):
-                    raise TransitionUserError(
-                        "새 학년도 진행 기록을 안전하게 확인하지 못했어요."
-                    )
-                if (
-                    loaded.get("previous_spreadsheet_id") == current_id
-                    and loaded.get("school_year") == school_year
-                ):
-                    saved_state = loaded
-            # 옛 통합 진행표는 실행하지 않는다. 사용자가 누른 새 학년도 진행표로
-            # 안전하게 덮고, Google의 기존 파일은 전혀 건드리지 않는다.
-
-        progress = {
-            str(key): str(value)
-            for key, value in dict(saved_state.get("progress") or {}).items()
-            if value
-        }
-        for key, value in reusable.items():
-            if value:
-                progress.setdefault(key, value)
-        transition_state = {
-            "state": "building",
-            "reason": install_attendance_automation.ATTENDANCE_CREATION_NEW_SCHOOL_YEAR,
-            "previous_spreadsheet_id": current_id,
-            "school_year": school_year,
-            "progress": dict(progress),
-        }
-        if isinstance(saved_state.get("chat_handover"), dict):
-            transition_state["chat_handover"] = dict(saved_state["chat_handover"])
-        _atomic_json(state_path, transition_state)
-
-        def remember(created: dict) -> None:
-            progress.clear()
-            progress.update(
-                {str(key): str(value) for key, value in created.items() if value}
-            )
-            transition_state["progress"] = dict(progress)
-            _atomic_json(state_path, transition_state)
-
-        result = deps.installer(
-            profile_path,
-            runner=deps.runner,
-            resume=progress,
-            progress=remember,
-            attendance_task_list_id=reusable["task_list_id"],
-            attendance_task_list_title="조종례시 담임학급 안내사항",
-            central_chat_sender_url="",
-            gemini_api_key=install_attendance_automation.local_gemini_api_key(
-                config_dir
-            ),
-            gws_executable=deps.gws_executable,
-            creation_reason=(
-                install_attendance_automation.ATTENDANCE_CREATION_NEW_SCHOOL_YEAR
-            ),
-            write_record_on_success=False,
-        )
-        if isinstance(result, install_attendance_automation.AttendanceInstallResult):
-            result = replace(result, setup_account=deps.account.strip().lower())
-        if not _candidate_ok(result, profile, current_id):
-            raise TransitionUserError(
-                "새 학년도 출석부와 자동 기능, 파일 이름을 모두 확인하지 못했어요."
-            )
-        candidate_id = str(result.spreadsheet_id)
-        transition_state.update(
-            {
-                "state": "candidate-verified",
-                "spreadsheet_id": candidate_id,
-                "spreadsheet_url": str(result.spreadsheet_url),
-            }
-        )
-        _atomic_json(state_path, transition_state)
-        _handover_chat_for_candidate(
-            deps=deps,
-            source_id=current_id,
-            candidate_id=candidate_id,
-            transition_state=transition_state,
-            state_path=state_path,
-        )
-        _switch_record_last(
-            record_path,
-            profile_path,
-            result,
-            write_record=deps.write_record,
-        )
-        transition_state["state"] = "complete"
-        if isinstance(transition_state.get("chat_handover"), dict):
-            transition_state["chat_handover"]["state"] = "complete"
-        _atomic_json(state_path, transition_state)
-        return TransitionResult(
-            state="complete",
-            spreadsheet_url=str(result.spreadsheet_url),
-        )
-    except TransitionUserError:
-        return TransitionResult(state="failed", detail=NEW_SCHOOL_YEAR_FAILURE)
-    except Exception:  # noqa: BLE001 - 외부 원문은 화면에 보내지 않는다
-        return TransitionResult(state="failed", detail=NEW_SCHOOL_YEAR_FAILURE)
+def start_new_school_year_workbook(config_dir: Path, *, deps: TransitionDeps) -> TransitionResult:
+    """Compatibility entry point routed through the same registry admission."""
+    if deps.binding_client is None:
+        return TransitionResult(state="verification-unavailable", detail="현재 계정과 학년도의 출석부 연결을 먼저 확인해야 해요. 기존 자료는 그대로입니다.")
+    from dashboard import engine
+    result = engine.start_new_attendance(Path(config_dir), deps=engine.AttendanceDeps(
+        attendance_installer=deps.installer, write_record=deps.write_record,
+        attendance_runner=deps.runner, gws_resolver=lambda: deps.gws_executable,
+        binding_client=deps.binding_client,
+    ))
+    return TransitionResult(state="complete" if result.created else result.state,
+                            spreadsheet_url=result.spreadsheet_url, detail=result.detail)
 
 
 __all__ = [

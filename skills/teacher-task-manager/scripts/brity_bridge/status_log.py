@@ -35,12 +35,12 @@ ATTACHMENT_LINK_START_ERROR_DETAIL = (
     "파일 링크만 사용할 수 없고 Brity 등록은 계속됩니다."
 )
 ATTACHMENT_LINK_PORT_IN_USE_MESSAGE = (
-    "다른 프로그램이 첨부파일을 여는 자리를 사용하고 있습니다. "
-    "다른 프로그램을 닫고 Teacher Manager를 다시 시작해 주세요."
+    "첨부파일을 바로 여는 기능을 켜지 못했어요. "
+    "파일은 Brity 다운로드 폴더에서 직접 열 수 있습니다."
 )
 ATTACHMENT_LINK_START_ERROR_MESSAGE = (
-    "이 컴퓨터에서 첨부파일 열기 준비에 실패했습니다. "
-    "Teacher Manager를 다시 시작해 주세요."
+    "첨부파일을 바로 여는 기능을 켜지 못했어요. "
+    "파일은 Brity 다운로드 폴더에서 직접 열 수 있습니다."
 )
 
 

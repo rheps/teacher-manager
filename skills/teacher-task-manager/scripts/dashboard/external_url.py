@@ -7,16 +7,16 @@ import subprocess
 import sys
 import webbrowser
 from ctypes import wintypes
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from brity_bridge import recovery
+from brity_bridge import google_account, recovery
 
 
 NO_EXTERNAL_BROWSER = "NO_EXTERNAL_BROWSER"
 _SUPPORT_EMAIL = "contact@big-silver.xyz"
 _NO_BROWSER_MESSAGE = (
-    "이 컴퓨터에서 웹 브라우저를 열지 못했어요. "
-    "기본 브라우저 또는 Microsoft Edge를 준비한 뒤 다시 눌러 주세요."
+    "웹 브라우저를 자동으로 열지 못했어요. "
+    "로그인 화면이라면 [로그인 주소 복사]를 눌러 Chrome 또는 Edge 주소창에 붙여 넣어 주세요."
 )
 
 
@@ -50,6 +50,22 @@ def _validated_https_url(value) -> str:
     ):
         raise ValueError("https 주소만 열 수 있어요")
     return value
+
+
+def with_google_account(url: str, account: str) -> str:
+    """Route through account selection, including accounts absent from the browser."""
+    parsed = urlsplit(_validated_https_url(url))
+    if parsed.hostname not in {"docs.google.com", "drive.google.com", "chat.google.com", "script.google.com"}:
+        raise ValueError("Google 자료의 주소를 확인해 주세요.")
+    checked = google_account.require_goedu_email(account)
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+             if key.casefold() != "authuser"]
+    destination = urlunsplit(parsed._replace(query=urlencode(query)))
+    # Email is case-sensitive in Google's account chooser. A bare authuser on a
+    # Sheet silently falls back to the browser's default if that account is absent.
+    return "https://accounts.google.com/accountchooser?" + urlencode({
+        "continue": destination, "Email": checked,
+    })
 
 
 def _windows_protocol_handler_available(scheme: str) -> bool | None:

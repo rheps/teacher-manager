@@ -338,20 +338,17 @@ def validate_verified_canonical_record(record: dict) -> dict:
     linked_id = _spreadsheet_id_from_url(record.get("spreadsheet_url"))
     if linked_id != spreadsheet_id:
         raise _error("정식 출석부 연결번호와 열기 주소가 서로 달라요.")
-    for key in ("school_year", "workbook_name"):
+    for key in ("school_year",):
         if not isinstance(record.get(key), str) or not str(record[key]).strip():
             raise _error(f"정식 출석부의 {key} 확인값이 비어 있어요.")
     school_year = str(record["school_year"]).strip()
-    grade = str(record.get("homeroom_grade", "") or "").strip()
-    klass = str(record.get("homeroom_class", "") or "").strip()
-    stem = (
-        f"{school_year}학년도 {grade}학년 {klass}반 출석부"
-        if grade and klass
-        else f"{school_year}학년도 출석부"
-    )
-    expected_name = stem + _CANONICAL_WORKBOOK_SUFFIX
-    if str(record["workbook_name"]).strip() != expected_name:
-        raise _error("현재 연결 기록의 출석부 이름이 정식 이름과 달라요.")
+    if re.fullmatch(r"[0-9]{4}", school_year) is None:
+        raise _error("정식 출석부의 학년도를 확인하지 못했어요.")
+    # Drive titles are mutable display metadata, never an identity requirement.
+    if "workbook_name" in record and not isinstance(record["workbook_name"], str):
+        raise _error("출석부 이름은 글자여야 해요.")
+    if "binding_generation" in record and (type(record["binding_generation"]) is not int or record["binding_generation"] < 0):
+        raise _error("출석부 연결 세대를 확인하지 못했어요.")
     return record
 
 
@@ -460,6 +457,49 @@ def write_attendance_install_record(path: Path, record: dict) -> dict:
         else:
             merged = incoming
         return _atomic_write(path, validate_attendance_install_record(merged))
+
+
+def restore_verified_registry_record(path: Path, record: dict) -> dict:
+    """Refresh an independently verified binding without losing prior evidence.
+
+    A changed binding or unreadable record is archived byte-for-byte under the
+    same file lock before replacement. Same-workbook extra protection records
+    survive refreshed names, generation and role manifests.
+    """
+    path = Path(path)
+    incoming = validate_verified_canonical_record(record)
+    with attendance_install_record_lock(path):
+        raw = path.read_bytes() if path.exists() else None
+        existing = None
+        if raw is not None:
+            try:
+                existing = load_attendance_install_record(path)
+            except AttendanceInstallRecordError:
+                pass
+        same = bool(existing and existing.get("spreadsheet_id") == incoming["spreadsheet_id"]
+                    and str(existing.get("school_year")) == incoming["school_year"]
+                    and existing.get("subject_key", incoming.get("subject_key")) == incoming.get("subject_key"))
+        if same:
+            merged = copy.deepcopy(existing)
+            merged.update(copy.deepcopy(incoming))
+        else:
+            merged = incoming
+            if raw is not None:
+                archive = path.parent / "attendance-record-history" / (hashlib.sha256(raw).hexdigest() + ".json")
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with archive.open("xb") as handle:
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except FileExistsError:
+                    if archive.read_bytes() != raw:
+                        raise _error("기존 설치 기록의 보관본이 원본과 달라서 연결을 바꾸지 못했어요.")
+        if existing == merged:
+            return merged
+        return _atomic_write(path, validate_verified_canonical_record(merged))
+
+
 
 
 def replace_attendance_install_record(
