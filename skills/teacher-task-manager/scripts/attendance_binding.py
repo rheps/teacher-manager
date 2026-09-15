@@ -6,6 +6,7 @@ mutations are sent once, retaining their operation identity after uncertainty.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 import hashlib
 import threading
@@ -162,6 +163,7 @@ class AttendanceBindingClient:
         self._refresh_lock = threading.Lock()
         self._restored = False
         self._resume_supported = False
+        self._reference_cache = {}
 
     @property
     def email(self):
@@ -329,7 +331,9 @@ class AttendanceBindingClient:
                 if not error.failure_domain:
                     error.failure_domain = 'central-attendance'
                 if (
-                    method == "GET" and path == "/v1/attendance/capabilities"
+                    ((method == "GET" and path == "/v1/attendance/capabilities")
+                     or path in ("/v1/attendance/current/record", "/v1/attendance/references")
+                     or path.startswith("/v1/attendance/references/"))
                     and error.status == 404 and error.code == "ATTENDANCE_AUTHORITY_UNAVAILABLE"
                 ):
                     # This unauthenticated handshake route is required by the
@@ -412,6 +416,85 @@ class AttendanceBindingClient:
 
     def current(self) -> AttendanceScope:
         return AttendanceScope.parse(self._request("GET", "/v1/attendance/current", safe_read=True), expected_subject=self._subject)
+
+    def workbook_choices(self):
+        value = self._request('GET', '/v1/attendance/current/choices', safe_read=True)
+        context = value.get('context') if isinstance(value, dict) else None
+        rows = value.get('candidates') if isinstance(value, dict) else None
+        if (not isinstance(context, dict) or value.get('state') != 'choices' or context.get('subjectKey') != self._subject
+                or str(value.get('email') or '').casefold() != self.email.casefold()
+                or not isinstance(rows, list)
+                or type(context.get('expectedGeneration')) is not int
+                or type(context.get('expectedSchoolYear')) is not int
+                or context['expectedGeneration'] < 0 or not 2000 <= context['expectedSchoolYear'] <= 2099
+                or any(context.get(key) is not None and not isinstance(context[key], str)
+                       for key in ('previousSpreadsheetId', 'previousOperationId'))):
+            raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
+        seen = set()
+        for row in rows:
+            sid = row.get('spreadsheet_id') if isinstance(row, dict) else None
+            if (not isinstance(sid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{3,200}', sid)
+                    or sid in seen or not isinstance(row.get('name'), str)
+                    or row.get('spreadsheet_url') != f'https://docs.google.com/spreadsheets/d/{sid}/edit'
+                    or type(row.get('can_edit')) is not bool or not isinstance(row.get('modified_time'), str)):
+                raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
+            seen.add(sid)
+        return value
+
+    def select_workbook(self, spreadsheet_id, context, idempotency_key):
+        if not isinstance(context, dict) or context.get('subjectKey') != self._subject:
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        payload = {key: context.get(key) for key in ('subjectKey', 'expectedSchoolYear',
+            'expectedGeneration', 'previousSpreadsheetId', 'previousOperationId')}
+        payload.update(spreadsheetId=spreadsheet_id, idempotencyKey=idempotency_key, explicitConfirmation=True)
+        scope = AttendanceScope.parse(self._request('POST', '/v1/attendance/current/select', payload), expected_subject=self._subject)
+        if (scope.payload['spreadsheetId'] != spreadsheet_id or scope.payload['bindingState'] != 'ACTIVE'
+                or scope.payload['verificationState'] != 'VERIFIED'
+                or scope.payload['workbookSchoolYear'] != context.get('expectedSchoolYear')
+                or scope.payload['generation'] != context.get('expectedGeneration', -1) + (0 if context.get('previousSpreadsheetId') == spreadsheet_id else 1)
+                or str(scope.payload.get('email') or '').casefold() != self.email.casefold()):
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        return scope
+
+    def save_workbook_record(self, record, expected=None):
+        from attendance_install_record import CONNECTION_FIELDS, validate_verified_canonical_record
+        from attendance_server_record import record_from_scope
+        checked = validate_verified_canonical_record(record)
+        if checked.get('subject_key') != self._subject or str(checked.get('setup_account') or '').casefold() != self.email.casefold():
+            raise AttendanceBindingError('ATTENDANCE_ACCOUNT_CHANGED')
+        body = dict(spreadsheetId=checked['spreadsheet_id'], generation=checked['binding_generation'],
+            workbookSchoolYear=int(checked['school_year']), protocolVersion=PROTOCOL_VERSION,
+            resourceManifest={key: checked[key] for key in CONNECTION_FIELDS},
+            monthlySheetIds=checked.get('monthly_sheet_ids'),
+            verification={key: checked[key] for key in ('script_attestation', 'script_update_required') if key in checked})
+        if expected is not None:
+            body['expectedVerification'] = {key: expected[key] for key in ('script_attestation', 'script_update_required') if key in expected}
+            body['expectedManifest'] = {key: expected[key] for key in CONNECTION_FIELDS}
+        value = self._request('POST', '/v1/attendance/current/record', body)
+        scope = AttendanceScope.parse(value, expected_subject=self._subject)
+        if scope.payload.get('spreadsheetId') != checked['spreadsheet_id'] or scope.payload.get('generation') != checked['binding_generation']:
+            raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')
+        return record_from_scope(scope, self.email)
+
+    def store_reference(self, field, value, key):
+        cache_key = (self._subject, key)
+        if self._reference_cache.get(cache_key) == value:
+            return
+        result = self._request('POST', '/v1/attendance/references', {'field': field, 'value': value, 'key': key})
+        if result.get('key') != key:
+            raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
+        self._reference_cache[cache_key] = value
+
+    def read_reference(self, key):
+        if not isinstance(key, str) or not re.fullmatch('[a-f0-9]{64}', key):
+            raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
+        if (self._subject, key) in self._reference_cache:
+            return self._reference_cache[(self._subject, key)]
+        result = self._request('GET', '/v1/attendance/references/' + key, safe_read=True)
+        if result.get('key') != key or not isinstance(result.get('value'), str):
+            raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
+        self._reference_cache[(self._subject, key)] = result['value']
+        return result['value']
 
     def adopt(self, spreadsheet_id: str) -> AttendanceScope:
         value = self._request("POST", "/v1/attendance/current/adopt", {"spreadsheetId": spreadsheet_id})

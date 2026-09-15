@@ -1,6 +1,8 @@
 """Account-owned roster drafts and explicit, same-workbook synchronization."""
 from __future__ import annotations
 
+import attendance_reference_storage as attendance_references
+
 import hashlib
 import json
 import re
@@ -15,8 +17,10 @@ MAX_STUDENTS = 199
 
 
 class RosterRequestError(RuntimeError):
-    def __init__(self, code):
+    def __init__(self, code, *, status=0, operation=''):
         self.code = code
+        self.status = status if type(status) is int and 100 <= status <= 599 else 0
+        self.operation = operation if operation in {'settings-read', 'roster-read', 'roster-write'} else ''
         super().__init__(code)
 
 
@@ -74,7 +78,7 @@ def preserve_for_replacement(config_dir, account, scope):
     editor = Editor(root, account, lambda: None, lambda *_: None)
     with component_lock.exclusive_file_lock(editor.path.with_suffix('.lock')):
         if receipt.exists():
-            saved = json.loads(receipt.read_text(encoding='utf-8'))
+            saved = json.loads(attendance_references.read_text(receipt, encoding='utf-8'))
             if not isinstance(saved, dict) or saved.get('scope') != scope:
                 raise ValueError('기존 명단의 보관 기록을 확인하지 못했어요.')
             archive_hash = saved.get('archive')
@@ -82,7 +86,7 @@ def preserve_for_replacement(config_dir, account, scope):
                 if not isinstance(archive_hash, str) or not re.fullmatch('[a-f0-9]{64}', archive_hash):
                     raise ValueError('기존 명단의 보관 기록을 확인하지 못했어요.')
                 archived = component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json'))
-                if hashlib.sha256(archived.read_bytes()).hexdigest() != archive_hash:
+                if hashlib.sha256(attendance_references.read_bytes(archived)).hexdigest() != archive_hash:
                     raise ValueError('기존 명단의 보관본을 확인하지 못했어요.')
             return
         archive_hash = None
@@ -94,15 +98,15 @@ def preserve_for_replacement(config_dir, account, scope):
                 if not isinstance(archive_hash, str) or not re.fullmatch('[a-f0-9]{64}', archive_hash):
                     raise ValueError('기존 명단의 보관 기록을 확인하지 못했어요.')
                 archived = component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json'))
-                if hashlib.sha256(archived.read_bytes()).hexdigest() != archive_hash:
+                if hashlib.sha256(attendance_references.read_bytes(archived)).hexdigest() != archive_hash:
                     raise ValueError('기존 명단의 보관본을 확인하지 못했어요.')
             else:
-                raw = editor.path.read_bytes()
+                raw = attendance_references.read_bytes(editor.path)
                 archive_hash = hashlib.sha256(raw).hexdigest()
                 archived = component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json'))
                 if not archived.exists():
                     _atomic_bytes(archived, raw)
-                if archived.read_bytes() != raw:
+                if attendance_references.read_bytes(archived) != raw:
                     raise ValueError('기존 명단의 보관본을 확인하지 못했어요.')
                 data.update(replacement_protection={'scope': scope, 'archive': archive_hash}, revision=uuid.uuid4().hex)
                 editor._store(data)
@@ -127,7 +131,7 @@ class Editor:
         if not isinstance(archive_hash, str) or not re.fullmatch('[a-f0-9]{64}', archive_hash):
             raise ValueError('Roster archive unavailable')
         history = self.path.parent / 'attendance-replacement-history'
-        archived = component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json')).read_bytes()
+        archived = attendance_references.read_bytes(component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json')))
         if hashlib.sha256(archived).hexdigest() != archive_hash:
             raise ValueError('Roster archive changed')
         original = json.loads(archived)
@@ -139,10 +143,10 @@ class Editor:
                 or any(item.get(key) is not None for item in (original, data) for key in ('target', 'baseline'))):
             raise ValueError('Roster belongs to a previous workbook')
         stamp = hashlib.sha256(json.dumps(old, sort_keys=True).encode()).hexdigest()
-        receipt = json.loads(component_lock.prepare_direct_file_path(history / ('roster-scope-' + stamp + '.json')).read_text(encoding='utf-8'))
+        receipt = json.loads(attendance_references.read_text(component_lock.prepare_direct_file_path(history / ('roster-scope-' + stamp + '.json')), encoding='utf-8'))
         if receipt != {'scope': old, 'archive': archive_hash}:
             raise ValueError('Roster preservation changed')
-        saved = json.loads(component_lock.prepare_direct_file_path(paths.attendance_setup_status_path(self.path.parent)).read_text(encoding='utf-8'))
+        saved = json.loads(attendance_references.read_text(component_lock.prepare_direct_file_path(paths.attendance_setup_status_path(self.path.parent)), encoding='utf-8'))
         action = saved['attendance_action']
         if (saved.get('account') != self.account or saved.get('state') != 'created'
                 or action.get('phase') != 'published' or action.get('reason') not in ('replace-trashed', 'replace-unavailable')
@@ -162,6 +166,39 @@ class Editor:
         if not isinstance(actual, dict) or actual.get('authorized') is not True or any(actual.get(k) != v for k, v in expected.items()):
             raise ValueError('Current workbook changed')
 
+    def _explicit_current_target(self, data, expected_revision):
+        """Use preserved rows only for the teacher's explicit current-sheet save."""
+        if not expected_revision or expected_revision != data['revision']:
+            raise ValueError('Roster revision changed')
+        protected = data['replacement_protection']
+        old, archive_hash = protected['scope'], protected['archive']
+        if not isinstance(archive_hash, str) or not re.fullmatch('[a-f0-9]{64}', archive_hash):
+            raise ValueError('Roster archive unavailable')
+        history = self.path.parent / 'attendance-replacement-history'
+        raw = attendance_references.read_bytes(component_lock.prepare_direct_file_path(history / ('homeroom-roster-' + archive_hash + '.json')))
+        if hashlib.sha256(raw).hexdigest() != archive_hash:
+            raise ValueError('Roster archive changed')
+        original = json.loads(raw)
+        if (original.get('account') != self.account or original.get('rows') != data['rows']
+                or not original.get('revision') or any(original.get(key) != data.get(key) for key in ('target', 'baseline'))):
+            raise ValueError('Roster preservation changed')
+        stamp = hashlib.sha256(json.dumps(old, sort_keys=True).encode()).hexdigest()
+        receipt = json.loads(attendance_references.read_text(component_lock.prepare_direct_file_path(history / ('roster-scope-' + stamp + '.json')), encoding='utf-8'))
+        if receipt != {'scope': old, 'archive': archive_hash}:
+            raise ValueError('Roster preservation changed')
+        current = self.authorize_target() if self.authorize_target else None
+        if (not isinstance(current, dict) or current.get('authorized') is not True
+                or not old.get('subjectKey') or current.get('subjectKey') != old['subjectKey']
+                or type(old.get('currentSchoolYear')) is not int or current.get('workbookSchoolYear') != old['currentSchoolYear']
+                or type(old.get('generation')) is not int or type(current.get('generation')) is not int
+                or current['generation'] < max(1, old['generation'])
+                or not isinstance(current.get('spreadsheetId'), str) or not current['spreadsheetId']):
+            raise ValueError('Current workbook changed')
+        expected = {key: current[key] for key in ('subjectKey', 'workbookSchoolYear', 'generation', 'spreadsheetId')}
+        if protected.get('sync_scope') is not None and protected['sync_scope'] != expected:
+            raise ValueError('Current workbook changed')
+        return expected
+
     def _protected_detail(self, data):
         try:
             self._explicit_replacement_target(data, data['revision'])
@@ -174,7 +211,7 @@ class Editor:
             return {'version': 1, 'account': self.account, 'rows': [], 'revision': '', 'pending': False,
                     'target': None, 'baseline': None}
         try:
-            data = json.loads(component_lock.prepare_direct_file_path(self.path).read_text(encoding='utf-8'))
+            data = json.loads(attendance_references.read_text(component_lock.prepare_direct_file_path(self.path), encoding='utf-8'))
             if not isinstance(data, dict) or data.get('version') != 1 or data.get('account') != self.account:
                 raise ValueError()
             if not isinstance(data.get('rows'), list) or not isinstance(data.get('revision'), str):
@@ -185,7 +222,7 @@ class Editor:
 
     def _store(self, data):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        component_lock.atomic_write_text_unique(self.path, json.dumps(data, ensure_ascii=False) + '\n')
+        component_lock.atomic_write_text_unique(self.path, attendance_references.protect(self.path, (json.dumps(data, ensure_ascii=False) + '\n').encode('utf-8')).decode('utf-8'))
 
     @staticmethod
     def _view(data, state, detail=''):
@@ -241,24 +278,33 @@ class Editor:
         return self._view(data, 'pending', '명단을 이 컴퓨터에 저장했어요.')
 
     @_locked
-    def sync(self, expected_revision=None):
+    def sync(self, expected_revision=None, *, use_current_workbook=False):
         data = self._load()
         if expected_revision is not None and (not expected_revision or expected_revision != data['revision']):
             return self._view(data, 'conflict', '저장된 명단이 바뀌었어요. 현재 명단을 확인한 뒤 연결해 주세요.')
         protected = data.get('replacement_protection')
         explicit_target = None
-        if protected and expected_revision is not None:
+        current_save = protected and use_current_workbook is True and expected_revision is not None
+        if protected and expected_revision is not None and not current_save:
             try:
                 explicit_target = self._explicit_replacement_target(data, expected_revision)
             except (OSError, ValueError, TypeError, KeyError):
                 return self._view(data, 'conflict', '보관된 명단과 현재 출석부의 연결 근거를 확인하지 못했어요. 입력한 명단은 그대로 보관했습니다.')
-        if protected and explicit_target is None:
+        if protected and explicit_target is None and not current_save:
             return self._view(data, 'conflict', self._protected_detail(data))
-        if not data['pending']:
+        if not data['pending'] and not current_save:
             return self._view(data, 'synced' if data.get('target') else 'local')
         rows = validate_rows(data['rows'])
         stage = '명단 조회'
         try:
+            if current_save:
+                from attendance_binding import AttendanceBindingError
+                try:
+                    explicit_target = self._explicit_current_target(data, expected_revision)
+                except AttendanceBindingError:
+                    raise
+                except (OSError, ValueError, TypeError, KeyError):
+                    return self._view(data, 'conflict', '보관된 명단 또는 현재 출석부의 계정·학년도를 확인하지 못했어요. 입력한 명단은 그대로 보관했습니다.')
             if explicit_target:
                 self._authorize_explicit_target(explicit_target)
             remote = self.read_remote()
@@ -266,17 +312,22 @@ class Editor:
                 return self._view(data, 'waiting', '명단은 저장됐어요. 출석부 준비가 끝나면 반영해요.')
             target, before = remote['target'], remote['rows']
             if explicit_target:
+                empty_template = current_save and all(len(row) == 3 and not row[1] and not row[2]
+                    and (not row[0] or re.fullmatch(r'[0-9]{1,4}', row[0])) for row in before)
                 if (target.get('spreadsheet_id') != explicit_target['spreadsheetId']
-                        or (before and before != rows)
+                        or (before and before != rows and not empty_template)
                         or (protected.get('sync_target') is not None and protected['sync_target'] != target)):
                     return self._view(data, 'conflict', '현재 출석부 또는 명단이 달라졌어요. 입력한 명단은 보관하고 덮어쓰지 않았습니다.')
                 protected['sync_target'] = target
+                if current_save:
+                    protected['sync_scope'] = explicit_target
+                    data['pending'] = True
                 self._store(data)
             conflict = (data.get('target') is not None and data['target'] != target)
             conflict = conflict or (before != rows and (
                 (data.get('target') is None and bool(before))
                 or (data.get('target') is not None and digest(before) != data.get('baseline'))))
-            if conflict:
+            if conflict and not current_save:
                 return self._view(data, 'conflict', '연결된 출석부 또는 시트 명단이 달라졌어요. 덮어쓰지 않았습니다. 시트 명단을 다시 불러온 뒤 수정해 주세요.')
             if data.get('target') is None and not explicit_target:
                 data.update(target=target, baseline=digest(before))
@@ -309,7 +360,8 @@ class Editor:
                 'stage': {'명단 조회': 'roster-read', '시트 저장': 'roster-write', '저장 결과 확인': 'roster-readback'}[stage],
                 'origin': origin,
                 'http_status': status if type(status) is int and 100 <= status <= 599 else 0,
-                'operation': error.operation if isinstance(error, AttendanceBindingError) and error.operation in OPERATION_NAMES else '',
+                'operation': (error.operation if isinstance(error, AttendanceBindingError) and error.operation in OPERATION_NAMES
+                              else error.operation if isinstance(error, RosterRequestError) else ''),
             }
             if self.on_failure:
                 try:
@@ -332,29 +384,46 @@ class Sheet:
         if body is not None:
             command += ['--json', json.dumps(body, ensure_ascii=False)]
         command += ['--format', 'json']
-        result = self.run(command)
-        exit_code, output = result[:2] if isinstance(result, tuple) else (0, result)
-        try:
-            data = process_win.parse_first_json(output)
-        except (ValueError, TypeError):
-            raise RosterRequestError('GOOGLE_RESPONSE_INVALID') from None
-        error = data.get('error') if isinstance(data, dict) else None
-        if exit_code or error:
+        read = method in {'get', 'batchGet'}
+        return self._execute(command, operation='roster-read' if read else 'roster-write', safe_read=read)
+
+    def _execute(self, command, *, operation, safe_read=False):
+        for attempt in range(3 if safe_read else 1):
+            result = self.run(command)
+            exit_code, output = result[:2] if isinstance(result, tuple) else (0, result)
+            try:
+                data = process_win.parse_first_json(output)
+            except (ValueError, TypeError):
+                raise RosterRequestError('GOOGLE_RESPONSE_INVALID', operation=operation) from None
+            error = data.get('error') if isinstance(data, dict) else None
+            if not exit_code and not error:
+                return data
             status = error.get('code') if isinstance(error, dict) else None
-            code = f'GOOGLE_{status}' if isinstance(status, int) and 400 <= status <= 599 else 'GOOGLE_COMMAND_FAILED'
-            raise RosterRequestError(code)
-        return data
+            if safe_read and type(status) is int and status in {429, 500, 502, 503, 504} and attempt < 2:
+                import time
+                time.sleep(attempt + 1)
+                continue
+            code = f'GOOGLE_{status}' if type(status) is int and 400 <= status <= 599 else 'GOOGLE_COMMAND_FAILED'
+            raise RosterRequestError(code, status=status, operation=operation)
+
+    def _settings_run(self, command):
+        if list(command[1:5]) == ['sheets', 'spreadsheets', 'values', 'get']:
+            # Preserve the Google error before the shared Chat reader reduces it
+            # to CentralChatError. Recovery remains local to roster reads.
+            return json.dumps(self._execute(command, operation='settings-read', safe_read=True), ensure_ascii=False)
+        return self.run(command)
 
     def _target(self):
         from attendance_install_record import read_verified_canonical_record
         from dashboard import engine
         path = paths.attendance_install_record_path(self.config_dir)
-        if not path.exists():
+        from attendance_server_record import record_exists
+        if not record_exists(path):
             return None
         record = read_verified_canonical_record(path)
         # Verify both the currently authenticated identity and the canonical owner.
         engine._require_google_target_account(self.run, self.gws, self.account)
-        title = engine._verified_attendance_roster_name(record, self.config_dir, self.run, self.gws)
+        title = engine._verified_attendance_roster_name(record, self.config_dir, self._settings_run, self.gws)
         return {'spreadsheet_id': record['spreadsheet_id'], 'title': title}
 
     def read(self):

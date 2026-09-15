@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import attendance_reference_storage as attendance_references
+
 import copy
 import hashlib
 import json
@@ -294,8 +296,11 @@ def read_attendance_install_snapshot(path: Path) -> InstallRecordSnapshot:
     """원본 바이트와 엄격한 기록, SHA-256을 한 번의 읽기로 묶는다."""
 
     path = Path(path)
+    if path.name == 'attendance-install.generated.json':
+        from attendance_server_record import read_snapshot
+        return read_snapshot(path)
     try:
-        raw = path.read_bytes()
+        raw = attendance_references.read_bytes(path)
     except OSError as exc:
         raise _error("파일을 끝까지 읽지 못했어요.", cause=exc)
     return InstallRecordSnapshot(
@@ -367,6 +372,7 @@ def ensure_create_only_install_backup(
     if not isinstance(expected, InstallRecordSnapshot):
         raise _error("백업할 설치 기록 snapshot을 확인하지 못했어요.")
     backup_path = Path(backup_path)
+    protected = attendance_references.protect(backup_path, expected.raw)
     try:
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -375,7 +381,7 @@ def ensure_create_only_install_backup(
             backup_file = None
         if backup_file is not None:
             with backup_file:
-                backup_file.write(expected.raw)
+                backup_file.write(protected)
                 backup_file.flush()
                 os.fsync(backup_file.fileno())
     except OSError as exc:
@@ -396,6 +402,8 @@ def ensure_create_only_install_backup(
 
 def _atomic_write(path: Path, record: dict) -> dict:
     path = Path(path)
+    raw = (json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    protected = attendance_references.protect(path, raw)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(
@@ -410,21 +418,13 @@ def _atomic_write(path: Path, record: dict) -> dict:
     try:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-                file.write(
-                    json.dumps(
-                        record,
-                        ensure_ascii=False,
-                        indent=2,
-                        allow_nan=False,
-                    )
-                    + "\n"
-                )
+                file.write(protected.decode("utf-8"))
                 file.flush()
                 os.fsync(file.fileno())
         except (OSError, TypeError, ValueError) as exc:
             raise _error("임시 파일을 끝까지 쓰지 못했어요.", cause=exc)
 
-        checked = load_attendance_install_record(temp_path)
+        checked = _parse_attendance_install_raw(attendance_references.restore(path, temp_path.read_bytes()))
         if checked != record:
             raise _error("임시 파일을 다시 읽은 값이 쓰려던 내용과 달라요.")
         try:
@@ -444,6 +444,9 @@ def write_attendance_install_record(path: Path, record: dict) -> dict:
     """연결값을 쓰되 기존의 알 수 없는 정상 JSON 값은 바꾸지 않는다."""
 
     path = Path(path)
+    if path.name == 'attendance-install.generated.json':
+        from attendance_server_record import save_record
+        return save_record(path, record)
     incoming = validate_attendance_install_record(record)
     with attendance_install_record_lock(path):
         if path.exists():
@@ -467,9 +470,12 @@ def restore_verified_registry_record(path: Path, record: dict) -> dict:
     survive refreshed names, generation and role manifests.
     """
     path = Path(path)
+    if path.name == 'attendance-install.generated.json':
+        # Server identity is never materialized as a PC connection file.
+        return validate_verified_canonical_record(record)
     incoming = validate_verified_canonical_record(record)
     with attendance_install_record_lock(path):
-        raw = path.read_bytes() if path.exists() else None
+        raw = attendance_references.read_bytes(path) if path.exists() else None
         existing = None
         if raw is not None:
             try:
@@ -493,7 +499,7 @@ def restore_verified_registry_record(path: Path, record: dict) -> dict:
                         handle.flush()
                         os.fsync(handle.fileno())
                 except FileExistsError:
-                    if archive.read_bytes() != raw:
+                    if attendance_references.read_bytes(archive) != raw:
                         raise _error("기존 설치 기록의 보관본이 원본과 달라서 연결을 바꾸지 못했어요.")
         if existing == merged:
             return merged
@@ -512,6 +518,13 @@ def replace_attendance_install_record(
     if not isinstance(expected, InstallRecordSnapshot):
         raise _error("교체 전 설치 기록 snapshot을 확인하지 못했어요.")
     path = Path(path)
+    if path.name == 'attendance-install.generated.json':
+        from attendance_server_record import save_record, read_snapshot
+        current = read_snapshot(path)
+        if current.raw != expected.raw:
+            raise _error('서버의 현재 출석부가 확인을 시작한 때와 달라졌어요.')
+        save_record(path, record, expected)
+        return read_snapshot(path)
     wanted = validate_attendance_install_record(record)
     with attendance_install_record_lock(path):
         current = read_attendance_install_snapshot(path)

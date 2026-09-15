@@ -2,16 +2,17 @@
 
 과거의 여러 출석부 통합·기록 이관·Google Drive 휴지통 이동 기능은 제거했다.
 이 모듈은 기존 출석부를 그대로 둔 채 새 학년도 출석부 후보를 완성하고, 모든
-확인이 끝난 뒤 로컬의 현재 연결번호만 마지막에 바꾼다.
+확인이 끝난 뒤 서버에서 현재 계정의 연결을 확정한다.
 """
 
 from __future__ import annotations
+
+import attendance_reference_storage as attendance_references
 
 import json
 import hashlib
 import os
 import re
-import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass, replace
@@ -113,15 +114,15 @@ def correlate_attendance_operation(action: dict, operation: dict) -> dict:
 def archive_attendance_setup(config_dir: Path) -> str:
     """Keep exact pre-migration bytes; never replace an existing history item."""
     source = Path(config_dir) / 'attendance-setup-status.generated.json'
-    raw = source.read_bytes()
+    raw = attendance_references.read_bytes(source)
     digest = hashlib.sha256(raw).hexdigest()
     history = Path(config_dir) / 'attendance-preparation-history'
     history.mkdir(exist_ok=True)
     target = history / (digest + '.json')
     try:
-        with target.open('xb') as stream: stream.write(raw)
+        with target.open('xb') as stream: stream.write(attendance_references.protect(target, raw))
     except FileExistsError:
-        if target.read_bytes() != raw:
+        if attendance_references.read_bytes(target) != raw:
             raise ValueError('출석부 준비 기록의 보관 결과를 확인하지 못했어요.')
     return digest
 
@@ -228,7 +229,7 @@ def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read_dict(path: Path) -> dict:
     try:
-        text = path.read_bytes().decode("utf-8")
+        text = attendance_references.read_bytes(path).decode("utf-8")
     except UnicodeError as error:
         raise ValueError(f"{path.name} 내용을 UTF-8 글자로 읽지 못했습니다.") from error
     value = json.loads(text, object_pairs_hook=_strict_json_object)
@@ -245,7 +246,7 @@ def _atomic_json(path: Path, value: dict) -> None:
     temporary = Path(temp_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-            file.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            file.write(attendance_references.protect(path, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")).decode("utf-8"))
             file.flush()
             os.fsync(file.fileno())
         temporary.replace(path)
@@ -262,7 +263,7 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
     temporary = Path(temp_name)
     try:
         with os.fdopen(descriptor, "wb") as file:
-            file.write(value)
+            file.write(attendance_references.protect(path, value))
             file.flush()
             os.fsync(file.fileno())
         temporary.replace(path)
@@ -282,8 +283,8 @@ def _archive_record(record_path: Path) -> Path:
         target = archive_dir / (
             f"{record_path.stem}-{stamp}-{counter}{record_path.suffix}"
         )
-    shutil.copy2(record_path, target)
-    if target.read_bytes() != record_path.read_bytes():
+    _atomic_bytes(target, attendance_references.read_bytes(record_path))
+    if attendance_references.read_bytes(target) != attendance_references.read_bytes(record_path):
         raise OSError("기존 출결 연결 기록 보관본을 다시 읽은 값이 다릅니다.")
     return target
 
@@ -298,11 +299,11 @@ def preserve_replacement_record(config_dir: Path) -> None:
         source = Path(config_dir) / name
         if not source.exists():
             continue
-        raw = source.read_bytes()
+        raw = attendance_references.read_bytes(source)
         target = Path(config_dir) / "attendance-replacement-history" / (source.stem + "-" + hashlib.sha256(raw).hexdigest() + ".json")
         if not target.exists():
             _atomic_bytes(target, raw)
-        if target.read_bytes() != raw:
+        if attendance_references.read_bytes(target) != raw:
             raise OSError("기존 출석부 연결 기록의 보관본을 확인하지 못했습니다.")
 
 
@@ -716,7 +717,7 @@ def _switch_record_last(
     *,
     write_record: Callable,
 ) -> None:
-    previous = record_path.read_bytes() if record_path.exists() else None
+    previous = attendance_references.read_bytes(record_path) if record_path.exists() else None
     candidate_id = str(getattr(result, "spreadsheet_id", "") or "").strip()
     if previous is not None:
         _archive_record(record_path)

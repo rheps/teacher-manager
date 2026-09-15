@@ -7,6 +7,7 @@ sheetId + sheetSecret을 보낸다.
 from __future__ import annotations
 
 import base64
+import attendance_reference_storage as attendance_references
 import ctypes
 import json
 import os
@@ -205,8 +206,25 @@ def _write_handover_recovery(
         "target_spreadsheet_id": target_spreadsheet_id,
         "target_previous_settings": target_previous_settings,
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    payload = attendance_references.protect(Path(config_dir) / "attendance-chat-handover.json", payload)
     protected = base64.b64encode(_dpapi_protect(payload)).decode("ascii")
     component_lock.atomic_write_text_unique(path, protected + "\n")
+
+
+def migrate_handover_references(config_dir: Path) -> None:
+    """Move file references only; encrypted Chat secrets remain on this PC."""
+    path = _recovery_path(config_dir)
+    if not path.exists():
+        return
+    encoded = path.read_text(encoding="ascii")
+    raw = _dpapi_unprotect(base64.b64decode(encoded.strip(), validate=True))
+    virtual_path = Path(config_dir) / "attendance-chat-handover.json"
+    updated = attendance_references.protect(virtual_path, raw)
+    if updated == raw:
+        return
+    if attendance_references.restore(virtual_path, updated) != raw or path.read_text(encoding="ascii") != encoded:
+        raise CentralChatError(CHAT_HANDOVER_RECOVERY_REQUIRED_MESSAGE)
+    component_lock.atomic_write_text_unique(path, base64.b64encode(_dpapi_protect(updated)).decode("ascii") + "\n")
 
 
 def _read_handover_recovery_payload(
@@ -216,7 +234,9 @@ def _read_handover_recovery_payload(
         protected = base64.b64decode(
             _recovery_path(config_dir).read_text(encoding="ascii").strip(), validate=True
         )
-        payload = json.loads(_dpapi_unprotect(protected).decode("utf-8"))
+        raw = _dpapi_unprotect(protected)
+        virtual_path = Path(config_dir) / "attendance-chat-handover.json"
+        payload = json.loads(attendance_references.restore(virtual_path, raw).decode("utf-8"))
         source = str(payload["source_spreadsheet_id"] or "").strip()
         target = str(payload["target_spreadsheet_id"] or "").strip()
         previous = dict(payload["target_previous_settings"])
@@ -329,10 +349,12 @@ def _command_output(run_command, args) -> str:
 
 def _load_record(config_dir: Path) -> dict:
     path = paths.attendance_install_record_path(Path(config_dir))
-    if not path.exists():
+    from attendance_server_record import record_exists
+    if not record_exists(path):
         raise CentralChatError(NOT_PREPARED_MESSAGE)
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        from attendance_install_record import load_attendance_install_record
+        record = load_attendance_install_record(path)
     except ValueError as error:
         raise CentralChatError(CONFIG_BROKEN_MESSAGE) from error
     if not isinstance(record, dict) or not record.get("spreadsheet_id"):

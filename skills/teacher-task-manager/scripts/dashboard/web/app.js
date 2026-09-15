@@ -714,6 +714,9 @@ function googleStatusKey(status) {
 }
 function clearGoogleDependentState(options) {
   const preserveResume = options?.preserveResume === true;
+  attendanceConnectionRequestToken += 1;
+  S.attendanceConnection = null;
+  S.attendanceConnectionBusy = false;
   stopAttendanceBoundaryCheck();
   if (S.banner?.topic === "attendance-gate") S.banner = null;
   attendanceAccountAuthorizationVersion += 1;
@@ -1657,7 +1660,7 @@ function rosterInputProblem() {
   return "";
 }
 let rosterAuthorizationRetry = null;
-async function saveRosterEditor(sync = false, authorize = true, explicitConnect = false) {
+async function saveRosterEditor(sync = false, authorize = true, explicitConnect = false, useCurrentWorkbook = false) {
   let editor = S.rosterEditor;
   if (!editor || editor.busy || S.attendanceAccountAuthorizing || editor.context !== rosterEditorContext()) return false;
   const problem = rosterInputProblem();
@@ -1697,7 +1700,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     if (sync) {
       requestedRevision = editor.revision;
       const result = explicitConnect
-        ? await call("sync_roster_editor", requestedRevision)
+        ? await call("sync_roster_editor", requestedRevision, ...(useCurrentWorkbook ? [true] : []))
         : await call("sync_roster_editor");
       if (!current()) return false;
       S.rosterEditor = editor = { ...result, rows: rosterEditableRows(result.rows), context, dirty: false, busy: true };
@@ -1706,7 +1709,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     if (["unavailable", "conflict"].includes(S.rosterEditor.state)) {
       if (visible()) setBanner("warn", S.rosterEditor.detail || "출석부에 명단을 저장하지 못했어요. 명단 저장을 다시 눌러 주세요.");
       if (authorize && visible() && S.rosterEditor.failure_code === "ATTENDANCE_AUTH_REQUIRED") {
-        rosterAuthorizationRetry = {context, owner, revision: requestedRevision, explicitConnect, connection};
+        rosterAuthorizationRetry = {context, owner, revision: requestedRevision, explicitConnect, useCurrentWorkbook, connection};
         await actions["attendance-account-authorize"]();
       }
       return false;
@@ -1801,7 +1804,7 @@ bindActions({
     S.rosterEditor.rows.push([String(next), "", ""]); S.rosterEditor.dirty = true; render();
     document.querySelector(`[data-roster-cell="${S.rosterEditor.rows.length - 1}:1"]`)?.focus();
   },
-  "roster-save": () => saveRosterEditor(S.mode === "edit" || S.rosterEditor?.linked === true || attendanceSheetSetupDone(), true, true),
+  "roster-save": () => saveRosterEditor(S.mode === "edit" || S.rosterEditor?.linked === true || attendanceSheetSetupDone(), true, true, true),
   "roster-reload": async () => {
     if (S.rosterEditor?.busy) return;
     if ((S.rosterEditor?.dirty || S.rosterEditor?.pending || S.rosterEditor?.state === "conflict") && !window.confirm("이 화면에 입력한 명단 대신 현재 시트의 명단을 불러올까요?")) return;
@@ -2308,6 +2311,7 @@ function classRoomReadinessMessage(state = classRoomReadiness()) {
   }[state] || "";
 }
 function loadChatStatus(force, renderResult = true) {
+  if (S.attendanceConnection) return Promise.resolve(null);
   if (S.chatStatusContext !== chatReadContext()) S.chatStatus = null;
   if (chatStatusPending?.active && chatStatusPending.context === chatReadContext()) return chatStatusPending.promise;
   if (!force && S.chatStatus != null) return chatStatusPending?.context === chatReadContext() ? chatStatusPending.promise : undefined;
@@ -2599,6 +2603,7 @@ function isClassSpaceIssue(issue) {
     && (issue.actions || []).every(action => action.key === "chat-space-list");
 }
 function loadChatSpaces(force = false, renderResult = true) {
+  if (S.attendanceConnection) return Promise.resolve(null);
   const context = chatReadContext();
   if (S.chatSpacesContext !== context) {
     S.chatSpaces = undefined;
@@ -2773,11 +2778,11 @@ function acceptAttendanceActionResult(data, flow) {
 }
 function attendanceExpectedWorkbookOpen(a) {
   const s = a?.attendance_scope;
-  const spreadsheetId = a?.spreadsheet_id || String(a?.spreadsheet_url || "")
-    .match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]+)(?:\/|[?#]|$)/)?.[1];
-  if (!attendanceHasConnectedWorkbook(a) || !s || s.bindingState !== "ACTIVE" || s.verificationState !== "VERIFIED"
+  // Opening the server-confirmed file does not require AI/Chat setup to finish.
+  // Display URLs and former PC records never choose this navigation target.
+  if (!s || s.bindingState !== "ACTIVE" || s.verificationState !== "VERIFIED"
       || !s.subjectKey || !s.spreadsheetId || s.workbookSchoolYear !== s.currentSchoolYear
-      || !Number.isInteger(s.generation) || s.generation < 1 || spreadsheetId !== s.spreadsheetId) return null;
+      || !Number.isInteger(s.generation) || s.generation < 1) return null;
   return { subjectKey: s.subjectKey, currentSchoolYear: s.currentSchoolYear, generation: s.generation,
     operationId: s.operationId || null, spreadsheetId: s.spreadsheetId };
 }
@@ -2857,13 +2862,14 @@ function attendanceInstallationHasExplicitCreation(a) {
 }
 function serviceOpenButtonHtml(entry, a, view = attendanceViewKind()) {
   if (entry.service !== "sheet") return "";
+  const choose = `<button class="btn-tonal" data-action="attendance-select-open"${!isGoogleReady(S.google) || S.attendanceTransitioning ? " disabled" : ""}>사용할 출석부 선택</button>`;
   const presentation = attendancePresentation(a);
   const allowed = a.creation_allowed === true || Boolean(attendanceReplacementScope(a));
   if (view === "installation" && (presentation.initial
       || !attendanceInstallationHasExplicitCreation(a)
-      || (!allowed && !presentation.pending))) return "";
+      || (!allowed && !presentation.pending))) return choose;
   const enabled = allowed && !S.attendanceTransitioning && !S.attendanceLoading && !S.attendanceReadFailed;
-  return `<button class="btn-tonal" data-action="new-attendance-go" data-busy-text="요청 중…"${enabled && !presentation.pending ? "" : " disabled"}>${presentation.pending ? presentation.text : "출석부 새로 만들기"}</button>`;
+  return choose + `<button class="btn-tonal" data-action="new-attendance-go" data-busy-text="요청 중…"${enabled && !presentation.pending ? "" : " disabled"}>${presentation.pending ? presentation.text : "출석부 새로 만들기"}</button>`;
 }
 
 function attendanceViewKind() {
@@ -3040,7 +3046,7 @@ function scheduleAttendanceBoundaryCheck(a) {
 let attendanceStatusReadVersion = 0;
 let attendanceStatusReadContext = "";
 function refreshAttendanceStatus() {
-  if (S.attendanceConnectionBusy) return;
+  if (S.attendanceConnection || S.attendanceConnectionBusy) return;
   // 화면에 이미 있는 내용은 그대로 두고 다시 읽는다. 결과가 오면 그때 갈아 끼운다.
   const context = chatReadContext();
   const record = S.attendance;
@@ -3083,7 +3089,7 @@ function refreshAttendanceStatus() {
     });
 }
 function loadAttendanceStatus() {
-  if (S.attendanceTransitioning || S.attendanceConnectionBusy) return;
+  if (S.attendanceTransitioning || S.attendanceConnection || S.attendanceConnectionBusy) return;
   if (S.attendance || S.attendanceLoading || S.attendanceReadFailed) return;
   S.attendanceLoading = true;
   const request = beginIssueRequest(false);
@@ -3188,6 +3194,98 @@ function focusAttendanceScriptResolve() {
   const trigger = document.querySelector('[data-action="attendance-script-update-resolve"]');
   if (trigger && trigger.focus) trigger.focus();
 }
+function attendanceConnectionFooterHtml(flow) {
+  const selected = flow.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
+  const disabled = !selected || !selected.can_edit || flow.loading || flow.saving;
+  return `${flow.selection_error ? `<p class="field-error" role="alert">${esc(flow.selection_error)}</p>` : ""}
+    <div class="attendance-update-dialog-actions">
+      <button class="btn-quiet" data-action="attendance-select-cancel"${flow.saving ? " disabled" : ""}>닫기</button>
+      <button class="btn-quiet" data-action="attendance-select-reload"${flow.loading || flow.saving ? " disabled" : ""}>목록 새로고침</button>
+      <button class="btn-tonal" data-action="attendance-select-preview"${!selected || flow.saving ? " disabled" : ""}>파일 열어보기</button>
+      <button class="btn" data-action="attendance-select-confirm"${disabled ? " disabled" : ""}>${flow.saving ? "연결 중…" : "이 출석부로 연결"}</button>
+    </div>`;
+}
+function attendanceConnectionDialogHtml() {
+  const flow = S.attendanceConnection;
+  if (!flow) return "";
+  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-selection-dialog" role="dialog" aria-modal="true" aria-label="사용할 출석부 선택">
+    <h3>사용할 출석부 선택</h3><p>내 Google Drive에서 원래 사용하던 출석부를 골라 주세요. 이름이 같으면 파일을 열어 내용을 확인할 수 있어요.</p>
+    ${flow.loading ? `<p role="status">목록을 불러오는 중…</p>` : `<label class="field">출석부
+      <select name="attendance-workbook-choice"${flow.saving ? " disabled" : ""}>
+      <option value="">${flow.candidates?.length ? "사용할 파일을 선택하세요" : flow.selection_error ? "목록을 다시 불러와 주세요" : "내 Drive의 시트 파일이 없습니다"}</option>
+      ${(flow.candidates || []).map(row => `<option value="${esc(row.spreadsheet_id)}"${row.spreadsheet_id === flow.selected_id ? " selected" : ""}${row.can_edit ? "" : " disabled"}>${esc(row.name)}${row.modified_time ? ` · ${esc(row.modified_time.slice(0, 10))}` : ""}</option>`).join("")}
+      </select></label>`}
+    <div class="attendance-picker-footer">${attendanceConnectionFooterHtml(flow)}</div>
+    </section></div>`;
+}
+async function openAttendanceConnectionPicker() {
+  if (S.attendanceConnection?.saving) return;
+  const resumePoll = S.attendanceConnection?.resumePoll || attendancePreparePollOn;
+  stopAttendancePreparePoll();
+  ++attendanceStatusReadVersion;
+  S.attendanceLoading = false;
+  const flow = { loading: true, saving: false, selected_id: "", candidates: [], resumePoll, accountContext: googleReadContext() };
+  const version = ++attendanceConnectionRequestToken;
+  S.attendanceConnection = flow;
+  S.attendanceConnectionBusy = true;
+  render();
+  try {
+    const data = await call("attendance_connection_candidates");
+    if (S.attendanceConnection !== flow || version !== attendanceConnectionRequestToken || flow.accountContext !== googleReadContext()) return;
+    flow.candidates = data.candidates; flow.context = data.context;
+  } catch (error) {
+    if (S.attendanceConnection === flow) flow.selection_error = error.message || "출석부 목록을 읽지 못했어요.";
+  } finally {
+    if (S.attendanceConnection === flow) { flow.loading = false; S.attendanceConnectionBusy = false; render(); }
+  }
+}
+bindActions({
+  "attendance-select-open": openAttendanceConnectionPicker,
+  "attendance-select-reload": openAttendanceConnectionPicker,
+  "attendance-select-cancel": () => {
+    if (S.attendanceConnection?.saving) return;
+    const resumePoll = S.attendanceConnection?.resumePoll;
+    const attempted = Boolean(S.attendanceConnection?.request);
+    ++attendanceConnectionRequestToken; S.attendanceConnection = null; S.attendanceConnectionBusy = false; render();
+    if (attempted) refreshAttendanceStatus();
+    else if (resumePoll) startAttendancePreparePoll();
+  },
+  "attendance-select-preview": async () => {
+    const flow = S.attendanceConnection;
+    const selected = flow?.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
+    if (selected) await call("open_url", selected.spreadsheet_url);
+  },
+  "attendance-select-confirm": async () => {
+    const flow = S.attendanceConnection;
+    const selected = flow?.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
+    if (!selected?.can_edit || flow.loading || flow.saving || flow.accountContext !== googleReadContext()) return;
+    if (!flow.request || flow.request.spreadsheetId !== selected.spreadsheet_id) flow.request = {
+      spreadsheetId: selected.spreadsheet_id, key: crypto.randomUUID() };
+    flow.saving = true; S.attendanceConnectionBusy = true; delete flow.selection_error; render();
+    try {
+      const data = await call("select_attendance_connection", selected.spreadsheet_id, flow.context, flow.request.key);
+      if (S.attendanceConnection !== flow || flow.accountContext !== googleReadContext()) return;
+      if (data.state !== "selected" || data.attendance_scope?.spreadsheetId !== selected.spreadsheet_id) throw new Error("선택한 출석부의 등록 결과를 확인하지 못했어요.");
+      S.attendanceConnection = null; S.attendanceConnectionBusy = false;
+      S.attendance = { state: "checking", attendance_scope: data.attendance_scope, current_user: data.current_user,
+        workbook_name: data.workbook_name, spreadsheet_url: data.spreadsheet_url };
+      S.chatStatus = null; S.firstSetupDone = false; S.firstSetupReadState = null; S.firstSetupConnectionCode = "";
+      S.attendanceReadFailed = false;
+      clearResolvedReadIssue("attendance_status");
+      setBanner("ok", `선택한 출석부로 연결했어요: ${data.workbook_name}`);
+      await refreshAttendanceStatus();
+    } catch (error) {
+      if (S.attendanceConnection === flow) {
+        flow.selection_error = error.message || "선택한 출석부의 연결을 마치지 못했어요. 같은 선택으로 다시 확인해 주세요.";
+        // The server may already have saved this choice before a reply failed.
+        S.attendanceReadFailed = true;
+      }
+    } finally {
+      if (S.attendanceConnection === flow) { flow.saving = false; S.attendanceConnectionBusy = false; }
+      render();
+    }
+  }
+});
 function attendanceScriptUpdateDialogHtml() {
   const kind = S.attendanceScriptDialog;
   if (!kind) return "";
@@ -3238,6 +3336,7 @@ let firstSetupReadContext = "";
 let firstSetupReadVersion = 0;
 let firstSetupInFlight = "";
 async function loadFirstSetupStatus(force = false) {
+  if (S.attendanceConnection) return;
   if (S.connectTab !== "attendance" || !((S.mode === "edit" && S.edit === "connect")
       || (S.mode === "wizard" && S.step === 8))
       || S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
@@ -3309,6 +3408,7 @@ function syncPreparedRoster() {
   return pending.promise;
 }
 async function loadAttendanceRosterStatus(force = false) {
+  if (S.attendanceConnection) return;
   if (isHomeroomTeacher() && attendanceSheetSetupDone()) await syncPreparedRoster();
   if (S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
   const context = chatReadContext();
@@ -3401,7 +3501,7 @@ bindActions({"attendance-account-authorize": async () => {
               && rosterRetry.revision === S.rosterEditor?.revision && !S.rosterEditor?.dirty
               && (!rosterRetry.explicitConnect || rosterRetry.connection === (attendanceScopeKey(S.attendance)
                 || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || ""))) {
-            await saveRosterEditor(true, false, rosterRetry.explicitConnect);
+            await saveRosterEditor(true, false, rosterRetry.explicitConnect, rosterRetry.useCurrentWorkbook === true);
           } else {
             await refreshAttendanceStatus();
           }
@@ -3618,7 +3718,7 @@ function attendanceTabHtml() {
     ])
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
       : ""}
-    ${attendanceScriptUpdateDialogHtml()}`;
+    ${attendanceScriptUpdateDialogHtml()}${attendanceConnectionDialogHtml()}`;
 }
 function attendanceStaleNoticeHtml() {
   if (S.mode !== "wizard" || !S.attendanceStaleNotice

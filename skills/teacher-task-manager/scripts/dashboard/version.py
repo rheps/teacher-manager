@@ -93,7 +93,9 @@
 # opening the verified school account and preserving completed attendance resources.
 # v4.2: Match action button heights, clarify setup sections and roster readiness,
 # and name the class-space creation action consistently.
-APP_VERSION = "4.3"
+# v4.4: Choose an existing attendance workbook and recover explicit roster saves
+# without repeating uncertain writes or changing the verified connection flow.
+APP_VERSION = "4.4"
 
 BRANDING = {
     "name": "Teacher Manager",

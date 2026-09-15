@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from attendance_server_record import record_exists as attendance_record_exists
+
 import argparse
 import json
 import os
@@ -1325,7 +1327,7 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
     school = profile.get("school") or {}
     homeroom = profile.get("homeroom") or {}
     record_year = str(getattr(result, "school_year", "") or "")
-    if not record_year and record_path.exists():
+    if not record_year and attendance_record_exists(record_path):
         from attendance_install_record import load_attendance_install_record
         previous = load_attendance_install_record(record_path)
         if previous.get("spreadsheet_id") == result.spreadsheet_id:
@@ -1369,10 +1371,7 @@ def write_install_record(profile_json: Path, result: AttendanceInstallResult) ->
             record, script_bundle_sha256
         )
     from attendance_install_record import restore_verified_registry_record, write_attendance_install_record
-    if result.subject_key:
-        restore_verified_registry_record(record_path, record)
-    else:
-        write_attendance_install_record(record_path, record)
+    write_attendance_install_record(record_path, record)
     return record_path
 
 
@@ -1454,7 +1453,7 @@ def _authorize_attendance_sheet_creation(
     )
 
     if reason == ATTENDANCE_CREATION_FIRST_SETUP:
-        if record_path.exists():
+        if attendance_record_exists(record_path):
             raise ValueError(
                 "이미 출석부 연결 기록이 있어 새 출석부를 만들지 않습니다. "
                 "기존 출석부를 선택해 연결해 주세요."

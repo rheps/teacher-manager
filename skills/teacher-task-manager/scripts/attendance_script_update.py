@@ -25,6 +25,11 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Exact public v4.3 tag and bundle reverified on 2026-09-15.
+    (
+        "c14b3959d435009e" "57b4c5d8da6f7d0f"
+        "1934f49621b52484" "1f97a5d6c5ce1eea"
+    ): (("v4.3", "9fd0726a416fb5ff965e" "b4abf6b6f3b43a96da9e"),),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
     # Exact public v4.1 tag c0c8ee6, checked against GitHub and independently
@@ -135,6 +140,13 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Read-only verification on 2026-09-14 found this exact source in both
+    # HEAD and the live workbook's deployed version. Both files also match
+    # d58b599 and the frozen roster-recovery-target fixture byte for byte.
+    # Trust only this bundle; edited source and extra files remain protected.
+    '371688554d25fb9f84adda39d481fe0936183bd761c85f0d30d6e5ee92d2afb1': (
+        ('roster-recovery-live-workbook-2026-09-14', 'd58b5997ce9cd7224f389419b33086d60eeb94d7'),
+    ),
     # Exact delivered Setup sources rechecked on 2026-09-10, including the
     # same-version predecessor found in the installed account's saved record.
     '16532566089614786f86afb4998a16d947a1110ee1aebe5fb87f7a377c9c082a': (('4.2-simple-google-candidate', '9365c63f3071dd8f1979160b2715abb28f8962ce'), ('4.2-attendance-feedback-candidate', '28eb0489c98e71d25a59dd8af9f912289f7c4c0e')),
@@ -203,7 +215,7 @@ _DELIVERED_42_ORDER = {
     "8c0b3d0f00f040ca0452fccb7d7aa38e5fc1f6213f4b2f8f8df1b1b92a0ed363": 6,
     # Reviewed next delivery target; frozen separately from delivered predecessors.
     "f6ccbc57a59cff820edb5a9f739af8c190040f775e4bf87e877e10c03adbb0fc": 7,
-    # Reviewed roster/recovery Candidate target; not trusted as a delivered predecessor.
+    # Exact roster/recovery source observed on a live workbook; provenance above.
     "371688554d25fb9f" "84adda39d481fe09" "36183bd761c85f0d" "30d6e5ee92d2afb1": 8,
     # Reviewed integrated Candidate target; frozen evidence, not a delivered predecessor.
     "c14b3959d435009e57b4c5d8da6f7d0f1934f49621b524841f97a5d6c5ce1eea": 9,

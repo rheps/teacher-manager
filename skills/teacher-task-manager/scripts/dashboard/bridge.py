@@ -23,6 +23,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import attendance_reference_storage as attendance_references
+
+from attendance_server_record import record_exists as attendance_record_exists
+
 from brity_bridge import (
     account_sessions,
     ai_skill_install,
@@ -324,7 +328,7 @@ def _record_issue_journal(config_dir, issue: recovery.UserIssue, error) -> None:
         }
         journal = paths.bridge_state_dir(config_dir) / "logs" / "error-journal.jsonl"
         journal.parent.mkdir(parents=True, exist_ok=True)
-        previous = journal.read_text(encoding="utf-8") if journal.exists() else ""
+        previous = attendance_references.read_text(journal, encoding="utf-8") if journal.exists() else ""
         lines = [line for line in previous.splitlines() if line.strip()]
         if lines:
             try:
@@ -1142,7 +1146,10 @@ def guarded(method):
                     run, gws = self._resolve_gws_or_fail()
                     current = engine.require_goedu_gws_session(run, gws)
                     self._assert_current_session_account(current)
-                result = _ok(method(self, *args, **kwargs))
+                from attendance_server_record import connection_context
+                with connection_context(request_dir, self._attendance_binding_client,
+                        lambda: self._verified_google_account or state.get('account', '') or self._attendance_binding_client().email):
+                    result = _ok(method(self, *args, **kwargs))
                 try:
                     current_token = account_sessions.token(self._account_root)
                 except account_sessions.AccountSessionStorageError:
@@ -1466,7 +1473,7 @@ class Api:
         path = self._state_path()
         if path.exists():
             try:
-                state = json.loads(path.read_text(encoding="utf-8"))
+                state = json.loads(attendance_references.read_text(path, encoding="utf-8"))
                 if isinstance(state, dict):
                     merged, changed = self._migrate_state(state)
                     if changed:
@@ -2120,11 +2127,28 @@ class Api:
 
     @guarded
     def attendance_connection_candidates(self):
-        return {"state": "recovery-required", "candidates": [], "detail": "출석부는 현재 계정의 확인된 연결로 자동 복구합니다. 여러 파일이나 확인번호로 연결을 바꿀 수 없습니다."}
+        from attendance_server_record import client_for
+        return client_for(self._config_dir).workbook_choices()
 
     @guarded
-    def select_attendance_connection(self, spreadsheet_id):
-        return {"state": "recovery-required", "candidates": [], "detail": "출석부는 현재 계정의 확인된 연결로 자동 복구합니다. 여러 파일이나 확인번호로 연결을 바꿀 수 없습니다."}
+    def select_attendance_connection(self, spreadsheet_id, context=None, idempotency_key=None):
+        from attendance_server_record import client_for, record_from_scope
+        from attendance_selection import connect_selected_workbook
+        with engine.attendance_remote_work_lock(self._config_dir):
+            _run, gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            client = client_for(self._config_dir)
+            if account.casefold() != client.email.casefold():
+                raise AttendanceBindingError('ATTENDANCE_ACCOUNT_CHANGED')
+            scope = client.select_workbook(spreadsheet_id, context, idempotency_key)
+            scope = connect_selected_workbook(client, scope, self._attendance_script_runner(), self._config_dir, gws)
+            record = record_from_scope(scope, client.email)
+            engine.save_attendance_status_cache(self._config_dir, {})
+            self._attendance_prepare_action = None
+            self._attendance_prepare_result = None
+            self._attendance_prepare_issue = None
+            return {"state": "selected", "attendance_scope": scope.payload,
+                    "spreadsheet_id": record['spreadsheet_id'], "spreadsheet_url": record['spreadsheet_url'],
+                    "workbook_name": record['workbook_name'], "current_user": client.email}
 
     @guarded
     def select_attendance_connection_by_code(self, connection_code):
@@ -2463,7 +2487,7 @@ class Api:
             run, gws = self._resolve_gws_or_fail()
             account = engine.require_goedu_gws_session(run, gws)
         def remote():
-            if not paths.attendance_install_record_path(self._config_dir).exists():
+            if not attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
                 return None
             run, gws = self._resolve_attendance_goedu_gws_or_fail()
             return roster.Sheet(self._config_dir, account, run, gws)
@@ -2493,9 +2517,10 @@ class Api:
         return self._roster_editor().save(rows, expected_revision)
 
     @guarded
-    def sync_roster_editor(self, expected_revision=None):
+    def sync_roster_editor(self, expected_revision=None, use_current_workbook=False):
         with engine.attendance_remote_work_lock(self._config_dir):
-            return self._roster_editor().sync(expected_revision=expected_revision)
+            return self._roster_editor().sync(expected_revision=expected_revision,
+                                             use_current_workbook=use_current_workbook is True)
 
     @guarded
     def attendance_roster_status(self):
@@ -2531,7 +2556,7 @@ class Api:
         """기존 출결 Sheet의 Apps Script만 확인하거나 명시적으로 갱신한다."""
 
         record_path = paths.attendance_install_record_path(self._config_dir)
-        if record_snapshot is None and not record_path.exists():
+        if record_snapshot is None and not attendance_record_exists(record_path):
             return {
                 "state": "not-ready",
                 "verified": False,
@@ -2697,7 +2722,6 @@ class Api:
 
     def _require_attendance_binding(self, record=None, *, purpose="repair"):
         from attendance_install_record import load_attendance_install_record
-        record = record or load_attendance_install_record(paths.attendance_install_record_path(self._config_dir))
         client = self._attendance_binding_client()
         _, _, account = self._resolve_attendance_goedu_gws_context_or_fail()
         if isinstance(client, AttendanceBindingClient):
@@ -2713,6 +2737,9 @@ class Api:
         if client.email.casefold() != account.casefold():
             client.clear()
             raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+        from attendance_server_record import connection_context
+        with connection_context(self._config_dir, client, account):
+            record = record or load_attendance_install_record(paths.attendance_install_record_path(self._config_dir))
         return client.authorize_workbook(record, purpose=purpose)
 
     def _attendance_scoped_runner(self, record, runner):
@@ -2754,7 +2781,7 @@ class Api:
         """예전 공식 출결 기능을 되찾은 직후에는 Chat 쓰기를 먼저 막는다."""
 
         record_path = paths.attendance_install_record_path(self._config_dir)
-        if record is None and not record_path.exists():
+        if record is None and not attendance_record_exists(record_path):
             return
         from attendance_install_record import (
             attendance_script_is_attested,
@@ -2847,13 +2874,13 @@ class Api:
         with engine.attendance_remote_work_lock(self._config_dir, **lock_options):
             resolved = (
                 self._resolve_attendance_goedu_gws_or_fail()
-                if record_path.exists()
+                if attendance_record_exists(record_path)
                 else None
             )
             with attendance_install_record_lock(record_path):
                 record_snapshot = (
                     read_attendance_install_snapshot(record_path)
-                    if record_path.exists()
+                    if attendance_record_exists(record_path)
                     else None
                 )
 
@@ -2889,7 +2916,7 @@ class Api:
 
             if record_snapshot is not None:
                 with attendance_install_record_lock(record_path):
-                    changed = not record_path.exists()
+                    changed = not attendance_record_exists(record_path)
                     if not changed:
                         current = read_attendance_install_snapshot(record_path)
                         changed = (
@@ -2928,9 +2955,7 @@ class Api:
             with engine.attendance_remote_work_lock(
                 self._config_dir, **lock_options
             ):
-                if not paths.attendance_install_record_path(
-                    self._config_dir
-                ).exists():
+                if not attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
                     return self._attendance_operation(
                         "attendance_script_update_apply",
                         "출결 기능을 바꾸지 못했어요.",
@@ -2969,7 +2994,7 @@ class Api:
     def attendance_chat_status(self):
         from dashboard import central_chat
         # 상태 조회는 화면에 보여 줄 값만 읽고, Google 시트는 바꾸지 않는다.
-        if paths.attendance_install_record_path(self._config_dir).exists():
+        if attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
             run, gws = self._resolve_attendance_goedu_gws_or_fail()
         else:
             run, gws = self._run(), None
@@ -3797,11 +3822,11 @@ class Api:
                 'detail': '입력은 저장했지만 설정을 완성하지 못해 출석부에는 반영하지 않았어요.',
                 'error_code': 'SETTINGS_PROFILE_UNAVAILABLE'}}
         record_path = paths.attendance_install_record_path(self._config_dir)
-        if not record_path.exists():
-            return {**result, 'settings_sync': {'state': 'not-linked',
-                'detail': '이 컴퓨터에 저장했어요. 연결된 출석부는 아직 없어요.', 'error_code': ''}}
         stage = 'SETTINGS_TARGET_UNVERIFIED'
         try:
+            if not attendance_record_exists(record_path):
+                return {**result, 'settings_sync': {'state': 'not-linked',
+                    'detail': '이 컴퓨터에 저장했어요. 연결된 출석부는 아직 없어요.', 'error_code': ''}}
             from attendance_install_record import read_verified_canonical_record
             from dashboard import central_chat
             record = read_verified_canonical_record(record_path)
@@ -3817,7 +3842,7 @@ class Api:
                         'detail': '설정은 저장했어요. 출석부의 처음 설정이 끝나야 반영할 수 있어요.',
                         'error_code': 'SETTINGS_SETUP_REQUIRED'}}
                 stage = 'SETTINGS_PROFILE_UNAVAILABLE'
-                profile = json.loads(paths.profile_path(self._config_dir).read_text(encoding='utf-8'))
+                profile = json.loads(attendance_references.read_text(paths.profile_path(self._config_dir), encoding='utf-8'))
                 def guard_write():
                     if read_verified_canonical_record(record_path) != record:
                         raise AttendanceBindingError('ATTENDANCE_SCOPE_CHANGED')

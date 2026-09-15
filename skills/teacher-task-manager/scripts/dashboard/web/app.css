@@ -529,6 +529,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog p { margin:10px 0 20px; color:var(--tm-sub); line-height:1.6; word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-update-dialog p.attendance-update-dialog-note { margin:-8px 0 20px; font-size:13px; color:var(--tm-faint); }
 .attendance-update-dialog-actions { display:flex; justify-content:flex-end; gap:8px; }
+.attendance-selection-dialog select { width:100%; min-width:0; max-width:100%; }
+.attendance-selection-dialog .attendance-update-dialog-actions { flex-wrap:wrap; }
 .attendance-connection-dialog { width:min(760px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; display:flex; flex-direction:column; box-sizing:border-box; }
 .attendance-connection-dialog > h3,.attendance-connection-dialog > p { flex:none; }
 .attendance-picker-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; padding:2px; }

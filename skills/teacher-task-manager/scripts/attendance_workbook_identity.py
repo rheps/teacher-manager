@@ -112,7 +112,7 @@ def attendance_workbook_app_properties(
 
 
 def current_attendance_spreadsheet_id(config_dir: Path) -> str:
-    """현재 출결 연결번호를 로컬 설치 기록 한 곳에서만 읽는다."""
+    """현재 계정의 출결 연결번호를 서버에서만 읽는다."""
 
     record_path = Path(config_dir) / "attendance-install.generated.json"
     try:
