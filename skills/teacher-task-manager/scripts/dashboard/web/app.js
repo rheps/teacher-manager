@@ -464,14 +464,17 @@ function firstIssueMessage(rows) {
 }
 function fieldError(name) {
   if (editingCard() === "connect" && LIVE_CONNECT_TARGETS.has(name)) {
-    return connectIssues().find((row) => row.target === name)?.message || "";
+    return connectIssues().find((row) => row.target === name && !row.pending)?.message || "";
   }
   const row = (S.fieldIssues || {})[name];
-  return row ? row.message : "";
+  return row && !row.pending ? row.message : "";
 }
 function fieldNoteHtml(name) {
   const error = fieldError(name);
-  return error ? `<span class="field-error">${esc(error)}</span>` : "";
+  if (error) return `<span class="field-error">${esc(error)}</span>`;
+  const pending = editingCard() === "connect" && LIVE_CONNECT_TARGETS.has(name)
+    ? connectIssues().find((row) => row.target === name && row.pending) : null;
+  return pending ? `<span class="hint">${esc(pending.message)}</span>` : "";
 }
 
 /* ---------- 입력 ---------- */
@@ -2048,7 +2051,7 @@ function currentListRows(kind) {
 }
 let linkListsPending = null;
 async function loadLinkLists(force = false, owns = () => true) {
-  const context = googleReadContext();
+  const context = googleListContext();
   if (S.linkLoading && linkListsPending?.context === context && linkListsPending.owns()) return linkListsPending.promise;
   const promise = readLinkLists(force, owns);
   const pending = linkListsPending = { context, promise, owns };
@@ -2062,10 +2065,9 @@ async function readLinkLists(force, owns) {
   S.linkLoading = true;
   S.listsError = false;
   S.listsLoaded = false;
-  const context = googleReadContext();
   const resourceContext = googleListContext();
   const version = ++linkListsReadVersion;
-  const current = () => version === linkListsReadVersion && context === googleReadContext() && owns();
+  const current = () => version === linkListsReadVersion && resourceContext === googleListContext() && owns();
   const paint = () => { if (editingCard() === "settings") paintSettingsReadiness(); else render(); };
   S.lists = { calendars: [], tasklists: [] };
   S.googleTargetStatuses = {};
@@ -2106,14 +2108,14 @@ async function refreshGoogleTargetStatuses(owns = () => true, kind = null) {
     .filter(field => !kind || (field.includes("Tasks") ? "tasklists" : "calendars") === kind)
     .filter((field) => S.draft.profile[field] && (field !== "담임안내Tasks목록ID" || S.draft.profile["담임여부"] === "예"))
     .map((field) => [field, S.draft.profile[field]]));
-  const context = googleReadContext();
+  const context = googleListContext();
   const kinds = kind ? [kind] : ["calendars", "tasklists"];
   const versions = Object.fromEntries(kinds.map(key => [key, ++targetReadVersions[key]]));
   const version = targetStatusReadVersion;
   let statuses;
   try { statuses = await call("google_target_statuses", targets); }
   catch (_) { statuses = {}; }
-  if (!owns() || version !== targetStatusReadVersion || context !== googleReadContext()) return;
+  if (!owns() || version !== targetStatusReadVersion || context !== googleListContext()) return;
   for (const [field, id] of Object.entries(targets)) {
     const key = field.includes("Tasks") ? "tasklists" : "calendars";
     if (versions[key] !== targetReadVersions[key]) continue;
@@ -2132,7 +2134,7 @@ function linkSelectRow(idField, title, options, value, excludeId, savedName, pha
   return rawRow(title, `<div class="field${error ? " has-error" : ""}">
     <select name="${esc(idField)}" data-link-select${phase !== "ready" ? " disabled" : ""}${error ? ' aria-invalid="true"' : ""}>
       <option value="">${empty}</option>${rows}
-    </select>${savedOutsideList ? '<p class="hint">저장된 선택은 보관하고 있어요. 현재 목록에서 확인한 뒤 연결해 주세요.</p>' : ""}${fieldNoteHtml(idField)}</div>`);
+    </select>${savedOutsideList && phase !== "pending" ? '<p class="hint">저장된 선택은 보관하고 있어요. 현재 목록에서 확인한 뒤 연결해 주세요.</p>' : ""}${fieldNoteHtml(idField)}</div>`);
 }
 function linkExistingRowsHtml(kind) {
   const cal = kind === "cal";
@@ -2286,7 +2288,7 @@ function classRoomReadiness() {
   if (S.attendanceReadFailed) return "read-failed";
   if (S.attendance?.state !== "ready"
       || (account && account !== verifiedGoogleAccount(S.google))) return "unverified";
-  if (S.attendanceLoading || S.classSpaceSaving || chatStatusReading()) return "loading";
+  if (S.attendanceLoading || S.classSpaceSaving || chatStatusReading() || homeClassRoomReading()) return "loading";
   if (!cs || cs === "loading" || S.chatStatusContext !== context) return "unverified";
   if (cs.read_failed || typeof cs.connected !== "boolean") return "read-failed";
   if (!cs.connected) return "account-required";
@@ -2645,9 +2647,10 @@ function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
   if (!isHomeroomTeacher()) return "";
   const content = classSpaceContentHtml(a, view);
   const state = classRoomReadiness();
-  const reading = state === "loading" || (state === "unverified" && S.attendanceLoading);
+  const waiting = state === "unverified" && attendancePresentation(a).pending;
+  const reading = state === "loading" || (state === "unverified" && S.attendanceLoading) || waiting;
   const connected = state === "ready";
-  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : reading ? "확인 중…" : state === "empty" ? "스페이스 없음" : state === "not-selected" ? "방 선택 필요" : "확인 필요";
+  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : waiting ? "출석부 준비 중…" : reading ? "확인 중…" : state === "empty" ? "스페이스 없음" : state === "not-selected" ? "방 선택 필요" : "확인 필요";
   const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
   const open = view === "installation" ? `<button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} 단톡방(스페이스) 만들러 가기</button>` : "";
   const retry = state === "read-failed" && S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed
@@ -3061,6 +3064,11 @@ function refreshAttendanceStatus() {
     .then((data) => {
       if (!current()) return;
       S.attendance = data;
+      // Carry the pending home check into the workbook just verified by its own
+      // attendance request, before that request paints its completion frame.
+      if (homeClassRoomPending?.attendanceVersion === version && homeClassRoomPending.context === context) {
+        homeClassRoomPending.context = chatReadContext();
+      }
       if (context !== chatReadContext()) S.chatStatus = null;
       if (data?.state === "ready") {
         clearResolvedReadIssue("attendance_status");
@@ -5084,8 +5092,19 @@ function connectIssues() {
       const kind = field.includes("Tasks") ? "tasklists" : "calendars";
       if (modes[kind === "tasklists" ? "task" : "cal"] !== "existing") continue;
       const read = S.listReads[kind];
+      const status = S.googleTargetStatuses?.[field];
+      const key = {"업무캘린더ID":"connect.work-calendar", "학사일정캘린더ID":"connect.school-calendar", "업무Tasks목록ID":"connect.work-tasks", "담임안내Tasks목록ID":"connect.homeroom-tasks"}[field];
+      const inCurrentList = currentListRows(kind).some(row => row.id === id);
+      // Keep waiting selections in validation/Next gates, but do not paint them
+      // as failed connections. A returned list still awaits its target check.
+      const pending = S.linkLoading && read?.context === googleListContext()
+        && (read.phase === "pending" || (read.phase === "ready" && inCurrentList
+          && (status?.id !== id || !status?.state)));
+      if (pending) {
+        rows.push({...issue(key, field, "현재 연결을 확인하고 있어요.", "messenger"), pending: true});
+        continue;
+      }
       if (read && !currentListRows(kind).some(row => row.id === id)) {
-        const key = {"업무캘린더ID":"connect.work-calendar", "학사일정캘린더ID":"connect.school-calendar", "업무Tasks목록ID":"connect.work-tasks", "담임안내Tasks목록ID":"connect.homeroom-tasks"}[field];
         rows.push(issue(key, field, read.phase === "pending" ? "현재 목록을 확인하고 있어요." : "저장된 선택을 현재 목록에서 확인하지 못했어요. 연결을 다시 확인해 주세요.", "messenger"));
       }
     }
@@ -5124,16 +5143,33 @@ function editingCard() {
 }
 function effectiveChecks() {
   const editing = editingCard();
+  const currentConnections = connectIssues();
   const saved = uniqueChecks(S.checks).filter(
     (row) => attendanceUiEnabled() || row.tab !== "attendance"
   ).map((row) => {
     if (checksRetry.dirtyCards.has(row.card)) return { ...row, ok: null,
       detail: checksRetry.failedAt ? "점검에 실패했어요. 다시 확인해 주세요." : "현재 상태를 점검하고 있어요." };
+    if (row.card === "connect" && GOOGLE_TARGET_ID_FIELDS.includes(row.target) && isGoogleReady(S.google)) {
+      const read = S.listReads[row.target.includes("Tasks") ? "tasklists" : "calendars"];
+      if (read?.context === googleListContext()) {
+        const current = currentConnections.find(issue => issue.target === row.target);
+        if (current) return {...row, ok: current.pending ? null : false, pending: Boolean(current.pending),
+          detail: current.message, fix: current.pending ? "" : current.message};
+        const target = S.googleTargetStatuses?.[row.target];
+        if (target?.id === S.draft.profile[row.target] && target.state === "ready") {
+          return {...row, ok: true, pending: false, detail: target.detail || "연결됨", fix: ""};
+        }
+      }
+    }
     const a = S.attendance;
+    if (row.key === "connect.attendance" && attendanceUiEnabled() && isGoogleReady(S.google) && S.attendanceLoading) {
+      return {...row, ok: null, pending: true, detail: "확인 중…", fix: ""};
+    }
     if (row.key === "connect.attendance" && attendanceUiEnabled() && a
         && String(a.account || a.current_user || "").trim().toLowerCase() === verifiedGoogleAccount(S.google)) {
       const presentation = attendancePresentation(a);
-      if (presentation.phase !== "connected") return { ...row, ok: presentation.pending || presentation.phase === "checking" ? (row.ok === false ? false : null) : false,
+      const pending = Boolean(presentation.pending || presentation.phase === "checking");
+      if (presentation.phase !== "connected") return { ...row, ok: pending ? null : false, pending,
         detail: presentation.text, fix: presentation.tone === "warn" ? (a.detail || presentation.text) : "" };
     }
     if (row.key !== "connect.attendance" || !attendanceUiEnabled()
@@ -5154,18 +5190,22 @@ function effectiveChecks() {
   const fieldRows = Object.values(S.fieldIssues || {}).filter((row) => editing !== "connect" || !LIVE_CONNECT_TARGETS.has(row.target));
   if (editing === "connect") {
     // Programmatic changes need the same current validation as keyboard changes.
-    const current = connectIssues();
-    fieldRows.push(...current.filter((row) => !fieldRows.some((existing) => existing.target === row.target)));
+    fieldRows.push(...currentConnections.filter((row) => !fieldRows.some((existing) => existing.target === row.target)));
   }
   const live = fieldRows.map((row) => ({
-    key: row.key, label: row.target, ok: false, detail: "", fix: row.message,
+    key: row.key, label: row.target, ok: row.pending ? null : false, pending: Boolean(row.pending),
+    detail: row.pending ? row.message : "", fix: row.pending ? "" : row.message,
     card: editing || "", tab: row.tab || "", target: row.target,
   }));
   const rows = uniqueChecks(kept.concat(live)).filter(row => row.key !== "connect.class-space");
   if (attendanceUiEnabled() && isHomeroomTeacher() && isGoogleReady(S.google)) {
-    const state = classRoomReadiness(), detail = classRoomReadinessMessage(state);
+    const state = classRoomReadiness(), presentation = attendancePresentation(S.attendance);
+    const waiting = state === "unverified" && (S.attendanceLoading || presentation.pending);
+    const pending = state === "loading" || waiting;
+    const detail = waiting ? presentation.text : classRoomReadinessMessage(state);
     rows.push({key:"connect.class-space", label:"학급 단톡방", card:"connect", tab:"attendance",
-      target:"class-space-select", ok:state === "ready", detail, fix:state === "ready" ? "" : detail});
+      target:"class-space-select", ok:pending ? null : state === "ready", pending,
+      detail, fix:pending || state === "ready" ? "" : detail});
   }
   if (!S.google) return rows;
   // The latest shared Google result wins over a previous home snapshot.
@@ -5185,7 +5225,8 @@ function checksForTab(tab) {
 function checkSummary(rows) {
   const counted = rows.filter((row) => row.ok !== null && row.ok !== undefined);
   const bad = counted.filter((row) => row.ok === false).length;
-  return { good: counted.length - bad, total: counted.length, bad };
+  const pending = rows.filter((row) => row.pending).length;
+  return { good: counted.length - bad, total: counted.length, bad, pending };
 }
 
 /* ---------- 입력 즉시 재검사: 문제 표시와 숫자를 함께 줄인다 ---------- */
@@ -5534,12 +5575,14 @@ function cardStatus(card) {
   if (!S.checks.length) return { kind: "n", label: "점검 중…", bad: false };
   const summary = checkSummary(checksForCard(card.key));
   if (summary.bad) return { kind: "y", label: "확인 필요", bad: true, summary };
+  if (summary.pending) return { kind: "n", label: "확인 중…", bad: false, summary };
   return { kind: "g", label: card.key === "timetable" ? "저장됨" : "정상", bad: false };
 }
 function cardBadges(card) {
   const st = cardStatus(card);
   if (!st.bad) return badge(st.kind, st.label);
-  return badge("y", st.label) + badge("n", `${st.summary.good}/${st.summary.total} 정상`);
+  return badge("y", st.label) + badge("n", `${st.summary.good}/${st.summary.total} 정상`)
+    + (st.summary.pending ? badge("n", `${st.summary.pending}개 확인 중…`) : "");
 }
 function cardDetail(card) {
   if (card.key === "connect" && !attendanceUiEnabled()) {
@@ -5557,12 +5600,16 @@ function invalidateCardChecks(...cards) {
   checksRetry.failedAt = 0;
 }
 let homeClassRoomPending = null;
+function homeClassRoomReading() {
+  return Boolean(homeClassRoomPending && homeClassRoomPending.context === chatReadContext());
+}
 function loadHomeClassRoom(force = false) {
   if (!attendanceUiEnabled() || !isHomeroomTeacher() || !isGoogleReady(S.google)) return;
   const accountContext = () => JSON.stringify([accountUiEpoch, googleContextVersion, googleLoginEpoch, verifiedGoogleAccount(S.google)]);
   const account = accountContext();
   const targetContext = chatReadContext();
   if (homeClassRoomPending?.account === account && homeClassRoomPending.context === targetContext) return homeClassRoomPending.promise;
+  const readsAttendance = !S.attendance && !S.attendanceLoading && !S.attendanceReadFailed;
   const promise = (async () => {
     if (!S.attendance && !S.attendanceLoading && !S.attendanceReadFailed) await refreshAttendanceStatus();
     if (account !== accountContext() || S.attendance?.state !== "ready" || S.attendanceLoading || S.attendanceReadFailed) return;
@@ -5571,7 +5618,8 @@ function loadHomeClassRoom(force = false) {
     if (context !== chatReadContext() || !S.chatStatus?.connected || S.chatStatus.read_failed) return;
     await loadChatSpaces(force, false);
   })();
-  const pending = homeClassRoomPending = { account, context: targetContext, promise };
+  const pending = homeClassRoomPending = { account, context: targetContext, promise,
+    attendanceVersion: readsAttendance ? attendanceStatusReadVersion : null };
   const clear = () => { if (homeClassRoomPending === pending) homeClassRoomPending = null; };
   promise.then(clear, clear);
   return promise;
@@ -5636,10 +5684,13 @@ function homeHtml(behind) {
   const visibleChecks = effectiveChecks().filter(
     (row) => attendanceUiEnabled() || row.tab !== "attendance"
   );
-  const problems = checkSummary(visibleChecks).bad;
+  const summary = checkSummary(visibleChecks);
+  const problems = summary.bad;
   const pill = checksRetry.dirtyCards.size ? badge(checksRetry.failedAt ? "y" : "n", checksRetry.failedAt ? "변경 사항 확인 필요" : "변경 사항 점검 중…")
     : !S.checks.length ? badge("n", "점검 중…")
-    : problems ? badge("y", `확인할 항목 ${problems}개`) : badge("g", "모두 정상");
+    : problems ? badge("y", `확인할 항목 ${problems}개`)
+      + (summary.pending ? badge("n", `${summary.pending}개 확인 중…`) : "")
+    : summary.pending ? badge("n", "연결 확인 중…") : badge("g", "모두 정상");
   const name = (S.profileCache && S.profileCache["선생님이름"]) ? `${S.profileCache["선생님이름"]} 선생님, ` : "";
   const tiles = CARDS.map((card) => {
     const st = cardStatus(card);
@@ -6128,6 +6179,7 @@ async function loadForEdit(key, request) {
       const attendance = await call("attendance_status");
       if (!ownsIssueRequest(request)) return false;
       S.attendance = attendance;
+      S.attendanceReadFailed = false;
     } catch (_error) {
       if (!ownsIssueRequest(request)) return false;
       S.attendance = null;

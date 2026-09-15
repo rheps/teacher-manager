@@ -2519,6 +2519,10 @@ def gws_auth_status(run_command, gws: str, *, config_dir: Path | None = None) ->
     return auth
 
 
+class GoogleAuthStatusReadError(RuntimeError):
+    """The current Google identity could not be read; logout is not confirmed."""
+
+
 def require_goedu_gws_session(run_command, gws: str) -> str:
     """실제 Google 자료를 읽거나 쓰기 직전에 Google 로그인 계정을 다시 확인한다."""
 
@@ -2527,7 +2531,7 @@ def require_goedu_gws_session(run_command, gws: str) -> str:
     auth = gws_auth_status(run_command, gws)
     if not auth.get("logged_in"):
         if auth.get("login_state") == "error":
-            raise RuntimeError(
+            raise GoogleAuthStatusReadError(
                 "Google 로그인 상태를 확인하지 못했어요. 설정에서 다시 점검해 주세요."
             )
         raise RuntimeError("Google 계정으로 먼저 로그인해 주세요.")

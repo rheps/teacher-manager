@@ -3089,7 +3089,17 @@ class Api:
                 # 원격 출결 기능 확인의 일시 모호함(hold)은 이미 재시도 분류가 끝났다.
                 # 일반 예외 갈래에서 원인 문구를 잃지 않도록 그대로 올린다.
                 raise
-            except (ScreenSafeError, gws_env.GwsAccountStorageError):
+            except ScreenSafeError as error:
+                # The session guard retains the typed cause. An indeterminate
+                # auth read is recoverable within this read-only three-cycle
+                # operation; confirmed logout/account/permission stops are not.
+                if isinstance(error.__cause__, engine.GoogleAuthStatusReadError):
+                    raise recovery.RetryableOperationError(
+                        "GOOGLE_AUTH_STATUS_READ",
+                        "현재 Google 로그인 상태를 확인하지 못해 학급 단톡방 목록을 가져오지 못했어요.",
+                    ) from error
+                raise
+            except gws_env.GwsAccountStorageError:
                 # 로그인·계정·현재 출결 연결처럼 선생님이 바로잡아야 하는 일은
                 # 같은 읽기를 세 번 되풀이하지 않고 원래 안내를 그대로 보낸다.
                 raise

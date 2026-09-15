@@ -11,6 +11,10 @@ HISTORY_UNAVAILABLE_DETAIL = (
     "중복 방지 기록을 안전하게 읽지 못해 Google에 추가 등록하지 않았습니다. "
     "기존 기록을 지우지 말고 Teacher Manager의 최근 기록과 Google 등록 결과를 확인해 주세요."
 )
+LEGACY_RESULT_UNCONFIRMED_DETAIL = (
+    "이전 등록 결과를 확인할 수 없는 항목과 겹쳐 Google에 다시 등록하지 않았습니다. "
+    "기존 기록을 지우지 말고 Teacher Manager의 최근 기록과 Google 등록 결과를 확인해 주세요."
+)
 
 
 class HistoryUnavailableError(RuntimeError):
@@ -24,6 +28,19 @@ def _unique_history_object(pairs):
             raise ValueError("ambiguous history key")
         result[key] = value
     return result
+
+
+def _legacy_unconfirmed_keys(entry: dict) -> set[str]:
+    # Older completed records did not require a Google result ID. Preserve that
+    # evidence, but never use it as confirmation or permission to repeat a write.
+    if entry.get("completed") is not True or "write_intents" in entry:
+        return set()
+    return {
+        key for key, action in entry.get("actions", {}).items()
+        if isinstance(action, dict)
+        and action.get("kind") in ("calendar", "task")
+        and action.get("google_id") == ""
+    }
 
 
 def _valid_history(raw: object) -> bool:
@@ -41,13 +58,14 @@ def _valid_history(raw: object) -> bool:
             return False
         if entry.get("completed") is True and not actions:
             return False
+        legacy_keys = _legacy_unconfirmed_keys(entry)
         for key, action in actions.items():
             if not isinstance(key, str) or not key or not isinstance(action, dict):
                 return False
             kind, google_id = action.get("kind"), action.get("google_id")
             if kind not in kinds or not isinstance(google_id, str):
                 return False
-            if kind != "notice" and not google_id.strip():
+            if kind != "notice" and not google_id.strip() and key not in legacy_keys:
                 return False
         for key, intent in intents.items():
             if not isinstance(key, str) or not key or not isinstance(intent, dict):
@@ -114,11 +132,16 @@ class HistoryStore:
         else:
             self.load_state = "unsupported"
 
-    def require_usable(self) -> None:
+    def require_usable(self, source_hash: str | None = None, action_keys=()) -> None:
         if self.load_state == "unloaded":
             self.load()
         if self.load_state not in {"new", "valid"} or not _valid_history(self.data):
             raise HistoryUnavailableError(HISTORY_UNAVAILABLE_DETAIL)
+        requested_keys = set(action_keys)
+        for source, entry in self.data["messages"].items():
+            legacy_keys = _legacy_unconfirmed_keys(entry)
+            if legacy_keys and (source == source_hash or legacy_keys & requested_keys):
+                raise HistoryUnavailableError(LEGACY_RESULT_UNCONFIRMED_DETAIL)
 
     def save(self) -> None:
         self.require_usable()
@@ -128,11 +151,11 @@ class HistoryStore:
         self.load_state = "valid"
 
     def entry(self, source_hash: str) -> dict | None:
-        self.require_usable()
+        self.require_usable(source_hash)
         return self.data["messages"].get(source_hash)
 
     def _ensure_entry(self, source_hash: str) -> dict:
-        self.require_usable()
+        self.require_usable(source_hash)
         entry = self.data["messages"].setdefault(
             source_hash,
             {"when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed": False, "actions": {}},
@@ -151,6 +174,9 @@ class HistoryStore:
         return set(entry.get("actions", {}).keys())
 
     def record_action(self, source_hash: str, action_key: str, kind: str, google_id: str) -> None:
+        self.require_usable(source_hash, (action_key,))
+        if kind in ("calendar", "task") and (not isinstance(google_id, str) or not google_id.strip()):
+            raise HistoryUnavailableError(HISTORY_UNAVAILABLE_DETAIL)
         entry = self._ensure_entry(source_hash)
         entry["actions"][action_key] = {"kind": kind, "google_id": google_id}
         intents = entry.get("write_intents")
@@ -176,6 +202,7 @@ class HistoryStore:
         spreadsheet_id: str = "",
         target: str = "",
     ) -> None:
+        self.require_usable(source_hash, (action_key,))
         entry = self._ensure_entry(source_hash)
         intents = entry.setdefault("write_intents", {})
         intents[action_key] = {

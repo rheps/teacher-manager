@@ -930,9 +930,9 @@ def execute_actions(
     notice_preflight=None,
 ) -> ExecutionReport:
     try:
-        history.require_usable()
-    except HistoryUnavailableError:
-        return _preparation_failures(actions, HISTORY_UNAVAILABLE_DETAIL, retry_allowed=False)
+        history.require_usable(source_hash, (action.action_key for action in actions))
+    except HistoryUnavailableError as error:
+        return _preparation_failures(actions, str(error), retry_allowed=False)
     runtime_run_command = None
     try:
         if runner is None:

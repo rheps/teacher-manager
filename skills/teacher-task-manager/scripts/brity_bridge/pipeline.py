@@ -28,7 +28,7 @@ from brity_bridge.gws_exec import (
     ExecutionReport,
     execute_actions,
 )
-from brity_bridge.history import HistoryStore, HistoryUnavailableError, HISTORY_UNAVAILABLE_DETAIL
+from brity_bridge.history import HistoryStore, HistoryUnavailableError
 from brity_bridge.local_attachment_links import (
     add_local_attachment_links,
 )
@@ -593,9 +593,9 @@ def retry_saved_capture(
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
     try:
-        history.require_usable()
-    except HistoryUnavailableError:
-        return FlowResult(False, "execute", HISTORY_UNAVAILABLE_DETAIL)
+        history.require_usable(source_hash, (action.action_key for action in actions))
+    except HistoryUnavailableError as error:
+        return FlowResult(False, "execute", str(error))
     completed_keys = history.completed_keys(source_hash)
     pending = [action for action in actions if action.action_key not in completed_keys]
     if not pending:
@@ -710,7 +710,7 @@ def saved_capture_retry_available(
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
     try:
-        history.require_usable()
+        history.require_usable(source_hash, (action.action_key for action in actions))
     except HistoryUnavailableError:
         return False
     completed = history.completed_keys(source_hash)
@@ -1156,10 +1156,10 @@ def run_capture_flow(
     history = HistoryStore(paths.history_path(config_dir))
     history.load()
     try:
-        history.require_usable()
-    except HistoryUnavailableError:
+        history.require_usable(record.source_hash)
+    except HistoryUnavailableError as error:
         return _finish(
-            config_dir, FlowResult(False, "execute", HISTORY_UNAVAILABLE_DETAIL),
+            config_dir, FlowResult(False, "execute", str(error)),
             record.source_hash, summary="중복 방지 기록 확인 실패", progress=progress,
             attachment_count=attachment_count, identity=identity, retry="",
             attachment_names=attachment_names,
