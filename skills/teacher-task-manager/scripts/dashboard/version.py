@@ -95,7 +95,7 @@
 # and name the class-space creation action consistently.
 # v4.4: Choose an existing attendance workbook and recover explicit roster saves
 # without repeating uncertain writes or changing the verified connection flow.
-APP_VERSION = "4.5"
+APP_VERSION = "4.6"
 
 BRANDING = {
     "name": "Teacher Manager",

@@ -130,7 +130,7 @@ function call(name, ...args) {
   if (!ATTENDANCE_READ_METHODS.has(name)) return callBridge(name, ...args);
   const epoch = accountUiEpoch;
   const contextForRead = () => ["attendance_status", "attendance_status_cached"].includes(name)
-    ? googleReadContext() : chatReadContext();
+    ? googleListContext() : chatReadContext();
   const context = contextForRead();
   const captured = JSON.parse(JSON.stringify(args));
   const key = JSON.stringify([epoch, context, name, captured]);
@@ -152,7 +152,7 @@ function callBridge(name, ...args) {
   const epoch = accountUiEpoch;
   const loginEpoch = googleLoginEpoch;
   const currentReadContext = () => ["attendance_status", "attendance_status_cached"].includes(name)
-    ? googleReadContext() : chatReadContext();
+    ? googleListContext() : chatReadContext();
   const readContext = ATTENDANCE_READ_METHODS.has(name) ? currentReadContext() : null;
   const api = window.pywebview.api;
   const expectedToken = accountWireToken ? [...accountWireToken] : null;
@@ -3054,6 +3054,7 @@ function refreshAttendanceStatus() {
   const context = chatReadContext();
   const record = S.attendance;
   const googleContext = googleReadContext();
+  const accountContext = googleListContext();
   if (S.attendanceLoading && attendanceStatusReadContext === context) return;
   attendanceStatusReadContext = context;
   const version = ++attendanceStatusReadVersion;
@@ -3090,9 +3091,12 @@ function refreshAttendanceStatus() {
       if (version !== attendanceStatusReadVersion) return;
       S.attendanceLoading = false;
       // A successful reply may itself change the attendance record identity.
-      if (googleReadContext() === googleContext) {
+      // Closing the connection window does not end this account's read.
+      if (googleListContext() === accountContext) {
         render();
-        if (!S.attendanceReadFailed) maybeStartInitialAttendancePreparation(S.attendance);
+        if (googleReadContext() === googleContext && !S.attendanceReadFailed) {
+          maybeStartInitialAttendancePreparation(S.attendance);
+        }
       }
     });
 }
@@ -3101,11 +3105,11 @@ function loadAttendanceStatus() {
   if (S.attendance || S.attendanceLoading || S.attendanceReadFailed) return;
   S.attendanceLoading = true;
   const request = beginIssueRequest(false);
-  const context = googleReadContext();
+  const context = googleListContext();
   const version = ++attendanceStatusReadVersion;
   let record = S.attendance;
   let readCompleted = false;
-  const current = () => version === attendanceStatusReadVersion && context === googleReadContext() && S.attendance === record;
+  const current = () => version === attendanceStatusReadVersion && context === googleListContext() && S.attendance === record;
   // 켠 직후에는 마지막으로 확인해 둔 상태부터 즉시 보여준다 — "확인하는 중이에요…"를
   // 프로그램을 켤 때마다 보여주지 않는다(사용자 결정 2026-07-30). 저장본을 보여준 뒤에도
   // 실제 확인은 반드시 다시 한다 — 로그인이 풀린 것을 저장본은 모른다.
@@ -4249,6 +4253,7 @@ window.addEventListener("focus", () => {
   // One fresh binding read drives setup, roster and Chat reads. This also
   // catches changes made in a browser the teacher opened independently.
   refreshAttendanceStatus();
+  render();
 });
 
 function stepConnect() {
