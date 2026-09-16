@@ -25,11 +25,15 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
-    # Exact public v4.3 tag and bundle reverified on 2026-09-15.
+    # Exact public v4.3-v4.5 tags share this bundle; v4.4/v4.5 reverified 2026-09-16.
     (
         "c14b3959d435009e" "57b4c5d8da6f7d0f"
         "1934f49621b52484" "1f97a5d6c5ce1eea"
-    ): (("v4.3", "9fd0726a416fb5ff965e" "b4abf6b6f3b43a96da9e"),),
+    ): (
+        ("v4.3", "9fd0726a416fb5ff965e" "b4abf6b6f3b43a96da9e"),
+        ("v4.4", "494a3570bf559b820b6de31300d4d5cf8c27d8fc"),
+        ("v4.5", "3a1d14e914ab86e3cb02841d398742cafa03ea12"),
+    ),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
     # Exact public v4.1 tag c0c8ee6, checked against GitHub and independently
