@@ -2671,7 +2671,7 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return `<p class="hint">Google Chat 연결 상태를 아직 확인하지 못했어요.</p>`;
   if (cs.read_failed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
   if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
-  loadChatSpaces();
+  if (!connectionRefreshActive()) loadChatSpaces();
   if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">방 목록을 가져오는 중이에요…</p>`;
   if (S.chatSpacesError) return `<p class="hint">방 목록을 가져오지 못했어요. 기존 선택은 그대로예요.</p>`;
   if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>`;
@@ -3048,7 +3048,7 @@ function scheduleAttendanceBoundaryCheck(a) {
 }
 let attendanceStatusReadVersion = 0;
 let attendanceStatusReadContext = "";
-function refreshAttendanceStatus() {
+function refreshAttendanceStatus(followups = true) {
   if (S.attendanceConnection || S.attendanceConnectionBusy) return;
   // 화면에 이미 있는 내용은 그대로 두고 다시 읽는다. 결과가 오면 그때 갈아 끼운다.
   const context = chatReadContext();
@@ -3073,7 +3073,7 @@ function refreshAttendanceStatus() {
       if (context !== chatReadContext()) S.chatStatus = null;
       if (data?.state === "ready") {
         clearResolvedReadIssue("attendance_status");
-        if (googleReadContext() === googleContext && S.connectTab === "attendance"
+        if (followups && googleReadContext() === googleContext && S.connectTab === "attendance"
             && (editingCard() === "connect" || (S.mode === "wizard" && S.step === 8))) {
           loadChatStatus(true).then(() => {
             if (googleReadContext() === googleContext && S.chatStatus?.connected && !S.chatStatus.read_failed) {
@@ -3094,7 +3094,7 @@ function refreshAttendanceStatus() {
       // Closing the connection window does not end this account's read.
       if (googleListContext() === accountContext) {
         render();
-        if (googleReadContext() === googleContext && !S.attendanceReadFailed) {
+        if (followups && googleReadContext() === googleContext && !S.attendanceReadFailed) {
           maybeStartInitialAttendancePreparation(S.attendance);
         }
       }
@@ -3327,7 +3327,7 @@ function attendanceScriptUpdateDialogHtml() {
 function firstSetupCardHtml(a, view = attendanceViewKind()) {
   const initialRequired = a.initial_setup_required === true
     && (a.state === "initial-setup-required" || !S.firstSetupReadState);
-  if (!initialRequired) loadFirstSetupStatus();
+  if (!initialRequired && !connectionRefreshActive()) loadFirstSetupStatus();
   const complete = attendanceSheetSetupDone();
   const checking = !initialRequired && S.firstSetupReadState === "checking";
   const unavailable = !initialRequired && S.firstSetupReadState === "unavailable";
@@ -3347,17 +3347,18 @@ function firstSetupCardHtml(a, view = attendanceViewKind()) {
 let firstSetupReadContext = "";
 let firstSetupReadVersion = 0;
 let firstSetupInFlight = "";
-async function loadFirstSetupStatus(force = false) {
+async function loadFirstSetupStatus(force = false, background = false) {
   if (S.attendanceConnection) return;
-  if (S.connectTab !== "attendance" || !((S.mode === "edit" && S.edit === "connect")
-      || (S.mode === "wizard" && S.step === 8))
+  if ((!background && (S.connectTab !== "attendance" || !((S.mode === "edit" && S.edit === "connect")
+      || (S.mode === "wizard" && S.step === 8))))
       || S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
   const context = chatReadContext();
   if (firstSetupInFlight === context) return;
   if (!force && firstSetupReadContext === context) return;
   const before = JSON.stringify([S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.firstSetupReason]);
-  const previousReadState = firstSetupReadContext === context ? S.firstSetupReadState : null;
   const requestScreen = screenKey();
+  const keepAcrossScreens = background || S.mode !== "wizard";
+  const previousReadState = firstSetupReadContext === context ? S.firstSetupReadState : null;
   if (firstSetupReadContext !== context) {
     S.firstSetupDone = false; S.firstSetupReason = "";
     S.firstSetupConnectionCode = "";
@@ -3365,7 +3366,8 @@ async function loadFirstSetupStatus(force = false) {
   }
   firstSetupReadContext = context;
   const version = ++firstSetupReadVersion;
-  const current = () => version === firstSetupReadVersion && context === chatReadContext() && requestScreen === screenKey();
+  const current = () => version === firstSetupReadVersion && context === chatReadContext()
+    && (keepAcrossScreens || requestScreen === screenKey());
   firstSetupInFlight = context;
   S.firstSetupReadState = "checking";
   if (force) render();
@@ -3379,7 +3381,7 @@ async function loadFirstSetupStatus(force = false) {
   } finally {
     if (version === firstSetupReadVersion) {
       firstSetupInFlight = "";
-      if (context === chatReadContext() && requestScreen !== screenKey()) {
+      if (!keepAcrossScreens && context === chatReadContext() && requestScreen !== screenKey()) {
         S.firstSetupReadState = previousReadState;
         if (!previousReadState) firstSetupReadContext = "";
       }
@@ -3419,9 +3421,9 @@ function syncPreparedRoster() {
   rosterAutoSyncPending = pending;
   return pending.promise;
 }
-async function loadAttendanceRosterStatus(force = false) {
+async function loadAttendanceRosterStatus(force = false, readOnly = false) {
   if (S.attendanceConnection) return;
-  if (isHomeroomTeacher() && attendanceSheetSetupDone()) await syncPreparedRoster();
+  if (!readOnly && isHomeroomTeacher() && attendanceSheetSetupDone()) await syncPreparedRoster();
   if (S.attendance?.state !== "ready" || !isGoogleReady(S.google)) return;
   const context = chatReadContext();
   if (rosterInFlight?.context === context) return rosterInFlight.promise;
@@ -3455,7 +3457,8 @@ let rosterConnecting = false;
 function studentRosterSubrowHtml(a, view = attendanceViewKind()) {
   if (!isHomeroomTeacher()) return "";
   const initialRequired = a.roster_input_required === true;
-  if (!initialRequired && (rosterContext !== chatReadContext() || !rosterStatus)) loadAttendanceRosterStatus();
+  if (!initialRequired && !connectionRefreshActive()
+      && (rosterContext !== chatReadContext() || !rosterStatus)) loadAttendanceRosterStatus();
   if (view === "installation") {
     const editor = S.rosterEditor?.context === rosterEditorContext() ? S.rosterEditor : null;
     const complete = attendanceSheetSetupDone() && rosterContext === chatReadContext() && rosterStatus?.state === "ready" && !editor?.pending;
@@ -3597,6 +3600,7 @@ bindActions({"attendance-existing-repair": async () => {
   }
 }});
 bindActions({"attendance-status-recheck": async () => {
+  if (S.mode === "edit") return refreshConnectionStatus();
   S.attendanceReadFailed = false;
   await refreshAttendanceWizardGate();
   render();
@@ -3663,8 +3667,10 @@ function attendanceComingSoonHtml() {
 function attendanceTabHtml() {
   // 마법사에서 준비 폴링이 도는 동안에는 같은 상태를 두 경로로 읽지 않는다 —
   // 느린 attendance_status 응답이 폴링이 방금 놓은 새 상태를 옛 값으로 덮는 것을 막는다.
-  if (!attendancePreparePollOn) loadAttendanceStatus();
-  if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
+  if (!connectionRefreshActive()) {
+    if (!attendancePreparePollOn) loadAttendanceStatus();
+    if (S.attendance && S.attendance.state === "ready") loadChatStatus(false);
+  }
   const a = S.attendance && typeof S.attendance === "object" ? S.attendance : { state: "checking" };
   scheduleAttendanceBoundaryCheck(a);
   if (attendanceReplacementAttempt?.context !== attendanceReplacementContext(a)) attendanceReplacementAttempt = null;
@@ -3814,11 +3820,6 @@ bindActions({
       if (S.mode === "wizard") {
         // 마법사에서는 준비 폴링이 상태를 읽는다 — 같은 정보를 두 경로로 묻지 않는다.
         startAttendancePreparePoll();
-      } else {
-        // 다시 확인은 하되 화면을 비우지는 않는다. 비우면 탭을 누를 때마다
-        // "출결 준비 상태를 확인하는 중이에요…"가 뜨면서 방금 보던 내용이 사라진다.
-        // 앞서 읽은 상태를 그대로 두고 조용히 새로 읽어 바뀐 것만 갈아 끼운다.
-        refreshAttendanceStatus();
       }
     } else {
       stopChatConnectPoll();
@@ -4247,13 +4248,16 @@ window.addEventListener("focus", () => {
     S.chatNewSpaceBrowserBlurred = false;
     return;
   }
+  const returningFromChatSetup = S.chatNewSpaceBrowserOpen && S.chatNewSpaceBrowserBlurred;
   S.chatNewSpaceBrowserOpen = false;
   S.chatNewSpaceBrowserBlurred = false;
   S.spaceCreate = null;
-  // One fresh binding read drives setup, roster and Chat reads. This also
-  // catches changes made in a browser the teacher opened independently.
-  refreshAttendanceStatus();
-  render();
+  // Ordinary window focus is navigation, not a new verification request.
+  // Returning from an explicit Chat setup still completes that operation.
+  if (S.mode === "wizard" || returningFromChatSetup) {
+    refreshAttendanceStatus();
+    render();
+  }
 });
 
 function stepConnect() {
@@ -4282,7 +4286,7 @@ function stepConnect() {
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
       <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 Google 계정과 필요한 권한을 확인한 뒤 시작해요.</p>${pendingChat()}`;
   }
-  if (S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
+  if (!connectionRefreshActive() && S.connectTab === "messenger" && !S.listsLoaded && !S.linkLoading && !S.listsError &&
       (linkModes().cal === "existing" || linkModes().task === "existing")) {
     loadLinkLists();
   }
@@ -5203,6 +5207,8 @@ function effectiveChecks() {
     card: editing || "", tab: row.tab || "", target: row.target,
   }));
   const rows = uniqueChecks(kept.concat(live)).filter(row => row.key !== "connect.class-space");
+  if (connectionRefreshActive()) rows.push({key:"connect.refresh", label:"연결", card:"connect",
+    tab:"", target:"", ok:null, pending:true, detail:"연결 확인 중…", fix:""});
   if (attendanceUiEnabled() && isHomeroomTeacher() && isGoogleReady(S.google)) {
     const state = classRoomReadiness(), presentation = attendancePresentation(S.attendance);
     const waiting = state === "unverified" && (S.attendanceLoading || presentation.pending);
@@ -5684,6 +5690,82 @@ function shouldAutoRefreshChecks() {
   if ((S.checks.length && !checksRetry.dirtyCards.size) || checksRetry.inflight) return false;
   return !checksRetry.failedAt;
 }
+// A completed connection read belongs to its account/workbook, not to a tab.
+const CONNECTION_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+let connectionRefreshTimer = null;
+let connectionRefreshPending = null;
+function connectionRefreshActive() {
+  return Boolean(connectionRefreshPending?.context === googleListContext());
+}
+function connectionRefreshBlocked() {
+  return Boolean(S.login || S.attendanceLoading || S.linkLoading || chatStatusReading()
+    || S.chatSpacesLoading || firstSetupInFlight || rosterInFlight || checksRetry.inflight
+    || S.attendanceConnection || S.attendanceConnectionBusy || S.attendanceScriptUpdating
+    || S.attendanceTransitioning || S.attendanceSaving || S.attendanceAccountAuthorizing
+    || S.attendanceRepairing || S.classSpaceSaving
+    || attendancePreparePollOn || rosterConnecting || S.rosterEditor?.busy
+    || editAutoSavePromise || settingsAutoSavePromise || editDirtyFields.size);
+}
+function connectionRefreshButtonHtml() {
+  const busy = connectionRefreshActive();
+  const label = busy ? "연결 확인 중…" : "연결 상태 새로고침";
+  return `<button type="button" class="win-refresh${busy ? " checking" : ""}" data-action="connection-refresh"
+    title="${label}" aria-label="${label}" aria-busy="${busy}"${busy || connectionRefreshBlocked() ? " disabled" : ""}>
+    ${icon("refresh", "small")}</button>`;
+}
+function scheduleConnectionRefresh(delay = CONNECTION_REFRESH_INTERVAL_MS) {
+  if (connectionRefreshTimer) clearTimeout(connectionRefreshTimer);
+  connectionRefreshTimer = setTimeout(async () => {
+    connectionRefreshTimer = null;
+    // Do not interrupt setup, an edit, or another ongoing read/write.
+    if (!["home", "about"].includes(S.mode) || !isGoogleReady(S.google)
+        || connectionRefreshActive() || connectionRefreshBlocked()) {
+      scheduleConnectionRefresh(60000);
+      return;
+    }
+    await refreshConnectionStatus();
+  }, delay);
+}
+function refreshConnectionStatus() {
+  if (connectionRefreshActive()) return connectionRefreshPending.promise;
+  if (connectionRefreshBlocked()) return Promise.resolve();
+  const pending = { context: googleListContext(), promise: null };
+  connectionRefreshPending = pending;
+  const current = () => connectionRefreshPending === pending && pending.context === googleListContext();
+  pending.promise = (async () => {
+    try {
+      const status = await call("google_status");
+      if (!current()) return;
+      adoptGoogleStatus(status);
+      if (!current() || !isGoogleReady(S.google)) return;
+      await Promise.all([
+        loadLinkLists(true, current),
+        attendanceUiEnabled() ? refreshAttendanceStatus(false) : Promise.resolve(),
+      ]);
+      if (!current() || S.attendanceReadFailed || S.attendance?.state !== "ready" || !attendanceUiEnabled()) return;
+      const target = chatReadContext();
+      await Promise.all([
+        loadFirstSetupStatus(true, true),
+        loadAttendanceRosterStatus(true, true),
+        loadChatStatus(true, false),
+      ]);
+      if (current() && target === chatReadContext() && isHomeroomTeacher()
+          && S.chatStatus?.connected && !S.chatStatus.read_failed) await loadChatSpaces(true, false);
+    } catch (error) {
+      // Account verification failures already update the shared login state.
+      if (current() && !(error instanceof StaleAccountResponse)) render();
+    } finally {
+      if (connectionRefreshPending === pending) {
+        connectionRefreshPending = null;
+        scheduleConnectionRefresh();
+        render();
+      }
+    }
+  })();
+  render();
+  return pending.promise;
+}
+bindActions({ "connection-refresh": () => refreshConnectionStatus() });
 function homeHtml(behind) {
   const info = S.info;
   const visibleChecks = effectiveChecks().filter(
@@ -5754,6 +5836,7 @@ function windowHtml(title, body, big) {
     <div class="win-modal${big ? " big" : ""}" role="dialog" aria-label="${esc(title)}">
       <div class="win-head"><h1 class="win-title">${esc(title)}</h1>
         <span class="save-state" id="save-state"></span>
+        ${S.mode === "edit" && S.edit === "connect" ? connectionRefreshButtonHtml() : ""}
         <button class="win-x" data-action="back-home" aria-label="닫기">✕</button></div>
       <div class="win-body"><div class="page">${messages}${body}</div></div>
     </div></div>`;
@@ -6164,11 +6247,6 @@ async function loadForEdit(key, request) {
   S.draft.profile = Object.assign({}, profile);
   if (key === "connect") {
     applyInvalidatedGoogleTargets();
-    linkListsReadVersion += 1;
-    targetStatusReadVersion += 1;
-    S.linkLoading = false;
-    S.listsLoaded = false;
-    S.listsError = false;
   }
   if (grid !== null) S.draft.grid = grid;
   if (settings !== null) {
@@ -6180,16 +6258,10 @@ async function loadForEdit(key, request) {
     };
   }
   if (key === "connect" && attendanceUiEnabled()) {
-    try {
-      const attendance = await call("attendance_status");
-      if (!ownsIssueRequest(request)) return false;
-      S.attendance = attendance;
-      S.attendanceReadFailed = false;
-    } catch (_error) {
-      if (!ownsIssueRequest(request)) return false;
-      S.attendance = null;
-    }
-    S.attendanceScriptUpdate = null;
+    // Keep the last account-bound result, including an in-flight read, on reopen.
+    // First entry without evidence still performs the initial verification.
+    if (!S.attendance && !S.attendanceLoading && !S.attendanceReadFailed) await refreshAttendanceStatus(false);
+    if (!ownsIssueRequest(request)) return false;
     clearAttendanceScriptDialogState();
     S.connectTab = S.attendance && ["connection-repair-required", "script-check-required", "script-update-required"].includes(S.attendance.state)
       ? "attendance"
@@ -6553,6 +6625,7 @@ async function boot() {
     watchNetworkStatus();
     askUpdateOnStart();
     startLoginWatch();
+    scheduleConnectionRefresh();
   } catch (error) {
     root().innerHTML = `<div class="boot">${esc(error.message)}</div>`;
   }
