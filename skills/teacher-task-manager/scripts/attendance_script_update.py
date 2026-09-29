@@ -36,6 +36,13 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         ("v4.5", "3a1d14e914ab86e3cb02841d398742cafa03ea12"),
         ("v4.6", "3b73723e2bcf861b4b1d" "1115a3ff704bfa439419"),
     ),
+    # Exact public v4.7 tag (Code.gs 5.13.13), rehashed from the public tag 2026-09-29.
+    (
+        "0f2a003a94ba6cdb" "48d01a04b6988510"
+        "203f8e71ac432220" "d2b6a88af3cb86b3"
+    ): (
+        ("v4.7", "330b8ca591823ceace88" "32c8949b4620441a5aea"),
+    ),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
     # Exact public v4.1 tag c0c8ee6, checked against GitHub and independently

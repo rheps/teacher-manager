@@ -2799,7 +2799,7 @@ class _UpdateInfoUnsafeRedirect(ValueError):
     pass
 
 
-def _fetch_update_json() -> dict:
+def _python_update_info_bytes() -> bytes:
     from brity_bridge import tls
 
     deadline = time.monotonic() + _UPDATE_INFO_DEADLINE_SECONDS
@@ -2817,6 +2817,128 @@ def _fetch_update_json() -> dict:
             contents.extend(block)
             if len(contents) > _UPDATE_INFO_MAX_BYTES:
                 raise _UpdateInfoTooLarge("UPDATE_INFO_TOO_LARGE")
+    return bytes(contents)
+
+
+# UPD-01: on a school PC Python (and .NET) HTTPS to GitHub timed out every time
+# while the built-in Windows curl.exe and the browser got 200 in under a second.
+# One Windows curl.exe try is part of the same attempt; the caller's three-attempt
+# budget is unchanged and every host/size/SHA-256 guard still applies.
+_UPDATE_CURL_RUNNER = None  # tests replace this; None runs the real curl.exe
+_UPDATE_TRANSPORT_LABEL = re.compile(r"^[a-z0-9-]{1,40}$")
+
+
+class _UpdateCurlFailed(OSError):
+    def __init__(self, label: str):
+        super().__init__(label)
+        self.label = label
+
+
+def _system_curl_path() -> str:
+    """Only %SystemRoot%\\System32\\curl.exe, by absolute path; never a PATH lookup."""
+    if os.name != "nt":
+        return ""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or ""
+    if not root or not os.path.isabs(root):
+        return ""
+    candidate = os.path.join(root, "System32", "curl.exe")
+    return candidate if os.path.isfile(candidate) else ""
+
+
+def _python_fallback_label(error: BaseException) -> str:
+    """Name a timeout/connection failure; '' for HTTP replies and certificate errors."""
+    if isinstance(error, urllib.error.HTTPError):
+        return ""
+    cause = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(cause, (ssl.SSLCertVerificationError, ssl.CertificateError)):
+        return ""
+    if isinstance(cause, ssl.SSLError) and not isinstance(
+        cause, (ssl.SSLEOFError, ssl.SSLZeroReturnError)
+    ):
+        return ""
+    if isinstance(cause, (TimeoutError, socket.timeout)):
+        return "python-timeout"
+    if isinstance(cause, OSError):
+        return "python-connect"
+    return ""
+
+
+def _attach_update_transport(error: BaseException, trail: list[str]) -> None:
+    try:
+        error.update_transport = ">".join(trail)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+
+
+def _curl_fetch(url: str, target: Path, *, max_seconds: float, max_bytes: int) -> str:
+    """Fetch one https URL to target with Windows curl.exe; return the checked final URL."""
+    curl = _system_curl_path() if _UPDATE_CURL_RUNNER is None else "curl.exe"
+    if not curl:
+        raise _UpdateCurlFailed("curl-missing")
+    marker = "TM_FINAL_URL="
+    args = [
+        curl, "--silent", "--fail", "--location", "--max-redirs", "5",
+        "--proto", "=https", "--proto-redir", "=https",
+        "--max-time", str(int(max_seconds)), "--max-filesize", str(int(max_bytes)),
+        "--output", str(target), "--write-out", f"\\n{marker}%{{url_effective}}\\n", url,
+    ]
+    runner = _UPDATE_CURL_RUNNER or (lambda values, timeout: process_win.run_captured(values, timeout=timeout))
+    code, output = runner(args, timeout=max_seconds + 10)
+    if code != 0:
+        raise _UpdateCurlFailed(f"curl-exit-{int(code)}")
+    finals = [line[len(marker):].strip() for line in str(output or "").splitlines() if line.startswith(marker)]
+    if not finals or not _valid_https_update_url(finals[-1]):
+        raise _UpdateCurlFailed("host-not-allowed")
+    size = target.stat().st_size if target.exists() else -1
+    if size < 0 or size > max_bytes:
+        raise _UpdateCurlFailed("curl-too-large" if size > max_bytes else "curl-no-file")
+    return finals[-1]
+
+
+def _curl_update_info_bytes() -> bytes:
+    folder = Path(tempfile.mkdtemp(prefix="tm-update-info-"))
+    target = folder / "version.json"
+    try:
+        _curl_fetch(UPDATE_INFO_URL, target, max_seconds=_UPDATE_INFO_DEADLINE_SECONDS,
+                    max_bytes=_UPDATE_INFO_MAX_BYTES)
+        return target.read_bytes()
+    finally:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+
+
+def _fetch_update_json() -> dict:
+    trail: list[str] = []
+    try:
+        contents = _python_update_info_bytes()
+        trail.append("python-ok")
+    except Exception as error:
+        label = _python_fallback_label(error)
+        if not label:
+            raise
+        trail.append(label)
+        try:
+            contents = _curl_update_info_bytes()
+        except _UpdateCurlFailed as curl_error:
+            trail.append(curl_error.label)
+            if curl_error.label == "host-not-allowed":
+                unsafe = _UpdateInfoUnsafeRedirect("UNSAFE_UPDATE_INFO_REDIRECT")
+                _attach_update_transport(unsafe, trail)
+                raise unsafe from None
+            if curl_error.label == "curl-too-large":
+                too_large = _UpdateInfoTooLarge("UPDATE_INFO_TOO_LARGE")
+                _attach_update_transport(too_large, trail)
+                raise too_large from None
+            # Both transports failed: keep the original Python failure as the cause.
+            _attach_update_transport(error, trail)
+            raise error
+        trail.append("curl-ok")
     # BOM이 붙어 있어도 읽는다.
     try:
         value = _json.loads(bytes(contents).decode("utf-8-sig"))
@@ -2824,6 +2946,8 @@ def _fetch_update_json() -> dict:
         raise _UpdateInfoMalformed("UPDATE_INFO_MALFORMED") from error
     if not isinstance(value, dict):
         raise _UpdateInfoMalformed("UPDATE_INFO_MALFORMED")
+    value = dict(value)
+    value["_transport"] = ">".join(trail)
     return value
 
 
@@ -2913,6 +3037,17 @@ _UPDATE_CHECK_OFFLINE = (
 )
 
 
+# A timeout reached neither Python nor Windows curl.exe (UPD-01). The browser may
+# still reach GitHub, so point to the download page first (C11).
+_UPDATE_DOWNLOAD_UNREACHABLE = (
+    "업데이트 서버(GitHub)에서 설치 파일을 받지 못했어요. "
+    "먼저 아래 [다운로드 페이지 열기]로 최신 설치 파일을 직접 받을 수 있어요."
+)
+_UPDATE_SERVER_UNREACHABLE = (
+    "업데이트 서버(GitHub)에 연결하지 못해 새 버전을 확인하지 못했어요. "
+    "먼저 아래 [다운로드 페이지 열기]로 최신 설치 파일을 직접 받을 수 있어요."
+)
+
 def _update_check_failure_reason(error: BaseException) -> str:
     if isinstance(error, (ssl.SSLCertVerificationError, ssl.CertificateError)):
         return (
@@ -2925,7 +3060,7 @@ def _update_check_failure_reason(error: BaseException) -> str:
         # 서버가 HTTP 응답을 돌려줬으니 인터넷이 없는 상황은 아니다.
         return f"배포 서버가 응답했지만 업데이트 확인을 마치지 못했어요. {_UPDATE_CHECK_RETRY}"
     if isinstance(error, (TimeoutError, socket.timeout)):
-        return f"인터넷 응답을 기다리는 시간이 지났어요. {_UPDATE_CHECK_RETRY}"
+        return _UPDATE_SERVER_UNREACHABLE
     if isinstance(error, urllib.error.URLError):
         reason = error.reason
         if isinstance(reason, (ssl.SSLCertVerificationError, ssl.CertificateError)):
@@ -2934,7 +3069,7 @@ def _update_check_failure_reason(error: BaseException) -> str:
                 "학교 보안 프로그램이나 컴퓨터의 날짜·시간을 확인해 주세요."
             )
         if isinstance(reason, (TimeoutError, socket.timeout)):
-            return f"인터넷 응답을 기다리는 시간이 지났어요. {_UPDATE_CHECK_RETRY}"
+            return _UPDATE_SERVER_UNREACHABLE
         return _UPDATE_CHECK_OFFLINE
     if isinstance(error, OSError):
         return _UPDATE_CHECK_OFFLINE
@@ -2944,9 +3079,50 @@ def _update_check_failure_reason(error: BaseException) -> str:
     )
 
 
+def _safe_update_transport(value) -> str:
+    parts = str(value or "").split(">")
+    if not value or len(parts) > 4 or not all(_UPDATE_TRANSPORT_LABEL.fullmatch(p) for p in parts):
+        return ""
+    return ">".join(parts)
+
+
 def check_update(current: str, fetch=None) -> dict:
     """새 버전, 최신 상태, 확인 실패를 서로 다른 값으로 알려준다."""
     fetch = fetch or _fetch_update_json
+    seen = {"transport": ""}
+
+    def traced():
+        # Which transport failed or succeeded goes to diagnostics only (UPD-01).
+        try:
+            data = fetch()
+        except BaseException as error:
+            seen["transport"] = getattr(error, "update_transport", "")
+            raise
+        if isinstance(data, dict):
+            seen["transport"] = data.get("_transport", "")
+        return data
+
+    result = _check_update_once(current, traced)
+    transport = _safe_update_transport(seen["transport"])
+    return {**result, "transport": transport} if transport else result
+
+
+def record_update_transport(config_dir, stage: str, transport: str) -> None:
+    """Keep a local line when the curl.exe fallback ran (UPD-01). Best effort only."""
+    if config_dir is None or not transport or transport == "python-ok":
+        return
+    try:
+        log = paths.bridge_state_dir(Path(config_dir)) / "logs" / "update-transport.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        lines = log.read_text(encoding="utf-8").splitlines()[-199:] if log.exists() else []
+        lines.append(_json.dumps({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": str(stage),
+                                  "transport": transport}, ensure_ascii=False))
+        atomic_io.atomic_write_text(log, "".join(line + "\n" for line in lines))
+    except Exception:  # noqa: BLE001 - diagnostics never block the update
+        pass
+
+
+def _check_update_once(current: str, fetch) -> dict:
     try:
         data = fetch() or {}
         latest = str(data.get("version", "") or "")
@@ -3136,7 +3312,38 @@ def _publish_download_no_overwrite(partial: Path, folder: Path, name: str,
         return target
 
 
-def _download_file(url: str, dest_dir, expected_sha256: str, opener=None):
+def _curl_download_into(url: str, partial: Path, identity: tuple[int, int]) -> str:
+    """UPD-01 fallback: curl.exe overwrites the same owned partial; hash it back here."""
+    _curl_fetch(url, partial, max_seconds=_UPDATE_SETUP_DEADLINE_SECONDS,
+                max_bytes=_UPDATE_SETUP_MAX_BYTES)
+    digest = hashlib.sha256()
+    total = 0
+    with partial.open("rb") as source:
+        if component_lock.assert_open_file_is_direct(partial, source) != identity:
+            raise component_lock.UnsafeLockPathError("받는 중인 설치 파일이 다른 파일로 바뀌었습니다.")
+        while True:
+            chunk = source.read(_UPDATE_READ_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _UPDATE_SETUP_MAX_BYTES:
+                raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
+            digest.update(chunk)
+        if component_lock.assert_open_file_is_direct(partial, source) != identity:
+            raise component_lock.UnsafeLockPathError("받는 중인 설치 파일이 다른 파일로 바뀌었습니다.")
+    return digest.hexdigest()
+
+
+def _download_fallback_label(error: BaseException) -> str:
+    # Local file and link-safety failures never switch transport.
+    if isinstance(error, component_lock.UnsafeLockPathError):
+        return ""
+    if not isinstance(error, (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError)):
+        return ""
+    return _python_fallback_label(error)
+
+
+def _download_file(url: str, dest_dir, expected_sha256: str, opener=None, transport_trail=None):
     """Setup을 고유 임시 파일에 받고 같은 읽기에서 크기·시간·확인값을 검사한다."""
     import urllib.request
 
@@ -3161,52 +3368,76 @@ def _download_file(url: str, dest_dir, expected_sha256: str, opener=None):
     digest = hashlib.sha256()
     total = 0
     try:
+        trail = transport_trail if transport_trail is not None else []
         try:
-            response = opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS))
-        except (ssl.SSLError, urllib.error.URLError):
-            raise
-        except OSError as error:
-            raise urllib.error.URLError(error) from error
-        with response as source:
-            _require_https_response(source, url)
-            with partial.open("xb") as sink:
-                partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
-                while True:
+            try:
+                response = opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS))
+            except (ssl.SSLError, urllib.error.URLError):
+                raise
+            except OSError as error:
+                raise urllib.error.URLError(error) from error
+            with response as source:
+                _require_https_response(source, url)
+                with partial.open("xb") as sink:
+                    partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
+                    while True:
+                        if time.monotonic() >= deadline:
+                            raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                        remaining = _UPDATE_SETUP_MAX_BYTES - total
+                        try:
+                            chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
+                        except OSError as error:
+                            # A socket read failure is not a local folder permission problem.
+                            raise urllib.error.URLError(error) from error
+                        if time.monotonic() >= deadline:
+                            raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _UPDATE_SETUP_MAX_BYTES:
+                            raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
+                        # 네트워크를 읽는 동안 다른 이름이 붙거나 경로가 바뀌었는지,
+                        # 실제 쓰기 바로 전에 열린 handle과 경로를 다시 맞춰 본다.
+                        current = component_lock.assert_open_file_is_direct(partial, sink)
+                        if current != partial_identity:
+                            raise component_lock.UnsafeLockPathError(
+                                "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
+                            )
+                        sink.write(chunk)
+                        digest.update(chunk)
+                    sink.flush()
+                    os.fsync(sink.fileno())
                     if time.monotonic() >= deadline:
                         raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                    remaining = _UPDATE_SETUP_MAX_BYTES - total
-                    try:
-                        chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
-                    except OSError as error:
-                        # A socket read failure is not a local folder permission problem.
-                        raise urllib.error.URLError(error) from error
-                    if time.monotonic() >= deadline:
-                        raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _UPDATE_SETUP_MAX_BYTES:
-                        raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
-                    # 네트워크를 읽는 동안 다른 이름이 붙거나 경로가 바뀌었는지,
-                    # 실제 쓰기 바로 전에 열린 handle과 경로를 다시 맞춰 본다.
                     current = component_lock.assert_open_file_is_direct(partial, sink)
                     if current != partial_identity:
                         raise component_lock.UnsafeLockPathError(
                             "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
                         )
-                    sink.write(chunk)
-                    digest.update(chunk)
-                sink.flush()
-                os.fsync(sink.fileno())
-                if time.monotonic() >= deadline:
-                    raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                current = component_lock.assert_open_file_is_direct(partial, sink)
-                if current != partial_identity:
-                    raise component_lock.UnsafeLockPathError(
-                        "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
-                    )
+            final_digest = digest.hexdigest()
+            trail.append("python-ok")
+        except Exception as error:
+            label = _download_fallback_label(error)
+            if not label:
+                raise
+            trail.append(label)
+            if partial_identity is None:
+                # Own the partial before curl writes it, so every exit path removes it.
+                with partial.open("xb") as sink:
+                    partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
+            try:
+                final_digest = _curl_download_into(url, partial, partial_identity)
+            except _UpdateCurlFailed as curl_error:
+                trail.append(curl_error.label)
+                _attach_update_transport(error, trail)
+                if curl_error.label == "curl-too-large":
+                    raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE") from None
+                if curl_error.label == "host-not-allowed":
+                    raise ValueError("unsafe final update URL") from None
+                raise error
+            trail.append("curl-ok")
 
-        if digest.hexdigest() != expected:
+        if final_digest != expected:
             raise _UpdateDownloadHashMismatch("UPDATE_SETUP_HASH_MISMATCH")
         if partial_identity is None:
             raise component_lock.UnsafeLockPathError("받은 설치 파일을 확인하지 못했습니다.")
@@ -3992,12 +4223,14 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
             }
 
         if path is None:
+            download_trail: list[str] = []
             try:
                 path = _download_file(
                     target_url,
                     dest_dir,
                     target_sha256,
                     opener=opener,
+                    transport_trail=download_trail,
                 )
             except _UpdateDownloadHashMismatch:
                 return {
@@ -4043,11 +4276,15 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                         "started": False, "code": "UPDATE_DOWNLOAD_TLS_UNSAFE", "latest": target_latest,
                         "reason": "배포 사이트의 보안 인증서를 확인하지 못해 설치 파일을 받지 않았어요. 컴퓨터의 날짜·시간을 확인해 주세요.",
                     }
+                transport = _safe_update_transport(">".join(download_trail))
+                record_update_transport(config_dir, "download", transport)
                 return {
                     "started": False,
                     "code": "UPDATE_DOWNLOAD_UNAVAILABLE",
                     "latest": target_latest,
-                    "reason": "새 버전 다운로드에 실패했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.",
+                    # Neither Python nor Windows curl.exe reached GitHub (UPD-01, C11).
+                    "reason": _UPDATE_DOWNLOAD_UNREACHABLE,
+                    **({"transport": transport} if transport else {}),
                 }
             except OSError:
                 return {
@@ -4064,6 +4301,7 @@ def start_update(current: str, fetch=None, opener=None, launch=None, dest_dir=No
                     "started": False, "code": "UPDATE_DOWNLOAD_FAILED", "latest": target_latest,
                     "reason": "설치 파일을 준비하지 못했어요. 실패 원인은 아직 확인하지 못했습니다.",
                 }
+            record_update_transport(config_dir, "download", _safe_update_transport(">".join(download_trail)))
             try:
                 actual_sha256 = _file_sha256(path)
             except OSError:

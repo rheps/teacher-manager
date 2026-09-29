@@ -629,10 +629,13 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .win-body .page { max-width:100%; }
 .about-brand { font-size:21px; font-weight:800; margin:2px 0 4px; }
 .update-manual-note { border-top:1px solid var(--tm-line); padding:12px 0 14px; }
-.update-manual-link { display:block; width:100%; border:0; background:none; padding:0;
-  color:var(--tm-faint); font-family:inherit; font-size:13px; line-height:1.65;
-  text-align:left; cursor:pointer; }
-.update-manual-link:hover, .update-manual-link:focus-visible { color:#4E5968; text-decoration:underline; text-underline-offset:3px; }
+/* 2026-09-29 user decision: plain guide sentence first, then the clickable Release address. */
+.update-manual-text { margin:0 0 6px; color:var(--tm-faint); font-size:13px; line-height:1.65; }
+.update-manual-link { display:block; max-width:100%; border:0; background:none; padding:0;
+  color:var(--tm-blue); font-family:inherit; font-size:13px; line-height:1.65;
+  text-align:left; cursor:pointer; text-decoration:underline; text-underline-offset:3px;
+  overflow-wrap:anywhere; }
+.update-manual-link:hover, .update-manual-link:focus-visible { color:#1B64DA; }
 .update-manual-link:focus-visible { outline:2px solid #B6D5FB; outline-offset:4px; border-radius:3px; }
 .update-manual-link:disabled { opacity:.55; cursor:default; text-decoration:none; }
 body.win-open { overflow:hidden; }

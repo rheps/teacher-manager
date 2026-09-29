@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -155,6 +156,39 @@ class AttendanceScriptRecheckError(ScreenSafeError):
 
 class AttendanceScriptChangedOutsideError(ScreenSafeError):
     """편집본이 프로그램 밖에서 바뀐 결정적 상태 — 되풀이하지 않고 출결 탭의 현재 상태 확인을 안내한다."""
+
+
+class AttendanceScriptUpdateStopped(Exception):
+    """Journal marker: 출결 기능 업데이트 stopped in a state that needs the teacher (ATT-UPD-01)."""
+
+    def __init__(self, state: str):
+        super().__init__(state)
+        self.diagnostic_detail = f"state={state}"
+
+
+# A stop in these states used to leave no journal line (2026-09-29 14:26).
+_ATTENDANCE_UPDATE_STOP_STATES = frozenset({
+    "ai-action-required", "initial-setup-required", "customized", "hold",
+    "permission-required", "verification-unavailable",
+})
+
+
+def _journal_attendance_update_stop(config_dir, operation: str, payload) -> None:
+    if not isinstance(payload, dict):
+        return
+    state = str(payload.get("state") or "")
+    if state not in _ATTENDANCE_UPDATE_STOP_STATES:
+        return
+    try:
+        issue = recovery.UserIssue(
+            operation=operation, state="needs_user", title="출결 기능 업데이트를 마치지 못했어요.",
+            message=str(payload.get("detail") or ""), change_status="", actions=(),
+            attempt_count=1, reason=str(payload.get("detail") or "")[:300],
+            diagnostic_id=str(uuid.uuid4()),
+        )
+        _record_issue_journal(config_dir, issue, AttendanceScriptUpdateStopped(state))
+    except Exception:  # noqa: BLE001 - the journal never blocks the screen
+        pass
 
 
 class _AttendanceRemoteWorkLease:
@@ -1071,7 +1105,7 @@ _SESSION_TRANSITIONS = frozenset({
     "gws_logout", "get_app_info",
 })
 _SESSION_GLOBAL = _SESSION_TRANSITIONS | frozenset({
-    "get_update_info", "update_offer", "decline_update", "start_update", "quit_app",
+    "get_update_info", "update_offer", "decline_update", "start_update", "quit_app", "error_report_status",
     "computer_status", "network_status", "gws_update_status", "install_gws_update",
     "gws_repair_oauth_client", "open_url", "open_picture_guide", "open_support_email", "open_logs",
     "ai_tools_status", "ai_node_status", "ai_node_prepare", "ai_skills_install",
@@ -1395,6 +1429,7 @@ class Api:
         self._attendance_revocation_unconfirmed = False
         self._support_mail_opener = self._deps.support_mail_opener
         self._error_report_flush_lock = threading.Lock()
+        self._error_report_retry_ids: set[str] = set()
 
     @property
     def _config_dir(self):
@@ -1668,6 +1703,28 @@ class Api:
                 "attendance_ui_enabled": engine.attendance_ui_enabled(),
             },
         }
+
+    @guarded
+    def error_report_status(self, report_id=""):
+        """The failure panel footer follows the real send result (sent/sending/retry/queued).
+
+        The panel is drawn before the background send finishes, so the reply alone
+        can only say "queued"; the screen reads this afterwards (UPD-01 footer).
+        """
+        wanted = str(report_id or "").strip()
+        if not wanted:
+            return {"state": "unknown"}
+        rows = error_reports.queue_rows(self._config_dir)
+        row = next((row for row in rows if str(row["report"].get("reportId") or "") == wanted), None)
+        if row is None:
+            return {"state": "unknown"}
+        if row.get("status") == "sent":
+            return {"state": "sent"}
+        if self._error_report_flush_lock.locked():
+            return {"state": "sending"}
+        if wanted in self._error_report_retry_ids:
+            return {"state": "retry"}
+        return {"state": "queued"}
 
     @guarded
     def get_update_info(self):
@@ -3156,16 +3213,18 @@ class Api:
                 self._config_dir, **lock_options
             ):
                 if not attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
-                    return self._attendance_operation(
+                    result = self._attendance_operation(
                         "attendance_script_update_apply",
                         "출결 기능을 바꾸지 못했어요.",
                         lambda: self._attendance_script_update(apply=True),
                         retry_states=frozenset(),
                     )
+                    _journal_attendance_update_stop(self._config_dir, "attendance_script_update", result)
+                    return result
                 run, gws, account = (
                     self._resolve_attendance_goedu_gws_context_or_fail()
                 )
-                return self._attendance_operation(
+                result = self._attendance_operation(
                     "attendance_script_update_apply",
                     "출결 기능을 바꾸지 못했어요.",
                     lambda: self._attendance_script_update(
@@ -3175,6 +3234,8 @@ class Api:
                     ),
                     retry_states=frozenset(),
                 )
+                _journal_attendance_update_stop(self._config_dir, "attendance_script_update", result)
+                return result
         finally:
             self._attendance_script_update_lock.release()
 
@@ -3183,12 +3244,14 @@ class Api:
         """Resume only reads and the local completion stamp; never replay Google writes."""
         with engine.attendance_remote_work_lock(self._config_dir):
             run, gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
-            return self._attendance_operation(
+            result = self._attendance_operation(
                 "attendance_script_update_resume", "출결 설정 완료 여부를 확인하지 못했어요.",
                 lambda: self._attendance_script_update(
                     apply=False, resume=True, resolved=(run, gws), account=account),
                 retry_states={"hold"},
             )
+            _journal_attendance_update_stop(self._config_dir, "attendance_script_update", result)
+            return result
 
     @guarded
     def attendance_chat_status(self, batch=""):
@@ -3756,6 +3819,8 @@ class Api:
             read_once,
             change_status="현재 앱과 기존 설정은 그대로입니다.",
         )
+        if isinstance(info, dict):
+            engine.record_update_transport(self._config_dir, "update_info", str(info.get("transport") or ""))
         self._remember_app_update_offer(info)
         return info
 
@@ -4272,7 +4337,13 @@ class Api:
                     if (self._session_identity_available is not True or local_problem
                             or self._verified_google_account != session_token[0]):
                         return
-                    error_reports.flush(self._config_dir, endpoint, poster)
+                    before = {str(row.get("reportId") or "") for row in error_reports.pending(self._config_dir)}
+                    try:
+                        error_reports.flush(self._config_dir, endpoint, poster)
+                    finally:
+                        # A report still pending after a real send attempt waits for the next start.
+                        after = {str(row.get("reportId") or "") for row in error_reports.pending(self._config_dir)}
+                        self._error_report_retry_ids = (self._error_report_retry_ids | (before & after)) - (before - after)
             except Exception:  # noqa: BLE001 - 다음 기회에 다시 보낸다.
                 pass
             finally:
@@ -4362,14 +4433,24 @@ class Api:
                 if isinstance(value, dict)
                 else ""
             )
+            # Which update transport failed goes to the journal and report only (UPD-01).
+            transport = str(value.get("transport") or "") if isinstance(value, dict) else ""
             if disposition == "retry":
-                raise recovery.RetryableOperationError(
+                retry = recovery.RetryableOperationError(
                     code,
                     detail or "현재 상태를 다시 확인하고 있어요.",
                 )
+                if transport:
+                    retry.diagnostic_detail = f"transport={transport}"
+                raise retry
             if return_stop_result:
                 return value
-            stop_now(code, detail)
+            try:
+                stop_now(code, detail)
+            except recovery.FinalOperationFailure as final:
+                if transport:
+                    final.diagnostic_detail = f"transport={transport}"
+                raise
 
         def verify_once():
             nonlocal cycle, verified_this_cycle

@@ -416,6 +416,33 @@ function directIssueActionHtml(issue) {
     .map((row) => `<button class="btn-tonal" data-action="issue-direct" data-preserve-issue="true" data-issue-action="${esc(row.key)}">${esc(DIRECT_ISSUE_ACTIONS[row.key] || row.label)}</button>`)
     .join("");
 }
+// The panel is drawn before the background send ends, so the reply can only say
+// "queued". The footer then follows the real send result (UPD-01 footer fix).
+let problemReportTimer = null;
+function followProblemReport(issue) {
+  clearTimeout(problemReportTimer);
+  const id = String(issue?.diagnostic_id || "");
+  if (!id || issue.report_queued !== true) return;
+  let tries = 0;
+  const tick = async () => {
+    if (S.problemIssue !== issue) return;
+    let state = "";
+    try { state = String((await call("error_report_status", id))?.state || ""); } catch (_) { return; }
+    if (S.problemIssue !== issue) return;
+    if (state && state !== "unknown") {
+      issue.report_state = state;
+      // Only the footer text changes; the panel's buttons stay attached (LOCK-02).
+      const footer = document.querySelector(".problem-panel .problem-footer");
+      const next = document.createElement("div");
+      next.innerHTML = problemPanelHtml(issue);
+      const text = next.querySelector(".problem-footer")?.textContent || "";
+      if (footer && text) footer.textContent = text;
+    }
+    if (state === "sent" || state === "retry" || ++tries >= 15) return;
+    problemReportTimer = setTimeout(tick, 2000);
+  };
+  problemReportTimer = setTimeout(tick, 1500);
+}
 function problemPanelHtml(issue) {
   if (!issue || !["needs_user", "failed"].includes(issue.state)) return "";
   const readUncertain = ATTENDANCE_READ_METHODS.has(issue.operation) || issue.operation === "attendance_prepare_status";
@@ -428,11 +455,14 @@ function problemPanelHtml(issue) {
   const stepsHtml = steps.length
     ? `<div class="problem-steps"><b>지금 할 수 있는 일</b><ol>${steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol></div>`
     : "";
-  const reportStatus = issue.reported === true
-    ? "오류 내용을 개발자에게 보냈어요."
-    : issue.report_queued === true
-      ? "오류 내용을 이 컴퓨터에 저장했어요. 개발자에게 전달됐는지는 아직 확인하지 못했습니다."
-      : "";
+  const reportState = issue.reported === true ? "sent"
+    : String(issue.report_state || (issue.report_queued === true ? "queued" : ""));
+  const reportStatus = {
+    sent: "오류 내용을 개발자에게 보냈어요.",
+    sending: "오류 내용을 개발자에게 보내고 있어요.",
+    retry: "오류 내용을 이 컴퓨터에 저장했어요. 지금은 개발자에게 보내지 못해 다음에 프로그램을 켤 때 다시 보냅니다.",
+    queued: "오류 내용을 이 컴퓨터에 저장했어요. 개발자에게 전달됐는지는 아직 확인하지 못했습니다.",
+  }[reportState] || "";
   return `<section class="problem-panel${readUncertain ? " read-uncertain" : ""}" role="alert">
     <h2>${esc(readUncertain ? "현재 상태를 확인하지 못했어요." : issueValue(issue, "title", "작업을 마치지 못했어요."))}</h2>
     <p class="problem-reason">${esc(reason || "다시 확인해 주세요.")}</p>
@@ -457,6 +487,7 @@ function showProblemIssue(error, request, paint = render) {
   problemIssueToken += 1;
   S.banner = null;
   paint();
+  followProblemReport(issue);
   return true;
 }
 function handleCaughtError(error, request) {
@@ -3420,9 +3451,24 @@ function focusAttendanceScriptResolve() {
   const trigger = document.querySelector('[data-action="attendance-script-update-resolve"]');
   if (trigger && trigger.focus) trigger.focus();
 }
+// ATT-PICK-01: on 2026-09-24 a school account linked an old pre-2026-08-14 sheet with the
+// same class name. Workbooks Teacher Manager made end with this suffix; list them first
+// and ask once before linking any other sheet. The selection itself is unchanged.
+const TM_WORKBOOK_SUFFIX = /\(Teacher Manager 출결 자동화\)\s*$/i;
+function isTeacherManagerWorkbook(row) {
+  return TM_WORKBOOK_SUFFIX.test(String(row?.name || ""));
+}
 function attendanceConnectionFooterHtml(flow) {
   const selected = flow.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
   const disabled = !selected || !selected.can_edit || flow.loading || flow.saving;
+  if (selected && flow.confirm_foreign === selected.spreadsheet_id && !flow.saving) {
+    return `<div class="banner warn attendance-foreign-confirm" role="alertdialog">
+      <span>Teacher Manager가 만든 출석부가 아니에요. 이 시트로 연결할까요?</span></div>
+    <div class="attendance-update-dialog-actions">
+      <button class="btn-quiet" data-action="attendance-select-foreign-cancel">취소</button>
+      <button class="btn" data-action="attendance-select-foreign-ok">연결</button>
+    </div>`;
+  }
   return `${flow.selection_error ? `<p class="field-error" role="alert">${esc(flow.selection_error)}</p>` : ""}
     <div class="attendance-update-dialog-actions">
       <button class="btn-quiet" data-action="attendance-select-cancel"${flow.saving ? " disabled" : ""}>닫기</button>
@@ -3430,6 +3476,13 @@ function attendanceConnectionFooterHtml(flow) {
       <button class="btn-tonal" data-action="attendance-select-preview"${!selected || flow.saving ? " disabled" : ""}>파일 열어보기</button>
       <button class="btn" data-action="attendance-select-confirm"${disabled ? " disabled" : ""}>${flow.saving ? "연결 중…" : "이 출석부로 연결"}</button>
     </div>`;
+}
+function attendanceWorkbookOptionsHtml(flow) {
+  const option = row => `<option value="${esc(row.spreadsheet_id)}"${row.spreadsheet_id === flow.selected_id ? " selected" : ""}${row.can_edit ? "" : " disabled"}>${esc(row.name)}${row.modified_time ? ` · ${esc(row.modified_time.slice(0, 10))}` : ""}</option>`;
+  const rows = flow.candidates || [];
+  const managed = rows.filter(isTeacherManagerWorkbook), others = rows.filter(row => !isTeacherManagerWorkbook(row));
+  return (managed.length ? `<optgroup label="Teacher Manager 출석부">${managed.map(option).join("")}</optgroup>` : "")
+    + (others.length ? `<optgroup label="옛 양식 또는 다른 시트">${others.map(option).join("")}</optgroup>` : "");
 }
 function attendanceConnectionDialogHtml() {
   const flow = S.attendanceConnection;
@@ -3439,7 +3492,7 @@ function attendanceConnectionDialogHtml() {
     ${flow.loading ? `<p role="status">목록을 불러오는 중…</p>` : `<label class="field">출석부
       <select name="attendance-workbook-choice"${flow.saving ? " disabled" : ""}>
       <option value="">${flow.candidates?.length ? "사용할 파일을 선택하세요" : flow.selection_error ? "목록을 다시 불러와 주세요" : "내 Drive의 시트 파일이 없습니다"}</option>
-      ${(flow.candidates || []).map(row => `<option value="${esc(row.spreadsheet_id)}"${row.spreadsheet_id === flow.selected_id ? " selected" : ""}${row.can_edit ? "" : " disabled"}>${esc(row.name)}${row.modified_time ? ` · ${esc(row.modified_time.slice(0, 10))}` : ""}</option>`).join("")}
+      ${attendanceWorkbookOptionsHtml(flow)}
       </select></label>`}
     <div class="attendance-picker-footer">${attendanceConnectionFooterHtml(flow)}</div>
     </section></div>`;
@@ -3481,7 +3534,32 @@ bindActions({
     const selected = flow?.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
     if (selected) await call("open_url", selected.spreadsheet_url);
   },
+  "attendance-select-foreign-cancel": () => {
+    const flow = S.attendanceConnection;
+    if (!flow || flow.saving) return;
+    flow.confirm_foreign = "";
+    render();
+  },
+  "attendance-select-foreign-ok": () => {
+    const flow = S.attendanceConnection;
+    if (!flow || flow.saving || flow.confirm_foreign !== flow.selected_id) return;
+    flow.foreign_confirmed = flow.selected_id;
+    flow.confirm_foreign = "";
+    return linkSelectedAttendanceWorkbook();
+  },
   "attendance-select-confirm": async () => {
+    const flow = S.attendanceConnection;
+    const selected = flow?.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
+    if (!selected?.can_edit || flow.loading || flow.saving || flow.accountContext !== googleReadContext()) return;
+    if (!isTeacherManagerWorkbook(selected) && flow.foreign_confirmed !== selected.spreadsheet_id) {
+      flow.confirm_foreign = selected.spreadsheet_id;
+      render();
+      return;
+    }
+    return linkSelectedAttendanceWorkbook();
+  }
+});
+async function linkSelectedAttendanceWorkbook() {
     const flow = S.attendanceConnection;
     const selected = flow?.candidates?.find(row => row.spreadsheet_id === flow.selected_id);
     if (!selected?.can_edit || flow.loading || flow.saving || flow.accountContext !== googleReadContext()) return;
@@ -3512,8 +3590,7 @@ bindActions({
       if (S.attendanceConnection === flow) { flow.saving = false; S.attendanceConnectionBusy = false; }
       render();
     }
-  }
-});
+}
 function attendanceScriptUpdateDialogHtml() {
   const kind = S.attendanceScriptDialog;
   if (!kind) return "";
@@ -4549,6 +4626,7 @@ document.addEventListener("change", (event) => {
     if (!flow.candidates?.some(candidate => candidate.spreadsheet_id === event.target.value)) return;
     flow.selected_id = event.target.value;
     delete flow.selection_error;
+    flow.confirm_foreign = "";
     // Keep the native radio nodes/focus for arrow-key selection.
     const footer = document.querySelector(".attendance-picker-footer");
     if (footer) footer.innerHTML = attendanceConnectionFooterHtml(flow);
@@ -6827,7 +6905,7 @@ function renderAbout() {
   const b = S.info.branding;
   const u = updateControls();
   const directDisabled = S.updating ? " disabled" : "";
-  const manualInstallGuide = "자동 업데이트가 정상적으로 되지 않는 경우, 이 안내를 눌러 GitHub 릴리즈 페이지에서 최신 설치 파일을 직접 내려받은 뒤 실행해 주세요. 기존 프로그램을 삭제할 필요 없이 그대로 설치하면 업데이트됩니다.";
+  const manualInstallGuide = "자동 업데이트가 정상적으로 되지 않는 경우, 아래 주소를 눌러 GitHub 릴리즈 페이지에서 최신 설치 파일을 직접 내려받은 뒤 실행해 주세요. 기존 프로그램을 삭제할 필요 없이 그대로 설치하면 업데이트됩니다.";
   root().innerHTML = homeHtml(true) + windowHtml("버전 및 제작 정보", `
     <h2 class="about-brand">${esc(b.name)}</h2>
     <p class="sub">${esc(b.tagline)}</p>
@@ -6836,7 +6914,8 @@ function renderAbout() {
       <div class="row"><span class="name">만든 사람</span><span class="st">${esc(b.credit.replace("만든 사람: ", ""))}</span></div>
       <div class="row"><span class="name">게시자</span><span class="st">${esc(b.publisher)}</span></div>
       <div class="row"><span class="name">프로그램 업데이트</span>${u.st}${u.btn}</div>
-      <div class="update-manual-note"><button type="button" class="update-manual-link" role="link" data-action="link-open" data-url="${LATEST_RELEASE_URL}"${directDisabled}>${esc(manualInstallGuide)}</button></div>
+      <div class="update-manual-note"><p class="update-manual-text">${esc(manualInstallGuide)}</p>
+        <button type="button" class="update-manual-link" role="link" data-action="link-open" data-url="${LATEST_RELEASE_URL}"${directDisabled}>${esc(LATEST_RELEASE_URL)}</button></div>
     </div>
     <div class="section-h">웹사이트</div>
     ${linkRow(b.website)}`, false) + toastHtml();

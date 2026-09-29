@@ -143,6 +143,12 @@ def enqueue(config_dir: Path, report: Mapping[str, Any]) -> bool:
     return True
 
 
+def queue_rows(config_dir: Path) -> list[dict]:
+    """Rows with their send status, for the failure panel footer."""
+    with _QUEUE_LOCK:
+        return _read_rows(queue_path(Path(config_dir)))
+
+
 def pending(config_dir: Path) -> list[dict]:
     with _QUEUE_LOCK:
         rows = _read_rows(queue_path(Path(config_dir)))

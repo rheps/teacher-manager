@@ -97,7 +97,9 @@
 # without repeating uncertain writes or changing the verified connection flow.
 # v4.7: AI attendance input resolves roster names, report column shown, sheet sort menus,
 # one refresh button per window, fewer stuck checking states, safe update over a running app.
-APP_VERSION = "4.7"
+# v4.8: in-app update retries the download once another way when GitHub does not answer,
+# clearer update failure notices, error report footer, grouped workbook picker, Release address.
+APP_VERSION = "4.8"
 
 BRANDING = {
     "name": "Teacher Manager",

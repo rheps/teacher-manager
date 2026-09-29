@@ -92,8 +92,8 @@ _GUIDANCE = {
     KIND_UPDATE: Guidance(
         reason="업데이트 정보를 받아 오지 못했어요.",
         steps=(
-            "설치 파일을 내려받지 못했다면 인터넷 연결을 확인해 주세요.",
-            "아래 [다운로드 페이지 열기]에서 최신 Teacher Manager 설치 파일을 직접 받을 수 있어요.",
+            "먼저 아래 [다운로드 페이지 열기]에서 최신 Teacher Manager 설치 파일을 직접 받을 수 있어요.",
+            "브라우저에서도 다운로드 페이지가 열리지 않으면 인터넷 연결을 확인해 주세요.",
             _PRESERVE_STEP,
         ),
         actions=(recovery.IssueAction("open-download-page", "다운로드 페이지 열기"),),
