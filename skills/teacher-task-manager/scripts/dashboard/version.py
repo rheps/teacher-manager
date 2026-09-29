@@ -95,7 +95,9 @@
 # and name the class-space creation action consistently.
 # v4.4: Choose an existing attendance workbook and recover explicit roster saves
 # without repeating uncertain writes or changing the verified connection flow.
-APP_VERSION = "4.6"
+# v4.7: AI attendance input resolves roster names, report column shown, sheet sort menus,
+# one refresh button per window, fewer stuck checking states, safe update over a running app.
+APP_VERSION = "4.7"
 
 BRANDING = {
     "name": "Teacher Manager",

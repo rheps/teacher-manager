@@ -25,7 +25,8 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
-    # Exact public v4.3-v4.5 tags share this bundle; v4.4/v4.5 reverified 2026-09-16.
+    # Exact public v4.3-v4.6 tags share this bundle; v4.4/v4.5 reverified 2026-09-16,
+    # v4.6 rehashed from the public tag 2026-09-29.
     (
         "c14b3959d435009e" "57b4c5d8da6f7d0f"
         "1934f49621b52484" "1f97a5d6c5ce1eea"
@@ -33,6 +34,7 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         ("v4.3", "9fd0726a416fb5ff965e" "b4abf6b6f3b43a96da9e"),
         ("v4.4", "494a3570bf559b820b6de31300d4d5cf8c27d8fc"),
         ("v4.5", "3a1d14e914ab86e3cb02841d398742cafa03ea12"),
+        ("v4.6", "3b73723e2bcf861b4b1d" "1115a3ff704bfa439419"),
     ),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
@@ -144,6 +146,38 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Code.gs 5.13.12 (notice for a name not on the roster) was delivered to the
+    # T03 test workbook by Candidate 813c6564 on 2026-09-29; frozen ai-roster-notice-target.
+    '776f987872bf2978ef8d2690d620707a73f6151c2cd83ca90acf74473dcf0eb2': (
+        ('candidate-5.13.12-ai-roster-notice-2026-09-29', '813c65643203d6416781484fc72d75071777b3fb'),
+    ),
+    # Code.gs 5.13.11 (class roster sent to Gemini, given names) was delivered to the
+    # T03 test workbook by Candidate 9c88a3d0 on 2026-09-29; frozen ai-roster-target.
+    'ac577eabe4a350e08fe5548b59fb0ec494824a5a4e92e52f6dca6b52f72cd6f8': (
+        ('candidate-5.13.11-ai-roster-2026-09-29', '9c88a3d08785b1df6f92012e0a515b367b637d3f'),
+    ),
+    # Code.gs 5.13.10 (AI failure notices: clear the box first) was delivered to the
+    # T03 test workbook by Candidate 283e9117 on 2026-09-29; frozen ai-retry-message-target.
+    'f316fe97814f2a251f48ee63b3677a4d6ce03c5026effe164b1dcf00baa3abb3': (
+        ('candidate-5.13.10-ai-notice-2026-09-29', '283e9117afd426e61a586fb6e67511d33a8696c1'),
+    ),
+    # Code.gs 5.13.9 (AI input retry/student form, 신고서 미제출) was delivered to the
+    # T03 test workbook by Candidate e2ea6e74 on 2026-09-29; frozen report-column-ai-target.
+    '585189c8755ddaee89fc6d27aabdcff326625146d73dad9172cf6bce575a81a4': (
+        ('candidate-5.13.9-ai-input-2026-09-29', 'e2ea6e74e137a9e4f5056f8945048d78b0f2854c'),
+    ),
+    # Code.gs 5.13.8 (date stripes) was delivered to the T03 test workbook by
+    # Candidates 0034a516..c04a149c through 출결 기능 업데이트; the frozen
+    # date-stripe-target fixture holds its exact files. 5.13.9 updates it in place.
+    'ac2626441ec62c0b07ae4bb4de76c09b9738ce025606034c50fe147758a58d3c': (
+        ('candidate-5.13.8-date-stripes-2026-09-28', '0034a5164daa9fc037bfc0883a0f36c5f40c5d32'),
+    ),
+    # Read-only verification on 2026-09-26 found this exact source in both
+    # HEAD and deployed version 3 of the user's selected existing workbook.
+    # Both files match 8c9f928 and the frozen direct-first-setup-target fixture.
+    'f6ccbc57a59cff820edb5a9f739af8c190040f775e4bf87e877e10c03adbb0fc': (
+        ('direct-first-setup-live-workbook-2026-09-26', '8c9f9284097d92af1ce9adb0174e645b0fe0910b'),
+    ),
     # Read-only verification on 2026-09-14 found this exact source in both
     # HEAD and the live workbook's deployed version. Both files also match
     # d58b599 and the frozen roster-recovery-target fixture byte for byte.
@@ -217,12 +251,24 @@ _DELIVERED_42_ORDER = {
     "9dd0f97423b8def309bcf22cce7f5df2bad83014ddaae915388359fbd4a26df7": 4,
     "16532566089614786f86afb4998a16d947a1110ee1aebe5fb87f7a377c9c082a": 5,
     "8c0b3d0f00f040ca0452fccb7d7aa38e5fc1f6213f4b2f8f8df1b1b92a0ed363": 6,
-    # Reviewed next delivery target; frozen separately from delivered predecessors.
+    # Exact direct-first-setup source observed on a live workbook; provenance above.
     "f6ccbc57a59cff820edb5a9f739af8c190040f775e4bf87e877e10c03adbb0fc": 7,
     # Exact roster/recovery source observed on a live workbook; provenance above.
     "371688554d25fb9f" "84adda39d481fe09" "36183bd761c85f0d" "30d6e5ee92d2afb1": 8,
     # Reviewed integrated Candidate target; frozen evidence, not a delivered predecessor.
     "c14b3959d435009e57b4c5d8da6f7d0f1934f49621b524841f97a5d6c5ce1eea": 9,
+    # Date-stripe Candidate target, delivered to the T03 test workbook (Candidates only).
+    "ac2626441ec62c0b07ae4bb4de76c09b9738ce025606034c50fe147758a58d3c": 10,
+    # Code.gs 5.13.9 Candidate target, delivered to the T03 test workbook (Candidates only).
+    "585189c8755ddaee89fc6d27aabdcff326625146d73dad9172cf6bce575a81a4": 11,
+    # Code.gs 5.13.10 Candidate target, delivered to the T03 test workbook (Candidates only).
+    "f316fe97814f2a251f48ee63b3677a4d6ce03c5026effe164b1dcf00baa3abb3": 12,
+    # Code.gs 5.13.11 Candidate target, delivered to the T03 test workbook (Candidates only).
+    "ac577eabe4a350e08fe5548b59fb0ec494824a5a4e92e52f6dca6b52f72cd6f8": 13,
+    # Code.gs 5.13.12 Candidate target, delivered to the T03 test workbook (Candidates only).
+    "776f987872bf2978ef8d2690d620707a73f6151c2cd83ca90acf74473dcf0eb2": 14,
+    # Reviewed Code.gs 5.13.13 Candidate target (sheet menu changes, date sort item).
+    "0f2a003a94ba6cdb48d01a04b6988510203f8e71ac432220d2b6a88af3cb86b3": 15,
 }
 
 

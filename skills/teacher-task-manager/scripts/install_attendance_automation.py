@@ -1663,6 +1663,13 @@ def install_attendance_automation(
                     created_ids.pop(key, None)
                 if changed:
                     report_progress()
+            elif getattr(error, "attendance_rejection_confirmed", False):
+                # The server already recorded the rejection and its progress and
+                # released the lease (CONN-09); only the local journal follows.
+                for key in rejected_creation_intents(args):
+                    created_ids.pop(key, None)
+                if progress is not None:
+                    progress(dict(created_ids))
             raise
 
     if registry_operation is not None:
@@ -2009,6 +2016,8 @@ def install_attendance_automation(
                     if registry_operation is None and google_error_status(error) in {400, 401, 403, 404, 429}:
                         created_ids.pop(_PENDING_SCRIPT_TITLE, None)
                         report_progress()
+                    elif getattr(error, "attendance_rejection_confirmed", False):
+                        created_ids.pop(_PENDING_SCRIPT_TITLE, None)  # journaled by the runner wrapper
                     raise
                 script = with_dry_run_fallback(
                     script,

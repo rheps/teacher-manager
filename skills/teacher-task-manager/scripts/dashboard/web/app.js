@@ -146,9 +146,35 @@ const ATTENDANCE_READ_METHODS = new Set([
   "attendance_status_cached", "attendance_status", "attendance_chat_status",
   "attendance_first_setup_status", "attendance_roster_status", "attendance_chat_spaces",
 ]);
-const ATTENDANCE_TIMED_READS = new Set(["attendance_roster_status", "attendance_chat_spaces"]);
+const CONTINUABLE_READS = new Set([
+  ...ATTENDANCE_READ_METHODS, "google_status",
+  "list_calendars", "list_tasklists", "google_target_statuses",
+  "attendance_account_authorization_status",
+]);
+function incompleteGoogleObservation(status) {
+  return googleAuthCheckFailed(status) && !status.local_settings_error
+    && !["logged_out", "account_invalid"].includes(status.login_state)
+    && !["login_required", "reauth_required", "account_required"].includes(status.authorization_state)
+    && status.gws_runtime_ready !== false && status.oauth_client_ready !== false
+    && !status.account_storage_override_unsafe && !status.oauth_client_conflict;
+}
+function pendingReadResponse(name, response) {
+  if (!CONTINUABLE_READS.has(name)) return false;
+  if (response?.ok !== true) return response?.read_pending === true;
+  if (name === "google_status") return incompleteGoogleObservation(response.data);
+  if (name === "gws_login_status") return response.data?.verification_pending === true
+    && incompleteGoogleObservation(response.data.google_status);
+  return response.data?.read_pending === true;
+}
 const attendanceReads = new Map();
+const pendingGoogleReads = new Set();
+let bootIdentityPending = false;
+function googleObservationPending() {
+  return [...pendingGoogleReads].some(read => read.epoch === accountUiEpoch && read.loginEpoch === googleLoginEpoch);
+}
+const ATTENDANCE_TIMED_READS = new Set(["attendance_roster_status", "attendance_chat_spaces"]);
 function callBridge(name, ...args) {
+  const attempts = name === "google_status" && S.mode === "loading" ? 1 : 3;
   const epoch = accountUiEpoch;
   const loginEpoch = googleLoginEpoch;
   const currentReadContext = () => ["attendance_status", "attendance_status_cached"].includes(name)
@@ -157,19 +183,39 @@ function callBridge(name, ...args) {
   const api = window.pywebview.api;
   const expectedToken = accountWireToken ? [...accountWireToken] : null;
   const requestArgs = JSON.parse(JSON.stringify(args));
-  const send = async () => {
-    const response = typeof api.account_call === "function"
-      ? api.account_call(name, requestArgs, expectedToken) : api[name](...requestArgs);
-    let timer;
-    try {
-      return await (ATTENDANCE_TIMED_READS.has(name) ? Promise.race([response,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("목록 응답을 기다리는 시간이 지났어요.")), 120000);
-        }),
-      ]) : response);
-    } finally { if (timer) clearTimeout(timer); }
+  const authorizationVersion = attendanceAccountAuthorizationVersion;
+  const stillCurrent = () => {
+    if (epoch !== accountUiEpoch || loginEpoch !== googleLoginEpoch) throw new StaleAccountResponse();
+    if (readContext !== null && readContext !== currentReadContext()) throw new StaleAccountResponse();
+    if (name === "attendance_account_authorization_status"
+        && authorizationVersion !== attendanceAccountAuthorizationVersion) throw new StaleAccountResponse();
   };
-  return send().then((res) => {
+  const send = async () => {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      stillCurrent();
+      const pending = typeof api.account_call === "function"
+        ? api.account_call(name, requestArgs, expectedToken) : api[name](...requestArgs);
+      let timer, response;
+      try {
+        response = await (ATTENDANCE_TIMED_READS.has(name) ? Promise.race([pending,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("목록 응답을 기다리는 시간이 지났어요.")), 120000);
+          }),
+        ]) : pending);
+      } finally { if (timer) clearTimeout(timer); }
+      stillCurrent();
+      if (!pendingReadResponse(name, response) || attempt === attempts - 1) return response;
+      if (expectedToken && Array.isArray(response.session)
+          && JSON.stringify(expectedToken) !== JSON.stringify(response.session)) throw new StaleAccountResponse();
+      await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 2000 : 5000));
+    }
+  };
+  const observation = name === "google_status" ? {epoch, loginEpoch} : null;
+  if (observation) {
+    pendingGoogleReads.add(observation);
+    Promise.resolve().then(() => { if (S.info && pendingGoogleReads.has(observation)) paintGoogleObservation(); });
+  }
+  const result = send().then((res) => {
     if (["google_status", "gws_login_status", "gws_login_start"].includes(name)
         && loginEpoch !== googleLoginEpoch) throw new StaleAccountResponse();
     if (epoch !== accountUiEpoch) throw new StaleAccountResponse("계정이 바뀌어 이전 화면의 작업을 멈췄어요.");
@@ -188,6 +234,7 @@ function callBridge(name, ...args) {
     }
     return res.data;
   });
+  return observation ? result.finally(() => pendingGoogleReads.delete(observation)) : result;
 }
 
 function callForAccount(epoch, name, ...args) {
@@ -272,6 +319,26 @@ function badge(kind, label) {
 function root() { return document.getElementById("app"); }
 
 function setBanner(kind, text, topic = "") { S.banner = text ? { kind, text, topic } : null; render(); }
+const SCREEN_PAINT_FAILED = "화면을 새로 표시하지 못했어요. 프로그램을 다시 열어 주세요.";
+// Background reads and repaints never fail silently (OBS-09). A bridge failure is already
+// shown by call() or its caller; a script error while adopting or painting a reply would
+// otherwise leave a pending frame on screen, so it ends in the plain error banner.
+function reportBackgroundFailure(error) {
+  console.error(error);
+  if (!(error instanceof TypeError || error instanceof ReferenceError || error instanceof RangeError)) return;
+  try { setBanner("error", SCREEN_PAINT_FAILED); } catch (paintError) { console.error(paintError); paintFallbackNotice(); }
+}
+// Last resort when render() itself keeps throwing: replace the frozen frame with a
+// fixed plain notice so the screen never stays on 확인 중 silently (PEND-02).
+function paintFallbackNotice() {
+  try {
+    const app = root();
+    if (!app) return;
+    app.innerHTML = `<div class="boot" role="alert"><p>${esc(SCREEN_PAINT_FAILED)}</p>
+      <button class="btn" type="button" id="screen-paint-reload">다시 열기</button></div>`;
+    app.querySelector("#screen-paint-reload")?.addEventListener("click", () => window.location.reload());
+  } catch (fallbackError) { console.error(fallbackError); }
+}
 function showToast(text) {
   S.toast = text; render();
   setTimeout(() => { S.toast = null; render(); }, 2200);
@@ -375,7 +442,7 @@ function problemPanelHtml(issue) {
     ${reportStatus ? `<p class="problem-footer">${esc(reportStatus)}</p>` : ""}
   </section>`;
 }
-function showProblemIssue(error, request) {
+function showProblemIssue(error, request, paint = render) {
   if (!(error instanceof AppIssueError)) return false;
   if (!ownsIssueRequest(request)) return true;
   const issue = error.issue;
@@ -389,7 +456,7 @@ function showProblemIssue(error, request) {
   problemIssueResumeAction = String(request?.action || "");
   problemIssueToken += 1;
   S.banner = null;
-  render();
+  paint();
   return true;
 }
 function handleCaughtError(error, request) {
@@ -404,7 +471,7 @@ function handleCaughtError(error, request) {
 }
 function bannerHtml() {
   const localSettings = S.google?.local_settings_error
-    ? `<div class="banner error"><span><b>이 컴퓨터의 설정을 확인해 주세요.</b> ${esc(S.google.local_settings_error)}</span>${settingsRefreshButtonHtml()}</div>`
+    ? `<div class="banner error"><span><b>이 컴퓨터의 설정을 확인해 주세요.</b> ${esc(S.google.local_settings_error)}</span>${inSettingsWindow() ? "" : settingsRecheckButtonHtml()}</div>`
     : "";
   // 기록 폴더를 여는 단추는 두지 않는다. 폴더만 열릴 뿐 거기서 뭘 하라는 안내가 없고,
   // 그 폴더에 보이는 파일은 Gemini API key가 든 settings.json이다 (2026-07-30 사용자 결정).
@@ -630,6 +697,8 @@ bindActions({
       if (!expected) throw new Error("현재 출석부 연결을 다시 확인한 뒤 열어 주세요.");
       await call("open_current_attendance", expected, false);
       if (context !== chatReadContext() || owner !== screenKey()) return;
+      // Returning from the Sheet's first-setup is an external setup return (C4·C5): re-read then (R4-3).
+      if (S.attendance?.state === "initial-setup-required") attendanceSetupReturn = { context, owner, blurred: false };
       if (S.mode === "edit" && S.edit === "connect" && S.connectTab === "attendance") startChatConnectPoll(true);
     } catch (error) {
       if (context === chatReadContext() && owner === screenKey()) setBanner("warn", error.message || "출석부를 열지 못했어요. 다시 눌러 주세요.");
@@ -661,13 +730,28 @@ function railHtml() {
 }
 
 /* ---------- 로그인 상시 감시 — 끊어지면 끊어졌다고 말한다 ---------- */
-const LOGIN_WATCH_INTERVAL_MS = 3 * 60 * 1000;  // 검증 전 앱은 토큰이 수시로 회수된다
+const LOGIN_WATCH_INTERVAL_MS = 30 * 60 * 1000;  // 로그인 해제를 알리는 주기. 토큰 유지와 무관하며 설정 열기·창 복귀·작업 시작 때 따로 확인한다
 let loginWatchTimer = null;
 let loginWatchChecking = false;
 let googleLoginEpoch = 0;
 let googleContextVersion = 0;
 let linkListsReadVersion = 0;
 let targetStatusReadVersion = 0;
+let googleRecoveryNeeded = false;
+let googleRecoveryTimer = null;
+function scheduleGoogleRecovery(delay = 0) {
+  if (!googleRecoveryNeeded) return;
+  if (googleRecoveryTimer) clearTimeout(googleRecoveryTimer);
+  googleRecoveryTimer = setTimeout(async () => {
+    googleRecoveryTimer = null;
+    if (!googleRecoveryNeeded || !isGoogleReady(S.google)) return;
+    if (connectionRefreshActive() || connectionRefreshBlocked()) {
+      scheduleGoogleRecovery(60000);
+      return;
+    }
+    await refreshConnectionStatus({ googleStatus: S.google });
+  }, delay);
+}
 function verifiedGoogleAccount(status) {
   return status?.logged_in && !googleAuthCheckFailed(status)
     ? String(status.user || "").trim().toLowerCase() : "";
@@ -697,6 +781,7 @@ function adoptGoogleStatus(status) {
     // A failed check cannot erase a workbook or a completed setup. Keep its
     // identity, while requiring an actual successful read to mark it current.
     S.firstSetupReadState = "unavailable";
+    googleRecoveryNeeded = Boolean(previousAccount);
     if (S.chatStatus && typeof S.chatStatus === "object") {
       S.chatStatus = { ...S.chatStatus, connected: null, read_failed: true };
     }
@@ -704,12 +789,13 @@ function adoptGoogleStatus(status) {
   S.google = status;
   if (isGoogleReady(status)) {
     delete S.fieldIssues["google-login"];
-    const oldLoginWarnings = [FIELD_MESSAGES["google-login"], GOEDU_REQUIRED_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE, previousAuthorizationMessage,
+    const oldLoginWarnings = [FIELD_MESSAGES["google-login"], GOEDU_REQUIRED_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE_SETTINGS, previousAuthorizationMessage,
       "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요."];
     if (S.banner && (S.banner.topic === "google-login" || oldLoginWarnings.includes(S.banner.text))) S.banner = null;
     if (["google_status", "gws_login_start", "gws_login_status"].includes(S.problemIssue?.operation)) clearProblemIssue();
+    scheduleGoogleRecovery();
   }
-  if (accountProfileNeedsReload) reloadAccountProfile().catch(() => {});
+  if (accountProfileNeedsReload) reloadAccountProfile().catch(reportBackgroundFailure);
 }
 function googleStatusKey(status) {
   if (!status) return "";
@@ -722,8 +808,10 @@ function clearGoogleDependentState(options) {
   S.attendanceConnectionBusy = false;
   stopAttendanceBoundaryCheck();
   if (S.banner?.topic === "attendance-gate") S.banner = null;
-  attendanceAccountAuthorizationVersion += 1;
-  S.attendanceAccountAuthorizing = false;
+  stopAttendanceAccountAuthorization();
+  googleRecoveryNeeded = false;
+  if (googleRecoveryTimer) clearTimeout(googleRecoveryTimer);
+  googleRecoveryTimer = null;
   rosterAuthorizationRetry = null;
   googleContextVersion += 1;
   linkListsReadVersion += 1;
@@ -782,25 +870,39 @@ function clearGoogleDependentState(options) {
     invalidateIssueResume();
   }
 }
+const GOOGLE_RESULT_PAINT_FAILED = "Google 확인 결과를 화면에 표시하지 못했어요. 프로그램을 다시 열어 주세요.";
 async function checkGoogleOnReturn() {
   if (S.login || loginWatchChecking || hasCurrentSettingsStatusRequest()) return;
   loginWatchChecking = true;
   const epoch = googleLoginEpoch;
   try {
+    if (googleLoginVerificationPending) {
+      await pollLoginOnce(beginIssueRequest(false)).catch(reportBackgroundFailure);
+      return;
+    }
     const displayState = () => JSON.stringify([S.google, S.banner, S.problemIssue, S.fieldIssues["google-login"]]);
     const beforeDisplay = displayState();
     const before = S.google;
-    const status = await call("google_status");
+    let status;
+    // call() marks a failed actual check unknown and repaints it; never infer logout.
+    try { status = await call("google_status"); } catch (error) { reportBackgroundFailure(error); return; }
     if (epoch !== googleLoginEpoch || S.login || hasCurrentSettingsStatusRequest()) return;
     adoptGoogleStatus(status);
-    if (googleAuthCheckFailed(status)) { render(); return; }
+    if (googleAuthCheckFailed(status)) { paintSettingsReadiness(); return; }
     if (before?.logged_in && !status.logged_in) {
       setBanner("warn", "Google 로그인이 풀렸어요. 설정에서 다시 로그인해 주세요.");
     } else if (beforeDisplay !== displayState()) {
-      render();
+      paintSettingsReadiness();
+    } else {
+      // An unchanged successful reply still ends the visible pending state.
+      paintGoogleObservation();
     }
-  } catch (error) { /* A failed actual check is marked unknown by call(); never infer logout. */ }
-  finally { loginWatchChecking = false; }
+  } catch (error) {
+    // The reply arrived but adopting or painting it failed: end the pending frame
+    // on screen instead of hiding the failure (OBS-01).
+    console.error(error);
+    try { setBanner("error", GOOGLE_RESULT_PAINT_FAILED, "google-login"); } catch (paintError) { console.error(paintError); paintFallbackNotice(); }
+  } finally { loginWatchChecking = false; }
 }
 function startLoginWatch() {
   if (loginWatchTimer) return;
@@ -808,7 +910,7 @@ function startLoginWatch() {
     try { await checkGoogleOnReturn(); }
     finally { loginWatchTimer = setTimeout(tick, LOGIN_WATCH_INTERVAL_MS); }
   };
-  loginWatchTimer = setTimeout(tick, 0);
+  loginWatchTimer = setTimeout(tick, LOGIN_WATCH_INTERVAL_MS);
 }
 window.addEventListener("focus", () => {
   if (!window.pywebview?.api) return;
@@ -928,17 +1030,18 @@ async function refreshAttendanceWizardGate() {
   // 다른 창이 현재 출석부를 바꿨을 수 있으므로 7단계를 넘기 직전에 실제 상태와
   // 그 Sheet에 묶인 완료 표시를 다시 읽는다. 확인 중에는 다음 단계를 막되,
   // 읽기 실패를 이미 마친 설정의 취소로 취급하지 않는다.
+  beginAttendanceAuthBatch();
   S.firstSetupReadState = "checking";
   let attendanceChecked = false;
   try {
-    const attendance = await call("attendance_status");
+    const attendance = await attendanceRead("attendance_status");
     if (!current()) return false;
     attendanceChecked = true;
     S.attendanceReadFailed = false;
     S.attendance = attendance;
     context = chatReadContext();
     if (!S.attendance || S.attendance.state !== "ready") return false;
-    const first = await call("attendance_first_setup_status");
+    const first = await attendanceRead("attendance_first_setup_status");
     if (!current()) return false;
     applyFirstSetupRead(first);
     await loadChatStatus(true);
@@ -963,7 +1066,7 @@ function attendanceWizardGateMessage() {
     if (!S.chatStatus || S.chatStatus === "loading" || S.chatStatus.read_failed || typeof S.chatStatus.connected !== "boolean") return "Google Chat 연결 상태를 확인해야 해요. 잠시 뒤 다시 확인해 주세요.";
     if (!S.chatStatus?.connected) return "Google Chat의 [연결(권한 승인)하러 가기]에서 권한 승인을 마쳐 주세요.";
     if (isHomeroomTeacher() && classRoomReadiness() !== "ready") return classRoomReadinessMessage();
-    if (S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending) return S.rosterEditor.detail || "저장한 학생명단을 출석부에 반영하고 있어요.";
+    if (S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending) return rosterDetailText(S.rosterEditor, "[학생명단 연결]") || "저장한 학생명단을 출석부에 반영하고 있어요.";
     if (!rosterStatus || rosterContext !== chatReadContext() || ["checking", "unavailable"].includes(rosterStatus.state)) return "학생명단을 아직 확인하지 못했어요. 학생명단 화면에서 저장 상태를 확인해 주세요.";
     return "학생명단 화면에서 번호·이름·이메일을 입력하고 [명단 저장]을 눌러 주세요.";
   }
@@ -1148,6 +1251,13 @@ function workspaceGuideOverlayHtml() {
 /* ---------- 구글 로그인 폴링 ---------- */
 let loginTimer = null;
 let loginPollRunning = false;
+let googleLoginVerificationPending = false;
+async function readGoogleStatus() {
+  if (!googleLoginVerificationPending) return call("google_status");
+  const snap = await call("gws_login_status");
+  googleLoginVerificationPending = snap.verification_pending === true;
+  return snap.google_status || call("google_status");
+}
 function stopLoginPoll() {
   if (loginTimer) { clearTimeout(loginTimer); loginTimer = null; }
 }
@@ -1160,6 +1270,14 @@ async function pollLoginOnce(request) {
   try {
   const snap = await call("gws_login_status");
   if (!current()) return false;
+  if (snap.verification_pending === true) {
+    googleLoginVerificationPending = true;
+    S.login = null;
+    if (snap.google_status) adoptGoogleStatus(snap.google_status);
+    setBanner("warn", googleAuthCheckMessage(), "google-login");
+    return false;
+  }
+  googleLoginVerificationPending = false;
   if (snap.ok === true) {
     request = beginIssueRequest(false);
     delete S.fieldIssues["google-login"];
@@ -1168,7 +1286,9 @@ async function pollLoginOnce(request) {
     if (!ownsIssueRequest(request)) return false;
     if (isGoogleReady(S.google)) {
       if (!(await resumeInterruptedGoogleScreen(request))) showToast("Google 계정으로 로그인했어요");
-      refreshChecks().catch(() => {});
+      refreshChecks().catch(reportBackgroundFailure);
+      googleRecoveryNeeded = true;
+      scheduleGoogleRecovery();
     } else setBanner("warn", googleAuthorizationMessage(S.google), "google-login");
     return false;
   }
@@ -1245,7 +1365,12 @@ bindActions({
   },
   "gws-login": async () => {
     if (S.login) return;
+    if (googleLoginVerificationPending) {
+      await pollLoginOnce(beginIssueRequest(false));
+      return;
+    }
     const epoch = ++googleLoginEpoch;
+    stopAttendanceAccountAuthorization();
     S.banner = null;
     S.login = { running: true };
     render();
@@ -1266,12 +1391,6 @@ bindActions({
       throw error;
     }
   },
-  "google-targets-recheck": async () => {
-    syncConnectFields();
-    S.listsLoaded = false;
-    S.listsError = false;
-    await loadLinkLists();
-  },
   "reauthorize-google": async () => {
     if (!(S.mode === "edit" && S.edit === "settings") && !(S.mode === "wizard" && S.step === 2)) {
       await actions["goto-settings"]();
@@ -1284,6 +1403,8 @@ bindActions({
     if (!(await flushEditSave())) return;
     if (S.login?.logging_out) return;
     const epoch = ++googleLoginEpoch;
+    googleLoginVerificationPending = false;
+    stopAttendanceAccountAuthorization();
     stopLoginPoll();
     S.login = { running: true, logging_out: true };
     render();
@@ -1318,6 +1439,8 @@ bindActions({
   },
   "login-cancel": async () => {
     const epoch = ++googleLoginEpoch;
+    googleLoginVerificationPending = false;
+    stopAttendanceAccountAuthorization();
     stopLoginPoll();
     try {
       const result = await call("gws_login_cancel");
@@ -1613,11 +1736,29 @@ let rosterEditorRequest = 0;
 let rosterEditorPending = null;
 function isHomeroomTeacher() { return (S.draft.profile["담임여부"] || S.profileCache?.["담임여부"]) === "예"; }
 function rosterEditorContext() { return JSON.stringify([accountUiEpoch, accountWireToken?.[0] || S.google?.user || ""]); }
+// The workbook an editor reply belongs to. After a replacement an idle editor still holds the
+// previous workbook's rows and revision; read it again instead of refusing the save (R5-5).
+function rosterEditorWorkbook() {
+  const s = S.attendance?.attendance_scope;
+  return s?.spreadsheetId ? JSON.stringify([s.spreadsheetId, s.generation]) : "";
+}
+function rosterEditorStale(editor = S.rosterEditor) {
+  if (editor?.context !== rosterEditorContext()) return true;
+  const workbook = rosterEditorWorkbook();
+  return editor.state !== "loading" && !editor.dirty && !editor.busy && Boolean(workbook) && editor.workbook !== workbook;
+}
 function rosterEditableRows(rows = [], minimum = 30) {
   const result = rows.map(row => [...row]);
   let next = Math.max(0, ...result.map(row => Number(row[0]) || 0)) + 1;
   while (result.length < minimum) result.push([String(next++), "", ""]);
   return result;
+}
+// One sync failure reaches several screens: name only the button that screen has (C11, R5-1).
+function rosterDetailText(editor, button) {
+  const text = editor?.detail || "";
+  if (!editor?.failure_code || !button) return text;
+  const later = ["ATTENDANCE_RATE_LIMITED", "GOOGLE_429"].includes(editor.failure_code) ? "잠시 뒤 " : "";
+  return `${text} ${later}${button}을 다시 눌러 주세요.`;
 }
 function rosterRowHasStudent(row) { return row.slice(1).some(value => String(value || "").trim()); }
 async function loadRosterEditor(refresh = false) {
@@ -1625,7 +1766,7 @@ async function loadRosterEditor(refresh = false) {
   const context = rosterEditorContext();
   const owner = screenKey();
   if (rosterEditorPending?.context === context && rosterEditorPending.owner === owner) return rosterEditorPending.promise;
-  if (!refresh && S.rosterEditor?.context === context && S.rosterEditor.state !== "loading") return;
+  if (!refresh && S.rosterEditor?.context === context && S.rosterEditor.state !== "loading" && !rosterEditorStale()) return;
   const version = ++rosterEditorRequest;
   let finishPending;
   rosterEditorPending = { context, owner, promise: new Promise(resolve => { finishPending = resolve; }) };
@@ -1633,11 +1774,11 @@ async function loadRosterEditor(refresh = false) {
   try {
     const data = await call("read_roster_editor", refresh);
     if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
-    S.rosterEditor = { ...data, rows: rosterEditableRows(data.rows), context, dirty: false };
-    if (data.state !== "unavailable" && S.banner?.topic === "roster-validation") S.banner = null;
+    S.rosterEditor = { ...data, rows: rosterEditableRows(data.rows), context, dirty: false, workbook: rosterEditorWorkbook() };
+    if (data.state !== "unavailable" && ["roster-validation", "roster-sync"].includes(S.banner?.topic)) S.banner = null;
   } catch (_) {
     if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
-    S.rosterEditor = { rows: [], revision: "", state: "unavailable", context, detail: "명단을 불러오지 못했어요. 다시 불러오기를 눌러 주세요." };
+    S.rosterEditor = { rows: [], revision: "", state: "unavailable", context, workbook: rosterEditorWorkbook(), detail: "명단을 불러오지 못했어요. 다시 불러오기를 눌러 주세요." };
   } finally {
     if (version === rosterEditorRequest) {
       rosterEditorPending = null;
@@ -1675,8 +1816,11 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
   const current = () => context === rosterEditorContext() && S.rosterEditor === editor;
   const visible = () => owner === screenKey();
   const rows = editor.rows.filter(rosterRowHasStudent).map(row => row.map(value => String(value).trim()));
-  editor.busy = true; render();
+  editor.busy = true;
+  // A new attempt ends the previous attempt's failure notice (R09, R5-2/R5-5).
+  if (S.banner?.topic === "roster-sync") S.banner = null;
   try {
+    render();  // inside try: a failed paint must still clear editor.busy in finally (OBS-10)
     if (sync && explicitConnect && !editor.dirty && editor.revision) {
       const pending = editor.pending, linked = Boolean(editor.linked);
       const fresh = await call("read_roster_editor", false, true, requestedRevision);
@@ -1690,7 +1834,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
           || JSON.stringify(fresh.rows) !== JSON.stringify(rows)) {
         editor.state = "conflict";
         editor.detail = "저장된 명단이 바뀌었어요. 현재 명단을 확인한 뒤 연결해 주세요.";
-        setBanner("warn", editor.detail);
+        setBanner("warn", editor.detail, "roster-sync");
         return false;
       }
       // Only the verified local protection record may advance this saved revision.
@@ -1699,18 +1843,19 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     let saved = editor;
     if (editor.dirty || !editor.revision) saved = await call("save_roster_editor", rows, editor.revision || "");
     if (!current()) return false;
-    S.rosterEditor = editor = { ...saved, rows: rosterEditableRows(saved.rows), context, dirty: false, busy: true };
+    S.rosterEditor = editor = { ...saved, rows: rosterEditableRows(saved.rows), context, dirty: false, busy: true, workbook: editor.workbook };
     if (sync) {
       requestedRevision = editor.revision;
       const result = explicitConnect
         ? await call("sync_roster_editor", requestedRevision, ...(useCurrentWorkbook ? [true] : []))
         : await call("sync_roster_editor");
       if (!current()) return false;
-      S.rosterEditor = editor = { ...result, rows: rosterEditableRows(result.rows), context, dirty: false, busy: true };
+      S.rosterEditor = editor = { ...result, rows: rosterEditableRows(result.rows), context, dirty: false, busy: true, workbook: rosterEditorWorkbook() };
       rosterStatus = null;
     }
     if (["unavailable", "conflict"].includes(S.rosterEditor.state)) {
-      if (visible()) setBanner("warn", S.rosterEditor.detail || "출석부에 명단을 저장하지 못했어요. 명단 저장을 다시 눌러 주세요.");
+      const button = S.mode === "wizard" && S.step === 8 ? "[학생명단 연결]" : "[명단 저장]";
+      if (visible()) setBanner("warn", rosterDetailText(S.rosterEditor, button) || "출석부에 명단을 저장하지 못했어요. 명단 저장을 다시 눌러 주세요.", "roster-sync");
       if (authorize && visible() && S.rosterEditor.failure_code === "ATTENDANCE_AUTH_REQUIRED") {
         rosterAuthorizationRetry = {context, owner, revision: requestedRevision, explicitConnect, useCurrentWorkbook, connection};
         await actions["attendance-account-authorize"]();
@@ -1723,7 +1868,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     if (current()) {
       S.rosterEditor.detail = "명단 저장 결과를 확인하지 못했어요. 입력한 내용은 이 화면에 남아 있어요. 다시 저장해 주세요.";
       S.rosterEditor.state = "unavailable";
-      if (visible()) setBanner("warn", S.rosterEditor.detail);
+      if (visible()) setBanner("warn", S.rosterEditor.detail, "roster-sync");
     }
     return false;
   } finally {
@@ -1752,19 +1897,24 @@ async function validateRoster() {
 }
 function stepRoster() {
   if (!isHomeroomTeacher()) return `<h1>담임학급 학생명단</h1><p class="sub">담임을 맡지 않아 이 단계는 사용하지 않아요.</p>`;
-  if (S.rosterEditor?.context !== rosterEditorContext()) loadRosterEditor();
+  if (rosterEditorStale()) loadRosterEditor();
   const editor = S.rosterEditor || { state: "loading", rows: [] };
   if (editor.state === "loading") return `<h1>담임학급 학생명단</h1><p class="sub">명단을 불러오고 있어요…</p>`;
   const disabled = editor.busy ? " disabled" : "";
   const rows = editor.rows.map((row, index) => `<tr>${row.map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}</tr>`).join("");
+  const reloadShown = editor.state === "conflict" || (editor.state === "unavailable" && !editor.dirty && !editor.pending);
+  // 입력 중이거나 보관한 명단이 있으면 [다시 불러오기]를 두지 않는다 — 그 안내 문장도 함께 뺀다
+  // (없는 버튼을 누르라고 하지 않는다, 2026-09-27 새 설치 확인).
+  const unavailableDetail = reloadShown ? rosterDetailText(editor, "[명단 저장]")
+    : String(rosterDetailText(editor, "[명단 저장]")).replace(/\s*다시 불러오기를 눌러 주세요\.?$/, "");
   return `<h1>담임학급 학생명단</h1>
     <p class="sub">학생 이메일은 경기도교육청 클라우드 계정(@goedu.kr)을 권장합니다.<br>엑셀·구글시트에서 복사·붙여넣기 가능합니다.</p>
     <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="roster-actions"><button class="btn-tonal" data-action="roster-add"${editor.busy || editor.rows.length >= 199 ? " disabled" : ""}>행 추가</button>
-      ${editor.state === "conflict" || (editor.state === "unavailable" && !editor.dirty && !editor.pending) ? `<button class="btn-quiet" data-action="roster-reload"${disabled}>${editor.state === "conflict" ? "시트 명단 다시 불러오기" : "다시 불러오기"}</button>` : ""}
+      ${reloadShown ? `<button class="btn-quiet" data-action="roster-reload"${disabled}>${editor.state === "conflict" ? "시트 명단 다시 불러오기" : "다시 불러오기"}</button>` : ""}
       <button class="btn" data-action="roster-save"${disabled}>${editor.busy ? "저장 중…" : "명단 저장"}</button>
     </div>
-    <p class="sub" role="status">${esc(editor.busy ? "명단 저장 결과를 확인하고 있어요." : editor.state === "unavailable" ? editor.detail : editor.dirty ? "수정한 명단을 저장해 주세요." : editor.detail || "출석부 연결 전에 입력해 둘 수 있어요.")}</p>`;
+    <p class="sub" role="status">${esc(editor.busy ? "명단 저장 결과를 확인하고 있어요." : editor.state === "unavailable" ? unavailableDetail : editor.dirty ? "수정한 명단을 저장해 주세요." : editor.detail || (editor.linked ? "" : "출석부 연결 전에 입력해 둘 수 있어요."))}</p>`;
 }
 function timetableEditBody() {
   const active = S.timetableTab || "timetable";
@@ -2053,13 +2203,13 @@ let linkListsPending = null;
 async function loadLinkLists(force = false, owns = () => true) {
   const context = googleListContext();
   if (S.linkLoading && linkListsPending?.context === context && linkListsPending.owns()) return linkListsPending.promise;
-  const promise = readLinkLists(force, owns);
+  const promise = readLinkLists(force);
   const pending = linkListsPending = { context, promise, owns };
   const clear = () => { if (linkListsPending === pending) linkListsPending = null; };
   promise.then(clear, clear);
   return promise;
 }
-async function readLinkLists(force, owns) {
+async function readLinkLists(force) {
   if (!force && S.listsLoaded && ["calendars", "tasklists"].every(kind => S.listReads[kind]?.context === googleListContext())) return;
   if (!isGoogleReady(S.google)) return;
   S.linkLoading = true;
@@ -2067,25 +2217,30 @@ async function readLinkLists(force, owns) {
   S.listsLoaded = false;
   const resourceContext = googleListContext();
   const version = ++linkListsReadVersion;
-  const current = () => version === linkListsReadVersion && resourceContext === googleListContext() && owns();
+  // One open/refresh = one batch: the bridge runs `gws auth status` once for all its reads.
+  const batch = `links-${Date.now().toString(36)}-${version}`;
+  // Same account/target result: keep it after the window that asked is closed (OBS-02).
+  // Dropping it left the rows "pending" with nothing reading them (OBS-14).
+  const current = () => version === linkListsReadVersion && resourceContext === googleListContext();
   const paint = () => { if (editingCard() === "settings") paintSettingsReadiness(); else render(); };
   S.lists = { calendars: [], tasklists: [] };
   S.googleTargetStatuses = {};
   for (const kind of ["calendars", "tasklists"]) {
     S.listReads[kind] = { phase: "pending", context: resourceContext, generation: version, value: [], error: null };
   }
-  paint();
   try {
+    // Inside try: a failed paint must still clear S.linkLoading, or the 30-minute refresh stays blocked.
+    paint();
     await Promise.all(["calendars", "tasklists"].map(async kind => {
       try {
-        const rows = await call(kind === "calendars" ? "list_calendars" : "list_tasklists");
+        const rows = await call(kind === "calendars" ? "list_calendars" : "list_tasklists", batch);
         if (!current()) return;
         if (!Array.isArray(rows) || rows.some(row => !row || typeof row.id !== "string" || !row.id.trim()))
           throw new Error("목록 응답을 확인하지 못했어요.");
         S.listReads[kind] = { phase: "ready", context: resourceContext, generation: version, value: rows, error: null };
         S.lists[kind] = rows;
         paint();
-        await refreshGoogleTargetStatuses(current, kind);
+        await refreshGoogleTargetStatuses(current, kind, batch);
       } catch (error) {
         if (!current()) return;
         S.listReads[kind] = { phase: "failed", context: resourceContext, generation: version, value: [], error: String(error.message || error) };
@@ -2101,7 +2256,7 @@ async function readLinkLists(force, owns) {
   }
 }
 const targetReadVersions = { calendars: 0, tasklists: 0 };
-async function refreshGoogleTargetStatuses(owns = () => true, kind = null) {
+async function refreshGoogleTargetStatuses(owns = () => true, kind = null, batch = "") {
   if (!isGoogleReady(S.google)) return;
   S.googleTargetStatuses ||= {};
   const targets = Object.fromEntries(GOOGLE_TARGET_ID_FIELDS
@@ -2113,14 +2268,14 @@ async function refreshGoogleTargetStatuses(owns = () => true, kind = null) {
   const versions = Object.fromEntries(kinds.map(key => [key, ++targetReadVersions[key]]));
   const version = targetStatusReadVersion;
   let statuses;
-  try { statuses = await call("google_target_statuses", targets); }
+  try { statuses = await call("google_target_statuses", targets, ...(batch ? [batch] : [])); }
   catch (_) { statuses = {}; }
   if (!owns() || version !== targetStatusReadVersion || context !== googleListContext()) return;
   for (const [field, id] of Object.entries(targets)) {
     const key = field.includes("Tasks") ? "tasklists" : "calendars";
     if (versions[key] !== targetReadVersions[key]) continue;
     const result = statuses?.[field];
-    S.googleTargetStatuses[field] = result?.id === id ? result : { id, state: "check_failed", detail: "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. [연결 다시 확인]을 눌러 주세요." };
+    S.googleTargetStatuses[field] = result?.id === id ? result : { id, state: "check_failed", detail: googleTargetCheckFailedMessage() };
   }
 }
 function linkSelectRow(idField, title, options, value, excludeId, savedName, phase = "ready") {
@@ -2200,6 +2355,14 @@ function watchNetworkStatus() {
     })
     .catch(() => { S.network = null; });
 }
+// The only re-read button is the ↻ refresh: the 연결 window title bar, or the
+// top right of setup step 8 (user decision 2026-09-28).
+function connectionRefreshHint() {
+  return `${S.mode === "wizard" ? "화면" : "연결 창"} 위쪽 [연결 상태 새로고침] 버튼(↻)을`;
+}
+function googleTargetCheckFailedMessage() {
+  return `저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. ${connectionRefreshHint()} 눌러 주세요.`;
+}
 function listsErrorNoticeHtml() {
   if (!S.listsError) return "";
   return `<div class="banner warn"><span>목록을 가져오지 못했어요. 설정에서 다시 점검해 주세요.</span>
@@ -2251,7 +2414,7 @@ function messengerTabHtml() {
   return `<div class="attendance-head"><div>
       <h2>메신저 내용을 어디에 등록할지 정해요</h2>
       <p>Google 연결과 로그인 상태는 설정 화면에서 확인해요.</p>
-    </div><button class="btn-tonal" data-action="google-targets-recheck" ${S.linkLoading ? "disabled" : ""}>연결 다시 확인</button></div>
+    </div></div>
     ${listProgress}
     ${listsErrorNoticeHtml()}
     <div class="connect-section">${linkGroupHtml("cal")}</div>
@@ -2280,6 +2443,11 @@ function chatStatusReading() {
   return Boolean(chatStatusPending?.active && chatStatusPending.context === chatReadContext()
     && chatStatusPending.version === chatStatusReadVersion);
 }
+function chatStatusAwaitingRead() {
+  // refreshConnectionStatus reads Chat only after the Calendar/Tasks lists: until then an unread status is pending, not a warning.
+  return chatStatusReading() || (connectionRefreshActive()
+    && (S.chatStatusContext !== chatReadContext() || !S.chatStatus || S.chatStatus === "loading"));
+}
 function classRoomReadiness() {
   if (!isHomeroomTeacher()) return "not-applicable";
   if (!isGoogleReady(S.google)) return "account-required";
@@ -2288,7 +2456,7 @@ function classRoomReadiness() {
   if (S.attendanceReadFailed) return "read-failed";
   if (S.attendance?.state !== "ready"
       || (account && account !== verifiedGoogleAccount(S.google))) return "unverified";
-  if (S.attendanceLoading || S.classSpaceSaving || chatStatusReading() || homeClassRoomReading()) return "loading";
+  if (S.attendanceLoading || S.classSpaceSaving || chatStatusAwaitingRead() || homeClassRoomReading()) return "loading";
   if (!cs || cs === "loading" || S.chatStatusContext !== context) return "unverified";
   if (cs.read_failed || typeof cs.connected !== "boolean") return "read-failed";
   if (!cs.connected) return "account-required";
@@ -2322,7 +2490,7 @@ function loadChatStatus(force, renderResult = true) {
   const version = ++chatStatusReadVersion;
   const current = () => version === chatStatusReadVersion && context === chatReadContext();
   const request = beginIssueRequest(true);
-  const promise = call("attendance_chat_status")
+  const promise = attendanceRead("attendance_chat_status")
     .then((data) => {
       if (!current()) return;
       chatStatusPending.active = false;
@@ -2337,7 +2505,7 @@ function loadChatStatus(force, renderResult = true) {
       if (!current()) return;
       chatStatusPending.active = false;
       S.chatStatus = { ...(typeof S.chatStatus === "object" ? S.chatStatus : {}), connected: null, read_failed: true };
-      if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
+      if (ownsIssueRequest(request) && showProblemIssue(error, request, paintSettingsReadiness)) return;
       if (renderResult) render();
     });
   chatStatusPending = { context, version, promise, active: true };
@@ -2444,7 +2612,8 @@ async function resumeAttendanceAfterPermission(flow) {
     }
     if (S.problemIssue?.actions?.some(action => action.key === "open-script-api-settings")) clearProblemIssue(false);
     S.banner = null;
-    S.attendance = { ...S.attendance, state: "installing" };
+    // The continuation thread is running now: no required-action prompt next to it (R5-4).
+    S.attendance = { ...S.attendance, state: "installing", preparation_running: true };
     startAttendancePreparePoll();
     render();
   } catch (error) {
@@ -2481,6 +2650,13 @@ function attendanceScriptPermissionHtml() {
     <button class="btn" data-action="attendance-script-settings"${busy ? " disabled" : ""}>Apps Script API 사용</button></div>`;
 }
 window.addEventListener("blur", () => {
+  // The notice asks the teacher to turn the API on in a browser; leaving for that
+  // browser without [Apps Script API 사용] still resumes on return (CONN-09).
+  if (!attendancePermissionReturn && S.attendance?.state === "script-permission-required") {
+    const flow = attendancePermissionReturn = { context: googleReadContext(), record: attendancePermissionRecord(),
+      phase: "waiting", blurred: false, attempts: 0, timer: null };
+    if (!ownsAttendancePermissionReturn(flow)) attendancePermissionReturn = null;
+  }
   if (ownsAttendancePermissionReturn(attendancePermissionReturn)) attendancePermissionReturn.blurred = true;
 });
 window.addEventListener("focus", () => {
@@ -2521,6 +2697,7 @@ function startAttendancePreparePoll(flow = null) {
       S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.chatStatus,
     ]);
     let keepPolling = false;
+    let chatRead = false;
     try {
       let a = S.attendance;
       if (!a || a.state !== "ready") {
@@ -2550,6 +2727,7 @@ function startAttendancePreparePoll(flow = null) {
         // Account consent and room selection can finish after the Sheet menu has returned.
         // Read them independently, including when only the Sheet checkpoint is present.
         if (!S.chatStatus?.connected || S.chatStatus.read_failed || !S.chatStatus.class_space_id) {
+          chatRead = true;
           await loadChatStatus(true, false);
         }
         if (!current()) return;
@@ -2584,7 +2762,9 @@ function startAttendancePreparePoll(flow = null) {
     }
     // 받은 내용이 직전과 같으면 다시 그리지 않는다 — 3초마다 render가 학급 단톡방
     // 이름 입력의 타이핑·포커스를 지우던 문제 (검토 C3).
-    if (JSON.stringify([
+    // A slow Chat read may have been painted grey by another repaint (e.g. the toast); a same-result
+    // reply must still end that frame (OBS-01, R9-2).
+    if (chatRead || JSON.stringify([
       S.attendance, S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.chatStatus,
     ]) !== before) render();
     if (!keepPolling) { attendancePreparePollOn = false; return; }
@@ -2622,7 +2802,7 @@ function loadChatSpaces(force = false, renderResult = true) {
   const version = ++chatSpacesReadVersion;
   const ownsRoomRead = () => version === chatSpacesReadVersion && context === chatReadContext();
   const request = beginIssueRequest(true);
-  const promise = call("attendance_chat_spaces")
+  const promise = attendanceRead("attendance_chat_spaces")
     .then((rows) => {
       if (!ownsRoomRead()) return;
       if (!Array.isArray(rows)) throw new Error("방 목록 응답을 확인하지 못했어요.");
@@ -2636,7 +2816,7 @@ function loadChatSpaces(force = false, renderResult = true) {
       S.chatSpaces = [];
       S.chatSpacesLoading = false;
       S.chatSpacesError = true;
-      if (ownsIssueRequest(request) && showProblemIssue(error, request)) return;
+      if (ownsIssueRequest(request) && showProblemIssue(error, request, paintSettingsReadiness)) return;
       if (renderResult) render();
     });
   chatSpacesPending = { context, promise };
@@ -2667,7 +2847,7 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (a.state === "initial-setup-required") return `<p class="hint">출석부 설정 후 Google Chat을 연결해 주세요.</p>`;
   if (a.state !== "ready") return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
   const cs = S.chatStatus;
-  if (chatStatusReading()) return `<p class="hint">Google Chat 연결 상태를 확인하고 있어요.</p>`;
+  if (chatStatusAwaitingRead()) return `<p class="hint">Google Chat 연결 상태를 확인하고 있어요.</p>`;
   if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return `<p class="hint">Google Chat 연결 상태를 아직 확인하지 못했어요.</p>`;
   if (cs.read_failed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
   if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
@@ -2677,7 +2857,8 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>`;
   const rooms = S.chatSpaces || [];
   const savedOutsideList = cs.class_space_id && !rooms.some(s => String(s.name || "") === String(cs.class_space_id));
-  const options = rooms.map(s => `<option value="${esc(s.name)}"${String(cs.class_space_id || "") === String(s.name || "") ? " selected" : ""}>${esc(s.displayName)}</option>`).join("");
+  const chosen = String((S.classSpaceSaving && S.classSpaceSavingId) || cs.class_space_id || "");
+  const options = rooms.map(s => `<option value="${esc(s.name)}"${chosen === String(s.name || "") ? " selected" : ""}>${esc(s.displayName)}</option>`).join("");
   return `<div class="chat-space-existing">
     <select name="class-space-select" aria-label="학급 단톡방" data-action-change="class-space-pick" data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}><option value="">학급 단톡방</option>${options}</select>
     ${savedOutsideList ? `<p class="hint">저장된 단톡방이 현재 목록에 없어요. 기존 선택은 그대로예요.</p>` : ""}</div>`;
@@ -2838,7 +3019,10 @@ function attendancePresentation(a) {
   const action = a?.attendance_action || flow?.action;
   const initial = !attendanceReplacementScope(a) && (action?.origin === "initial-auto" || flow?.origin === "initial-auto"
     || (attendanceViewKind() === "installation" && a?.initial_preparation_allowed === true));
-  const pendingState = ["preparing", "installing"].includes(a?.state);
+  // While this PC's continuation thread runs, the server may still report the saved
+  // operation as recovery-required until the thread claims it; that is not an action (R5-4).
+  const pendingState = ["preparing", "installing"].includes(a?.state)
+    || (a?.state === "recovery-required" && a?.preparation_running === true);
   const running = pendingState && (a?.preparation_running === true || a?.attendance_scope?.preparationRunning === true)
     && !["requested", "blocked", "reconciling"].includes(action?.phase);
   const requesting = Boolean(flow?.requesting || S.attendanceTransitioning
@@ -2849,6 +3033,7 @@ function attendancePresentation(a) {
   if (pendingState) return { phase: "required", tone: "warn", text: "확인 필요", initial };
   if (S.attendanceLoading || a?.state === "checking") return {phase:"checking", tone:"muted", text:"확인 중…", initial};
   if (a?.account_authorization_required) return {phase:"required", tone:"warn", text:"권한 승인 필요", initial};
+  if (a?.state === "auth-error") return {phase:"required", tone:"warn", text:"확인 필요", initial};
   if (S.attendanceReadFailed || ["verification-unavailable", "recovery-required", "binding-required"].includes(a?.state)) {
     return {phase:"required", tone:"warn", text:a?.creation_allowed ? "생성 필요" : "확인 필요", initial};
   }
@@ -2904,6 +3089,7 @@ function serviceStatusHtml(entry, a) {
   if (["preparing", "installing"].includes(a.state)) return `<span class="svc-status warn">${entry.service === "sheet" ? "확인 필요" : "출석부 준비 필요"}</span>`;
   if (S.attendanceLoading) return `<span class="svc-status muted">확인 중…</span>`;
   if (S.attendanceReadFailed) return `<span class="svc-status warn">확인 필요</span>`;
+  if (a.state === "auth-error") return `<span class="svc-status warn">확인 필요</span>`;
   if (a.state === "checking") return `<span class="svc-status muted">확인 중…</span>`;
   if (["verification-unavailable", "recovery-required", "binding-required"].includes(a.state)) return `<span class="svc-status warn">확인 필요</span>`;
   if (a.account_authorization_required) return `<span class="svc-status warn">권한 승인 필요</span>`;
@@ -2919,12 +3105,12 @@ function serviceStatusHtml(entry, a) {
   }
   if (["script-recovery-required", "script-permission-required"].includes(a.state)
       || (a.state === "failed" && Object.keys(a.progress || {}).length)) {
-    return `<span class="svc-status warn">${a.state === "script-permission-required" ? "권한 승인 필요" : "확인 필요"}</span>`;
+    return `<span class="svc-status warn">${a.state === "script-permission-required" ? "API 사용 필요" : "확인 필요"}</span>`;
   }
   if (presentation.phase === "setup" && entry.service !== "sheet") return `<span class="svc-status warn">출석부 설정 필요</span>`;
   if (entry.service === "chat") {
     const cs = S.chatStatus;
-    if (a.state === "ready" && chatStatusReading()) {
+    if (a.state === "ready" && chatStatusAwaitingRead()) {
       return `<span class="svc-status muted">확인 중…</span>`;
     }
     if (a.state === "ready" && (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading"
@@ -2970,13 +3156,20 @@ function attendanceChatConnectBlockReason(a = S.attendance) {
   const presentation = attendancePresentation(a);
   if (presentation.phase === "pending") return "출석부 준비가 끝나면 연결할 수 있어요.";
   if (presentation.phase === "waiting") return "기존 출석부 준비 결과를 확인한 뒤 연결할 수 있어요.";
+  // Name the confirmed cause: the Apps Script API is off (C11, R5-6).
+  if (a.state === "script-permission-required") return "위의 [Apps Script API 사용]으로 Google Apps Script API를 켜면 출석부 준비가 이어진 뒤 연결할 수 있어요.";
   if (["preparing", "installing"].includes(a.state)) return "출석부 준비에 필요한 확인을 먼저 마쳐 주세요.";
   if (S.attendanceSaving) return "출결 자료의 저장이 끝나면 연결할 수 있어요.";
   if (S.attendanceScriptUpdating || S.attendanceTransitioning) return "출결 자료를 변경하고 있어요. 끝나면 연결할 수 있어요.";
   if (["script-check-required", "script-update-required"].includes(a.state)) return "위의 출결 기능 확인·업데이트를 먼저 마쳐 주세요.";
+  // Name the step that is actually missing (C11, R4-6/R4-7).
+  if (a.state === "initial-setup-required") return attendanceViewKind() === "installation"
+    ? "출석부의 [처음 한 번 연결하러 가기]에서 처음 설정을 마치면 연결할 수 있어요."
+    : "출석부의 [설정하러 가기]에서 처음 설정을 마치면 연결할 수 있어요.";
+  if (attendanceReplacementScope(a)) return "새 출석부를 만든 뒤 연결할 수 있어요.";
   if (a.state !== "ready") return "출결 자료 준비를 먼저 마쳐 주세요.";
   const cs = S.chatStatus;
-  if (chatStatusReading()) return "Google Chat 연결 상태를 확인하고 있어요.";
+  if (chatStatusAwaitingRead()) return "Google Chat 연결 상태를 확인하고 있어요.";
   if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return "Google Chat 연결 상태를 아직 확인하지 못했어요.";
   if (cs.read_failed || hasCurrentFinalIssue(["attendance_chat_status"]) || typeof cs.connected !== "boolean") return "Google Chat 연결 상태를 확인하지 못했어요.";
   if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
@@ -3000,8 +3193,15 @@ function attendanceServiceRow(entry, a, view = attendanceViewKind()) {
     const hint = connected ? "" : reason || S.chatStatus?.reason || "";
     chatHint = hint ? `<p class="hint attendance-chat-action-hint" id="attendance-chat-action-hint">${esc(hint)}</p>` : "";
   }
+  // The status cell above says 준비 필요 for a year mismatch; give its confirmed reason here.
+  const yearNote = entry.service === "sheet" && a.state === "ready" && a.year_mismatch
+    && !S.attendanceLoading && !S.attendanceReadFailed && !attendancePresentation(a).pending
+    ? `<small class="attendance-year-note">${a.school_year && a.current_school_year
+      ? `연결된 출석부는 ${esc(a.school_year)}학년도 자료예요. ${esc(a.current_school_year)}학년도 출석부가 필요해요.`
+      : "연결된 출석부가 현재 학년도 자료가 아니에요."}</small>` : "";
   const note = (a.state === "failed" && a.failed_service === entry.service)
     ? `<span class="field-error">${esc(a.detail || "")}</span>`
+    : yearNote ? yearNote
     : (entry.service === "chat" && S.chatStatus && S.chatStatus.moved)
       ? `<span class="field-error">${esc(S.chatStatus.reason || "")}</span>` : "";
   const connectionCode = entry.service === "sheet" && S.mode !== "wizard" && a.connection_code
@@ -3043,8 +3243,22 @@ function scheduleAttendanceBoundaryCheck(a) {
     attendanceBoundaryCheck = null;
     if (pending.context !== chatReadContext() || !attendanceViewVisible()) return;
     // Refresh only: crossing March 1 never creates or selects a workbook by itself.
+    beginAttendanceAuthBatch();
     refreshAttendanceStatus();
   }, Math.min(boundary - serverNow, 2147483647));
+}
+// One attendance-tab read batch (tab open, 연결 상태 새로고침, 30-minute refresh, wizard gate,
+// window return, Home check): the bridge runs `gws auth status` once for its reads (2026-09-28).
+const ATTENDANCE_AUTH_BATCH_MS = 120000;
+let attendanceAuthBatch = { id: "", at: 0 };
+let attendanceAuthBatchCount = 0;
+function beginAttendanceAuthBatch() {
+  attendanceAuthBatch = { id: `att-${Date.now().toString(36)}-${++attendanceAuthBatchCount}`, at: Date.now() };
+}
+function attendanceRead(name) {
+  // A read long after its trigger starts its own batch instead of reusing an old one.
+  if (!attendanceAuthBatch.id || Date.now() - attendanceAuthBatch.at > ATTENDANCE_AUTH_BATCH_MS) beginAttendanceAuthBatch();
+  return call(name, attendanceAuthBatch.id);
 }
 let attendanceStatusReadVersion = 0;
 let attendanceStatusReadContext = "";
@@ -3061,7 +3275,7 @@ function refreshAttendanceStatus(followups = true) {
   const current = () => version === attendanceStatusReadVersion && context === chatReadContext() && S.attendance === record;
   S.attendanceLoading = true;
   S.attendanceReadFailed = false;
-  return call("attendance_status")
+  return attendanceRead("attendance_status")
     .then((data) => {
       if (!current()) return;
       S.attendance = data;
@@ -3078,7 +3292,7 @@ function refreshAttendanceStatus(followups = true) {
           loadChatStatus(true).then(() => {
             if (googleReadContext() === googleContext && S.chatStatus?.connected && !S.chatStatus.read_failed) {
               loadChatSpaces(true);
-              render();
+              paintSettingsReadiness();
             }
           });
           loadFirstSetupStatus(true);
@@ -3093,7 +3307,7 @@ function refreshAttendanceStatus(followups = true) {
       // A successful reply may itself change the attendance record identity.
       // Closing the connection window does not end this account's read.
       if (googleListContext() === accountContext) {
-        render();
+        paintSettingsReadiness();
         if (followups && googleReadContext() === googleContext && !S.attendanceReadFailed) {
           maybeStartInitialAttendancePreparation(S.attendance);
         }
@@ -3117,8 +3331,8 @@ function loadAttendanceStatus() {
     .then((saved) => {
       if (current() && saved && !S.attendance) { S.attendance = record = saved; render(); }
     })
-    .catch(() => {});
-  call("attendance_status")
+    .catch(reportBackgroundFailure);
+  attendanceRead("attendance_status")
     .then((data) => { if (current()) { S.attendance = record = data; readCompleted = true; } })
     .catch((error) => {
       if (!current()) return;
@@ -3240,8 +3454,8 @@ async function openAttendanceConnectionPicker() {
   const version = ++attendanceConnectionRequestToken;
   S.attendanceConnection = flow;
   S.attendanceConnectionBusy = true;
-  render();
   try {
+    render();  // inside try: a failed paint must still clear the busy flag (OBS-10)
     const data = await call("attendance_connection_candidates");
     if (S.attendanceConnection !== flow || version !== attendanceConnectionRequestToken || flow.accountContext !== googleReadContext()) return;
     flow.candidates = data.candidates; flow.context = data.context;
@@ -3259,7 +3473,7 @@ bindActions({
     const resumePoll = S.attendanceConnection?.resumePoll;
     const attempted = Boolean(S.attendanceConnection?.request);
     ++attendanceConnectionRequestToken; S.attendanceConnection = null; S.attendanceConnectionBusy = false; render();
-    if (attempted) refreshAttendanceStatus();
+    if (attempted) { beginAttendanceAuthBatch(); refreshAttendanceStatus(); }
     else if (resumePoll) startAttendancePreparePoll();
   },
   "attendance-select-preview": async () => {
@@ -3273,8 +3487,9 @@ bindActions({
     if (!selected?.can_edit || flow.loading || flow.saving || flow.accountContext !== googleReadContext()) return;
     if (!flow.request || flow.request.spreadsheetId !== selected.spreadsheet_id) flow.request = {
       spreadsheetId: selected.spreadsheet_id, key: crypto.randomUUID() };
-    flow.saving = true; S.attendanceConnectionBusy = true; delete flow.selection_error; render();
+    flow.saving = true; S.attendanceConnectionBusy = true; delete flow.selection_error;
     try {
+      render();  // inside try: a failed paint must still clear the busy flag (OBS-10)
       const data = await call("select_attendance_connection", selected.spreadsheet_id, flow.context, flow.request.key);
       if (S.attendanceConnection !== flow || flow.accountContext !== googleReadContext()) return;
       if (data.state !== "selected" || data.attendance_scope?.spreadsheetId !== selected.spreadsheet_id) throw new Error("선택한 출석부의 등록 결과를 확인하지 못했어요.");
@@ -3285,6 +3500,7 @@ bindActions({
       S.attendanceReadFailed = false;
       clearResolvedReadIssue("attendance_status");
       setBanner("ok", `선택한 출석부로 연결했어요: ${data.workbook_name}`);
+      beginAttendanceAuthBatch();
       await refreshAttendanceStatus();
     } catch (error) {
       if (S.attendanceConnection === flow) {
@@ -3355,7 +3571,6 @@ async function loadFirstSetupStatus(force = false, background = false) {
   const context = chatReadContext();
   if (firstSetupInFlight === context) return;
   if (!force && firstSetupReadContext === context) return;
-  const before = JSON.stringify([S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.firstSetupReason]);
   const requestScreen = screenKey();
   const keepAcrossScreens = background || S.mode !== "wizard";
   const previousReadState = firstSetupReadContext === context ? S.firstSetupReadState : null;
@@ -3370,9 +3585,9 @@ async function loadFirstSetupStatus(force = false, background = false) {
     && (keepAcrossScreens || requestScreen === screenKey());
   firstSetupInFlight = context;
   S.firstSetupReadState = "checking";
-  if (force) render();
+  if (force) paintSettingsReadiness();
   try {
-    const first = await call("attendance_first_setup_status");
+    const first = await attendanceRead("attendance_first_setup_status");
     if (!current()) return;
     applyFirstSetupRead(first);
   } catch (_) {
@@ -3387,7 +3602,8 @@ async function loadFirstSetupStatus(force = false, background = false) {
       }
     }
   }
-  if (current() && before !== JSON.stringify([S.firstSetupDone, S.firstSetupConnectionCode, S.firstSetupReadState, S.firstSetupReason])) render();
+  // The checking frame is already on screen, so a same-result reply must still end it (OBS-01).
+  if (current()) paintSettingsReadiness();
 }
 let rosterReadVersion = 0;
 let rosterContext = "";
@@ -3395,6 +3611,8 @@ let rosterStatus = null;
 let rosterInFlight = "";
 let rosterAutoSyncAttempt = "";
 let rosterAutoSyncPending = null;
+const ROSTER_SYNC_LOCK_WAIT_MS = 120000;
+const ROSTER_SYNC_LOCK_RETRY_MS = 3000;
 function syncPreparedRoster() {
   if (rosterConnecting) return Promise.resolve();
   if (!isHomeroomTeacher() || !attendanceSheetSetupDone()) return Promise.resolve();
@@ -3402,7 +3620,7 @@ function syncPreparedRoster() {
   if (rosterAutoSyncPending?.context === context) return rosterAutoSyncPending.promise;
   const pending = { context };
   pending.promise = (async () => {
-    if (S.rosterEditor?.context !== rosterEditorContext()) await loadRosterEditor();
+    if (rosterEditorStale()) await loadRosterEditor();
     if (context !== chatReadContext()) return;
     const editor = S.rosterEditor;
     if (!editor?.pending || editor.dirty || editor.busy) return;
@@ -3411,11 +3629,29 @@ function syncPreparedRoster() {
     rosterAutoSyncAttempt = attempt;
     editor.busy = true;
     try {
-      const result = await call("sync_roster_editor");
-      if (context !== chatReadContext()) return;
-      S.rosterEditor = { ...result, rows: rosterEditableRows(result.rows), context: rosterEditorContext(), dirty: false };
-    } catch (_) {
-      if (context === chatReadContext()) { editor.state = "unavailable"; editor.detail = "시트 반영 결과를 확인하지 못했어요. 명단 수정에서 다시 확인해 주세요."; }
+      // A busy lock is refused before sync writes anything, so wait (grey) and follow
+      // the running job; bounded (OBS-04). Each screen appends its own button (C11, PEND-46).
+      const waitUntil = Date.now() + ROSTER_SYNC_LOCK_WAIT_MS;
+      for (;;) {
+        try {
+          const result = await call("sync_roster_editor");
+          if (context !== chatReadContext()) return;
+          S.rosterEditor = { ...result, rows: rosterEditableRows(result.rows), context: rosterEditorContext(), dirty: false, workbook: rosterEditorWorkbook() };
+          return;
+        } catch (error) {
+          if (error?.issue?.code !== "ATTENDANCE_REMOTE_BUSY" || Date.now() >= waitUntil) throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, ROSTER_SYNC_LOCK_RETRY_MS));
+        if (context !== chatReadContext()) return;
+      }
+    } catch (error) {
+      if (context === chatReadContext()) {
+        const busy = error?.issue?.code === "ATTENDANCE_REMOTE_BUSY";
+        editor.state = "unavailable";
+        editor.failure_code = busy ? "ATTENDANCE_REMOTE_BUSY" : "ROSTER_SYNC_UNCONFIRMED";
+        editor.detail = busy ? "출석부의 다른 작업이 끝나지 않아 학생명단을 아직 연결하지 못했어요."
+          : "시트 반영 결과를 확인하지 못했어요.";
+      }
     } finally { if (context === chatReadContext()) { S.rosterEditor.busy = false; render(); } }
   })().finally(() => { if (rosterAutoSyncPending === pending) rosterAutoSyncPending = null; });
   rosterAutoSyncPending = pending;
@@ -3437,9 +3673,9 @@ async function loadAttendanceRosterStatus(force = false, readOnly = false) {
   const sheet = S.attendance.spreadsheet_id
     || String(S.attendance.spreadsheet_url || "").match(/\/spreadsheets\/d\/([^/]+)/)?.[1] || "";
   const current = () => version === rosterReadVersion && context === chatReadContext();
-  if (force) render();
+  if (force) paintSettingsReadiness();
   try {
-    const result = await call("attendance_roster_status");
+    const result = await attendanceRead("attendance_roster_status");
     if (!current()) return;
     const validCount = Number.isInteger(result?.count) && (result.state === "empty" ? result.count === 0 : result.count > 0);
     rosterStatus = result && sheet && result.spreadsheet_id === sheet && validCount && ["empty","incomplete","ready"].includes(result.state)
@@ -3449,7 +3685,7 @@ async function loadAttendanceRosterStatus(force = false, readOnly = false) {
     rosterStatus = {state:"unavailable"};
   } finally {
     if (rosterInFlight === pending) rosterInFlight = "";
-    if (current()) render();
+    if (current()) paintSettingsReadiness();
     finishPending();
   }
 }
@@ -3463,85 +3699,188 @@ function studentRosterSubrowHtml(a, view = attendanceViewKind()) {
     const editor = S.rosterEditor?.context === rosterEditorContext() ? S.rosterEditor : null;
     const complete = attendanceSheetSetupDone() && rosterContext === chatReadContext() && rosterStatus?.state === "ready" && !editor?.pending;
     const busy = rosterConnecting || editor?.busy || S.attendanceAccountAuthorizing;
-    const detail = editor?.state === "unavailable" || editor?.state === "conflict" ? editor.detail
+    // A re-read of the setup marker is not an unfinished setup: do not ask the teacher to finish it again.
+    const setupReading = !attendanceSheetSetupDone() && S.firstSetupReadState === "checking";
+    // A roster re-read (e.g. the [다음] gate) is not an unlinked roster: grey, no write button (R07).
+    const rosterReading = !busy && attendanceSheetSetupDone() && rosterContext === chatReadContext() && rosterStatus?.state === "checking";
+    // A running link replaces the previous failure text (R09, R5-2).
+    const detail = busy ? "저장한 학생명단을 출석부에 연결하고 있어요."
+      : editor?.state === "unavailable" || editor?.state === "conflict" ? rosterDetailText(editor, "[학생명단 연결]")
+      : setupReading ? "출석부 설정 상태를 확인하고 있어요."
       : !attendanceSheetSetupDone() ? "출석부 설정을 먼저 완료해 주세요."
+      : rosterReading ? "출석부의 학생명단을 확인하고 있어요."
       : complete ? "저장한 학생명단을 출석부에서 확인했어요." : "6번에서 저장한 학생명단을 출석부에 연결해 주세요.";
     return `<div class="svc-subrow student-roster-subrow"><div class="first-setup-head"><b>학생명단 연결</b><span class="chat-space-reload-status">
-      <button class="btn-tonal" data-action="attendance-roster-connect"${busy || !attendanceSheetSetupDone() || complete ? " disabled" : ""}>${busy ? "연결 중…" : "학생명단 연결"}</button>
-      <span class="svc-status ${busy ? "muted" : complete ? "ok" : "warn"}">${busy ? "연결 중…" : complete ? "연결됨" : "연결 필요"}</span></span></div><p>${esc(detail)}</p></div>`;
+      <button class="btn-tonal" data-action="attendance-roster-connect"${busy || rosterReading || !attendanceSheetSetupDone() || complete ? " disabled" : ""}>${busy ? "연결 중…" : "학생명단 연결"}</button>
+      <span class="svc-status ${busy || setupReading || rosterReading ? "muted" : complete ? "ok" : "warn"}">${busy ? "연결 중…" : setupReading || rosterReading ? "확인 중…" : complete ? "연결됨" : "연결 필요"}</span></span></div><p>${esc(detail)}</p></div>`;
   }
   const status = rosterContext === chatReadContext() ? rosterStatus : null;
-  const state = status?.state === "unavailable" ? "unavailable" : initialRequired ? "empty" : status?.state || "checking";
+  // Before the Sheet first-setup the roster is not read at all (loadAttendanceRosterStatus
+  // needs state "ready"): say so instead of an endless 확인 중… (R4-3).
+  const setupFirst = a.state !== "ready" && !initialRequired && !status;
+  const state = status?.state === "unavailable" ? "unavailable" : initialRequired ? "empty" : setupFirst ? "setup" : status?.state || "checking";
   const pending = S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending;
   const complete = state === "ready" && !pending;
-  const label = pending ? "반영 필요" : complete ? "입력됨" : state === "empty" ? "입력 필요" : state === "incomplete" ? "수정 필요" : state === "unavailable" ? "확인 필요" : "확인 중…";
-  let detail = "";
+  const label = pending ? "반영 필요" : complete ? "입력됨" : state === "empty" ? "입력 필요" : state === "incomplete" ? "수정 필요" : state === "unavailable" ? "확인 필요" : state === "setup" ? "설정 후 확인" : "확인 중…";
+  let detail = state === "setup" ? "출석부 설정을 마치면 학생명단을 확인해요." : "";
   if (state === "unavailable") detail = "현재 출석부의 학생명단을 확인하지 못했어요. 입력한 명단은 그대로 보관하고 있어요.";
   if (state === "incomplete") {
     const missing = Object.entries(status.missing || {}).filter(([, count]) => count > 0).map(([field, count]) => `${field} ${count}명 누락`);
     if (status.invalid_rows?.length) missing.push(`${status.invalid_rows.join(", ")}행의 번호·이메일 형식 또는 중복 확인`);
     detail = missing.join(" · ");
   }
-  if (pending) detail = S.rosterEditor.detail || "저장한 학생명단을 출석부에 반영하고 있어요.";
+  if (pending) detail = rosterDetailText(S.rosterEditor, "[명단 수정]에서 [명단 저장]") || "저장한 학생명단을 출석부에 반영하고 있어요.";
   return `<div class="svc-subrow student-roster-subrow">
     <div class="first-setup-head"><b>${view === "installation" ? "학생명단 입력" : "학생 명단"}</b><span class="chat-space-reload-status">
       <button class="btn-tonal" data-action="attendance-roster-edit">${view === "installation" ? `${icon("external-link", "small")} 명단 입력하러 가기` : "명단 수정"}</button>
-      <span class="svc-status ${complete ? "ok" : state === "checking" ? "muted" : "warn"}">${esc(label)}</span></span></div>
+      <span class="svc-status ${complete ? "ok" : ["checking", "setup"].includes(state) ? "muted" : "warn"}">${esc(label)}</span></span></div>
     ${detail ? `<p>${esc(detail)}</p>` : ""}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-roster-guide" data-preserve-issue="true">입력 방법 그림으로 보기</button></p></div>`;
 }
 function openAttendancePictureGuide(kind) { return call("open_picture_guide", kind); }
 let attendanceAccountAuthorizationVersion = 0;
+let attendanceAccountAuthorization = null;
+function attendanceAuthorizationNotice(text) {
+  S.banner = { kind: "warn", text, topic: "attendance-authorization" };
+  paintSettingsReadiness();
+}
+function stopAttendanceAccountAuthorization() {
+  attendanceAccountAuthorizationVersion += 1;
+  if (attendanceAccountAuthorization?.timer) clearTimeout(attendanceAccountAuthorization.timer);
+  attendanceAccountAuthorization = null;
+  S.attendanceAccountAuthorizing = false;
+}
+function ownsAttendanceAccountAuthorization(attempt) {
+  return attempt.version === attendanceAccountAuthorizationVersion && attempt.epoch === googleLoginEpoch
+    && attempt.account === (verifiedGoogleAccount(S.google) || S.lastVerifiedGoogleAccount);
+}
+function scheduleAttendanceAccountAuthorization(attempt, delay = 1000) {
+  if (attempt.timer) clearTimeout(attempt.timer);
+  if (attempt.opening) return;
+  attempt.timer = setTimeout(() => pollAttendanceAccountAuthorization(attempt), delay);
+}
+function pollAttendanceAccountAuthorization(attempt, observed = null) {
+  if (attempt.reading) return attempt.reading;
+  attempt.reading = readAttendanceAccountAuthorization(attempt, observed).finally(() => { attempt.reading = null; });
+  return attempt.reading;
+}
+async function readAttendanceAccountAuthorization(attempt, observed) {
+  attempt.timer = null;
+  if (!ownsAttendanceAccountAuthorization(attempt)) {
+    if (attendanceAccountAuthorization === attempt) stopAttendanceAccountAuthorization();
+    return;
+  }
+  try {
+    // The bridge owns the bounded read retries. A paused attempt is retained,
+    // including after its deadline, until one final status read can resolve it.
+    const result = observed || await call("attendance_account_authorization_status");
+    if (!ownsAttendanceAccountAuthorization(attempt)) return;
+    if (result?.state === "complete") {
+      attendanceAccountAuthorization = null;
+      S.attendanceAccountAuthorizing = false;
+      if (S.banner?.topic === "attendance-authorization") S.banner = null;
+      const rosterRetry = rosterAuthorizationRetry;
+      rosterAuthorizationRetry = null;
+      if (!isGoogleReady(S.google)) adoptGoogleStatus(await readGoogleStatus());
+      if (!ownsAttendanceAccountAuthorization(attempt)) return;
+      if (!isGoogleReady(S.google)) { googleRecoveryNeeded = true; paintSettingsReadiness(); return; }
+      if (rosterRetry && rosterRetry.context === rosterEditorContext() && rosterRetry.owner === screenKey()
+          && rosterRetry.revision === S.rosterEditor?.revision && !S.rosterEditor?.dirty
+          && (!rosterRetry.explicitConnect || rosterRetry.connection === (attendanceScopeKey(S.attendance)
+            || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || ""))) {
+        await saveRosterEditor(true, false, rosterRetry.explicitConnect, rosterRetry.useCurrentWorkbook === true);
+      } else {
+        googleRecoveryNeeded = true;
+        await refreshConnectionStatus({ googleStatus: S.google });
+        scheduleGoogleRecovery();
+      }
+      if (ownsAttendanceAccountAuthorization(attempt)) paintSettingsReadiness();
+      return;
+    }
+    if (result?.state !== "pending" || (attempt.deadline && Date.now() >= attempt.deadline)) {
+      stopAttendanceAccountAuthorization();
+      rosterAuthorizationRetry = null;
+      attendanceAuthorizationNotice(result?.detail || "권한 승인 시간이 지났어요. 연결 버튼에서 다시 시작해 주세요.");
+      return;
+    }
+    scheduleAttendanceAccountAuthorization(attempt, 3000);
+  } catch (error) {
+    if (!ownsAttendanceAccountAuthorization(attempt)) return;
+    S.attendanceAccountAuthorizing = false;
+    if (error instanceof StaleAccountResponse || error.issue?.state === "needs_user") {
+      stopAttendanceAccountAuthorization();
+      rosterAuthorizationRetry = null;
+    }
+    attendanceAuthorizationNotice(error.issue?.state === "needs_user" ? error.message : `권한 승인 결과를 읽지 못했어요. 진행한 승인은 유지하며, ${connectionRefreshHint()} 누르면 결과를 이어서 확인해요.`);
+  } finally {
+    if (attendanceAccountAuthorization === attempt && !ownsAttendanceAccountAuthorization(attempt)) stopAttendanceAccountAuthorization();
+    if (ownsAttendanceAccountAuthorization(attempt)) paintSettingsReadiness();
+  }
+}
+bindActions({"attendance-account-reopen": async () => {
+  const attempt = attendanceAccountAuthorization;
+  if (!attempt || attempt.opening || !ownsAttendanceAccountAuthorization(attempt)) return;
+  attempt.opening = true;
+  if (attempt.timer) clearTimeout(attempt.timer);
+  paintSettingsReadiness();
+  try {
+    // Let a status read already in flight finish before deciding to reopen.
+    if (attempt.reading) await attempt.reading;
+    if (attendanceAccountAuthorization !== attempt || !ownsAttendanceAccountAuthorization(attempt)) return;
+    const result = await call("attendance_account_authorize", true);
+    if (attendanceAccountAuthorization !== attempt || !ownsAttendanceAccountAuthorization(attempt)) return;
+    if (result?.state === "pending") {
+      attempt.deadline = Date.parse(result.expires_at) || attempt.deadline;
+      S.attendanceAccountAuthorizing = true;
+    } else {
+      await pollAttendanceAccountAuthorization(attempt, result);
+    }
+  } catch (error) {
+    if (attendanceAccountAuthorization === attempt && ownsAttendanceAccountAuthorization(attempt)) {
+      S.attendanceAccountAuthorizing = false;
+      attendanceAuthorizationNotice(error.message || "승인 화면을 다시 열지 못했어요. 기존 승인 요청은 유지됩니다.");
+    }
+  } finally {
+    attempt.opening = false;
+    if (attendanceAccountAuthorization === attempt && ownsAttendanceAccountAuthorization(attempt)
+        && S.attendanceAccountAuthorizing) scheduleAttendanceAccountAuthorization(attempt);
+    paintSettingsReadiness();
+  }
+}});
 bindActions({"attendance-account-authorize": async () => {
   if (S.attendanceAccountAuthorizing) return;
-  const version = ++attendanceAccountAuthorizationVersion;
-  const context = googleReadContext();
-  const current = () => version === attendanceAccountAuthorizationVersion && context === googleReadContext();
+  if (attendanceAccountAuthorization && ownsAttendanceAccountAuthorization(attendanceAccountAuthorization)) {
+    S.attendanceAccountAuthorizing = true;
+    scheduleAttendanceAccountAuthorization(attendanceAccountAuthorization);
+    paintSettingsReadiness();
+    return;
+  }
+  const attempt = attendanceAccountAuthorization = {
+    version: ++attendanceAccountAuthorizationVersion, epoch: googleLoginEpoch,
+    account: verifiedGoogleAccount(S.google) || S.lastVerifiedGoogleAccount, timer: null, deadline: null, opening: true,
+  };
   S.attendanceAccountAuthorizing = true;
-  render();
+  paintSettingsReadiness();
   try {
     const started = await call("attendance_account_authorize");
-    if (!current()) return;
-    if (started?.state !== "pending") throw new Error(started?.detail || "권한 승인 창을 열지 못했어요.");
-    const deadline = Date.now() + 180000;
-    const poll = async () => {
-      if (!current()) return;
-      try {
-        const result = await call("attendance_account_authorization_status");
-        if (!current()) return;
-        if (result?.state === "complete") {
-          S.attendanceAccountAuthorizing = false;
-          const rosterRetry = rosterAuthorizationRetry;
-          rosterAuthorizationRetry = null;
-          if (rosterRetry && rosterRetry.context === rosterEditorContext() && rosterRetry.owner === screenKey()
-              && rosterRetry.revision === S.rosterEditor?.revision && !S.rosterEditor?.dirty
-              && (!rosterRetry.explicitConnect || rosterRetry.connection === (attendanceScopeKey(S.attendance)
-                || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || ""))) {
-            await saveRosterEditor(true, false, rosterRetry.explicitConnect, rosterRetry.useCurrentWorkbook === true);
-          } else {
-            await refreshAttendanceStatus();
-          }
-          if (current()) render();
-          return;
-        }
-        if (result?.state !== "pending" || Date.now() >= deadline) {
-          S.attendanceAccountAuthorizing = false;
-          setBanner("warn", result?.detail || "권한 승인을 확인하지 못했어요. 연결 버튼에서 다시 시작해 주세요.");
-          return;
-        }
-        setTimeout(poll, 3000);
-      } catch (_) {
-        if (!current()) return;
-        S.attendanceAccountAuthorizing = false;
-        setBanner("warn", "권한 승인 결과를 읽지 못했어요. 연결 버튼에서 다시 확인해 주세요.");
-      }
-    };
-    setTimeout(poll, 1000);
-  } catch (error) {
-    if (current()) {
-      S.attendanceAccountAuthorizing = false;
-      setBanner("warn", error.message || "권한 승인 창을 열지 못했어요.");
+    if (!ownsAttendanceAccountAuthorization(attempt)) return;
+    if (started?.state === "complete") {
+      await pollAttendanceAccountAuthorization(attempt, started);
+      return;
     }
-  } finally { if (current()) render(); }
+    if (started?.state !== "pending") throw new Error(started?.detail || "권한 승인 창을 열지 못했어요.");
+    // Server expiry, not an unrelated three-minute screen timeout.
+    attempt.deadline = Date.parse(started.expires_at) || null;
+  } catch (error) {
+    if (ownsAttendanceAccountAuthorization(attempt)) {
+      stopAttendanceAccountAuthorization();
+      attendanceAuthorizationNotice(error.message || "권한 승인 창을 열지 못했어요.");
+    }
+  } finally {
+    attempt.opening = false;
+    if (attendanceAccountAuthorization === attempt && !ownsAttendanceAccountAuthorization(attempt)) stopAttendanceAccountAuthorization();
+    if (attendanceAccountAuthorization === attempt && S.attendanceAccountAuthorizing) scheduleAttendanceAccountAuthorization(attempt);
+    paintSettingsReadiness();
+  }
 }});
 bindActions({
   "google-login-guide": () => openAttendancePictureGuide("login"),
@@ -3588,6 +3927,7 @@ bindActions({"attendance-existing-repair": async () => {
     const result = await call("attendance_script_update_apply");
     if (!current()) return;
     if (["updated", "current"].includes(result?.state)) {
+      beginAttendanceAuthBatch();
       await refreshAttendanceStatus();
     } else {
       setBanner("warn", result?.detail || "기존 출석부의 복구를 마치지 못했어요. 다시 확인해 주세요.");
@@ -3649,7 +3989,7 @@ bindActions({"attendance-recovery": async (el) => {
     } : null);
     const result = await call("attendance_prepare_resume", expected);
     if (context !== chatReadContext() || owner !== screenKey()) return;
-    if (result?.status) S.attendance = result.status;
+    if (result?.status) S.attendance = { ...result.status, preparation_running: result.started === true };
     if (result?.started) startAttendancePreparePoll();
     else if (result?.reason) setBanner("warn", result.reason);
     render();
@@ -3684,12 +4024,17 @@ function attendanceTabHtml() {
     statusArea = recovery;
   } else if (presentation.pending) {
     statusArea = "";
-  } else if (a.account_authorization_required) {
-    statusArea = `<div class="banner warn attendance-account-consent"><span>출석부 연결을 확인하려면 Google 권한 승인이 필요해요.</span><button class="btn-tonal" data-action="attendance-account-authorize"${S.attendanceAccountAuthorizing ? " disabled" : ""}>${icon("external-link", "small")} ${S.attendanceAccountAuthorizing ? "승인 기다리는 중…" : "연결(권한 승인)하러 가기"}</button></div>`;
+  } else if (a.account_authorization_required && (presentation.phase !== "checking" || attendanceAccountAuthorization)) {
+    // A re-check after consent keeps the previous record until it returns: do not
+    // ask for the finished consent again next to the grey checking rows (C6·C8).
+    statusArea = `<div class="banner warn attendance-account-consent"><span>출석부 연결을 확인하려면 Google 권한 승인이 필요해요.${S.attendanceAccountAuthorizing ? `<br><span class="muted">승인 기다리는 중…</span>` : ""}</span><button class="btn-tonal" data-action="${attendanceAccountAuthorization ? "attendance-account-reopen" : "attendance-account-authorize"}"${attendanceAccountAuthorization?.opening ? " disabled" : ""}>${icon("external-link", "small")} ${attendanceAccountAuthorization ? "승인 화면 다시 열기" : "연결(권한 승인)하러 가기"}</button></div>`;
   } else if (S.attendanceReadFailed) {
     statusArea = `<div class="banner" role="status"><span>출석부의 현재 상태를 확인하지 못했어요. 잠시 후 [다시 확인]을 눌러 주세요.</span><button class="btn-tonal" data-action="attendance-status-recheck">다시 확인</button></div>`;
   } else if (attendanceReplacementScope(a)) {
-    statusArea = "";
+    // Name the confirmed cause (trash / unavailable); the create button stays in the row (C11, R4-6).
+    const cause = a.creation_reason === "replace-trashed" ? "기존 출석부가 Google Drive 휴지통에 있어요."
+      : (a.detail || "기존 출석부를 확인할 수 없어요.");
+    statusArea = `<div class="banner warn" role="status"><span>${esc(cause)}</span></div>`;
   } else if (a.state === "account-required") {
     statusArea = `<div class="banner warn"><span>${esc(a.detail || GOEDU_REQUIRED_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>`;
@@ -3817,6 +4162,7 @@ bindActions({
     S.banner = null;  // 이전 탭의 안내 배너(게이트 포함)가 새 탭까지 따라가지 않는다 (검토 C2)
     S.connectTab = tab;
     if (tab === "attendance" && attendanceUiEnabled()) {
+      beginAttendanceAuthBatch();
       if (S.mode === "wizard") {
         // 마법사에서는 준비 폴링이 상태를 읽는다 — 같은 정보를 두 경로로 묻지 않는다.
         startAttendancePreparePoll();
@@ -3917,12 +4263,13 @@ bindActions({
     render();
     try {
       S.attendance = await call("ensure_attendance");
-      S.checks = await call("home_checks");
+      beginAttendanceAuthBatch();
+      S.checks = await attendanceRead("home_checks");
       // 출결 준비가 끝난 직후 현재 Chat 허용 상태까지 읽어야 별도의 "연결하기"
       // 단추를 바로 보여 줄 수 있다. 화면을 먼저 그리면 바깥 클릭 작업이 끝날 때
       // 그 읽기가 취소되어 "확인 중"에 계속 머물 수 있다.
       S.chatStatus = S.attendance.state === "ready"
-        ? await call("attendance_chat_status")
+        ? await attendanceRead("attendance_chat_status")
         : null;
       if (S.attendance.state === "ready") showToast("출결 업무 준비를 마쳤어요");
     } finally {
@@ -3964,7 +4311,8 @@ bindActions({
     S.attendanceScriptUpdate = update;
     S.attendanceScriptDialog = null;
     if (resuming && update.state === "current" && update.verified) {
-      const attendance = await call("attendance_status");
+      beginAttendanceAuthBatch();
+      const attendance = await attendanceRead("attendance_status");
       if (!current()) return;
       S.attendance = attendance;
       S.attendanceScriptUpdate = null;
@@ -3993,11 +4341,12 @@ bindActions({
         if (S.banner?.topic === "attendance-script-update") S.banner = null;
         S.attendanceScriptDialog = null;
         S.attendanceScriptUpdate = null;
-        S.attendance = await call("attendance_status");
+        beginAttendanceAuthBatch();
+        S.attendance = await attendanceRead("attendance_status");
         S.chatStatus = null;
         // 홈 점검 결과도 같이 다시 읽는다 — 안 읽으면 연결 카드의 `확인 필요`와
         // 출결 탭의 빨간 숫자가 프로그램을 다시 켤 때까지 그대로 남는다.
-        refreshChecks().catch(() => {});
+        refreshChecks().catch(reportBackgroundFailure);
         // 마무리로 상태가 준비됨이 되면, 마법사에서는 시트 처음 설정 완료 확인이
         // 이어서 돌아야 "기다리는 중…"이 풀린다 (검토 C6).
         if (S.mode === "wizard") startAttendancePreparePoll();
@@ -4006,7 +4355,7 @@ bindActions({
         S.attendanceScriptDialog = null;
         if (S.attendanceScriptUpdate.state === "permission-required") {
           adoptGoogleStatus(await call("google_status"));
-          refreshChecks().catch(() => {});
+          refreshChecks().catch(reportBackgroundFailure);
         }
       }
     } finally {
@@ -4048,6 +4397,14 @@ bindActions({
     try {
       const data = intent ? await call("start_new_attendance", intent) : await call("start_new_attendance");
       if (context !== googleReadContext()) return;
+      if (S.mode === "wizard" && data?.state === "profile-required") {
+        // 마법사의 내 정보·하루 일과는 Brity 메신저 탭 [다음]이 파일에 저장할 때까지 초안이다.
+        // 출결 탭을 바로 열어 만들기를 누르면 그 저장이 아직 없어 거절된다 — 이미 입력한 값을
+        // 다시 입력하라고 하지 않고 실제 저장 경로를 안내한다(2026-09-27 새 설치 확인).
+        attendanceReplacementAttempt = null;
+        setBanner("warn", "입력한 내 정보와 하루 일과는 아직 이 컴퓨터에 저장되지 않았어요. Brity 메신저 탭에서 [다음]을 누르면 저장한 뒤 출석부를 만들 수 있어요.");
+        return;
+      }
       if (!acceptAttendanceActionResult(data, flow)) {
         if (replacementContext === attendanceReplacementContext(S.attendance)) {
           setBanner("warn", data.detail || "새 출석부의 준비 결과를 확인하지 못했어요. 현재 상태를 다시 확인해 주세요.");
@@ -4087,6 +4444,8 @@ bindActions({
     const context = chatReadContext();
     const owner = screenKey();
     S.chatConnectOpening = true;
+    // The consent may finish after the one wizard read or the 10-minute poll: the next return to the window re-reads (R9-1).
+    const consent = chatConsentReturn = { context, owner, blurred: false };
     render();
     try {
       await call("attendance_chat_connect");
@@ -4094,6 +4453,9 @@ bindActions({
       showToast("브라우저에서 구글 허용을 마쳐 주세요");
       if (S.mode === "wizard") startAttendancePreparePoll();
       else startChatConnectPoll();
+    } catch (error) {
+      if (chatConsentReturn === consent) chatConsentReturn = null;
+      throw error;
     } finally {
       S.chatConnectOpening = false;
       if (context === chatReadContext() && owner === screenKey()) render();
@@ -4137,6 +4499,7 @@ bindActions({
     render();
   },
   "class-space-reload": async () => {
+    beginAttendanceAuthBatch();
     S.spaceCreate = null;
     const status = loadChatStatus(true, false);
     const reading = loadChatSpaces(true);
@@ -4218,26 +4581,33 @@ document.addEventListener("change", (event) => {
     const request = beginIssueRequest(false);
     const context = chatReadContext();
     S.classSpaceSaving = true;
+    S.classSpaceSavingId = spaceName; // keep the chosen room shown while it saves (R5-7)
     render();
     chatStatusReadVersion += 1;
     call("attendance_chat_set_space", spaceName, label, expected)
       .then(() => {
-        if (!ownsIssueRequest(request) || context !== chatReadContext()) return;
+        // The saved room belongs to this account and workbook, not to the problem-panel
+        // token that the edit auto-save renews 700 ms after this change (R4-4).
+        if (context !== chatReadContext()) return;
         chatStatusReadVersion += 1;
         S.chatSpaceName = label;
-        if (S.chatStatus && typeof S.chatStatus === "object") {
+        if (S.chatStatus && typeof S.chatStatus === "object" && S.chatStatusContext === context) {
           S.chatStatus.class_space_id = spaceName;
           S.chatStatus.class_space_name = label;
-        }
+        } else loadChatStatus(true);
         showToast("학급 단톡방을 골랐어요");
         render();
       })
       .catch((error) => { if (context === chatReadContext()) handleCaughtError(error, request); })
-      .finally(() => { S.classSpaceSaving = false; if (context === chatReadContext()) render(); });
+      .finally(() => { S.classSpaceSaving = false; S.classSpaceSavingId = ""; if (context === chatReadContext()) render(); });
   }
 });
+let attendanceSetupReturn = null;
+let chatConsentReturn = null;
 window.addEventListener("blur", () => {
   if (S.chatNewSpaceBrowserOpen) S.chatNewSpaceBrowserBlurred = true;
+  if (attendanceSetupReturn) attendanceSetupReturn.blurred = true;
+  if (chatConsentReturn) chatConsentReturn.blurred = true;
 });
 window.addEventListener("focus", () => {
   if (S.connectTab !== "attendance" || !((S.mode === "wizard" && S.step === 8)
@@ -4252,14 +4622,46 @@ window.addEventListener("focus", () => {
   S.chatNewSpaceBrowserOpen = false;
   S.chatNewSpaceBrowserBlurred = false;
   S.spaceCreate = null;
+  // The Sheet setup may need several visits; keep the return check until the marker is read as done.
+  const setupFlow = attendanceSetupReturn;
+  if (setupFlow && (setupFlow.owner !== screenKey() || setupFlow.context !== chatReadContext()
+      || S.attendance?.state !== "initial-setup-required")) attendanceSetupReturn = null;
+  const returningFromSheetSetup = Boolean(attendanceSetupReturn?.blurred);
+  if (returningFromSheetSetup) attendanceSetupReturn.blurred = false;
+  // Chat consent: keep the return check until Chat reads connected for this account and workbook (R9-1).
+  const consent = chatConsentReturn;
+  if (consent && (consent.owner !== screenKey() || consent.context !== chatReadContext()
+      || (S.chatStatusContext === consent.context && S.chatStatus?.connected === true))) chatConsentReturn = null;
+  const returningFromChatConsent = Boolean(chatConsentReturn?.blurred);
+  if (returningFromChatConsent) chatConsentReturn.blurred = false;
   // Ordinary window focus is navigation, not a new verification request.
-  // Returning from an explicit Chat setup still completes that operation.
-  if (S.mode === "wizard" || returningFromChatSetup) {
+  // Returning from an explicit Chat or Sheet setup still completes that operation.
+  if (S.mode === "wizard" || returningFromChatSetup || returningFromSheetSetup || returningFromChatConsent) scheduleFocusAttendanceRefresh();
+});
+/* 창이 포커스를 얻는 순간 다시 그리면, 그 포커스를 만든 클릭(예: 브라우저에서 돌아와 바로
+   [다음])이 눌린 버튼과 함께 사라진다 — mousedown이 창을 활성화하고, 동기 render()가 푸터를
+   갈아 끼워 click이 새 버튼에 닿지 않는다(2026-09-27 새 설치 확인). 같은 읽기를 클릭이 전달된
+   뒤로 미룬다. 그 클릭이 이미 [다음] 게이트 확인을 시작했으면 같은 읽기를 겹쳐 시작하지 않는다. */
+const FOCUS_ATTENDANCE_REFRESH_DELAY_MS = 400;
+let focusAttendanceRefreshTimer = null;
+function scheduleFocusAttendanceRefresh() {
+  if (focusAttendanceRefreshTimer) clearTimeout(focusAttendanceRefreshTimer);
+  const owner = screenKey(), epoch = accountUiEpoch;
+  focusAttendanceRefreshTimer = setTimeout(() => {
+    focusAttendanceRefreshTimer = null;
+    if (owner !== screenKey() || epoch !== accountUiEpoch || hasPendingWizardNext()) return;
+    beginAttendanceAuthBatch();
     refreshAttendanceStatus();
     render();
-  }
-});
+  }, FOCUS_ATTENDANCE_REFRESH_DELAY_MS);
+}
 
+// Setup step 8 has no title bar: the same ↻ refresh sits at the top right of its header.
+// The 연결 window drops this <h1> and keeps its own title-bar ↻.
+function wizardConnectHead(title) {
+  return S.mode === "wizard"
+    ? `<div class="wizard-head"><h1>${esc(title)}</h1>${connectionRefreshButtonHtml()}</div>` : `<h1>${esc(title)}</h1>`;
+}
 function stepConnect() {
   // Keep the Chat actions visible while first-install login is being checked,
   // without starting any attendance or Chat requests before verification.
@@ -4270,19 +4672,19 @@ function stepConnect() {
     call("google_status")
       .then((data) => { if (ownsIssueRequest(request)) { adoptGoogleStatus(data); render(); } })
       .catch((error) => handleCaughtError(error, request));
-    return `<h1>연결</h1><p class="sub">상태를 확인하는 중이에요…</p>${pendingChat()}`;
+    return `${wizardConnectHead("연결")}<p class="sub">상태를 확인하는 중이에요…</p>${pendingChat()}`;
   }
   if (googleAuthCheckFailed(S.google)) {
-    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
+    return `${wizardConnectHead("Google 연결")}<div class="banner warn"><span>${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>${pendingChat()}`;
   }
   if (isGoeduGoogleStatus(S.google) && !isGoogleReady(S.google)) {
-    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(googleAuthorizationMessage(S.google))}</span>
+    return `${wizardConnectHead("Google 연결")}<div class="banner warn"><span>${esc(googleAuthorizationMessage(S.google))}</span>
       <button class="btn-tonal" data-action="reauthorize-google">다시 로그인 (권한 승인)</button></div>${pendingChat()}`;
   }
   if (!isGoeduGoogleStatus(S.google)) {
     const message = S.google.logged_in ? GOEDU_REQUIRED_MESSAGE : FIELD_MESSAGES["google-login"];
-    return `<h1>Google 연결</h1><div class="banner warn"><span>${esc(message)}</span>
+    return `${wizardConnectHead("Google 연결")}<div class="banner warn"><span>${esc(message)}</span>
       <button class="btn-quiet" data-action="goto-settings">Google 로그인 열기</button></div>
       <p class="sub">Calendar·Tasks·Sheet·Docs·Chat 작업은 Google 계정과 필요한 권한을 확인한 뒤 시작해요.</p>${pendingChat()}`;
   }
@@ -4293,7 +4695,7 @@ function stepConnect() {
   const body = S.connectTab === "attendance" ? (attendanceUiEnabled() ? attendanceTabHtml() : attendanceComingSoonHtml())
     : S.connectTab === "ai" ? aiTabHtml() : messengerTabHtml();
   return `
-    <h1>Google 연결</h1>
+    ${wizardConnectHead("Google 연결")}
     <p class="sub">Google 서비스를 연결하여 학교 업무를 자동화해요.</p>
     ${connectTabsHtml()}
     ${body}`;
@@ -4378,17 +4780,13 @@ async function refreshSettingsStatus(request, options = {}) {
   settingsStatusRequest = owner;
   // 실제 계정 확인 결과를 먼저 표시하고, 나머지 컴퓨터·목록 점검을 이어 간다.
   try {
-    const previousGoogle = S.google;
-    const nextGoogle = options.googleStatus || await call("google_status");
+    const nextGoogle = options.googleStatus || await readGoogleStatus();
     if (!ownsIssueRequest(owner)) return false;
     if (options.loginEpoch !== undefined && options.loginEpoch !== googleLoginEpoch) return false;
     if (options.loginComplete) S.login = null;
+    if (S.attendanceReadFailed || S.attendance?.state === "auth-error" || S.chatStatus?.read_failed) googleRecoveryNeeded = true;
     adoptGoogleStatus(nextGoogle);
     paintSettingsReadiness();
-    if (previousGoogle && googleStatusKey(previousGoogle) !== googleStatusKey(nextGoogle)) {
-      S.checks = [];
-      checksRetry.lastGood = [];
-    }
     const context = googleReadContext();
     const current = () => ownsIssueRequest(owner) && context === googleReadContext();
     const computer = await call("computer_status");
@@ -4408,7 +4806,7 @@ async function refreshSettingsStatus(request, options = {}) {
         // List failures belong to their current read, independently of login.
         S.listsError = true;
       }
-    } else {
+    } else if (!googleAuthCheckFailed(S.google)) {
       S.lists = { calendars: [], tasklists: [] };
       S.listReads = {};
       S.listsLoaded = false;
@@ -4421,6 +4819,8 @@ async function refreshSettingsStatus(request, options = {}) {
     return false;
   } finally {
     if (settingsStatusRequest === owner) settingsStatusRequest = null;
+    paintSettingsRefreshButton();
+    if (isGoogleReady(S.google)) scheduleGoogleRecovery();
   }
 }
 
@@ -4539,6 +4939,10 @@ async function resumeGoogleTargetSelection() {
   }
 }
 const GOOGLE_AUTH_CHECK_MESSAGE = "Google 계정 상태 확인을 마치지 못했어요. [다시 점검]을 눌러 주세요. 로그인이 해제된 것으로 판단하지 않았습니다.";
+// The settings window has no in-window [다시 점검]; name its title-bar ↻ instead.
+const GOOGLE_AUTH_CHECK_MESSAGE_SETTINGS = "Google 계정 상태 확인을 마치지 못했어요. 창 위쪽 [다시 점검] 버튼(↻)을 눌러 주세요. 로그인이 해제된 것으로 판단하지 않았습니다.";
+function inSettingsWindow() { return S.mode === "edit" && S.edit === "settings"; }
+function googleAuthCheckMessage() { return inSettingsWindow() ? GOOGLE_AUTH_CHECK_MESSAGE_SETTINGS : GOOGLE_AUTH_CHECK_MESSAGE; }
 function updateFailureText(reason, fallback, buttonLabel) {
   const base = String(reason || fallback || "").trim();
   if (base.includes(`'${buttonLabel}'`)) return base;
@@ -4586,8 +4990,22 @@ function oauthRepairMessage(g) {
 function googleAuthCheckFailed(g) {
   return Boolean(g && (g.login_state === "error" || g.error_code === "GWS_AUTH_STATUS_FAILED" || g.authorization_state === "check_failed"));
 }
-function settingsRefreshButtonHtml() {
+// Wizard screens (steps 2 and 7) and Home keep this text button; the settings window has
+// only the title-bar ↻ (settingsRefreshButtonHtml), like the 연결 window.
+function settingsRecheckButtonHtml() {
   return `<button class="btn-quiet" data-action="settings-refresh" data-busy-text="점검 중…">다시 점검</button>`;
+}
+let settingsRefreshRunning = false;
+function settingsRefreshButtonHtml() {
+  const busy = settingsRefreshRunning || hasCurrentSettingsStatusRequest();
+  const label = busy ? "점검 중…" : "다시 점검";
+  return `<button type="button" class="win-refresh${busy ? " checking" : ""}" data-action="settings-refresh"
+    title="${label}" aria-label="${label}" aria-busy="${busy}"${busy ? " disabled" : ""}>
+    ${icon("refresh", "small")}</button>`;
+}
+function paintSettingsRefreshButton() {
+  const button = document.querySelector('.win-head [data-action="settings-refresh"]');
+  if (button) button.outerHTML = settingsRefreshButtonHtml();
 }
 function computerSectionHtml(includeGoogle) {
   const c = S.computer;
@@ -4596,9 +5014,40 @@ function computerSectionHtml(includeGoogle) {
       + readinessRow("문서 읽기 기능", "PDF와 첨부 문서를 읽어요", c.documents)
       + readinessRow("화면 표시 기능", "Teacher Manager 화면을 보여줘요", c.screen)
     : `<div class="row"><span class="st">준비 상태를 확인하는 중이에요…</span></div>`;
-  return `<div class="section-h section-head"><span>컴퓨터 준비</span>${settingsRefreshButtonHtml()}</div>
+  return `<div class="section-h section-head"><span>컴퓨터 준비</span>${inSettingsWindow() ? "" : settingsRecheckButtonHtml()}</div>
     <div class="panel">${rows}</div>
-    ${includeGoogle ? googleAccountSectionHtml(false) : ""}`;
+    ${includeGoogle ? googleAccountSectionHtml(false) + settingsCheckRowsHtml() : ""}`;
+}
+// Home counts every failing settings check; the settings window shows the same rows with an
+// action that exists here (R5-3). The Google rows are already drawn above.
+function settingsCheckRowsHtml() {
+  const rows = effectiveChecks().filter(row => row.card === "settings" && row.ok === false
+    && !["settings.google-login", "settings.goedu-account"].includes(row.key));
+  if (!rows.length) return "";
+  return `<div class="section-h">확인이 필요한 항목</div><div class="panel">${rows.map(row => {
+    const action = row.key === "settings.helper"
+      ? `<button class="btn-tonal" data-action="helper-restart" data-busy-text="켜는 중…">메신저 단축키 다시 켜기</button>` : "";
+    return `<div class="row" data-settings-check="${esc(row.key)}"><span class="nameblock"><b>${esc(row.label)}</b><small>${esc(row.detail || "")}</small></span><span class="row-actions"><span class="st warn">확인 필요</span>${action}</span></div>`;
+  }).join("")}</div>`;
+}
+bindActions({
+  "helper-restart": async () => {
+    // The verified restart (stop, then at most three starts) used by the settings auto-save.
+    await call("restart_helper");
+    S.helperRestartPending = false;
+    invalidateCardChecks("settings");
+    await refreshChecks();
+    paintSettingsReadiness();
+  },
+});
+function paintGoogleObservation() {
+  // A background identity check must not replace an open form's unsaved input.
+  const background = (S.mode === "edit" && S.edit !== "settings") || S.mode === "about"
+    ? document.querySelector("#app > .body") : null;
+  if (background && !accountProfileNeedsReload) {
+    background.outerHTML = homeHtml(true);
+    updateTabBadges();
+  } else paintSettingsReadiness();
 }
 function paintSettingsReadiness() {
   const region = S.mode === "edit" && S.edit === "settings"
@@ -4609,6 +5058,9 @@ function paintSettingsReadiness() {
     const messages = document.querySelector("#settings-status-messages");
     if (messages) messages.innerHTML = bannerHtml();
     region.innerHTML = computerSectionHtml(true);
+    paintSettingsRefreshButton();
+    const background = document.querySelector("#app > .body");
+    if (background) background.outerHTML = homeHtml(true);
   } else render();
 }
 
@@ -4669,6 +5121,9 @@ function googleLoginRowsHtml() {
   const oauthRow = `<div class="row">${oauthBlock}<span class="row-actions">${oauthRight}</span></div>`;
   const loginBlock = `<span class="nameblock"><b>Google 로그인</b></span>`;
   const canLogin = Boolean(runtimeReady && g.oauth_client_ready && !g.oauth_client_conflict && !oauthProblem);
+  // A failed check leaves readiness unread (null), not false: keep the login route open.
+  const canLoginAfterCheckFailure = !oauthProblem && !g.oauth_client_conflict
+    && (runtimeReady || runtimeUnknown) && (Boolean(g.oauth_client_ready) || oauthUnknown);
   const loginButton = `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">로그인 (권한 승인)</button>`;
   const blockedReason = oauthProblem
     ? "Google 로그인 사용 가능 상태를 먼저 확인해 주세요"
@@ -4677,14 +5132,16 @@ function googleLoginRowsHtml() {
       : "프로그램의 Google 로그인에 필요한 파일이 없습니다";
   const loginRow = S.login
     ? `<div class="row">${loginBlock}<span class="st">진행 중…</span></div>`
+    : googleObservationPending()
+      ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st">확인 중…</span>${g.logged_in ? '<button class="btn-quiet" data-action="gws-logout">로그아웃</button>' : ""}</span></div>`
+    : authCheckFailed && !accountStorageProblem
+      ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${googleAuthCheckMessage()}</span>${inSettingsWindow() ? "" : settingsRecheckButtonHtml()}${canLoginAfterCheckFailure ? loginButton : ""}</span></div>`
     : isGoeduGoogleStatus(g) && !isGoogleReady(g)
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st warn">${esc(g.user)} · ${authCheckFailed ? "권한 확인 필요" : "다시 승인 필요"}</span>${canLogin ? `<button class="btn-tonal" data-action="gws-login" data-busy-text="진행 중…">다시 로그인 (권한 승인)</button>` : ""}</span></div>`
     : isGoogleReady(g)
       ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st ok">${esc(g.user || "완료")}</span><button class="btn-quiet" data-action="gws-logout">로그아웃</button></span></div>`
       : accountStorageProblem
         ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${esc(accountStorageProblem.status)}. ${esc(accountStorageProblem.repair)}</span></span></div>`
-      : authCheckFailed
-        ? `<div class="row${loginError ? " problem-row" : ""}">${loginBlock}<span class="row-actions"><span class="st warn">${GOOGLE_AUTH_CHECK_MESSAGE}</span>${canLogin ? loginButton : ""}</span></div>`
       : g.logged_in
         ? `<div class="row">${loginBlock}<span class="row-actions"><span class="st warn">${esc(googleAuthorizationMessage(g))}</span>${canLogin ? loginButton : ""}</span></div>`
       : canLogin
@@ -4727,6 +5184,10 @@ function lockedGoogleServicesHtml() {
 function googleAccountDecisionHtml() {
   const g = S.google;
   if (!g || !g.logged_in || S.login) return "";
+  if (googleObservationPending()) return `<div class="account-box">
+    <span class="avatar">${accountAvatar(g.user)}</span>
+    <span class="account-copy"><span>마지막으로 확인한 계정</span><b>${esc(g.user)}</b></span>
+    <span class="account-state st">확인 중…</span></div>`;
   const allowed = isGoeduGoogleStatus(g);
   const ready = isGoogleReady(g);
   const checkFailed = googleAuthCheckFailed(g);
@@ -4736,7 +5197,7 @@ function googleAccountDecisionHtml() {
     <span class="account-copy"><span>${checkFailed ? "마지막으로 확인한 계정" : "현재 선택한 계정"}</span><b>${esc(g.user || "계정 확인 필요")}</b></span>
     <span class="account-state ${ready ? "good" : "bad"}">${label}</span>
   </div>`;
-  if (checkFailed) return `${account}<div class="banner warn">${esc(GOOGLE_AUTH_CHECK_MESSAGE)}</div>`;
+  if (checkFailed) return `${account}<div class="banner warn">${esc(googleAuthCheckMessage())}</div>`;
   if (!allowed) {
     return `${account}<div class="decision-banner error">
       <h3>${esc(GOEDU_REQUIRED_MESSAGE)}</h3><p>Google 계정으로 진행할 수 있습니다.</p>
@@ -4747,7 +5208,7 @@ function googleAccountDecisionHtml() {
 }
 function googleAccountSectionHtml(includeRefresh) {
   return `<div class="section-h section-head google-account-section-head"><span>Google 계정 준비</span>
-    <div class="google-account-actions">${includeRefresh ? settingsRefreshButtonHtml() : ""}</div></div>
+    <div class="google-account-actions">${includeRefresh ? settingsRecheckButtonHtml() : ""}</div></div>
     <div class="panel">${googleLoginRowsHtml()}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="google-login-guide" data-preserve-issue="true">Google 로그인 그림 안내</button></p></div>
     ${googleAccountDecisionHtml()}
     ${loginWaitHtml()}`;
@@ -4910,7 +5371,21 @@ stepBodies[8] = stepConnect;
 validators[8] = validateConnect;
 
 bindActions({
-  "settings-refresh": (_el, request) => refreshSettingsStatus(request),
+  "settings-refresh": async (_el, request) => {
+    settingsRefreshRunning = true;
+    paintSettingsRefreshButton();
+    try {
+      const done = await refreshSettingsStatus(request);
+      // The Helper row lives in home_checks; re-read it or a stopped Helper stays `정상` (R6-4).
+      invalidateCardChecks("settings");
+      await refreshChecks();
+      paintSettingsReadiness();
+      return done;
+    } finally {
+      settingsRefreshRunning = false;
+      paintSettingsRefreshButton();
+    }
+  },
   "goto-settings": async () => {
     // 연결 화면에서 로그인 문제를 발견해 설정으로 보낸 경우에는 출발 화면을 기억한다.
     // 선생님이 로그인을 마치면 별도 "다시 불러오기" 없이 그 화면으로 돌아가
@@ -4954,7 +5429,9 @@ bindActions({
       "verify_gemini_key", S.draft.bridge.gemini_api_key, S.draft.bridge.gemini_model
     );
     const kind = r.status === "ok" ? "g" : ["missing", "invalid"].includes(r.status) ? "r" : "y";
-    S.keyStatus = { kind, text: KEY_MESSAGES[r.status] || r.status };
+    // Show which HTTP answer Google gave so a busy service is not mistaken for a bad key.
+    const http = r.status !== "ok" && /^http \d{3}( [A-Z_]+)?$/.test(r.detail || "") ? ` (Google 응답: HTTP ${r.detail.slice(5)})` : "";
+    S.keyStatus = { kind, text: (KEY_MESSAGES[r.status] || r.status) + http };
     render();
   },
 });
@@ -4985,11 +5462,24 @@ stepBodies[9] = function stepFinish() {
     </div>
     <div class="foot">
       <button class="btn-prev" data-action="go-prev">${icon("chevron-left", "small")} 이전</button>
-      <button class="btn" data-action="apply-all" data-busy-text="저장하는 중… (1~2분 걸릴 수 있어요)">모두 저장</button>
+      <button class="btn" data-action="apply-all" data-busy-text="저장하는 중… (1~2분 걸릴 수 있어요)"${applyAllPending ? " disabled" : ""}>모두 저장</button>
     </div>`;
 };
+// Step 9 has no footer, so every repaint re-created an enabled [모두 저장] while the
+// gate check ran; one run at a time, and a stale gate result stays off other screens (OBS-17).
+let applyAllPending = false;
 bindActions({
   "apply-all": async () => {
+    if (applyAllPending) return;
+    applyAllPending = true;
+    try { await applyAllOnce(); } finally {
+      applyAllPending = false;
+      if (S.mode === "wizard" && S.step === WIZARD_STEPS.length) render();
+    }
+  },
+});
+async function applyAllOnce() {
+    const owner = screenKey();
     try {
       adoptGoogleStatus(await call("google_status"));
     } catch (error) {
@@ -5002,6 +5492,7 @@ bindActions({
     }
     // 모두 저장 화면엔 격자 입력이 없다 — draft에 저장된 최신 값을 그대로 쓴다.
     if (attendanceUiEnabled() && !(await refreshAttendanceWizardGate())) {
+      if (owner !== screenKey()) return;
       const message = attendanceWizardGateMessage();
       S.connectTab = "attendance";
       await goStepAsync(8);
@@ -5015,7 +5506,8 @@ bindActions({
     await call("finish_setup");
     if (attendanceUiEnabled()) {
       try {
-        S.attendance = await call("attendance_status");
+        beginAttendanceAuthBatch();
+        S.attendance = await attendanceRead("attendance_status");
       } catch (_error) {
         S.attendance = null;
       }
@@ -5036,7 +5528,8 @@ bindActions({
       ? "일부 항목을 준비하지 못했어요 — 홈에서 확인해 주세요"
       : "설정을 모두 저장했어요");
     render();
-  },
+}
+bindActions({
   "dismiss-first-notice": () => { S.firstHomeNotice = false; render(); },
 });
 
@@ -5114,7 +5607,7 @@ function connectIssues() {
         continue;
       }
       if (read && !currentListRows(kind).some(row => row.id === id)) {
-        rows.push(issue(key, field, read.phase === "pending" ? "현재 목록을 확인하고 있어요." : "저장된 선택을 현재 목록에서 확인하지 못했어요. 연결을 다시 확인해 주세요.", "messenger"));
+        rows.push(issue(key, field, read.phase === "pending" ? "현재 목록을 확인하고 있어요." : `저장된 선택을 현재 목록에서 확인하지 못했어요. ${connectionRefreshHint()} 눌러 주세요.`, "messenger"));
       }
     }
     for (const [field, status] of Object.entries(S.googleTargetStatuses || {})) {
@@ -5123,7 +5616,8 @@ function connectIssues() {
       if (modes[field.includes("Tasks") ? "task" : "cal"] !== "existing") continue;
       if (["unavailable", "check_failed"].includes(status.state)) {
         const key = {"업무캘린더ID":"connect.work-calendar", "학사일정캘린더ID":"connect.school-calendar", "업무Tasks목록ID":"connect.work-tasks", "담임안내Tasks목록ID":"connect.homeroom-tasks"}[field];
-        rows.push({...issue(key, field, status.detail, "messenger"), optional: status.state === "check_failed"});
+        const detail = status.state === "check_failed" ? googleTargetCheckFailedMessage() : status.detail;
+        rows.push({...issue(key, field, detail, "messenger"), optional: status.state === "check_failed"});
       }
     }
   }
@@ -5156,16 +5650,21 @@ function effectiveChecks() {
   const saved = uniqueChecks(S.checks).filter(
     (row) => attendanceUiEnabled() || row.tab !== "attendance"
   ).map((row) => {
+    if (row.key === "connect.attendance" && row.ok === null && row.detail === "확인 중…") {
+      row = {...row, pending:true, fix:""};
+    }
     if (checksRetry.dirtyCards.has(row.card)) return { ...row, ok: null,
       detail: checksRetry.failedAt ? "점검에 실패했어요. 다시 확인해 주세요." : "현재 상태를 점검하고 있어요." };
     if (row.card === "connect" && GOOGLE_TARGET_ID_FIELDS.includes(row.target) && isGoogleReady(S.google)) {
       const read = S.listReads[row.target.includes("Tasks") ? "tasklists" : "calendars"];
-      if (read?.context === googleListContext()) {
+      // A restarted Home has an empty draft (finish_setup clears it): keep the saved check.
+      const selected = S.draft.profile[row.target];
+      if (selected && read?.context === googleListContext()) {
         const current = currentConnections.find(issue => issue.target === row.target);
         if (current) return {...row, ok: current.pending ? null : false, pending: Boolean(current.pending),
           detail: current.message, fix: current.pending ? "" : current.message};
         const target = S.googleTargetStatuses?.[row.target];
-        if (target?.id === S.draft.profile[row.target] && target.state === "ready") {
+        if (target?.id === selected && target.state === "ready") {
           return {...row, ok: true, pending: false, detail: target.detail || "연결됨", fix: ""};
         }
       }
@@ -5191,7 +5690,7 @@ function effectiveChecks() {
     const ok = a.state === "ready" ? true
       : ["gws-required", "login-required", "account-required", "auth-error", "profile-required"].includes(a.state) ? null : false;
     const detail = a.detail || (ok === true ? "출결 업무 준비가 끝났어요" : row.detail || "");
-    return { ...row, ok, detail, fix: ok === false ? (a.detail || row.fix || "") : "" };
+    return { ...row, ok, pending:false, detail, fix: ok === false ? (a.detail || row.fix || "") : "" };
   });
   const kept = editing
     ? saved.filter((row) => !(row.card === editing && EDITABLE_TARGETS.has(row.target)))
@@ -5217,6 +5716,29 @@ function effectiveChecks() {
     rows.push({key:"connect.class-space", label:"학급 단톡방", card:"connect", tab:"attendance",
       target:"class-space-select", ok:pending ? null : state === "ready", pending,
       detail, fix:pending || state === "ready" ? "" : detail});
+    // An empty or unlinked roster of the current workbook is a required step, not 모두 정상 (R4-8).
+    const roster = S.mode !== "wizard" && S.attendance?.state === "ready" && rosterContext === chatReadContext() ? rosterStatus : null;
+    if (roster) {
+      const unsaved = S.rosterEditor?.context === rosterEditorContext() && S.rosterEditor.pending;
+      const reading = roster.state === "checking";
+      const ok = reading ? null : roster.state === "ready" && !unsaved;
+      const text = reading ? "학생명단을 확인하고 있어요." : ok ? "학생명단을 확인했어요."
+        : unsaved ? "저장한 학생명단을 출석부에 반영해야 해요."
+        : roster.state === "empty" ? "현재 출석부에 학생명단이 없어요. 학생명단을 입력해 주세요."
+        : roster.state === "incomplete" ? "학생명단에 빠진 항목이 있어요. 학생명단을 확인해 주세요."
+        : "현재 출석부의 학생명단을 확인하지 못했어요.";
+      rows.push({key:"connect.roster", label:"학생명단", card:"connect", tab:"attendance",
+        target:"attendance-roster", ok, pending:reading, detail:text, fix:ok !== false ? "" : text});
+    }
+  }
+  if (googleObservationPending()) {
+    const pendingRows = rows.map(row => row.card === "connect" || row.target === "google-login"
+      ? {...row, ok:null, pending:true, detail:"확인 중…", fix:""} : row);
+    if (!pendingRows.some(row => row.key === "settings.google-login")) pendingRows.push({
+      key:"settings.google-login", label:"Google 로그인과 권한", card:"settings", target:"google-login",
+      ok:null, pending:true, detail:"확인 중…", fix:"",
+    });
+    return pendingRows;
   }
   if (!S.google) return rows;
   // The latest shared Google result wins over a previous home snapshot.
@@ -5544,7 +6066,7 @@ async function runCapturePoll() {
     const p = await call("capture_progress");
     active = p.active === true;
     applyProgress(p);
-  } catch (error) { /* 폴링 실패는 다음 틱에 다시 */ }
+  } catch (error) { console.error(error); /* 폴링 실패는 다음 틱에 다시 */ }
   finally { S.capPollBusy = false; }
   if (S.mode === "home") capTimer = setTimeout(runCapturePoll, active ? 400 : 2000);
 }
@@ -5625,6 +6147,9 @@ function loadHomeClassRoom(force = false) {
     if (!S.attendance && !S.attendanceLoading && !S.attendanceReadFailed) await refreshAttendanceStatus();
     if (account !== accountContext() || S.attendance?.state !== "ready" || S.attendanceLoading || S.attendanceReadFailed) return;
     const context = chatReadContext();
+    // Read-only: Home counts the current workbook's roster but never writes it (R4-8).
+    await loadAttendanceRosterStatus(force, true);
+    if (account !== accountContext() || context !== chatReadContext()) return;
     await loadChatStatus(force, false);
     if (context !== chatReadContext() || !S.chatStatus?.connected || S.chatStatus.read_failed) return;
     await loadChatSpaces(force, false);
@@ -5637,6 +6162,7 @@ function loadHomeClassRoom(force = false) {
 }
 async function refreshChecks() {
   if (checksRetry.inflight) return;
+  beginAttendanceAuthBatch();
   // A saved-card refresh owns only that scope; an explicit full refresh owns all cards.
   if (!checksRetry.dirtyCards.size) CARDS.forEach(card => checksRetry.dirtyCards.add(card.key));
   checksRetry.failedAt = 0;
@@ -5665,7 +6191,7 @@ async function refreshChecks() {
   };
   try {
     if (S.checks.length) paint();
-    const checks = await call("home_checks");
+    const checks = await attendanceRead("home_checks");
     if (!current()) return;
     S.checks = checks;
     checksRetry.lastGood = checks;
@@ -5687,6 +6213,7 @@ async function refreshChecks() {
   }
 }
 function shouldAutoRefreshChecks() {
+  if (bootIdentityPending || (!S.google && googleObservationPending())) return false;
   if ((S.checks.length && !checksRetry.dirtyCards.size) || checksRetry.inflight) return false;
   return !checksRetry.failedAt;
 }
@@ -5718,7 +6245,7 @@ function scheduleConnectionRefresh(delay = CONNECTION_REFRESH_INTERVAL_MS) {
   connectionRefreshTimer = setTimeout(async () => {
     connectionRefreshTimer = null;
     // Do not interrupt setup, an edit, or another ongoing read/write.
-    if (!["home", "about"].includes(S.mode) || !isGoogleReady(S.google)
+    if (!["home", "about"].includes(S.mode) || (!isGoogleReady(S.google) && !googleAuthCheckFailed(S.google))
         || connectionRefreshActive() || connectionRefreshBlocked()) {
       scheduleConnectionRefresh(60000);
       return;
@@ -5726,18 +6253,31 @@ function scheduleConnectionRefresh(delay = CONNECTION_REFRESH_INTERVAL_MS) {
     await refreshConnectionStatus();
   }, delay);
 }
-function refreshConnectionStatus() {
+function refreshConnectionStatus(options = {}) {
   if (connectionRefreshActive()) return connectionRefreshPending.promise;
   if (connectionRefreshBlocked()) return Promise.resolve();
-  const pending = { context: googleListContext(), promise: null };
+  const pending = { context: googleListContext(), epoch: googleLoginEpoch, accountEpoch: accountUiEpoch,
+    account: verifiedGoogleAccount(S.google) || S.lastVerifiedGoogleAccount, promise: null };
   connectionRefreshPending = pending;
   const current = () => connectionRefreshPending === pending && pending.context === googleListContext();
   pending.promise = (async () => {
     try {
-      const status = await call("google_status");
+      const status = options.googleStatus || await readGoogleStatus();
       if (!current()) return;
       adoptGoogleStatus(status);
+      // An unknown -> verified observation changes the read context, not its
+      // account. Rebind this explicit read only when the identity is unchanged.
+      if (pending.epoch === googleLoginEpoch && pending.accountEpoch === accountUiEpoch
+          && isGoogleReady(status) && verifiedGoogleAccount(status) === pending.account) {
+        pending.context = googleListContext();
+      }
       if (!current() || !isGoogleReady(S.google)) return;
+      googleRecoveryNeeded = false;
+      beginAttendanceAuthBatch();
+      if (attendanceAccountAuthorization && !S.attendanceAccountAuthorizing) {
+        await actions["attendance-account-authorize"]();
+        return;
+      }
       await Promise.all([
         loadLinkLists(true, current),
         attendanceUiEnabled() ? refreshAttendanceStatus(false) : Promise.resolve(),
@@ -5753,19 +6293,20 @@ function refreshConnectionStatus() {
           && S.chatStatus?.connected && !S.chatStatus.read_failed) await loadChatSpaces(true, false);
     } catch (error) {
       // Account verification failures already update the shared login state.
-      if (current() && !(error instanceof StaleAccountResponse)) render();
+      if (current() && !(error instanceof StaleAccountResponse)) paintSettingsReadiness();
     } finally {
       if (connectionRefreshPending === pending) {
         connectionRefreshPending = null;
         scheduleConnectionRefresh();
-        render();
+        paintSettingsReadiness();
       }
     }
   })();
-  render();
+  paintSettingsReadiness();
   return pending.promise;
 }
-bindActions({ "connection-refresh": () => refreshConnectionStatus() });
+// Keep a Calendar/Tasks choice or Gemini key typed on this screen before the re-read.
+bindActions({ "connection-refresh": () => { syncConnectFields(); return refreshConnectionStatus(); } });
 function homeHtml(behind) {
   const info = S.info;
   const visibleChecks = effectiveChecks().filter(
@@ -5821,7 +6362,7 @@ function renderHome() {
     S.profileCache = p;
     if (S.mode === "home") await loadHomeClassRoom();
     render();
-  }).catch(() => {});
+  }).catch(reportBackgroundFailure);
   if (S.caps === null) {
     loadCapturePage(1);
   }
@@ -5837,6 +6378,7 @@ function windowHtml(title, body, big) {
       <div class="win-head"><h1 class="win-title">${esc(title)}</h1>
         <span class="save-state" id="save-state"></span>
         ${S.mode === "edit" && S.edit === "connect" ? connectionRefreshButtonHtml() : ""}
+        ${inSettingsWindow() ? settingsRefreshButtonHtml() : ""}
         <button class="win-x" data-action="back-home" aria-label="닫기">✕</button></div>
       <div class="win-body"><div class="page">${messages}${body}</div></div>
     </div></div>`;
@@ -6258,6 +6800,7 @@ async function loadForEdit(key, request) {
     };
   }
   if (key === "connect" && attendanceUiEnabled()) {
+    beginAttendanceAuthBatch();
     // Keep the last account-bound result, including an in-flight read, on reopen.
     // First entry without evidence still performs the initial verification.
     if (!S.attendance && !S.attendanceLoading && !S.attendanceReadFailed) await refreshAttendanceStatus(false);
@@ -6325,7 +6868,7 @@ async function openCard(key) {
   // 화면을 먼저 지정해야 늦은 결과가 홈 요청으로 잘못 귀속되지 않는다.
   if (S.settingsRefreshOnOpen) {
     S.settingsRefreshOnOpen = false;
-    refreshSettingsStatus().catch(() => {});
+    refreshSettingsStatus().catch(reportBackgroundFailure);
   }
   render();
 }
@@ -6417,7 +6960,7 @@ async function openGoogleLoginSettings() {
   S.edit = "settings";
   editDirtyFields.clear();
   render();
-  refreshSettingsStatus().catch(() => {});
+  refreshSettingsStatus().catch(reportBackgroundFailure);
   return true;
 }
 function copyGoogleResumeValue(value) {
@@ -6479,6 +7022,7 @@ registerResumeHandler("google-login", async () => {
   await openGoogleLoginSettings();
 });
 registerResumeHandler("chat-space-list", async ({ ownsRequest }) => {
+  beginAttendanceAuthBatch();
   const context = chatReadContext();
   // Reuse the same loading/error ownership as manual and external-return reads.
   S.chatSpaces = undefined;
@@ -6616,18 +7160,35 @@ async function askUpdateOnStart() {
 }
 
 async function boot() {
+  bootIdentityPending = true;
   try {
-    // Verify identity before showing saved teacher data on app startup.
-    adoptGoogleStatus(await call("google_status"));
-    const info = await call("get_app_info");
-    adoptAppInfo(info);
-    render();
+    // get_app_info hides saved account data until backend identity is verified.
+    // Preserve the fast verified startup, but never gate the local shell on I/O.
+    const identity = call("google_status").then(adoptGoogleStatus)
+      .finally(() => { bootIdentityPending = false; });
+    const identitySettled = identity.catch(reportBackgroundFailure);
+    const localInfo = await call("get_app_info");
+    await Promise.race([identitySettled, new Promise(resolve => setTimeout(resolve, 0))]);
+    let startupScreen = null;
+    if (bootIdentityPending) {
+      adoptAppInfo(localInfo);
+      render();
+      startupScreen = screenKey();
+    }
+    try { await identity; } catch (error) {
+      // call() records an unknown observation without declaring logout.
+    }
+    const verifiedInfo = await call("get_app_info");
+    if (startupScreen === null || screenKey() === startupScreen) adoptAppInfo(verifiedInfo);
+    paintSettingsReadiness();
     watchNetworkStatus();
     askUpdateOnStart();
     startLoginWatch();
     scheduleConnectionRefresh();
   } catch (error) {
-    root().innerHTML = `<div class="boot">${esc(error.message)}</div>`;
+    bootIdentityPending = false;
+    if (S.info) paintSettingsReadiness();
+    else root().innerHTML = `<div class="boot">${esc(error.message)}</div>`;
   }
 }
 function adoptAppInfo(info) {

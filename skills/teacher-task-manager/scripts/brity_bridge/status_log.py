@@ -102,3 +102,41 @@ def read_last_status(state_dir: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+# 도우미(TeacherManagerHelper.exe)가 켜지고 끝난 까닭 (PEND-43, R7-3).
+# 끝난 까닭 줄이 없이 시작 줄만 남으면 밖에서 강제로 끝났거나 프로그램 자체가 멈춘 것이다.
+HELPER_EVENTS = ("start", "already-running", "stop-requested", "session-end", "exception", "exit")
+
+
+def helper_log_path(logs_dir: Path, now: datetime | None = None) -> Path:
+    now = now or datetime.now()
+    return Path(logs_dir) / f"helper-{now:%Y-%m-%d}.log"
+
+
+def append_helper_event(logs_dir: Path, event: str, detail: str = "", pid: int | None = None) -> None:
+    """도우미 시작·종료 까닭을 한 줄 남긴다. 기록 실패는 도우미를 막지 않는다."""
+    import os
+
+    if event not in HELPER_EVENTS:
+        event = "exit"
+    try:
+        now = datetime.now()
+        path = helper_log_path(logs_dir, now)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        clean = " ".join(str(detail).split())[:_DETAIL_MAX_LEN]
+        line = "\t".join([f"{now:%Y-%m-%d %H:%M:%S}", str(pid or os.getpid()), event, clean])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:  # noqa: BLE001 - 기록 실패가 도우미 시작·종료를 막으면 안 된다
+        pass
+
+
+def exception_site(error: BaseException) -> str:
+    """예외 종류와 마지막 코드 위치(파일 이름:줄)만 돌려준다. 예외 문장은 넣지 않는다."""
+    import os
+    import traceback
+
+    frames = traceback.extract_tb(error.__traceback__) if error.__traceback__ else []
+    site = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else "-"
+    return f"{type(error).__name__} {site}"

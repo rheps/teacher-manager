@@ -203,7 +203,9 @@ class Editor:
         try:
             self._explicit_replacement_target(data, data['revision'])
         except (OSError, ValueError, TypeError, KeyError):
-            return '이전 명단은 보관했어요. 현재 출석부의 명단을 확인한 뒤 입력해 주세요.'
+            # The kept rows can be written to the current workbook with the explicit
+            # [명단 저장] (use_current_workbook); do not ask for re-entry (R07, R5-5).
+            return '이전 출석부의 명단을 보관했어요. 이 명단을 현재 출석부에 쓰려면 [명단 저장]을 눌러 주세요.'
         return '입력한 명단은 보관 중이에요. [명단 저장] 또는 구글 연결의 [학생명단 연결]을 눌러 현재 출석부에 반영해 주세요.'
 
     def _load(self):
@@ -293,7 +295,10 @@ class Editor:
         if protected and explicit_target is None and not current_save:
             return self._view(data, 'conflict', self._protected_detail(data))
         if not data['pending'] and not current_save:
-            return self._view(data, 'synced' if data.get('target') else 'local')
+            # Nothing changed since the last confirmed sync: no Sheet read or write happened (R7-1).
+            if data.get('target'):
+                return self._view(data, 'synced', '바뀐 내용이 없어 출석부에 다시 저장하지 않았어요.')
+            return self._view(data, 'local')
         rows = validate_rows(data['rows'])
         stage = '명단 조회'
         try:
@@ -371,13 +376,19 @@ class Editor:
             code = str(getattr(error, 'code', ''))
             if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,79}', code):
                 code = type(error).__name__
-            return {**self._view(data, 'unavailable', f'{stage}에 실패했어요 ({code}). 입력한 명단은 이 컴퓨터에 보관돼 있습니다. [명단 저장]을 다시 눌러 주세요.'), 'failure_code': code, 'failure_diagnostic': diagnostic}
+            # Plain cause only: each screen appends its own retry button (C11, R5-1).
+            cause = ('Google 요청이 잠시 많아 학생명단을 출석부에 반영하지 못했어요.'
+                     if code in ('ATTENDANCE_RATE_LIMITED', 'GOOGLE_429') else f'{stage}에 실패했어요 ({code}).')
+            return {**self._view(data, 'unavailable', f'{cause} 입력한 명단은 이 컴퓨터에 보관돼 있습니다.'), 'failure_code': code, 'failure_diagnostic': diagnostic}
 
 
 class Sheet:
     """The adapter writes only approved roster cells and the student dropdown source."""
-    def __init__(self, config_dir, account, run, gws):
+    def __init__(self, config_dir, account, run, gws, *, record=None, authorize=None):
         self.config_dir, self.account, self.run, self.gws = Path(config_dir), account, run, gws
+        # record: the operation's single server confirmation (CONN-30);
+        # authorize: the server's exact-binding check sent right before batchUpdate.
+        self._record, self._authorize = record, authorize
 
     def _request(self, method, params, body=None):
         command = [self.gws, 'sheets', 'spreadsheets', 'values', method, '--params', json.dumps(params, ensure_ascii=False)]
@@ -416,11 +427,16 @@ class Sheet:
     def _target(self):
         from attendance_install_record import read_verified_canonical_record
         from dashboard import engine
-        path = paths.attendance_install_record_path(self.config_dir)
-        from attendance_server_record import record_exists
-        if not record_exists(path):
-            return None
-        record = read_verified_canonical_record(path)
+        if self._record is not None:
+            record = self._record()
+            if record is None:
+                return None
+        else:
+            path = paths.attendance_install_record_path(self.config_dir)
+            from attendance_server_record import record_exists
+            if not record_exists(path):
+                return None
+            record = read_verified_canonical_record(path)
         # Verify both the currently authenticated identity and the canonical owner.
         engine._require_google_target_account(self.run, self.gws, self.account)
         title = engine._verified_attendance_roster_name(record, self.config_dir, self._settings_run, self.gws)
@@ -453,6 +469,10 @@ class Sheet:
         current = self.read()
         if current != before or self._target() != before['target']:
             raise ValueError('Roster changed')
+        if self._authorize is not None:
+            # The server refuses unless the same ACTIVE binding (file, generation,
+            # months) is still current; another PC's replacement stops the write here.
+            self._authorize()
         title = before['target']['title'].replace("'", "''")
         count = max(len(before['rows']), len(rows))
         values = rows + [['', '', ''] for _ in range(count - len(rows))]

@@ -20,6 +20,14 @@ AI_LABEL = 'AI 출결 입력'
 AI_HINT = '여기에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르세요'
 STUDENT_RANGE = "='드롭다운'!$J$2:$J$200"
 STUDENT_FORMULA = '=IF(AND(\'학생명단\'!A2<>"",\'학생명단\'!B2<>""),\'학생명단\'!A2&\'학생명단\'!B2,"")'
+# Date stripes are conditional formats computed from column A, so a sort or an
+# inserted row recolours at once. INDIRECT keeps the A3/A2 anchors fixed when a
+# teacher inserts or deletes the first data row (a $A$3 reference would shift or
+# become #REF!). Code.gs uses the same two formulas and colours.
+STRIPE_GRAY_FORMULA = ('=AND(COUNTA($A3:$M3)>0,ISODD(SUMPRODUCT((INDIRECT("A3:A"&ROW())<>"")'
+                       '*(INDIRECT("A3:A"&ROW())<>INDIRECT("A2:A"&(ROW()-1))))))')
+STRIPE_BASE_FORMULA = '=ROW()>=3'
+STRIPE_RULES = ((STRIPE_GRAY_FORMULA, 'BDBDBD'), (STRIPE_BASE_FORMULA, 'FFFFFF'))
 
 USAGE_TITLE = 'Teacher Manager 출결 사용 안내'
 PREVIOUS_USAGE_TITLE = '출결 신고서 자동화 사용 순서 — 기존 Google Docs 템플릿 그대로 사용'
@@ -107,9 +115,17 @@ def _is_current(sheet):
             and props.get('gridProperties',{}).get('frozenRowCount') == 2
             and student_rule.get('type') == 'ONE_OF_RANGE' and len(student_values)==1
             and _formula_key(student_values[0].get('userEnteredValue')) == _formula_key(STUDENT_RANGE)
-            and {6,11}.issubset(hidden)
+            and 11 in hidden
             and any(all(m.get(k,0)==v for k,v in _range(sid,0,1,1,13).items())
                     for m in sheet.get('merges',[])))
+
+
+def _column_hidden(sheet, index):
+    for block in sheet.get('data',[]):
+        start = int(block.get('startColumn',0)); meta = block.get('columnMetadata',[])
+        if start <= index < start + len(meta):
+            return bool(meta[index-start].get('hiddenByUser'))
+    return False
 
 
 def _tail_header_repairs(sheet, old_header):
@@ -180,6 +196,49 @@ def _usage_title_repairs(guide):
     return requests
 
 
+def _is_stripe_rule(rule):
+    """Our date stripes, including the shipped $A$3 form that sorts and row edits broke."""
+    condition = (rule.get('booleanRule') or {}).get('condition') or {}
+    values = condition.get('values') or [{}]
+    key = _formula_key(values[0].get('userEnteredValue'))
+    if condition.get('type') != 'CUSTOM_FORMULA':
+        return False
+    if key in {_formula_key(formula) for formula, _ in STRIPE_RULES}:
+        return True
+    return (key.startswith('and(') and 'mod(sumproduct((' in key
+            and key.endswith((',2)=0)', ',2)=1)')))
+
+
+def _stripe_rule_repairs(sheet, rows):
+    """Keep exactly the two date-stripe rules last; other rules keep their order and priority."""
+    rules = sheet.get('conditionalFormats') or []
+    ours = [index for index, rule in enumerate(rules) if _is_stripe_rule(rule)]
+    others = len(rules) - len(ours)
+    wanted = {'startRowIndex': 2, 'endRowIndex': rows, 'startColumnIndex': 0, 'endColumnIndex': 13}
+
+    def matches(rule, formula, color):
+        ranges = rule.get('ranges') or []
+        boolean = rule.get('booleanRule') or {}
+        values = (boolean.get('condition') or {}).get('values') or [{}]
+        fmt = boolean.get('format') or {}
+        actual = fmt.get('backgroundColorStyle', {}).get('rgbColor', fmt.get('backgroundColor', {}))
+        return (len(ranges) == 1 and all(ranges[0].get(k, 0) == v for k, v in wanted.items())
+                and _formula_key(values[0].get('userEnteredValue')) == _formula_key(formula)
+                and all(abs(actual.get(k, 0) - v) < .002 for k, v in _color(color).items()))
+
+    if ours == [others, others + 1] and all(
+            matches(rules[index], formula, color) for index, (formula, color) in zip(ours, STRIPE_RULES)):
+        return []
+    sid = sheet['properties']['sheetId']
+    requests = [{'deleteConditionalFormatRule': {'sheetId': sid, 'index': index}} for index in reversed(ours)]
+    for offset, (formula, color) in enumerate(STRIPE_RULES):
+        requests.append({'addConditionalFormatRule': {'index': others + offset, 'rule': {
+            'ranges': [_range(sid, 2, rows)], 'booleanRule': {
+                'condition': {'type': 'CUSTOM_FORMULA', 'values': [{'userEnteredValue': formula}]},
+                'format': {'backgroundColor': _color(color)}}}}})
+    return requests
+
+
 def validate_month_sheet_ids(value):
     """The role map is identity evidence, not a list of current tab titles."""
     if isinstance(value, str):
@@ -233,7 +292,7 @@ def bootstrap_month_sheet_ids(snapshot):
     return validate_month_sheet_ids({name[:-1]: names[name]['properties']['sheetId'] for name in MONTHS})
 
 
-def plan_layout(snapshot, month_sheet_ids=None):
+def plan_layout(snapshot, month_sheet_ids=None, reveal_report_column=False):
     sheets = {s.get('properties',{}).get('title'):s for s in snapshot.get('sheets',[])}
     if month_sheet_ids is not None:
         monthly_ids = set(validate_month_sheet_ids(month_sheet_ids).values())
@@ -312,7 +371,7 @@ def plan_layout(snapshot, month_sheet_ids=None):
         for start,end,pixels in ((0,1,34),(1,2,40),(2,rows,24)):
             requests.append({'updateDimensionProperties':{'range':{'sheetId':sid,'dimension':'ROWS','startIndex':start,'endIndex':end},'properties':{'pixelSize':pixels},'fields':'pixelSize'}})
         for index,pixels in enumerate((90,120,90,90,220,90,90,90,130,150,360,70,90)):
-            requests.append({'updateDimensionProperties':{'range':{'sheetId':sid,'dimension':'COLUMNS','startIndex':index,'endIndex':index+1},'properties':{'pixelSize':pixels, 'hiddenByUser':index in (6,11)},'fields':'pixelSize,hiddenByUser'}})
+            requests.append({'updateDimensionProperties':{'range':{'sheetId':sid,'dimension':'COLUMNS','startIndex':index,'endIndex':index+1},'properties':{'pixelSize':pixels, 'hiddenByUser':index == 11},'fields':'pixelSize,hiddenByUser'}})
         rules = ((1,2,'ONE_OF_RANGE',[STUDENT_RANGE],True),(2,3,'ONE_OF_LIST',['질병','미인정','기타','출석인정'],True),
                  (3,4,'ONE_OF_LIST',['결석함','지각함','조퇴함','결과함'],True),
                  (5,6,'ONE_OF_LIST',['1교시','2교시','3교시','4교시','5교시','6교시','7교시','조회','종례'],False),
@@ -321,16 +380,24 @@ def plan_layout(snapshot, month_sheet_ids=None):
             requests.append({'setDataValidation':{'range':_range(sid,2,rows,start,end),'rule':{'condition':{'type':kind,'values':[{'userEnteredValue':v} for v in values]},'strict':strict,'showCustomUi':True}}})
         border = {'style':'SOLID','color':_color('A6A6A6')}
         requests.append({'updateBorders':{'range':_range(sid,2,rows), **{k:border for k in ('top','bottom','left','right','innerHorizontal','innerVertical')}}})
-        for parity,color in ((1,'BDBDBD'),(0,'FFFFFF')):
-            formula = f'=AND($A3<>"",MOD(SUMPRODUCT(($A$3:$A3<>$A$2:$A2)*($A$3:$A3<>"")),2)={parity})'
-            requests.append({'addConditionalFormatRule':{'index':0,'rule':{'ranges':[_range(sid,2,rows)],'booleanRule':{'condition':{'type':'CUSTOM_FORMULA','values':[{'userEnteredValue':formula}]},'format':{'backgroundColor':_color(color)}}}}})
+        requests.extend(_stripe_rule_repairs(sheet, rows))
+    # Current months also lose the old $A$3 stripes that a sort or row edit left wrong.
+    for name in MONTHS:
+        if name not in todo:
+            sheet = sheets[name]
+            rows = int(sheet['properties'].get('gridProperties',{}).get('rowCount',250))
+            requests.extend(_stripe_rule_repairs(sheet, rows))
+            if reveal_report_column and _column_hidden(sheet, 6):
+                # 신고서(G) used to ship hidden. Show it once; other columns stay as the teacher left them (R11-2).
+                requests.append({'updateDimensionProperties':{'range':{'sheetId':sheet['properties']['sheetId'],
+                    'dimension':'COLUMNS','startIndex':6,'endIndex':7},'properties':{'hiddenByUser':False},'fields':'hiddenByUser'}})
     for name in MONTHS:
         requests.extend(_tail_header_repairs(sheets[name], kinds[name] == 'one-header-row'))
     return requests
 
 
 def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
-                  allow_manifest_bootstrap=False):
+                  allow_manifest_bootstrap=False, reveal_report_column=False):
     manifest = validate_month_sheet_ids(month_sheet_ids) if month_sheet_ids is not None else None
     metadata = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',
         json.dumps({'spreadsheetId':spreadsheet_id,'fields':'spreadsheetId,sheets(properties(sheetId,title))'}),
@@ -358,7 +425,7 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
     def read():
         params = {'spreadsheetId':spreadsheet_id,'includeGridData':True,
                   'ranges':[f"{quote(title)}!1:3" for title in titles]+["'드롭다운'!J1:J2","'학생명단'!A1:C1"],
-                  'fields':'spreadsheetId,sheets(properties,merges,data(startRow,startColumn,columnMetadata(hiddenByUser),rowData(values(userEnteredValue,note,dataValidation,userEnteredFormat(backgroundColor,backgroundColorStyle)))))'}
+                  'fields':'spreadsheetId,sheets(properties,merges,conditionalFormats,data(startRow,startColumn,columnMetadata(hiddenByUser),rowData(values(userEnteredValue,note,dataValidation,userEnteredFormat(backgroundColor,backgroundColorStyle)))))'}
         reply = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',json.dumps(params,ensure_ascii=False),'--format','json'],workdir))
         if not isinstance(reply,dict) or reply.get('spreadsheetId') != spreadsheet_id:
             raise ValueError('준비하던 출결표와 Google 응답이 일치하지 않아 멈췄어요.')
@@ -378,7 +445,7 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
     snapshot = read()
     if manifest is None:
         manifest = bootstrap_month_sheet_ids(snapshot)
-    requests = plan_layout(snapshot, manifest)
+    requests = plan_layout(snapshot, manifest, reveal_report_column)
     if requests:
         # Keep each month's insert and formatting in one atomic Sheets request,
         # and keep the Windows command line below its 32,767-character limit.
@@ -388,6 +455,8 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
             sid = (operation.get('range') or operation.get('start') or operation.get('properties') or {}).get('sheetId')
             if sid is None and 'rule' in operation:
                 sid = operation['rule']['ranges'][0]['sheetId']
+            if sid is None:
+                sid = operation.get('sheetId')
             if not groups or groups[-1][0] != sid:
                 groups.append((sid, []))
             groups[-1][1].append(request)
@@ -397,6 +466,6 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
                 raise RuntimeError('출결 서식 적용 요청이 너무 커서 안전하게 보내지 않았어요.')
             runner([gws,'sheets','spreadsheets','batchUpdate','--params',json.dumps({'spreadsheetId':spreadsheet_id}),
                     '--json',body,'--format','json'],workdir)
-        if plan_layout(read(), manifest):
+        if plan_layout(read(), manifest, reveal_report_column):
             raise RuntimeError('최신 출결 서식이 적용된 것을 확인하지 못했어요. 준비 완료로 표시하지 않았습니다.')
     return manifest

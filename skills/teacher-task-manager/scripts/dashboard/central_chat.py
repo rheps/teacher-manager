@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from brity_bridge import component_lock, google_account, gws_env, paths, process_win, tool_runtime
+from brity_bridge import component_lock, google_account, gws_env, paths, process_win, recovery, tool_runtime
 
 SETTINGS_RANGE = "설정!A1:D200"
 
@@ -348,15 +348,11 @@ def _command_output(run_command, args) -> str:
 
 
 def _load_record(config_dir: Path) -> dict:
-    path = paths.attendance_install_record_path(Path(config_dir))
-    from attendance_server_record import record_exists
-    if not record_exists(path):
+    from attendance_server_record import read_record
+    # One server `current` (was two, CONN-30); its errors propagate as record_exists did.
+    record = read_record(Path(config_dir))
+    if record is None:
         raise CentralChatError(NOT_PREPARED_MESSAGE)
-    try:
-        from attendance_install_record import load_attendance_install_record
-        record = load_attendance_install_record(path)
-    except ValueError as error:
-        raise CentralChatError(CONFIG_BROKEN_MESSAGE) from error
     if not isinstance(record, dict) or not record.get("spreadsheet_id"):
         raise CentralChatError(CONFIG_BROKEN_MESSAGE)
     return record
@@ -1435,6 +1431,7 @@ def chat_status(
         })
     except CentralChatError as error:
         return {"connected": None, "read_failed": True, "registered": False, "account": "",
+                "read_pending": recovery.transient_read_error(error),
                 "class_space_name": "", "class_space_id": "",
                 "moved": False,
                 "reason": _safe_central_error_detail(

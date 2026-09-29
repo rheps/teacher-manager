@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import queue
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from brity_bridge import (
 
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
+WM_ENDSESSION = 0x0016
 WM_COMMAND = 0x0111
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
@@ -287,6 +289,8 @@ class TrayApp:
         self._taskbar_created_message = 0  # 탐색기 재시작 알림 — 아이콘을 다시 등록해야 한다
         self._pending_update = None  # 알림으로 알린 새 버전 — 알림을 누르면 이걸로 시작한다
         self._update_check_running = False  # [새 버전 확인]이 인터넷에 나가 있는 중
+        # 메시지 루프가 끝난 까닭 — run_tray가 helper-*.log에 남긴다(PEND-43, R7-3).
+        self.exit_reason = ""
 
     # --- 알림 ---
 
@@ -817,6 +821,7 @@ class TrayApp:
                 autostart_win.enable_autostart()
                 self.notify("Brity 연결 도우미", "Windows 시작 시 자동 실행을 켰습니다.")
         elif command_id == CMD_EXIT:
+            self.exit_reason = "menu-exit"
             close_dashboard_windows()  # 대시보드·설치 마법사 창도 함께 닫는다
             ctypes.windll.user32.DestroyWindow(self.hwnd)
 
@@ -979,7 +984,13 @@ class TrayApp:
                 )
 
         message = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+        while True:
+            result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+            if result <= 0:
+                if result < 0:
+                    # -1은 WM_QUIT 없이 루프가 끝난 오류다 — 조용히 끝내지 않고 까닭을 남긴다.
+                    self.exit_reason = f"loop-error {ctypes.windll.kernel32.GetLastError()}"
+                break
             user32.TranslateMessage(ctypes.byref(message))
             user32.DispatchMessageW(ctypes.byref(message))
 
@@ -1010,6 +1021,11 @@ class TrayApp:
         if message_id == WM_COMMAND:
             self.on_command(wparam & 0xFFFF)
             return 0
+        if message_id == WM_CLOSE and not self.exit_reason:
+            self.exit_reason = "wm-close"  # 대시보드 stop_helper·설치 프로그램 등 밖에서 닫았다
+        if message_id == WM_ENDSESSION and wparam:
+            # Windows 로그오프·종료 — 이 뒤로는 기록할 틈 없이 끝날 수 있어 지금 남긴다.
+            status_log.append_helper_event(paths.logs_dir(self._account_root), "session-end")
         if message_id == WM_CLOSE and not self._close_forced and not self._capture_idle():
             # 받아 둔 메시지 저장 도중 창을 파괴하면 메인 스레드 종료가 워커를 즉살해
             # 잘린 파일이 남는다(재검증 9-F2). 저장이 끝난 뒤 다시 닫는다.
@@ -1256,8 +1272,10 @@ def run_tray(config_dir: Path, launch_dashboard: bool = False) -> None:
 
     app_identity.apply_app_identity()  # 알림이 우리 아이콘으로 뜨게 한다
 
+    helper_logs = paths.logs_dir(account_sessions.root_config_dir(config_dir))
     mutex = single_instance.acquire_single_instance()
     if mutex is None:
+        status_log.append_helper_event(helper_logs, "already-running", f"launch_dashboard={launch_dashboard}")
         if launch_dashboard:
             # 이미 실행 중인데 다시 켰다는 건 프로그램을 보고 싶다는 뜻 — 대시보드를 보여준다.
             try:
@@ -1272,6 +1290,9 @@ def run_tray(config_dir: Path, launch_dashboard: bool = False) -> None:
             None, "Brity 연결 도우미가 이미 실행 중입니다.", "Brity 연결 도우미", MB_ICONINFORMATION
         )
         return
+    status_log.append_helper_event(helper_logs, "start", f"launch_dashboard={launch_dashboard}")
+    if bundle_paths.is_frozen():
+        _enable_crash_log(helper_logs)
     try:
         # 예전 버전이 남긴 자동 실행 명령(--launch-dashboard 없는)을 현재 형식으로 새로 고친다.
         try:
@@ -1300,5 +1321,35 @@ def run_tray(config_dir: Path, launch_dashboard: bool = False) -> None:
 
         app.on_ready = _on_ready
         app.run()
+    except BaseException as error:
+        # 도우미가 까닭 없이 사라지지 않게 예외 종류와 코드 위치만 남긴다(PEND-43, R7-3).
+        status_log.append_helper_event(helper_logs, "exception", status_log.exception_site(error))
+        raise
+    else:
+        status_log.append_helper_event(helper_logs, "exit", getattr(app, "exit_reason", "") or "quit")
     finally:
         single_instance.release_single_instance(mutex)
+
+
+_crash_log_file = None
+
+
+def _enable_crash_log(logs_dir: Path) -> None:
+    """프로그램 자체가 멈춰 끝날 때(접근 위반 등) Python 위치를 helper-crash.log에 남긴다."""
+    global _crash_log_file
+    if _crash_log_file is not None:
+        return
+    try:
+        import faulthandler
+
+        Path(logs_dir).mkdir(parents=True, exist_ok=True)
+        _crash_log_file = open(Path(logs_dir) / "helper-crash.log", "a", encoding="utf-8")
+        # On Windows faulthandler also prints access violations that Windows handles
+        # itself (seen at every normal start), so mark each start; the exit line in
+        # helper-*.log, not these records, tells whether the Helper really ended.
+        _crash_log_file.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\tpid={os.getpid()}\tstart"
+                              " (records below may be handled exceptions; see helper-*.log exit)\n")
+        _crash_log_file.flush()
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except Exception:  # noqa: BLE001 - 기록 준비 실패가 도우미 시작을 막으면 안 된다
+        _crash_log_file = None

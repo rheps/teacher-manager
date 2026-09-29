@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone, timedelta
 import re
 import time
+import subprocess
+import json
+from urllib.error import HTTPError
 from typing import Any, Callable, Mapping, TypeVar
 import uuid
 
@@ -21,6 +24,47 @@ SUPPORT_WEB = "https://big-silver.xyz"
 KOREA_TIME = timezone(timedelta(hours=9))
 
 T = TypeVar("T")
+def transient_read_error(error: BaseException) -> bool:
+    """Classify evidence, not localized messages; denial overrides wrappers.
+
+    This does not authorize retries of writes. The bridge separately restricts
+    continuation to observational methods and fences each observation by account.
+    """
+    seen, retryable = set(), False
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        status = getattr(error, "status", None)
+        if isinstance(error, HTTPError):
+            status = error.code
+        if isinstance(status, int):
+            if 400 <= status < 500 and status not in {408, 429}:
+                return False
+            retryable |= status in {408, 429, 500, 502, 503, 504}
+        retryable |= isinstance(error, (TimeoutError, ConnectionResetError, subprocess.TimeoutExpired))
+        if isinstance(error, subprocess.CalledProcessError):
+            retryable |= transient_command_result((error.returncode, error.stderr or error.output))
+        retryable |= isinstance(error, RetryableOperationError) and error.code == "TRANSIENT_READ"
+        reason = getattr(error, "reason", None)
+        error = error.__cause__ or error.__context__ or (reason if isinstance(reason, BaseException) else None)
+    return retryable
+
+
+def transient_command_result(result) -> bool:
+    """Preserve only explicit timeout/temporary response codes, never raw text."""
+    if not isinstance(result, tuple) or len(result) != 2:
+        return False
+    code, output = result
+    if code == 124:
+        return True
+    if code == 0:
+        return False
+    text = str(output or "")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
+    except (ValueError, TypeError):
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    return isinstance(error, dict) and error.get("code") in {408, 429, 500, 502, 503, 504}
 
 
 @dataclass(frozen=True)

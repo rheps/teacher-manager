@@ -36,6 +36,7 @@ from attendance_context import AttendanceScope, AttendanceScopeError
 from attendance_binding import AttendanceBindingClient, AttendanceBindingError
 import parse_settings
 from attendance_server_record import record_exists as attendance_record_exists, server_connection
+from attendance_server_record import read_record as read_attendance_server_record
 from attendance_install_record import (
     AttendanceInstallRecordError,
     CONNECTION_FIELDS,
@@ -195,10 +196,10 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
                       else read_attendance_status(config_dir, doctor_deps.run_command, binding_client=deps.binding_client))
         # 로그인처럼 출결 밖에서 해결하는 상태만 위 목록에서 안내용(None)으로 둔다.
         # 새 안전 정지 상태가 추가돼도 홈이 실수로 정상 취급하지 않게 나머지는 문제로 본다.
-        attendance_ok = _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
+        attendance_ok = None if attendance.read_pending else _ATTENDANCE_STATE_TO_OK.get(attendance.state, False)
         results.append(CheckResult(
             "connect.attendance", "출결 시트", attendance_ok,
-            attendance.detail or "출결 업무 준비가 끝났어요",
+            "확인 중…" if attendance.read_pending else (attendance.detail or "출결 업무 준비가 끝났어요"),
             "" if attendance_ok is not False else (attendance.detail or "연결의 출결 탭에서 출결 준비 시작하기를 눌러 주세요."),
             card="connect", tab="attendance", target="attendance-setup",
         ))
@@ -431,12 +432,9 @@ def read_first_time_setup_done(config_dir: Path, run_command, gws_executable: st
             result["reason"] = reason
         return result
 
-    record_path = paths.attendance_install_record_path(Path(config_dir))
-    if not attendance_record_exists(record_path):
-        return not_done("connection_invalid")
-    try:
-        record = read_verified_canonical_record(record_path)
-    except (OSError, AttendanceInstallRecordError):
+    # One server `current` per read (was two, CONN-30); its errors propagate as before.
+    record = read_attendance_server_record(Path(config_dir))
+    if record is None:
         return not_done("connection_invalid")
     spreadsheet_id = str(record.get("spreadsheet_id", "") or "").strip()
     expected_connection_code = attendance_workbook_identity.attendance_connection_code(
@@ -778,6 +776,7 @@ def stop_helper(timeout_seconds: float = 5.0) -> bool:
     hwnd = user32.FindWindowW(HELPER_WINDOW_CLASS, None)
     if not hwnd:
         return True
+    _log_helper_stop_request()
     user32.PostMessageW(ctypes.c_void_p(hwnd), _WM_CLOSE, 0, 0)
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -785,6 +784,23 @@ def stop_helper(timeout_seconds: float = 5.0) -> bool:
             return True
         time.sleep(0.1)
     return False
+
+
+def _log_helper_stop_request() -> None:
+    """대시보드가 도우미를 닫은 흐름(함수 이름)만 helper-*.log에 남긴다(PEND-43, R7-3)."""
+    try:
+        from brity_bridge import status_log
+
+        callers = []
+        frame = sys._getframe(2)
+        while frame is not None and len(callers) < 3:
+            callers.append(frame.f_code.co_name)
+            frame = frame.f_back
+        status_log.append_helper_event(
+            paths.logs_dir(paths.default_config_dir()), "stop-requested",
+            "by-dashboard " + "<".join(callers))
+    except Exception:  # noqa: BLE001 - 기록 실패가 도우미 종료를 막으면 안 된다
+        pass
 
 
 def start_helper(timeout_seconds: float = 5.0) -> bool:
@@ -937,6 +953,7 @@ class AttendanceStatus:
     canonical_workbook_name: str = ""  # 연결 선택·새 학년도 확인창에 보여줄 정식 이름
     progress: dict = field(default_factory=dict)
     failure_code: str = ""
+    read_pending: bool = False
     recovery_action: str = ""
     attendance_scope: dict = field(default_factory=dict)
     current_school_year: str = ""
@@ -1055,6 +1072,7 @@ ATTENDANCE_APPS_SCRIPT_API_MESSAGE = (
     "Teacher Manager 출결 탭으로 돌아와 이어지는 안내를 확인해 주세요. "
     "사용 허용이 반영되기까지 잠시 걸릴 수 있어요."
 )
+ATTENDANCE_GOOGLE_REJECTED_MESSAGE = "Google에서 이 출결 작업을 허용하지 않았어요. 파일을 열 수 있는 계정인지 확인해 주세요."
 
 
 def friendly_attendance_error(error) -> tuple[str, str]:
@@ -1086,7 +1104,7 @@ def friendly_attendance_error(error) -> tuple[str, str]:
     if "insufficientpermissions" in evidence or "insufficient authentication scopes" in evidence:
         return service, "출결 작업에 필요한 Google 권한이 부족해요. [Google 로그인]에서 다시 로그인하고 요청한 권한을 승인해 주세요."
     if re.search(r"\b403\b", evidence) or "permission_denied" in evidence:
-        return service, "Google에서 이 출결 작업을 허용하지 않았어요. 파일을 열 수 있는 계정인지 확인해 주세요."
+        return service, ATTENDANCE_GOOGLE_REJECTED_MESSAGE
     return service, ATTENDANCE_ERROR_MESSAGES[service]
 
 
@@ -1498,13 +1516,20 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command, *
         if scope.payload['verificationState'] == 'VERIFIED':
             from attendance_server_record import connection_context
             with connection_context(config_dir, binding_client, local.current_user):
-                attendance_references.migrate_known_references(config_dir)
+                from brity_bridge.account_sessions import AccountSessionBusy
+                try:
+                    attendance_references.migrate_known_references(config_dir)
+                except AccountSessionBusy:
+                    # A running write holds the account lock; a later read migrates.
+                    # Failing here showed a status read failure during a roster save (OBS-15).
+                    pass
     except (AttendanceScopeError, AttendanceInstallRecordError, OSError, ValueError) as error:
         code = str(getattr(error, "code", "ATTENDANCE_AUTHORITY_UNAVAILABLE"))
         auth_required = code == "ATTENDANCE_AUTH_REQUIRED"
         return replace(local, state="account-authorization-required" if auth_required else "verification-unavailable",
                        detail=str(error) if isinstance(error, AttendanceScopeError) else ATTENDANCE_RECORD_BROKEN_MESSAGE,
-                       failure_code=code, account_authorization_required=auth_required,
+                       failure_code=code, read_pending=getattr(error, 'read_pending', False) is True,
+                       account_authorization_required=auth_required,
                        spreadsheet_url="", connection_code="", workbook_name="", canonical_workbook_name="",
                        template_doc_url="", school_year="", progress={},
                        creation_allowed=False, replacement_allowed=False, replacement_previous_spreadsheet_id="",
@@ -1533,7 +1558,7 @@ def read_attendance_status(config_dir: Path, run_command=_default_run_command, *
         elif value["automationState"] == "UPGRADE_REQUIRED":
             state, detail = "script-update-required", "기존 출석부의 연결 정보를 현재 기능에 맞게 확인해야 해요."
         elif value["automationState"] not in ("AUTHORIZED", "READY"):
-            state, detail = "verification-unavailable", "현재 출석부의 자동 처리 권한을 확인하지 못했어요. 연결 상태를 다시 확인해 주세요."
+            state, detail = "verification-unavailable", "현재 출석부의 자동 처리 권한을 확인하지 못했어요. 위쪽 [연결 상태 새로고침] 버튼(↻)을 눌러 주세요."
     elif value["bindingState"] == "UNBOUND_CONFIRMED":
         local = replace(local, spreadsheet_url="", connection_code="", template_doc_url="",
                         school_year="", workbook_name="", canonical_workbook_name="", progress={})
@@ -4630,6 +4655,8 @@ class _MalformedGwsJsonResponse(ValueError):
 def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> list[dict]:
     code, output = run_command(args)
     if code != 0:
+        if code == 124:
+            raise recovery.RetryableOperationError("TRANSIENT_READ", failure_message)
         try:
             failed = process_win.parse_first_json(output)
         except (TypeError, ValueError):
@@ -4642,6 +4669,8 @@ def _run_gws_json_pages(run_command, args: list[str], failure_message: str) -> l
                 raise _google_login_issue()
             if error_code == 403 or error_status == "PERMISSION_DENIED":
                 raise _google_list_permission_issue()
+            if error_code in {408, 429, 500, 502, 503, 504}:
+                raise recovery.RetryableOperationError("TRANSIENT_READ", failure_message)
             if (
                 isinstance(error_code, int)
                 and 400 <= error_code < 500
@@ -5018,7 +5047,8 @@ GOOGLE_SAVED_TARGET_KINDS = {
     "업무캘린더ID": "calendar", "학사일정캘린더ID": "calendar",
     "업무Tasks목록ID": "tasklist", "담임안내Tasks목록ID": "tasklist",
 }
-GOOGLE_TARGET_CHECK_FAILED = "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. [연결 다시 확인]을 눌러 주세요."
+# Shown in the 연결 window and on setup step 8; both have the ↻ refresh at the top.
+GOOGLE_TARGET_CHECK_FAILED = "저장된 연결을 확인하지 못했어요. 선택은 그대로 두었어요. 위쪽 [연결 상태 새로고침] 버튼(↻)을 눌러 주세요."
 
 
 def google_target_statuses(run_command, gws: str, targets: dict, *, auth: dict | None = None) -> dict:
@@ -5134,6 +5164,10 @@ class AttendanceRemoteWorkBusyError(RuntimeError):
     """같은 출결 자료의 다른 원격 작업이 제한 시간 안에 끝나지 않음."""
 
 
+class AttendanceReadTimeout(TimeoutError, RuntimeError):
+    """A supervised attempt ended; keep the timeout classification through readers."""
+
+
 def attendance_remote_command(
     args,
     *,
@@ -5159,7 +5193,7 @@ def attendance_remote_command(
     code = int(getattr(result, "code", 127))
     output = str(getattr(result, "output", "") or "")
     if code == 124:
-        raise RuntimeError(_ATTENDANCE_REMOTE_TIMEOUT_MESSAGE)
+        raise AttendanceReadTimeout(_ATTENDANCE_REMOTE_TIMEOUT_MESSAGE)
     return code, output
 
 
@@ -5861,7 +5895,8 @@ def _attendance_action_status_locked(config_dir: Path, deps: AttendanceDeps | No
         error = AttendanceBindingError(fields.get('failure_code', 'ATTENDANCE_RESULT_UNKNOWN'), status=fields.get('http_status', 0),
             failure_domain=fields.get('failure_domain', ''), failure_stage=fields.get('failure_stage', ''),
             recovery_action=fields.get('recovery_action', ''))
-        status = replace(status, state='verification-unavailable', detail=str(error), **_attendance_failure_fields(error))
+        state, detail, failure = _setup_failure_view(fields, str(error), _attendance_failure_fields(error))
+        status = replace(status, state=state, detail=detail, **failure)
     return _action_status(status, action, saved)
 
 
@@ -6095,6 +6130,31 @@ def _ensure_attendance_once(
         return _failed_attendance_action(config_dir, deps, status, action, error)
 
 
+def _setup_failure_view(fields: dict, fallback_detail: str, fallback_failure: dict) -> tuple[str, str, dict]:
+    """(state, detail, failure fields) for a blocked creation, from sanitized evidence.
+
+    Every write is dispatched through the server registry, which turns its failure
+    into AttendanceBindingError; that stays unknown and is never repeated (C7). A raw
+    Google 403 reached this point from a request that wrote nothing, so it is a
+    definite failure with its real cause.
+    """
+    if fields.get("error_type") != "AttendanceBindingError":
+        if fields.get("category") == "script-api-disabled":
+            # [Apps Script API 사용] resumes this operation; a generic resume action from
+            # the pre-run status read must not replace that button (CONN-09).
+            return ("script-permission-required", ATTENDANCE_APPS_SCRIPT_API_MESSAGE,
+                    {"failure_code": "ATTENDANCE_SCRIPT_API_DISABLED", "http_status": fields.get("http_status") or 0,
+                     "recovery_action": ""})
+        if fields.get("category") == "permission" and fields.get("http_status") == 403:
+            return ("verification-unavailable", ATTENDANCE_GOOGLE_REJECTED_MESSAGE,
+                    {"failure_code": "ATTENDANCE_SETUP_HTTP_403", "http_status": 403})
+    if fields.get("cause_category") == "script-api-disabled":
+        # Unknown stays unknown, but the confirmed Google cause is not hidden.
+        fallback_detail = ("Google 응답에 따르면 이 계정에서 Google Apps Script API가 꺼져 있어요. "
+                           "https://script.google.com/home/usersettings 에서 켤 수 있어요. " + fallback_detail)
+    return "verification-unavailable", fallback_detail[:ATTENDANCE_DETAIL_LIMIT], fallback_failure
+
+
 def _failed_attendance_action(config_dir, deps, status, action, error):
     try:
         fresh = deps.binding_client.current()
@@ -6112,9 +6172,10 @@ def _failed_attendance_action(config_dir, deps, status, action, error):
         _write_setup_status(config_dir, saved)
     except (AttendanceScopeError, OSError, ValueError):
         saved = {}
-    failure = _attendance_failure_fields(error) or {'failure_code': 'ATTENDANCE_RESULT_UNKNOWN'}
-    result = replace(status, state='verification-unavailable', replacement_previous_spreadsheet_id='',
-        detail=str(error) if isinstance(error, AttendanceScopeError) else '출석부 준비 결과를 확인하지 못했어요. 기록을 보존했습니다.',
+    state, detail, failure = _setup_failure_view(_safe_setup_failure(error),
+        str(error) if isinstance(error, AttendanceScopeError) else '출석부 준비 결과를 확인하지 못했어요. 기록을 보존했습니다.',
+        _attendance_failure_fields(error) or {'failure_code': 'ATTENDANCE_RESULT_UNKNOWN'})
+    result = replace(status, state=state, replacement_previous_spreadsheet_id='', detail=detail,
         verification_state='UNVERIFIED', automation_state='BLOCKED', **failure)
     return _action_status(result, action, saved)
 

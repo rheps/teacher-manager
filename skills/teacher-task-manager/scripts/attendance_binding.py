@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Callable
+from brity_bridge import recovery
 
 from attendance_context import AttendanceScope, AttendanceScopeError, HistoricalPublicationReceipt, PROTOCOL_VERSION
 
@@ -25,9 +26,10 @@ FAILURE_STAGES = frozenset({'account-grants', 'file-metadata', 'workbook-metadat
     'workbook-settings', 'workbook-headers', 'workbook-structure', 'inventory-list', 'inventory-headers'})
 RECOVERY_ACTIONS = frozenset({'authorize-attendance-account', 'check-file-access',
     'retry-verification', 'update-attendance-service'})
+RATE_LIMIT_DELAYS = (2.0, 5.0)
 OPERATION_NAMES = frozenset({'capabilities', 'current', 'discover', 'adopt', 'adoption-candidate',
     'replacement-check', 'start', 'operation-read', 'claim', 'authorize', 'dispatch', 'checkpoint',
-    'evidence', 'publish', 'register-sheet', 'auth-start', 'auth-status'})
+    'evidence', 'reject', 'publish', 'register-sheet', 'auth-start', 'auth-status'})
 
 
 class AttendanceBindingError(AttendanceScopeError):
@@ -130,8 +132,10 @@ def _http_request(method, url, body, headers):
         except (AttributeError, ValueError, OSError):
             pass
         raise AttendanceBindingError(code, status=error.code, **controlled) from None
-    except (OSError, urllib.error.URLError):
-        raise AttendanceBindingError() from None
+    except (OSError, urllib.error.URLError) as error:
+        failure = AttendanceBindingError()
+        failure.read_pending = recovery.transient_read_error(error)
+        raise failure from None
     if len(raw) > 2_000_000:
         raise AttendanceBindingError("ATTENDANCE_INVALID_RESPONSE")
     try:
@@ -157,6 +161,9 @@ class AttendanceBindingClient:
         self._subject = ""
         self._email = ""
         self._attempt = None
+        self._auth_url = ""
+        self._auth_expires = None
+        self._authorization_lock = threading.RLock()
         self._store, self._clock = session_store, clock
         self._resume = ""
         self._expires = self._resume_expires = ""
@@ -236,6 +243,8 @@ class AttendanceBindingClient:
             self._token = self._subject = self._email = self._resume = ''
             self._expires = self._resume_expires = ''
             self._attempt = None
+            self._auth_url = ""
+            self._auth_expires = None
             self._restored = True
             if self._store:
                 try:
@@ -341,15 +350,50 @@ class AttendanceBindingClient:
                     raise AttendanceBindingError("ATTENDANCE_PROTOCOL_REQUIRED", status=404) from None
                 if not safe_read or error.code not in ("ATTENDANCE_AUTHORITY_UNAVAILABLE", "ATTENDANCE_VERIFY_UNAVAILABLE", "ATTENDANCE_RATE_LIMITED") or error.status not in (0, 429, 500, 502, 503, 504) or attempt == attempts - 1:
                     raise
-                self._sleeper(0.25 * (attempt + 1))
+                # Google counts requests per minute: a quarter-second retry only spends the
+                # same quota again. Keep three attempts, wait longer for a limit (R5-1).
+                self._sleeper(RATE_LIMIT_DELAYS[attempt] if error.code == "ATTENDANCE_RATE_LIMITED" else 0.25 * (attempt + 1))
 
-    def begin_authorization(self, expected_email: str, expected_subject_key: str = ""):
-        self.clear(revoke=True)
-        with self._lock:
-            epoch = self._epoch
+    def begin_authorization(self, expected_email: str, expected_subject_key: str = "", *, reopen=False):
+        # Serialize with status persistence: reopening must not race a completed
+        # approval into a new bootstrap, or revoke an existing same-account session.
+        with self._authorization_lock:
+            return self._begin_authorization(expected_email, expected_subject_key, reopen=reopen)
+
+    def _begin_authorization(self, expected_email, expected_subject_key, *, reopen):
         expected_email = str(expected_email).strip().casefold()
         if not expected_email or "@" not in expected_email:
             raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+        with self._lock:
+            if self._email and self._email != expected_email:
+                raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+            epoch = self._epoch
+            pending = bool(self._attempt)
+        if pending:
+            try:
+                result = self.authorization_status(expected_email)
+            except AttendanceBindingError as error:
+                if error.code != "ATTENDANCE_AUTH_EXPIRED":
+                    raise
+                result = {"state": "expired"}
+            with self._lock:
+                if epoch != self._epoch:
+                    raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
+                if result["state"] == "complete":
+                    return result
+                if result["state"] == "pending":
+                    if not self._auth_url:
+                        raise AttendanceBindingError("ATTENDANCE_AUTH_URL_INVALID")
+                    return {"state": "pending", "auth_url": self._auth_url, "expires_at": self._auth_expires}
+                # Only a confirmed terminal attempt is discarded. Session and
+                # workbook state survive; a failed read never reaches this branch.
+                self._attempt = None
+                self._auth_url = ""
+                self._auth_expires = None
+                if result["state"] == "failed":
+                    return result
+        elif reopen and self._token:
+            return {"state": "complete"}
         capabilities = self._request("GET", "/v1/attendance/capabilities", authenticated=False, safe_read=True)
         if capabilities.get("protocolVersion") != PROTOCOL_VERSION or capabilities.get("accountBootstrap") is not True:
             raise AttendanceBindingError("ATTENDANCE_PROTOCOL_REQUIRED")
@@ -369,10 +413,16 @@ class AttendanceBindingClient:
             if epoch != self._epoch:
                 raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
             self._attempt = {"attemptId": value["attemptId"], "pollSecret": value["pollSecret"]}
+            self._auth_url = value["authUrl"]
+            self._auth_expires = value.get("expiresAt")
             self._email = expected_email
         return {"state": "pending", "auth_url": value["authUrl"], "expires_at": value.get("expiresAt")}
 
-    def authorization_status(self, expected_email: str):
+    def authorization_status(self, expected_email: str, *, retry=True):
+        with self._authorization_lock:
+            return self._authorization_status(expected_email, retry=retry)
+
+    def _authorization_status(self, expected_email: str, *, retry=True):
         with self._lock:
             epoch = self._epoch
             attempt = dict(self._attempt or {})
@@ -381,7 +431,7 @@ class AttendanceBindingClient:
                 raise AttendanceBindingError("ATTENDANCE_ACCOUNT_CHANGED")
         if not attempt:
             return {"state": "complete" if self._token else "required"}
-        value = self._request("POST", "/v1/attendance/auth/status", attempt, authenticated=False, safe_read=True)
+        value = self._request("POST", "/v1/attendance/auth/status", attempt, authenticated=False, safe_read=retry)
         if value.get("state") == "complete":
             session = value.get("session", value)
             if not all(isinstance(session.get(key), str) and session[key] for key in ("sessionToken", "subjectKey", "email")):
@@ -396,6 +446,8 @@ class AttendanceBindingClient:
                     raise AttendanceBindingError('ATTENDANCE_INVALID_RESPONSE')
                 self._token, self._subject = session["sessionToken"], session["subjectKey"]
                 self._attempt = None
+                self._auth_url = ""
+                self._auth_expires = None
                 if self._resume_supported:
                     self._resume, self._expires = session['resumeToken'], session['expiresAt']
                     self._resume_expires = session['resumeExpiresAt']
@@ -592,9 +644,27 @@ class AttendanceBindingClient:
         return "/v1/attendance/operations/" + operation_id
 
     def operation_action(self, operation_id: str, action: str, body: dict):
-        if action not in ("claim", "dispatch", "evidence", "publish", "checkpoint", "authorize"):
+        if action not in ("claim", "dispatch", "evidence", "reject", "publish", "checkpoint", "authorize"):
             raise AttendanceBindingError("ATTENDANCE_OPERATION_INVALID")
         return self._request("POST", self._operation_path(operation_id) + "/" + action, body)
+
+
+# The project create is the first Apps Script API call; a later version or
+# deployment call means the API was already on. Pending intent it journals first.
+_REJECTABLE_PENDING = {"script": ("pending_script_project_title",)}
+_APPS_SCRIPT_API_DISABLED_MARKERS = ("script.google.com/home/usersettings", "has not enabled the apps script api")
+
+
+def _apps_script_api_disabled(error) -> bool:
+    """Google's own 403 for a disabled Apps Script API, read from its error JSON."""
+    output = str(getattr(error, "output", "") or "")
+    try:
+        from brity_bridge.process_win import parse_first_json
+        code = parse_first_json(output).get("error", {}).get("code")
+    except (ValueError, AttributeError, TypeError):
+        return False
+    text = (output + " " + str(error)).lower()
+    return code == 403 and any(marker in text for marker in _APPS_SCRIPT_API_DISABLED_MARKERS)
 
 
 class RegistryCreationOperation:
@@ -704,6 +774,18 @@ class RegistryCreationOperation:
             except Exception as error:
                 # Even a transport-reported rejection cannot erase the durable
                 # server intent. Reconcile that original intent before reuse.
+                # Sole exception (CONN-09): Google's "Apps Script API disabled" 403
+                # created nothing; the server records it as confirmed-rejected.
+                if kind in _REJECTABLE_PENDING and _apps_script_api_disabled(error):
+                    progress = {key: value for key, value in dict(self.operation.get("progress") or {}).items()
+                                if key not in _REJECTABLE_PENDING[kind]}
+                    try:
+                        self._action("reject", resourceKind=kind, intent=intent, httpStatus=403,
+                                     category="script-api-disabled", progress=progress)
+                    except Exception:
+                        raise AttendanceBindingError("ATTENDANCE_RESULT_UNKNOWN") from error
+                    error.attendance_rejection_confirmed = True
+                    raise
                 raise AttendanceBindingError("ATTENDANCE_RESULT_UNKNOWN") from error
             try:
                 from brity_bridge.process_win import parse_first_json

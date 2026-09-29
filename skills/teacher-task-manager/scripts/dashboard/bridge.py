@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -26,6 +27,8 @@ if __package__ in (None, ""):
 import attendance_reference_storage as attendance_references
 
 from attendance_server_record import record_exists as attendance_record_exists
+from attendance_server_record import read_record as read_attendance_server_record
+from attendance_server_record import read_snapshot_or_none as read_attendance_server_snapshot
 
 from brity_bridge import (
     account_sessions,
@@ -220,6 +223,8 @@ def _fail(error, operation: str = "", config_dir=None, reporter=None):
         reply["code"] = external_url.NO_EXTERNAL_BROWSER
     elif isinstance(error, engine.AttendanceRemoteWorkBusyError):
         reply["error"] = str(error)
+        # Refused before the protected work began: the screen may wait and follow it (PEND-46).
+        reply["issue"]["code"] = "ATTENDANCE_REMOTE_BUSY"
     else:
         try:
             from dashboard import central_chat
@@ -653,6 +658,9 @@ def _attendance_workbook_layout_is_current(
     return True
 
 
+REPORT_COLUMN_SHOWN_SETTING = "REPORT_COLUMN_SHOWN"
+
+
 def _migrate_attendance_roster_layout(
     *, runner, workdir, gws_executable, spreadsheet_id
 ) -> bool:
@@ -782,7 +790,10 @@ def _migrate_attendance_roster_layout(
         month_ids = validate_month_sheet_ids(settings_map.get("ATTENDANCE_MONTH_SHEET_IDS", ""))
         resolved_months = resolve_month_sheets(metadata, month_ids)
         month_names = [sheet["properties"]["title"] for sheet in resolved_months.values()]
-        ensure_layout(runner, Path(workdir), spreadsheet, gws, month_sheet_ids=month_ids)
+        # 신고서(G) shipped hidden; show it on the first update only, then record that (R11-2).
+        reveal_report = settings_map.get(REPORT_COLUMN_SHOWN_SETTING) != "1"
+        ensure_layout(runner, Path(workdir), spreadsheet, gws, month_sheet_ids=month_ids,
+                      reveal_report_column=reveal_report)
     except (ValueError, TypeError, KeyError):
         return False
     required_sheets = month_names + [personal_sheet, class_sheet]
@@ -845,13 +856,24 @@ def _migrate_attendance_roster_layout(
                 }
             )
             break
+    next_setting_row = len(settings) + 1
     if not dropdown_setting_found:
-        setting_row = len(settings) + 1
+        setting_row = next_setting_row
+        next_setting_row += 1
         value_updates.append(
             {
                 "range": f"'설정'!A{setting_row}:B{setting_row}",
                 "majorDimension": "ROWS",
                 "values": [["STUDENT_DROPDOWN_RANGE", "J2:J200"]],
+            }
+        )
+    if reveal_report:
+        value_updates.append(
+            {
+                "range": f"'설정'!A{next_setting_row}:C{next_setting_row}",
+                "majorDimension": "ROWS",
+                "values": [[REPORT_COLUMN_SHOWN_SETTING, "1",
+                            "신고서 열을 한 번 보이게 했는지 기록합니다. 다시 숨겨도 그대로 둡니다."]],
             }
         )
 
@@ -1080,6 +1102,60 @@ _SESSION_READS = _SESSION_EMPTY_READS | frozenset({
 })
 
 
+# Only observations may be continued by the desktop. No writes, starts, creates,
+# open-browser actions, or local-storage recovery belong in this set.
+_CONTINUABLE_READS = frozenset({
+    "google_status", "gws_login_status", "list_calendars", "list_tasklists",
+    "google_target_statuses", "attendance_status", "attendance_status_cached",
+    "attendance_first_setup_status", "attendance_roster_status",
+    "attendance_chat_status", "attendance_chat_spaces",
+    "attendance_account_authorization_status",
+})
+
+
+def _can_continue_read(name, error, transport_pending=False):
+    if name not in _CONTINUABLE_READS:
+        return False
+    chain = _journal_error_chain(error)
+    # A completed three-attempt backend operation must not become a new batch.
+    if any(isinstance(item, recovery.FinalOperationFailure) for item in chain):
+        return False
+    if any(isinstance(item, account_sessions.AccountSessionError) for item in chain):
+        return False
+    for item in chain:
+        status = getattr(item, "status", getattr(item, "code", None))
+        if isinstance(status, int) and 400 <= status < 500 and status not in {408, 429}:
+            return False
+    pending_identity = transport_pending and any(
+        isinstance(item, recovery.UserActionRequired) and item.issue.operation == "google_auth_status"
+        for item in chain
+    )
+    return pending_identity or recovery.transient_read_error(error) or any(
+        isinstance(item, engine.GoogleAuthStatusReadError)
+        or (isinstance(item, AttendanceBindingError) and getattr(item, "read_pending", False) is True)
+        for item in chain
+    )
+
+
+# One messenger-tab read batch (list_calendars, list_tasklists, google_target_statuses
+# sharing a screen-issued id) reuses one verified `gws auth status` of the same account
+# and generation. Writes and calls without an id keep their own check.
+# The attendance-tab reads and the Home check join the same mechanism (2026-09-28).
+_AUTH_BATCH_ARG = {"list_calendars": 0, "list_tasklists": 0, "google_target_statuses": 1,
+                   "attendance_status": 0, "attendance_first_setup_status": 0,
+                   "attendance_roster_status": 0, "attendance_chat_status": 0,
+                   "attendance_chat_spaces": 0, "home_checks": 0}
+AUTH_BATCH_TTL_SECONDS = 300.0
+
+
+def _auth_batch_id(name, args, kwargs):
+    index = _AUTH_BATCH_ARG.get(name)
+    if index is None:
+        return ""
+    value = kwargs.get("batch", args[index] if len(args) > index else "")
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) else ""
+
+
 def guarded(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -1088,7 +1164,11 @@ def guarded(method):
         capture_gate = None
         previous_dir = getattr(self._session_context, "config_dir", None)
         previous_observed = getattr(self._session_context, "observed", None)
+        previous_delayed = getattr(self._session_context, "delayed_reads", None)
+        previous_batch = getattr(self._session_context, "auth_batch", None)
         name = method.__name__
+        delayed_reads = set() if name in _CONTINUABLE_READS else None
+        self._session_context.delayed_reads = delayed_reads
         try:
             if name == "retry_capture":
                 if not self._capture_retry_lock.acquire(blocking=False):
@@ -1129,6 +1209,13 @@ def guarded(method):
                     request_dir = self._account_root
                 self._session_context.config_dir = request_dir
                 self._session_context.observed = request_token
+                batch_id = _auth_batch_id(name, args, kwargs)
+                self._session_context.auth_batch = (
+                    (batch_id, *request_token) if batch_id and request_token and request_token[0] else None)
+                if (not batch_id and name in _AUTH_BATCH_ARG and previous_batch
+                        and tuple(previous_batch[1:]) == tuple(request_token or ())):
+                    # home_checks' own attendance_status read stays in the Home check's batch.
+                    self._session_context.auth_batch = previous_batch
                 if name not in {"google_status", "get_app_info"} and expected is not None and tuple(expected) != request_token:
                     raise account_sessions.AccountSessionError()
                 if name not in _SESSION_GLOBAL:
@@ -1144,8 +1231,16 @@ def guarded(method):
                             raise account_sessions.AccountSessionError("설정에서 Google 연결을 확인한 뒤 다시 진행해 주세요.")
                 if state.get("managed") and name in _SESSION_GOOGLE_WORK:
                     run, gws = self._resolve_gws_or_fail()
-                    current = engine.require_goedu_gws_session(run, gws)
-                    self._assert_current_session_account(current)
+                    try:
+                        current = engine.require_goedu_gws_session(run, gws)
+                    except engine.GoogleAuthStatusReadError:
+                        # DELAY-05: the Chat connect start re-reads and asserts this account
+                        # inside its own three-cycle recovery before anything is sent.
+                        if name != "attendance_chat_connect":
+                            raise
+                        current = None
+                    if current is not None:
+                        self._assert_current_session_account(current)
                 from attendance_server_record import connection_context
                 with connection_context(request_dir, self._attendance_binding_client,
                         lambda: self._verified_google_account or state.get('account', '') or self._attendance_binding_client().email):
@@ -1163,11 +1258,20 @@ def guarded(method):
                 if local_problem and (name not in _SESSION_GLOBAL or (name == "get_app_info" and not empty_problem_bootstrap)):
                     raise account_sessions.AccountSessionError(self._local_settings_error)
                 result["session"] = list(current_token)
+                data = result.get("data")
+                settled_read = isinstance(data, dict) and data.get("read_pending") is False
+                if delayed_reads and not settled_read:
+                    return {"ok": False, "read_pending": True, "session": list(current_token)}
                 return result
         except Exception as error:  # noqa: BLE001 - JS에는 사람이 읽을 안내만 보낸다
             if request_token is not None and not isinstance(error, account_sessions.AccountSessionError):
                 try:
                     if request_token == account_sessions.token(self._account_root):
+                        if _can_continue_read(name, error, bool(delayed_reads)):
+                            # The bounded attempt ended, not the user's read.
+                            # No final error/report and no secret-bearing cause.
+                            return {"ok": False, "read_pending": True,
+                                    "session": list(request_token)}
                         return _fail(error, name, request_dir, self._report_issue)
                 except account_sessions.AccountSessionError:
                     pass
@@ -1175,6 +1279,10 @@ def guarded(method):
         finally:
             self._session_context.config_dir = previous_dir
             self._session_context.observed = previous_observed
+            self._session_context.delayed_reads = previous_delayed
+            self._session_context.auth_batch = previous_batch
+            if previous_delayed is not None and delayed_reads:
+                previous_delayed.update(delayed_reads)
             if capture_gate is not None:
                 capture_gate.release()
 
@@ -1261,6 +1369,8 @@ class Api:
         self._local_settings_error_token = None
         self._deps = deps or BridgeDeps()
         self._login = engine.LoginSession()
+        self._auth_batch_lock = threading.Lock()
+        self._auth_batch_results = {}
         self._gws_update_offer = None
         self._gws_update_offer_key = ""
         self._gws_update_last_status = None
@@ -1356,7 +1466,7 @@ class Api:
         return replace(deps, binding_client=self._attendance_binding_client())
 
     @guarded
-    def attendance_account_authorize(self):
+    def attendance_account_authorize(self, reopen=False):
         _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
         subject_hint = ""
         try:
@@ -1366,7 +1476,9 @@ class Api:
                 subject_hint = str(record.get("subject_key") or "")
         except (ValueError, OSError):
             pass
-        result = self._attendance_binding_client().begin_authorization(account, expected_subject_key=subject_hint)
+        result = self._attendance_binding_client().begin_authorization(account, expected_subject_key=subject_hint, reopen=reopen is True)
+        if result["state"] != "pending":
+            return result
         # Only this explicit action opens consent; status reads never navigate.
         opened = self._open_external_url(result["auth_url"])
         if not isinstance(opened, dict) or opened.get("opened") is not True:
@@ -1375,8 +1487,31 @@ class Api:
 
     @guarded
     def attendance_account_authorization_status(self):
-        _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
-        return self._attendance_binding_client().authorization_status(account)
+        def read_status():
+            try:
+                _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+                # One recovery budget covers identity and consent status together.
+                # Do not nest the client's own three transport attempts inside it.
+                return self._attendance_binding_client().authorization_status(account, retry=False)
+            except ScreenSafeError as error:
+                if not isinstance(error.__cause__, engine.GoogleAuthStatusReadError):
+                    raise
+                raise recovery.RetryableOperationError(
+                    "GOOGLE_AUTH_STATUS_READ", "현재 Google 계정 확인을 마치지 못했어요. 승인 요청은 유지됩니다.",
+                ) from error
+            except AttendanceBindingError as error:
+                if error.code not in ("ATTENDANCE_AUTHORITY_UNAVAILABLE", "ATTENDANCE_VERIFY_UNAVAILABLE", "ATTENDANCE_RATE_LIMITED") or error.status not in (0, 429, 500, 502, 503, 504):
+                    raise
+                raise recovery.RetryableOperationError(
+                    "ATTENDANCE_AUTH_STATUS_READ", "권한 승인 결과를 읽지 못했어요. 승인 요청은 유지됩니다.",
+                ) from error
+
+        return recovery.run_operation(
+            "attendance_account_authorization_status", "권한 승인 결과를 확인하지 못했어요.",
+            read_status, delays=recovery.NETWORK_DELAYS,
+            change_status="기존 자료와 진행한 승인 요청은 유지됩니다.",
+            app_version=version.APP_VERSION, **self._network_recovery_options(),
+        )
 
     def _open_external_url(self, url) -> dict:
         return external_url.open_external_url(
@@ -1890,9 +2025,54 @@ class Api:
 
     # ----- 조회·검증 -----
 
+    def _shared_auth_status(self, batch, read):
+        """Run `gws auth status` once per read batch; reuse only a verified same-account result."""
+        with self._auth_batch_lock:
+            now = time.monotonic()
+            # Keyed by batch: a messenger batch and an attendance batch running
+            # together (refreshConnectionStatus) must not evict each other.
+            self._auth_batch_results = {key: value for key, value in self._auth_batch_results.items()
+                                        if now < value[0]}
+            cached = self._auth_batch_results.get(batch)
+            if cached:
+                return cached[1]
+            result = read()
+            auth = engine.gws_auth_status(lambda _args: result, "gws")
+            # A failed or other-account read is never reused: unknown stays unknown.
+            if auth.get("logged_in") and str(auth.get("user") or "").casefold() == batch[1].casefold():
+                self._auth_batch_results[batch] = (time.monotonic() + AUTH_BATCH_TTL_SECONDS, result)
+            return result
+
+    def _observe_read_runner(self, runner):
+        def observed(args, *extra):
+            delayed = getattr(self._session_context, "delayed_reads", None)
+            key = tuple(str(arg) for arg in args)
+            batch = getattr(self._session_context, "auth_batch", None)
+            try:
+                if batch and [str(arg) for arg in args[1:3]] == ["auth", "status"]:
+                    result = self._shared_auth_status(batch, lambda: runner(args, *extra))
+                else:
+                    result = runner(args, *extra)
+            except Exception as error:
+                if delayed is not None:
+                    if recovery.transient_read_error(error):
+                        delayed.add(key)
+                    else:
+                        delayed.discard(key)
+                raise
+            if delayed is not None:
+                # Only observational public methods install this request-local
+                # set. A later successful read of the same command clears it.
+                if recovery.transient_command_result(result):
+                    delayed.add(key)
+                else:
+                    delayed.discard(key)
+            return result
+        return observed
+
     def _run(self):
         if self._deps.run_command is not None:
-            return self._deps.run_command
+            return self._observe_read_runner(self._deps.run_command)
         base = self._gws_base_environ()
         environment = gws_env.gws_environ(
             base,
@@ -1909,13 +2089,13 @@ class Api:
                 args, env=environment, timeout=GWS_COMMAND_TIMEOUT_SECONDS
             )
 
-        return run
+        return self._observe_read_runner(run)
 
     def _attendance_remote_run(self):
         """출결 Google 명령은 자식 작업까지 실제 제한 시간이 있는 길로 실행한다."""
 
         if self._deps.run_command is not None:
-            return self._deps.run_command
+            return self._observe_read_runner(self._deps.run_command)
         base = self._gws_base_environ()
         environment = gws_env.gws_environ(
             base,
@@ -1924,15 +2104,16 @@ class Api:
 
         def run(args):
             dns_warm.wait_shared_ready(DNS_WARM_WAIT_SECONDS)
-            return engine.attendance_remote_command(args, environment=environment)
+            return engine.attendance_remote_command(args, environment=environment,
+                timeout_seconds=engine._ATTENDANCE_REMOTE_COMMAND_TIMEOUT_SECONDS)
 
-        return run
+        return self._observe_read_runner(run)
 
     def _attendance_script_runner(self):
         """출결 시트·Apps Script 명령을 작업 폴더와 함께 제한 시간 안에 실행한다."""
 
         if self._deps.attendance_script_runner is not None:
-            return self._deps.attendance_script_runner
+            return self._observe_read_runner(self._deps.attendance_script_runner)
         base = self._gws_base_environ()
         environment = gws_env.gws_environ(
             base,
@@ -1943,7 +2124,8 @@ class Api:
             dns_warm.wait_shared_ready(DNS_WARM_WAIT_SECONDS)
             try:
                 return engine.attendance_remote_runner(
-                    args, cwd, environment=environment
+                    args, cwd, environment=environment,
+                    timeout_seconds=engine._ATTENDANCE_REMOTE_COMMAND_TIMEOUT_SECONDS
                 )
             except subprocess.CalledProcessError as error:
                 output = error.stderr or error.output or ""
@@ -1960,7 +2142,7 @@ class Api:
                     pass
                 raise
 
-        return script_runner
+        return self._observe_read_runner(script_runner)
 
     def _gws_base_environ(self) -> dict:
         """GWS가 물려받을 Windows 환경값의 읽기 전용 사본."""
@@ -1986,7 +2168,7 @@ class Api:
             )
 
     @guarded
-    def home_checks(self):
+    def home_checks(self, batch=""):
         self._require_safe_gws_account_storage()
         deps = self._deps.home_check_deps
         if deps is None:
@@ -1998,6 +2180,8 @@ class Api:
             )
         def attendance_probe():
             result = self.attendance_status()
+            if result.get("read_pending") or (result.get("data") or {}).get("read_pending"):
+                return engine.AttendanceStatus(state="auth-error", read_pending=True, detail="확인 중…")
             if result.get("ok") is False:
                 return engine.AttendanceStatus(state="verification-unavailable", detail="현재 출결 상태를 확인하지 못했어요.")
             value = result.get("data", result)
@@ -2010,7 +2194,7 @@ class Api:
         return [asdict(r) for r in results]
 
     @guarded
-    def attendance_status(self):
+    def attendance_status(self, batch=""):
         self._require_safe_gws_account_storage()
         # 폴링 경로(attendance_prepare_status)와 같이 자식 작업까지 제한 시간이 있는
         # 감독 실행으로 읽는다. `gws auth status`가 응답 없이 멈추면 출결 탭이 영원히
@@ -2020,9 +2204,12 @@ class Api:
             self._attendance_remote_run(),
             binding_client=self._attendance_binding_client(),
         )
+        status = {key: value for key, value in asdict(status_value).items()
+                  if key != "read_pending" or value}
+        if status_value.state == "auth-error" or status_value.http_status in {408, 429, 500, 502, 503, 504}:
+            return {**status, "read_pending": True}
         if status_value.state in _ATTENDANCE_AUTH_BLOCKED_STATES:
-            return asdict(status_value)
-        status = asdict(status_value)
+            return status
         layout_unreadable = False
         if status_value.state == "ready":
             from attendance_install_record import load_attendance_install_record
@@ -2071,6 +2258,9 @@ class Api:
                     )
                 except recovery.FinalOperationFailure:
                     layout_current = None
+                    # This batch already used all three attempts; a swallowed
+                    # transport marker must not ask the UI to start another one.
+                    status["read_pending"] = False
             layout_unreadable = layout_current is None
             if layout_current is False:
                 status["state"] = "script-update-required"
@@ -2443,7 +2633,7 @@ class Api:
         return {"running": False, "status": status}
 
     @guarded
-    def attendance_first_setup_status(self):
+    def attendance_first_setup_status(self, batch=""):
         """시트의 [처음 설정 한 번에 끝내기] 완료 표시 — 마법사 출결 탭이 폴링한다."""
         self._require_safe_gws_account_storage()
         # 폴마다 부르는 네트워크 명령이므로 제한 시간 없는 self._run() 대신
@@ -2486,31 +2676,59 @@ class Api:
         if not account:
             run, gws = self._resolve_gws_or_fail()
             account = engine.require_goedu_gws_session(run, gws)
+        # One server `current` per user action (CONN-30): this Editor's reads, write
+        # and read-back share it. The write and the read-back still ask the server's
+        # authorize (Drive metadata only) whether that exact binding is ACTIVE.
+        confirmed, wrote = [], []
+        def record():
+            if not confirmed:
+                confirmed.append(read_attendance_server_record(self._config_dir))
+            return confirmed[0]
+        def authorize():
+            current = record()
+            if current is None:
+                # Same result as loading an unbound record before this change.
+                raise AttendanceBindingError("ATTENDANCE_BINDING_UNVERIFIED")
+            return self._require_attendance_binding(current)
         def remote():
-            if not attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
+            if record() is None:
                 return None
             run, gws = self._resolve_attendance_goedu_gws_or_fail()
-            return roster.Sheet(self._config_dir, account, run, gws)
+            return roster.Sheet(self._config_dir, account, run, gws, record=record, authorize=authorize)
         def read():
             sheet = remote()
+            if sheet and wrote:
+                authorize()  # read-back after a write: the same binding must still be ACTIVE
             return sheet.read() if sheet else None
         def write(before, rows):
             sheet = remote()
             if sheet is None:
                 raise ValueError("출석부 연결을 확인하지 못했어요.")
-            self._require_attendance_binding()
+            wrote.append(True)
             sheet.write(before, rows)
         def record_failure(diagnostic):
             error = ScreenSafeError("학생명단 반영 결과를 확인하지 못했어요.")
             error.diagnostic_detail = json.dumps(diagnostic, ensure_ascii=True, sort_keys=True)
             _fail(error, 'sync_roster_editor', self._config_dir)
         return roster.Editor(self._config_dir, account, read, write, on_failure=record_failure,
-                             authorize_target=self._require_attendance_binding)
+                             authorize_target=authorize)
 
     @guarded
     def read_roster_editor(self, refresh=False, local_only=False, expected_revision=None):
-        return self._roster_editor().read(refresh is True, local_only=local_only is True,
-                                          expected_revision=expected_revision)
+        result = self._roster_editor().read(refresh is True, local_only=local_only is True,
+                                            expected_revision=expected_revision)
+        if result.get('state') == 'unavailable' and not self._attendance_session_saved():
+            # Before the attendance permission (step 8) no sheet can be read, and
+            # [다시 불러오기] only repeats that failure; show the no-workbook-yet view (OBS-16).
+            result = {**result, 'state': 'local', 'detail': '명단을 저장하면 출석부 연결 후 반영해요.'}
+        return result
+
+    def _attendance_session_saved(self):
+        from attendance_session_store import AttendanceSessionStore
+        try:
+            return AttendanceSessionStore(self._config_dir).path.exists()
+        except (OSError, ValueError):
+            return True
 
     @guarded
     def save_roster_editor(self, rows, expected_revision):
@@ -2523,7 +2741,7 @@ class Api:
                                              use_current_workbook=use_current_workbook is True)
 
     @guarded
-    def attendance_roster_status(self):
+    def attendance_roster_status(self, batch=""):
         """Read only roster completeness; student identities never reach the UI."""
         self._require_safe_gws_account_storage()
         run = self._attendance_remote_run()
@@ -2859,10 +3077,7 @@ class Api:
     def _run_attendance_chat_action(self, action):
         """긴 작업은 별도 잠금으로 직렬화하고 설치 기록 잠금은 짧게만 쓴다."""
 
-        from attendance_install_record import (
-            attendance_install_record_lock,
-            read_attendance_install_snapshot,
-        )
+        from attendance_install_record import attendance_install_record_lock
 
         record_path = paths.attendance_install_record_path(self._config_dir)
         timeout = self._deps.attendance_remote_work_timeout_seconds
@@ -2872,26 +3087,12 @@ class Api:
         # 출결 새 준비·연결 교체·Chat 작업은 같은 원격 작업 잠금을 쓴다. 반면
         # 설치 기록 파일은 처음 snapshot과 마지막 대조 순간에만 잠근다.
         with engine.attendance_remote_work_lock(self._config_dir, **lock_options):
-            resolved = (
-                self._resolve_attendance_goedu_gws_or_fail()
-                if attendance_record_exists(record_path)
-                else None
-            )
+            # One server `current` before the action (was three, CONN-30).
             with attendance_install_record_lock(record_path):
-                record_snapshot = (
-                    read_attendance_install_snapshot(record_path)
-                    if attendance_record_exists(record_path)
-                    else None
-                )
+                record_snapshot = read_attendance_server_snapshot(record_path)
 
             if record_snapshot is not None:
-                if resolved is None:
-                    # 파일이 없다고 본 직후 다른 과정이 새 연결을 놓은 드문 경우다.
-                    # 그 새 연결을 이 버튼이 우연히 이어 쓰지 않고 다시 눌러 확인시킨다.
-                    raise ScreenSafeError(
-                        "출결 연결이 방금 바뀌었어요. 현재 출결 상태를 다시 확인해 주세요."
-                    )
-                run, gws = resolved
+                run, gws = self._resolve_attendance_goedu_gws_or_fail()
                 self._require_attendance_binding(record_snapshot.record, purpose="health")
                 self._require_current_attendance_script(record_snapshot.record)
                 try:
@@ -2916,13 +3117,12 @@ class Api:
 
             if record_snapshot is not None:
                 with attendance_install_record_lock(record_path):
-                    changed = not attendance_record_exists(record_path)
-                    if not changed:
-                        current = read_attendance_install_snapshot(record_path)
-                        changed = (
-                            current.raw != record_snapshot.raw
-                            or current.sha256 != record_snapshot.sha256
-                        )
+                    # One server `current` after the action (was two).
+                    current = read_attendance_server_snapshot(record_path)
+                    changed = current is None or (
+                        current.raw != record_snapshot.raw
+                        or current.sha256 != record_snapshot.sha256
+                    )
                 if changed:
                     raise ScreenSafeError(
                         "Chat 작업 중 다른 창에서 출결 연결이 바뀌었어요. "
@@ -2991,7 +3191,7 @@ class Api:
             )
 
     @guarded
-    def attendance_chat_status(self):
+    def attendance_chat_status(self, batch=""):
         from dashboard import central_chat
         # 상태 조회는 화면에 보여 줄 값만 읽고, Google 시트는 바꾸지 않는다.
         if attendance_record_exists(paths.attendance_install_record_path(self._config_dir)):
@@ -3016,6 +3216,8 @@ class Api:
                 gws_executable=gws,
             )
             reason = str(value.get("reason") or "")
+            if value.get("read_pending") is True:
+                raise recovery.RetryableOperationError("TRANSIENT_READ", reason or "Chat status read is delayed")
             if reason == central_chat.CONFIG_VALUE_MISSING_MESSAGE:
                 # 설정 탭을 제대로 읽었는데 값이 비어 있는 결정적 상태는 다시 읽어도
                 # 같으므로 한 번에 멈추고 사람 행동을 안내한다(2026-09-04).
@@ -3063,16 +3265,29 @@ class Api:
                     "학급 단톡방 연결을 위한 Google 확인을 다시 진행하고 있어요.",
                 ) from error
 
+        def start_connect_after_login_read():
+            try:
+                return start_connect()
+            except ScreenSafeError as error:
+                # Same as attendance_chat_spaces: an unreadable login status is read
+                # before start_auth sends anything, so it stays in the three-cycle read.
+                if isinstance(error.__cause__, engine.GoogleAuthStatusReadError):
+                    raise recovery.RetryableOperationError(
+                        "GOOGLE_AUTH_STATUS_READ",
+                        "현재 Google 로그인 상태를 확인하지 못해 학급 단톡방 연결을 시작하지 못했어요.",
+                    ) from error
+                raise
+
         auth_url = self._attendance_operation(
             "attendance_chat_connect",
             "학급 단톡방 연결을 시작하지 못했어요.",
-            start_connect,
+            start_connect_after_login_read,
             retry_states=frozenset(),
         )
         return self._open_external_url(auth_url)
 
     @guarded
-    def attendance_chat_spaces(self):
+    def attendance_chat_spaces(self, batch=""):
         from dashboard import central_chat
 
         def read_spaces():
@@ -3371,21 +3586,23 @@ class Api:
         )
 
     @guarded
-    def list_calendars(self):
+    def list_calendars(self, batch=""):
         run, gws = self._resolve_gws_or_fail()
         return engine.list_calendars(run, gws, **self._network_recovery_options())
 
     @guarded
-    def list_tasklists(self):
+    def list_tasklists(self, batch=""):
         run, gws = self._resolve_gws_or_fail()
         return engine.list_tasklists(run, gws, **self._network_recovery_options())
 
     @guarded
-    def google_target_statuses(self, targets):
+    def google_target_statuses(self, targets, batch=""):
         if not isinstance(targets, dict):
             raise ValueError("저장된 연결 정보를 확인해 주세요")
         run, gws = self._resolve_gws_or_fail()
         auth = engine.gws_auth_status(run, gws, config_dir=self._config_dir)
+        if auth.get("authorization_state") == "check_failed":
+            raise engine.GoogleAuthStatusReadError("Google identity observation is incomplete")
         return engine.google_target_statuses(run, gws, targets, auth=auth)
 
     @guarded
@@ -3697,9 +3914,18 @@ class Api:
             # One actual observation supplies both completion and the screen.
             # A second token refresh could be slower or fail after the first succeeded.
             status = self._google_status_payload(explicit_login=True)
+            for delay in recovery.NETWORK_DELAYS[1:]:
+                if status.get("authorization_state") != "check_failed":
+                    break
+                (self._deps.recovery_sleeper or time.sleep)(delay)
+                status = self._google_status_payload(explicit_login=True)
             snapshot = {**snapshot, "google_status": status,
                         "local_settings_error": status.get("local_settings_error", "")}
-            if status.get("authorization_state") != "ready":
+            if status.get("authorization_state") == "check_failed":
+                # Browser completion is retained; no new login is required just
+                # because its read-only verification exhausted the retry budget.
+                snapshot = {**snapshot, "ok": None, "verification_pending": True, "url": ""}
+            elif status.get("authorization_state") != "ready":
                 state = status.get("authorization_state")
                 snapshot = {**snapshot, "ok": False, "error_code": (
                     "GWS_CONSENT_INCOMPLETE" if state == "reauth_required" else

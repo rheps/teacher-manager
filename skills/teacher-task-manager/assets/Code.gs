@@ -1,6 +1,6 @@
 /**
  * 출결 신고서 자동화 · 기존 Google Docs 템플릿 유지
- * 버전: 5.13.7
+ * 버전: 5.13.13
  *   (아래 APP_VERSION과 항상 같아야 한다. 버전을 올릴 때 두 곳을 함께 고친다 — 테스트가 대조 검사함)
  * for Google Sheets + Google Docs + Google Tasks
  *
@@ -12,7 +12,7 @@
  */
 
 const APP_NAME = '출결 신고서 자동화';
-const APP_VERSION = '5.13.7';
+const APP_VERSION = '5.13.13';
 // 제작자 정보는 설정 시트가 아니라 코드에 고정한다.
 // 설정 시트에 두면 사용자가 지웠을 때 되살릴 방법이 없다.
 const APP_AUTHOR_NAME = 'Big-Silver EDU LAB (http://big-silver.xyz)\n부천 중원고등학교 김대은';
@@ -46,6 +46,17 @@ const MONTHLY_ATTENDANCE_LAST_DATA_COL = 13;      // M (AI 입력 표시까지�
 const STRIPE_END_COL  = 13;      // A(1)~M(13)
 const STRIPE_COLOR_WHITE = '#ffffff';
 const STRIPE_COLOR_GRAY  = '#bdbdbd'; // 구글 시트 팔레트 '회색' 중앙 톤 근사값
+// 날짜 줄무늬는 조건부 서식이다. 행마다 칠한 색은 정렬 때 행을 따라가 날짜와 어긋났다.
+// INDIRECT로 A3·A2 기준을 고정해 첫 자료 행을 넣거나 지워도 규칙이 깨지지 않는다.
+// attendance_sheet_layout.py의 STRIPE_RULES와 같은 식이다.
+const DATE_STRIPE_RULES = Object.freeze([
+  Object.freeze({
+    formula: '=AND(COUNTA($A3:$M3)>0,ISODD(SUMPRODUCT((INDIRECT("A3:A"&ROW())<>"")'
+      + '*(INDIRECT("A3:A"&ROW())<>INDIRECT("A2:A"&(ROW()-1))))))',
+    color: STRIPE_COLOR_GRAY
+  }),
+  Object.freeze({ formula: '=ROW()>=3', color: STRIPE_COLOR_WHITE })
+]);
 const ATTENDANCE_AI_INTERACTIONS_URL =
   'https://generativelanguage.googleapis.com/v1beta/interactions';
 const ATTENDANCE_AI_MODEL = 'gemini-3.5-flash-lite';
@@ -147,17 +158,17 @@ function onOpen() {
     .addItem('선택 행 미제출 서류 Google Tasks에 추가하기', 'addSelectedRowToTasks')
     .addItem('선택 행 미제출 서류 Google Chat 개인톡 보내기', 'sendSelectedRowsChatNow')
     .addSeparator()
+    .addItem('날짜별 정렬·음영 다시 맞추기', 'sortActiveMonthByDateAndStripes')
+    .addSeparator()
     .addItem('ⓘ 만든 사람 / 버전', 'showAbout')
     .addToUi();
 
-  ui.createMenu('교육청 메신저 정리·발송')
+  ui.createMenu('경기도교육청 메신저(Brity) 정리ㆍ발송')
     // 탭 열기 항목은 두지 않는다 — 시트 탭을 누르면 되는 일이라 메뉴 중복이다 (사용자 결정 2026-07-21).
     .addItem('메신저 쪽지 내용 Google Chat으로 개인톡 보내기', 'sendMessengerPersonalMessages')
     .addItem('메신저 쪽지 내용 Google Chat으로 단체톡 보내기', 'sendMessengerClassMessages')
     .addItem('메신저 쪽지 내용 Google Chat으로 개인톡+단체톡 보내기', 'sendMessengerAllMessages')
-    .addSeparator()
-    .addItem('Google Chat 발송 기록 보기', 'openChatLogSheet')
-    .addItem('Google Chat 발송 연결 끊기', 'disconnectCentralChatSender')
+    // 발송 기록 보기·발송 연결 끊기는 메뉴에서 뺐다(사용자 결정 2026-09-29). 함수는 남긴다.
     .addToUi();
 }
 
@@ -1010,6 +1021,7 @@ function applyInputSheetFormatting_(sh) {
     // B열·C~D열·F~H열에 옅은 색을 따로 칠했는데, 그 칸에서 줄무늬가 지워져
     // 한 날짜 덩어리가 A열부터 M열까지 이어지지 않고 구멍이 뚫렸다(2026-07-27).
     // 어느 칸에 적는지는 그 칸을 누를 때 나오는 드롭다운 화살표로 알 수 있다.
+    applyDateStripeRules_(sh);
 
     const categoryRule = SpreadsheetApp.newDataValidation().requireValueInList(['질병','미인정','기타','출석인정'], true).setAllowInvalid(false).build();
     const kindRule = SpreadsheetApp.newDataValidation().requireValueInList(['결석함','지각함','조퇴함','결과함'], true).setAllowInvalid(false).build();
@@ -1043,11 +1055,123 @@ function getAttendanceAiCalendarYear_(schoolYear, month) {
   return Number(schoolYearText) + (monthNumber <= 2 ? 1 : 0);
 }
 
-function buildAttendanceAiGeminiRequest_(sentence, context) {
+// The class roster (number and name only, never email) goes to Gemini with every
+// request so a given name or nickname ("유빈이가") resolves to one roster row (R12-1).
+function attendanceAiRosterStudentRule_() {
+  return (
+    'student에는 roster 목록에서 문장이 가리키는 학생 한 명의 student 값(번호와 이름, 예: 3홍길동)을 그대로 적으세요. ' +
+    '문장에는 번호, 성을 뺀 이름, 이름 뒤의 이, 조사(이·가·은·는·을·를·도·랑 등)가 붙을 수 있습니다. ' +
+    '같은 이름의 학생이 둘 이상인데 번호나 성이 없어 한 명으로 정할 수 없거나 roster에 없는 학생이면 ' +
+    '추측해서 고르지 말고 그 학생의 기록을 넣지 마세요.'
+  );
+}
+
+function attendanceAiRosterForGemini_(rosterRows) {
+  const seen = new Set();
+  return (Array.isArray(rosterRows) ? rosterRows : []).map(row => {
+    if (!Array.isArray(row)) return null;
+    const number = String(row[0] === null || row[0] === undefined ? '' : row[0]).trim();
+    const name = String(row[1] === null || row[1] === undefined ? '' : row[1]).trim();
+    const student = combineStudentNumberAndName_(number, name);
+    if (!student || seen.has(student)) return null;
+    seen.add(student);
+    return { student: student, number: number, name: name };
+  }).filter(Boolean);
+}
+
+function attendanceAiSentenceHasIdentity_(sentence, identity, blockedSuffixes) {
+  const text = String(sentence || '');
+  const particles = [
+    '에게서','한테서','께서','으로','에게','한테','부터','까지','이랑','랑','하고',
+    '은','는','이','가','을','를','와','과','의','께','도','만','로'
+  ];
+  const isIdentityCharacter = character => (
+    !!character && /[0-9A-Za-z가-힣]/.test(character)
+  );
+  const hasBoundaryOrParticle = value => (
+    !isIdentityCharacter(value.charAt(0))
+    || particles.some(particle => (
+      value.indexOf(particle) === 0
+      && !isIdentityCharacter(value.charAt(particle.length))
+    ))
+  );
+  if (!identity) return false;
+  let searchFrom = 0;
+  while (searchFrom <= text.length - identity.length) {
+    const foundAt = text.indexOf(identity, searchFrom);
+    if (foundAt < 0) return false;
+    searchFrom = foundAt + 1;
+    if (isIdentityCharacter(text.charAt(foundAt - 1))) continue;
+    const tail = text.slice(foundAt + identity.length);
+    if ((blockedSuffixes || []).some(suffix => suffix && tail.indexOf(suffix) === 0)) continue;
+    if (hasBoundaryOrParticle(tail)) return true;
+    if (tail.indexOf('학생') === 0 && hasBoundaryOrParticle(tail.slice(2))) return true;
+  }
+  return false;
+}
+
+// Given name = Korean full name of 3+ syllables without its first syllable (surname).
+function attendanceAiGivenName_(student) {
+  const name = String(student && student.name || '');
+  return /^[가-힣]{3,}$/.test(name) ? name.slice(1) : '';
+}
+
+// A given name ("유빈", "유빈이", "유빈이가") identifies a student only when no other
+// roster student shares it. Returns false for an ambiguous or missing given name.
+function attendanceAiGivenNameMentioned_(sentence, student, roster) {
+  const given = attendanceAiGivenName_(student);
+  if (!given) return false;
+  const others = (roster || []).filter(other => other.combined !== student.combined);
+  if (others.some(other => attendanceAiGivenName_(other) === given || other.name === given)) {
+    return false;
+  }
+  const blocked = [];
+  others.forEach(other => {
+    [attendanceAiGivenName_(other), other.name].forEach(value => {
+      if (value && value !== given && value.indexOf(given) === 0) blocked.push(value.slice(given.length));
+    });
+  });
+  return attendanceAiSentenceHasIdentity_(sentence, given, blocked)
+    || attendanceAiSentenceHasIdentity_(sentence, given + '이', blocked
+      .filter(suffix => suffix.indexOf('이') === 0).map(suffix => suffix.slice(1)));
+}
+
+function attendanceAiNumberMentioned_(sentence, student) {
+  return new RegExp(
+    '(^|[^0-9])' + String(student.number).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*번([^0-9]|$)'
+  ).test(String(sentence || ''));
+}
+
+// A given name mentioned in the sentence that two or more roster students share,
+// with none of them named by full name, number+name or number (R12-1).
+function attendanceAiAmbiguousGivenNameMentioned_(sentence, roster) {
+  const groups = {};
+  (roster || []).forEach(student => {
+    const given = attendanceAiGivenName_(student);
+    if (given) (groups[given] = groups[given] || []).push(student);
+  });
+  return Object.keys(groups).some(given => {
+    const sharing = groups[given];
+    if (sharing.length < 2) return false;
+    const mentioned = attendanceAiSentenceHasIdentity_(sentence, given, [])
+      || attendanceAiSentenceHasIdentity_(sentence, given + '이', []);
+    if (!mentioned) return false;
+    return !sharing.some(student => (
+      attendanceAiSentenceHasIdentity_(sentence, student.name, [])
+      || attendanceAiSentenceHasIdentity_(sentence, student.combined, [])
+      || attendanceAiNumberMentioned_(sentence, student)
+    ));
+  });
+}
+
+function buildAttendanceAiGeminiRequest_(sentence, context, rosterRows) {
+  const roster = attendanceAiRosterForGemini_(rosterRows);
+  const studentSchema = { type: 'string', minLength: 1 };
+  if (roster.length) studentSchema.enum = roster.map(row => row.student);
   const recordProperties = {
     date: { type: 'string', format: 'date' },
     end_date: { type: 'string', format: 'date' },
-    student: { type: 'string', minLength: 1 },
+    student: studentSchema,
     category: { type: 'string', enum: [''].concat(ATTENDANCE_AI_CATEGORIES) },
     kind: { type: 'string', enum: [''].concat(ATTENDANCE_AI_KINDS) },
     reason: { type: 'string' },
@@ -1063,9 +1187,11 @@ function buildAttendanceAiGeminiRequest_(sentence, context) {
         '날짜가 없거나 오늘이면 기준 오늘 날짜를 date와 end_date에 적으세요. ' +
         '원문에 없는 category, kind, reason, period만 빈 문자열로 적고 추측하지 마세요. ' +
         '원문에 값이 있지만 서로 충돌하거나 허용 목록 밖이면 빈칸으로 숨기지 마세요. ' +
-        'requested_student_count에는 서로 다른 학생 수를 적으세요.'
+        'requested_student_count에는 서로 다른 학생 수를 적으세요. ' +
+        attendanceAiRosterStudentRule_()
       ),
       sentence: sentence,
+      roster: roster,
       today: String(context.today || ''),
       school_year: String(context.schoolYear),
       calendar_year: getAttendanceAiCalendarYear_(context.schoolYear, context.month),
@@ -1203,37 +1329,9 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext, holiday
     };
   }).filter(row => row && row.number && row.name && row.combined);
   const sentence = sheetContext.sentence;
-  const particles = [
-    '에게서','한테서','께서','으로','에게','한테','부터','까지',
-    '은','는','이','가','을','를','와','과','의','께','도','만','로'
-  ];
-  const isIdentityCharacter = character => (
-    !!character && /[0-9A-Za-z가-힣]/.test(character)
+  const hasExactIdentityMention = (identity, blockedSuffixes) => (
+    attendanceAiSentenceHasIdentity_(sentence, identity, blockedSuffixes)
   );
-  const hasExactIdentityMention = (identity, blockedSuffixes) => {
-    let searchFrom = 0;
-    while (searchFrom <= sentence.length - identity.length) {
-      const foundAt = sentence.indexOf(identity, searchFrom);
-      if (foundAt < 0) return false;
-      searchFrom = foundAt + 1;
-      if (isIdentityCharacter(sentence.charAt(foundAt - 1))) continue;
-
-      const tail = sentence.slice(foundAt + identity.length);
-      if (blockedSuffixes.some(suffix => tail.indexOf(suffix) === 0)) continue;
-      const hasBoundaryOrParticle = value => (
-        !isIdentityCharacter(value.charAt(0))
-        || particles.some(particle => (
-          value.indexOf(particle) === 0
-          && !isIdentityCharacter(value.charAt(particle.length))
-        ))
-      );
-      if (hasBoundaryOrParticle(tail)) return true;
-      if (tail.indexOf('학생') === 0 && hasBoundaryOrParticle(tail.slice(2))) {
-        return true;
-      }
-    }
-    return false;
-  };
   const studentAppearsInSentence = student => {
     const longerRosterNameSuffixes = roster
       .filter(other => (
@@ -1247,7 +1345,8 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext, holiday
     );
     return hasExactIdentityMention(student.name, longerRosterNameSuffixes)
       || hasExactIdentityMention(student.combined, [])
-      || numberPattern.test(sentence);
+      || numberPattern.test(sentence)
+      || attendanceAiGivenNameMentioned_(sentence, student, roster);
   };
 
   const matchedStudents = new Set();
@@ -1268,12 +1367,7 @@ function validateAttendanceAiRecords_(payload, rosterRows, sheetContext, holiday
     if (!studentText) {
       return null;
     }
-    const matches = roster.filter(student => (
-      studentText === student.combined
-      || studentText === student.name
-      || studentText === student.number
-      || studentText === student.number + '번'
-    ));
+    const matches = roster.filter(student => attendanceAiStudentTextMatches_(studentText, student));
     if (
       matches.length !== 1
       || !studentAppearsInSentence(matches[0])
@@ -1391,6 +1485,12 @@ function validateAttendanceAiRecordsDetailed_(
   }).filter(row => row && row.number && row.name && row.combined);
   const calendarYear = getAttendanceAiCalendarYear_(sheetContext.schoolYear, sheetContext.month);
   const month = Number(sheetContext.month);
+  if (attendanceAiAmbiguousGivenNameMentioned_(sheetContext.sentence, roster)) {
+    return failed(
+      'ambiguous_student',
+      '이름이 같은 학생이 여러 명이라 누구인지 정하지 못했어요. 입력칸을 지우고 번호를 함께 적어 다시 입력해 주세요(예: 3번 이름).'
+    );
+  }
 
   for (let index = 0; index < payload.records.length; index++) {
     const record = payload.records[index];
@@ -1406,16 +1506,25 @@ function validateAttendanceAiRecordsDetailed_(
     }
 
     const studentText = record.student.trim();
-    const matches = roster.filter(student => (
-      studentText === student.combined
-      || studentText === student.name
-      || studentText === student.number
-      || studentText === student.number + '번'
-    ));
+    const matches = roster.filter(student => attendanceAiStudentTextMatches_(studentText, student));
     if (!studentText || matches.length !== 1) {
       return failed(
         'student',
         '학생명단에서 학생을 한 명으로 찾지 못했습니다. 이름이나 번호를 확인해 주세요.'
+      );
+    }
+    // With the roster enum Gemini must name a roster student even for a name that is
+    // not on the roster; say so instead of the generic notice (R12-1).
+    const named = matches[0];
+    if (!(
+      attendanceAiSentenceHasIdentity_(sheetContext.sentence, named.name, [])
+      || attendanceAiSentenceHasIdentity_(sheetContext.sentence, named.combined, [])
+      || attendanceAiNumberMentioned_(sheetContext.sentence, named)
+      || attendanceAiGivenNameMentioned_(sheetContext.sentence, named, roster)
+    )) {
+      return failed(
+        'student',
+        '문장에 적힌 학생을 학생명단에서 찾지 못했어요. 입력칸을 지우고 학생명단의 이름이나 번호로 다시 입력해 주세요.'
       );
     }
 
@@ -1490,8 +1599,8 @@ function buildAttendanceAiBatchUpdate_(records, writeContext) {
       textCell(record.reason),
       textCell(record.period)
     ];
-    // 신고서(G)는 비워 두고 첨부(H)는 미제출로 시작한다. I~L은 비워 둔다.
-    values.push({});
+    // 신고서(G)와 첨부(H)는 미제출로 시작한다(R11-3). I~L은 비워 둔다.
+    values.push({ userEnteredValue: { stringValue: '미제출' } });
     values.push({ userEnteredValue: { stringValue: '미제출' } });
     // M열에만 AI가 넣은 줄이라고 적는다.
     // 배경색은 건드리지 않는다 — 그 자리는 날짜 줄무늬가 쓴다.
@@ -1527,7 +1636,10 @@ function isAttendanceAiExistingUpdateSentence_(sentence) {
 }
 
 /** 기존 줄 수정 문장을 새 줄 추가와 다른 모양으로 해석하게 한다. */
-function buildAttendanceAiExistingUpdateGeminiRequest_(sentence, context) {
+function buildAttendanceAiExistingUpdateGeminiRequest_(sentence, context, rosterRows) {
+  const roster = attendanceAiRosterForGemini_(rosterRows);
+  const studentSchema = { type: 'string' };
+  if (roster.length) studentSchema.enum = [''].concat(roster.map(row => row.student));
   const fieldNames = [
     'date','student','category','kind','reason','period',
     'report_status','attachment_status'
@@ -1552,9 +1664,11 @@ function buildAttendanceAiExistingUpdateGeminiRequest_(sentence, context) {
         '제출 또는 미제출이라고만 하고 신고서라는 말이 없으면 attachment_status로 보세요. ' +
         'category는 질병·미인정·기타·출석인정, kind는 결석함·지각함·조퇴함·결과함, ' +
         'period는 빈 값·1~7교시·조회·종례, 신고서와 첨부는 빈 값·제출·미제출·해당없음만 쓰세요. ' +
-        '날짜와 학생은 문장에 적힌 값을 그대로 근거로 삼고 추측하지 마세요.'
+        '날짜와 학생은 문장에 적힌 값을 그대로 근거로 삼고 추측하지 마세요. ' +
+        '학생(student와 학생 칸의 old_value·new_value)은 ' + attendanceAiRosterStudentRule_()
       ),
       sentence: String(sentence || ''),
+      roster: roster,
       today: String(context.today || ''),
       school_year: String(context.schoolYear || ''),
       calendar_year: getAttendanceAiCalendarYear_(context.schoolYear, context.month),
@@ -1589,7 +1703,7 @@ function buildAttendanceAiExistingUpdateGeminiRequest_(sentence, context) {
               type: 'object',
               additionalProperties: false,
               properties: {
-                student: { type: 'string' },
+                student: studentSchema,
                 changes: {
                   type: 'array',
                   minItems: 1,
@@ -1691,19 +1805,32 @@ function attendanceAiUpdateRoster_(rosterRows) {
   }).filter(Boolean);
 }
 
+// Gemini returns the student as "5번 김OO" (number, 번, space, name) as often as "5번"
+// or the bare name; that form named exactly one roster row but was rejected (R11-1).
+function attendanceAiStudentTextMatches_(text, student) {
+  const value = String(text === null || text === undefined ? '' : text).trim();
+  if (!value || !student) return false;
+  if (
+    value === student.combined
+    || value === student.name
+    || value === student.number
+    || value === student.number + '번'
+  ) {
+    return true;
+  }
+  const compact = value.replace(/\s+/g, '');
+  return compact === student.number + '번' + student.name;
+}
+
 function attendanceAiResolveUpdateStudent_(value, roster) {
   const text = String(value === null || value === undefined ? '' : value).trim();
-  const matches = (roster || []).filter(student => (
-    text === student.combined
-    || text === student.name
-    || text === student.number
-    || text === student.number + '번'
-  ));
+  const matches = (roster || []).filter(student => attendanceAiStudentTextMatches_(text, student));
   return matches.length === 1 ? matches[0] : null;
 }
 
-function attendanceAiSentenceMentionsStudent_(sentence, student) {
+function attendanceAiSentenceMentionsStudent_(sentence, student, roster) {
   if (!student) return false;
+  if (roster && attendanceAiGivenNameMentioned_(sentence, student, roster)) return true;
   const text = String(sentence || '');
   if (text.indexOf(student.combined) !== -1 || text.indexOf(student.name) !== -1) {
     return true;
@@ -1732,7 +1859,7 @@ function attendanceAiNormalizeExistingUpdateValue_(
   }
   if (field === 'student') {
     const student = attendanceAiResolveUpdateStudent_(text, roster);
-    if (!student || !attendanceAiSentenceMentionsStudent_(sentence, student)) return null;
+    if (!student || !attendanceAiSentenceMentionsStudent_(sentence, student, roster)) return null;
     return { comparable: student.combined, value: student.combined };
   }
   if (field === 'category' && ATTENDANCE_AI_CATEGORIES.indexOf(text) < 0) return null;
@@ -1836,7 +1963,10 @@ function planAttendanceAiExistingUpdates_(
       }
     } else {
       sourceStudent = attendanceAiResolveUpdateStudent_(target.student, roster);
-      if (!sourceStudent || !attendanceAiSentenceMentionsStudent_(context.sentence, sourceStudent)) {
+      if (!sourceStudent || !attendanceAiSentenceMentionsStudent_(context.sentence, sourceStudent, roster)) {
+        if (attendanceAiAmbiguousGivenNameMentioned_(context.sentence, roster)) {
+          return failed('ambiguous_student', '이름이 같은 학생이 여러 명이라 누구인지 정하지 못했어요. 입력칸을 지우고 번호를 함께 적어 다시 입력해 주세요(예: 3번 이름).');
+        }
         return failed('student', '학생명단에서 수정할 학생을 한 명으로 찾지 못했습니다.');
       }
       targetStudents.add(sourceStudent.combined);
@@ -2135,6 +2265,23 @@ function attendanceAiSkipLog_(reason) {
   } catch (err) { /* 기록 실패는 동작에 영향 주지 않는다 */ }
 }
 
+// Gemini answers 429 (free-tier 15 requests/minute) and 503 ("high demand") for a
+// moment; one such reply dropped the teacher's sentence (R11-1). The call happens
+// before any Sheet write, so these transient codes are tried at most 3 times.
+function callAttendanceAiGeminiWithRetry_(send, sleep) {
+  const transient = [429, 500, 502, 503, 504];
+  const delaysMs = [5000, 15000];
+  let code = 0;
+  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
+    if (attempt) sleep(delaysMs[attempt - 1]);
+    const reply = send();
+    code = reply.code;
+    if (code >= 200 && code < 300) return JSON.parse(reply.text());
+    if (transient.indexOf(code) < 0) break;
+  }
+  throw new Error('Gemini HTTP ' + code);
+}
+
 function handleAttendanceAiEdit(e, testPorts) {
   // 설치형 감지기는 실제 편집자 주소가 숨겨질 수 있다. 주소가 보이면 허용 계정인지
   // 확인하고, 주소가 안 보여도 감지기를 만든 계정은 허용 계정인지 따로 확인한다.
@@ -2220,20 +2367,19 @@ function handleAttendanceAiEdit(e, testPorts) {
         // 화면 안내가 막혀도 출결행 안전 판단은 그대로 유지한다.
       }
     },
-    callGemini: (request, apiKey) => {
-      const response = UrlFetchApp.fetch(ATTENDANCE_AI_INTERACTIONS_URL, {
-        method: 'post',
-        contentType: 'application/json',
-        headers: { 'x-goog-api-key': apiKey },
-        payload: JSON.stringify(request),
-        muteHttpExceptions: true
-      });
-      const responseCode = response.getResponseCode();
-      if (responseCode < 200 || responseCode >= 300) {
-        throw new Error('Gemini HTTP ' + responseCode);
-      }
-      return JSON.parse(response.getContentText());
-    },
+    callGemini: (request, apiKey) => callAttendanceAiGeminiWithRetry_(
+      () => {
+        const response = UrlFetchApp.fetch(ATTENDANCE_AI_INTERACTIONS_URL, {
+          method: 'post',
+          contentType: 'application/json',
+          headers: { 'x-goog-api-key': apiKey },
+          payload: JSON.stringify(request),
+          muteHttpExceptions: true
+        });
+        return { code: response.getResponseCode(), text: () => response.getContentText() };
+      },
+      milliseconds => Utilities.sleep(milliseconds)
+    ),
     readWriteState: targetSheet => ({
       headerRow: targetSheet
         .getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, 12)
@@ -2369,7 +2515,7 @@ function handleAttendanceAiEdit(e, testPorts) {
     }
   } catch (err) {
     attendanceAiSkipLog_('2행 제목 줄을 읽지 못함: ' + (err && err.message ? err.message : err));
-    ports.showMessage('월별 출결표를 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.');
+    ports.showMessage('월별 출결표를 읽지 못했습니다. 잠시 뒤 입력칸을 지우고 같은 문장을 다시 입력해 주세요.');
     return { status: 'ignored' };
   }
 
@@ -2387,7 +2533,7 @@ function handleAttendanceAiEdit(e, testPorts) {
     const today = String(ports.getTodayDate() || '').trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) {
       attendanceAiSkipLog_('한국 기준 오늘 날짜를 확인하지 못함');
-      ports.showMessage('오늘 날짜를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.');
+      ports.showMessage('오늘 날짜를 확인하지 못했습니다. 잠시 뒤 입력칸을 지우고 같은 문장을 다시 입력해 주세요.');
       return { status: 'check_required' };
     }
     const requestContext = {
@@ -2411,10 +2557,10 @@ function handleAttendanceAiEdit(e, testPorts) {
 
     editingExisting = isAttendanceAiExistingUpdateSentence_(sentence);
     if (editingExisting) {
-      const request = buildAttendanceAiExistingUpdateGeminiRequest_(sentence, requestContext);
+      const rosterRows = ports.readRosterRows(source, sheetContext);
+      const request = buildAttendanceAiExistingUpdateGeminiRequest_(sentence, requestContext, rosterRows);
       const interaction = ports.callGemini(request, apiKey);
       const payload = extractAttendanceAiGeminiPayload_(interaction);
-      const rosterRows = ports.readRosterRows(source, sheetContext);
       const existingState = ports.readExistingAttendanceRows(sheet);
       let plan;
       try {
@@ -2495,7 +2641,8 @@ function handleAttendanceAiEdit(e, testPorts) {
       };
     }
 
-    const request = buildAttendanceAiGeminiRequest_(sentence, requestContext);
+    const rosterRows = ports.readRosterRows(source, sheetContext);
+    const request = buildAttendanceAiGeminiRequest_(sentence, requestContext, rosterRows);
     const interaction = ports.callGemini(request, apiKey);
     const payload = extractAttendanceAiGeminiPayload_(interaction);
     const crossesIntoAnotherMonth = (
@@ -2522,7 +2669,6 @@ function handleAttendanceAiEdit(e, testPorts) {
       );
       return { status: 'check_required' };
     }
-    const rosterRows = ports.readRosterRows(source, sheetContext);
     const validation = validateAttendanceAiRecordsDetailed_(
       payload,
       rosterRows,
@@ -2597,7 +2743,10 @@ function handleAttendanceAiEdit(e, testPorts) {
               ? '수정 결과를 확인하지 못했습니다. 바로 다시 입력하지 말고 출결표를 먼저 확인해 주세요.'
               : '등록 결과를 확인하지 못했습니다. 바로 다시 입력하지 말고 출결표에 줄이 생겼는지 먼저 확인해 주세요.'
           )
-        : 'AI 출결 입력을 처리하지 못했습니다. 입력 문장을 남겨 두었습니다. 잠시 뒤 다시 시도해 주세요.'
+        // The same text typed again over the kept sentence fires no edit event (R11-7).
+        : String(err && err.message ? err.message : err) === 'Gemini HTTP 429'
+          ? 'Gemini 무료 사용량(1분에 15번)을 넘었어요. 입력 문장을 남겨 두었습니다. 1분 뒤 입력칸을 지우고 같은 문장을 다시 입력해 주세요.'
+          : 'AI 출결 입력을 처리하지 못했습니다. 입력 문장을 남겨 두었습니다. 잠시 뒤 입력칸을 지우고 같은 문장을 다시 입력해 주세요.'
     );
     return { status: 'check_required' };
   } finally {
@@ -3775,9 +3924,17 @@ function sortMonthlyAttendanceRows_(sheet, mode) {
       .getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 2, lastRow - 2, 1)
       .getValues();
     const largestSortNumber = Number.MAX_SAFE_INTEGER;
-    const numberValues = studentValues.map(row => {
+    // 날짜 정렬은 A열 값 대신 `날짜(yyyymmdd) × 10000 + 번호` 열쇠로 한다. A열을 그대로
+    // 정렬하면 글자로 적힌 날짜가 모든 날짜 뒤로 가고, 빈 날짜가 앞에 올 수 있다.
+    const dayKeys = mode === 'date'
+      ? monthlyAttendanceDayKeys_(sheet.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 1, lastRow - 2, 1).getValues())
+      : null;
+    const numberValues = studentValues.map((row, index) => {
       const parsed = parseStudentLabel_(row[0]);
       const number = Number(parsed.number);
+      if (dayKeys) {
+        return [dayKeys[index] * 10000 + (Number.isSafeInteger(number) && number >= 0 && number < 9999 ? number : 9999)];
+      }
       return [
         Number.isSafeInteger(number) && number >= 0
           ? number
@@ -3793,7 +3950,6 @@ function sortMonthlyAttendanceRows_(sheet, mode) {
     helperRange.setValues(numberValues);
     const sortSpec = mode === 'date'
       ? [
-          { column: 1, ascending: true },
           { column: helperColumn, ascending: true },
           { column: 2, ascending: true }
         ]
@@ -3829,10 +3985,79 @@ function sortMonthlyAttendanceRows_(sheet, mode) {
     }
   }
   if (!sorted || !cleanupComplete) return false;
-  // Google 정렬은 기존 배경색도 각 행에 붙여 옮긴다. 새 날짜 순서에서 다시 칠하지
-  // 않으면 같은 날짜 묶음 안에 예전 회색·흰색이 섞여 남는다.
+  // 줄무늬는 조건부 서식이라 정렬 결과로 다시 계산된다. 규칙이 없거나 옛 모양이면 여기서 맞춘다.
   reStripeSheet_(sheet);
   return true;
+}
+
+/**
+ * A열 값마다 정렬용 날짜 열쇠(yyyymmdd)를 만든다. 날짜 값과 글자로 적힌 날짜를 같은
+ * 기준으로 비교한다. 연도가 없는 글자(`9/21`, `9월 21일`)는 이 탭의 날짜 값에서 가장
+ * 많이 쓴 연도를 쓴다. 날짜로 읽을 수 없는 글자는 날짜 뒤, 빈 날짜는 맨 뒤에 둔다.
+ */
+function monthlyAttendanceDayKeys_(columnValues) {
+  const years = {};
+  columnValues.forEach(row => {
+    const value = row[0];
+    if (value instanceof Date && !isNaN(value.getTime())) {
+      years[value.getFullYear()] = (years[value.getFullYear()] || 0) + 1;
+    }
+  });
+  const known = Object.keys(years).sort((a, b) => years[b] - years[a]);
+  const defaultYear = known.length ? Number(known[0]) : new Date().getFullYear();
+  const valid = (y, m, d) => {
+    const probe = new Date(y, m - 1, d);
+    return probe.getFullYear() === y && probe.getMonth() === m - 1 && probe.getDate() === d;
+  };
+  return columnValues.map(row => {
+    const value = row[0];
+    if (value instanceof Date && !isNaN(value.getTime())) {
+      return value.getFullYear() * 10000 + (value.getMonth() + 1) * 100 + value.getDate();
+    }
+    const text = String(value === null || value === undefined ? '' : value).trim();
+    if (!text) return 99999999;
+    const nums = (text.match(/\d+/g) || []).map(Number);
+    let y = 0, m = 0, d = 0;
+    const parts = text.match(/\d+/g) || [];
+    if (parts.length >= 3 && parts[0].length === 4) { y = nums[0]; m = nums[1]; d = nums[2]; }
+    else if (parts.length >= 3 && parts[2].length === 4) { y = nums[2]; m = nums[0]; d = nums[1]; }
+    else if (parts.length === 2) { y = defaultYear; m = nums[0]; d = nums[1]; }
+    return y && valid(y, m, d) ? y * 10000 + m * 100 + d : 99999998;
+  });
+}
+
+/**
+ * 메뉴 [날짜별 정렬·음영 다시 맞추기]: 지금 연 월별 출결 탭의 3행부터 마지막 줄까지를
+ * 날짜 → 번호 순으로 줄 전체(숨긴 L열 포함)를 옮겨 정렬하고 날짜 음영 규칙을 다시 맞춘다.
+ * 1행 AI 입력칸과 2행 제목은 건드리지 않는다(SHEET-MENU-01).
+ */
+function sortActiveMonthByDateAndStripes() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getActiveSheet();
+  const title = '날짜별 정렬·음영';
+  if (!isInputMonthSheet_(sheet)) {
+    spreadsheet.toast('월별 출결 탭(예: 9월)을 연 뒤 다시 눌러 주세요.', title, 6);
+    return;
+  }
+  if (sheet.getLastRow() < MONTHLY_ATTENDANCE_DATA_START_ROW) {
+    reStripeSheet_(sheet);
+    spreadsheet.toast('정렬할 출결 줄이 없어요.', title, 5);
+    return;
+  }
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(10000)) {
+    spreadsheet.toast('다른 작업이 진행 중이에요. 잠시 뒤 다시 눌러 주세요.', title, 6);
+    return;
+  }
+  try {
+    const sorted = sortMonthlyAttendanceRows_(sheet, 'date');
+    spreadsheet.toast(sorted
+      ? '날짜·번호 순으로 정렬하고 음영을 다시 맞췄어요.'
+      : '표 모양이 달라 정렬하지 않았어요. 필터를 끄고, M열 오른쪽에 적은 내용이 있으면 옮긴 뒤 다시 눌러 주세요.',
+      title, 6);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function getHolidaySheetName_() {
@@ -6316,7 +6541,7 @@ function onEdit(e) {
       }
     }
 
-    // A열을 포함한 편집/붙여넣기 때만 실행 → 성능 최적화
+    // A열 편집 때 줄무늬 규칙 범위만 확인한다(행 삽입으로 범위가 밀린 경우). 색은 칠하지 않는다.
     if (
       startCol <= 1
       && endCol >= 1
@@ -6328,57 +6553,55 @@ function onEdit(e) {
     console.log('onEdit error:', err);
   }
 }
-/** 핵심: A열의 '같은 날짜 블록'마다 교대로 색을 칠함 (A:L) */
+/** 월 탭의 날짜 줄무늬 조건부 서식을 확인한다. 행마다 색을 칠하지 않는다. */
 function reStripeSheet_(sheet) {
   if (shouldSkipSheet_(sheet)) return;
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow < MONTHLY_ATTENDANCE_DATA_START_ROW) return;
-
-  const endCol = Math.min(STRIPE_END_COL, sheet.getMaxColumns());
-  if (endCol < 1) return;
-
-  const numRows = lastRow - MONTHLY_ATTENDANCE_DATA_START_ROW + 1;
-  const stripeRange = sheet.getRange(
-    MONTHLY_ATTENDANCE_DATA_START_ROW,
-    1,
-    numRows,
-    endCol
-  );
-  const vals = stripeRange.getValues();
-  const bgs  = new Array(numRows);
-
-  let currentDate = null; // 현재 블록 기준 날짜
-  let groupIndex  = -1;   // 0,1,0,1… 토글
-
-  for (let r = 0; r < numRows; r++) {
-    const v = vals[r][0];
-    const isDate = (v instanceof Date) && !isNaN(v.getTime());
-    const rowHasContent = vals[r].some(cell => cell !== '' && cell !== null);
-
-    if (isDate) {
-      if (!currentDate || !isSameYMD_(currentDate, v)) {
-        currentDate = v;
-        groupIndex++;
-      }
-      const color = (groupIndex % 2 === 0) ? STRIPE_COLOR_WHITE : STRIPE_COLOR_GRAY;
-      bgs[r] = Array(endCol).fill(color);
-    } else if (rowHasContent && currentDate) {
-      // 병합 셀처럼 A열 날짜가 첫 줄에만 있는 경우 같은 날짜 블록으로 간주
-      const color = (groupIndex % 2 === 0) ? STRIPE_COLOR_WHITE : STRIPE_COLOR_GRAY;
-      bgs[r] = Array(endCol).fill(color);
-    } else {
-      currentDate = null;
-      bgs[r] = Array(endCol).fill(null);
-    }
-  }
-
-  stripeRange.setBackgrounds(bgs);
+  applyDateStripeRules_(sheet);
 }
 
-/** 날짜(연-월-일) 동일성 비교 */
-function isSameYMD_(d1, d2) {
-  return d1.getFullYear() === d2.getFullYear() &&
-         d1.getMonth()    === d2.getMonth() &&
-         d1.getDate()     === d2.getDate();
+function dateStripeFormulaKey_(value) {
+  return String(value || '').replace(/[\s$']/g, '').replace(/^=/, '').toLowerCase();
+}
+
+/** 우리가 넣는 날짜 줄무늬 규칙인지 본다. 예전 $A$3 모양 규칙도 같은 것으로 본다. */
+function isDateStripeRule_(rule) {
+  const condition = rule && typeof rule.getBooleanCondition === 'function'
+    ? rule.getBooleanCondition() : null;
+  if (!condition || condition.getCriteriaType() !== SpreadsheetApp.BooleanCriteria.CUSTOM_FORMULA) {
+    return false;
+  }
+  const key = dateStripeFormulaKey_((condition.getCriteriaValues() || [])[0]);
+  if (DATE_STRIPE_RULES.some(item => key === dateStripeFormulaKey_(item.formula))) return true;
+  return key.indexOf('and(') === 0 && key.indexOf('mod(sumproduct((') >= 0
+    && /,2\)=[01]\)$/.test(key);
+}
+
+// 정렬·행 삽입 뒤에도 Google 시트가 A열 날짜로 색을 다시 계산하게 조건부 서식 두 개를
+// 맨 뒤에 둔다. 선생님이 만든 다른 규칙은 순서와 우선순위를 그대로 둔다. 이미 맞으면 쓰지 않는다.
+function applyDateStripeRules_(sheet) {
+  const numRows = sheet.getMaxRows() - MONTHLY_ATTENDANCE_DATA_START_ROW + 1;
+  const endCol = Math.min(STRIPE_END_COL, sheet.getMaxColumns());
+  if (numRows < 1 || endCol < 1) return false;
+  const range = sheet.getRange(MONTHLY_ATTENDANCE_DATA_START_ROW, 1, numRows, endCol);
+  const wanted = range.getA1Notation();
+  const rules = sheet.getConditionalFormatRules();
+  const others = rules.filter(rule => !isDateStripeRule_(rule));
+  const tail = rules.slice(others.length);
+  const current = tail.length === DATE_STRIPE_RULES.length && tail.every((rule, index) => {
+    const condition = rule.getBooleanCondition();
+    const ranges = rule.getRanges();
+    return isDateStripeRule_(rule)
+      && dateStripeFormulaKey_(condition.getCriteriaValues()[0])
+        === dateStripeFormulaKey_(DATE_STRIPE_RULES[index].formula)
+      && String(condition.getBackground() || '').toLowerCase() === DATE_STRIPE_RULES[index].color
+      && ranges.length === 1 && ranges[0].getA1Notation() === wanted;
+  });
+  if (current) return false;
+  const ours = DATE_STRIPE_RULES.map(item => SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied(item.formula)
+    .setBackground(item.color)
+    .setRanges([range])
+    .build());
+  sheet.setConditionalFormatRules(others.concat(ours));
+  return true;
 }

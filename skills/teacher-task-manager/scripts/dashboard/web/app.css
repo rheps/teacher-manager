@@ -180,6 +180,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .row .name { font-weight:600; color:#333D4B; }
 .row .st { margin-left:auto; font-size:13.5px; color:var(--tm-faint); }
 .row .st.ok { color:var(--tm-green); font-weight:600; }
+/* 설정 점검 행: 사용자가 버튼을 눌러야 끝나는 항목은 주황(PEND-48). 다른 .st.warn 행의 회색은 그대로 둔다. */
+.row[data-settings-check] .st.warn { color:var(--tm-amber); font-weight:600; }
 .row .st.new { color:var(--tm-blue); font-weight:700; }
 .row .ver { color:var(--tm-faint); font-size:13px; font-weight:500; }
 .action-line { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:14px; }
@@ -621,6 +623,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .win-refresh.checking .ic { animation:connection-refresh-spin 1.2s linear infinite; }
 @keyframes connection-refresh-spin { to { transform:rotate(360deg); } }
 @media (prefers-reduced-motion:reduce) { .win-refresh.checking .ic { animation:none; } }
+.wizard-head { display:flex; align-items:flex-start; gap:12px; }
+.wizard-head h1 { flex:1; }
 .win-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; padding:20px 24px 28px; }
 .win-body .page { max-width:100%; }
 .about-brand { font-size:21px; font-weight:800; margin:2px 0 4px; }

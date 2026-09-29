@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from brity_bridge import paths, process_win, tool_runtime
-from brity_bridge.gemini_analyze import check_gemini_key
+from brity_bridge.gemini_analyze import cached_gemini_key_check
 from brity_bridge.google_account import (
     GOEDU_ACCOUNT_REQUIRED_MESSAGE,
     extract_email,
@@ -24,7 +24,8 @@ GEMINI_RATE_LIMIT_DETAIL = "Gemini 사용 한도에 도달했어요. 한도가 �
 HOTKEY_FIX = "설정에서 메신저 단축키를 다시 눌러 주세요."
 GOOGLE_LOGIN_FIX = "설정에서 Google 계정으로 로그인해 주세요."
 GWS_CLI_FIX = "설정에서 Google Workspace CLI를 준비해 주세요."
-HELPER_FIX = "Teacher Manager의 [설정]에서 [저장]을 눌러 메신저 단축키를 다시 켜 주세요."
+# The settings window saves automatically; it has no [저장] button (C11, R5-3).
+HELPER_FIX = "Teacher Manager의 [설정]에서 [메신저 단축키 다시 켜기]를 눌러 주세요."
 
 
 @dataclass
@@ -62,7 +63,7 @@ def _default_autostart_checker() -> bool:
 @dataclass
 class DoctorDeps:
     run_command: object = _default_run_command
-    gemini_checker: object = check_gemini_key
+    gemini_checker: object = cached_gemini_key_check
     find_helper_window: object = _default_find_helper_window
     autostart_checker: object = _default_autostart_checker
     gws_resolver: object = tool_runtime.resolve_gws_executable
@@ -203,6 +204,8 @@ def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
         bridge_settings.gemini_api_key, bridge_settings.gemini_model
     )
     common = {"card": "connect", "tab": "messenger", "target": "gemini_api_key"}
+    if key_status == "unchecked":
+        return CheckResult("connect.gemini-key", "Gemini API key", None, key_detail, **common)
     if key_status == "ok":
         return CheckResult("connect.gemini-key", "Gemini API key", True, "key가 정상이에요", **common)
     if key_status == "rate-limited":

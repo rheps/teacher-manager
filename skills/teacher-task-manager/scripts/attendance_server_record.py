@@ -110,13 +110,21 @@ def record_exists(path):
     return read_record(path.parent) is not None
 
 
-def read_snapshot(path):
+def read_snapshot_or_none(path):
+    """One server `current`: the snapshot, or None when no ACTIVE binding (CONN-30)."""
     from attendance_install_record import InstallRecordSnapshot
     record = read_record(Path(path).parent)
     if record is None:
-        raise AttendanceBindingError('ATTENDANCE_BINDING_UNVERIFIED')
+        return None
     raw = (json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
     return InstallRecordSnapshot(raw, record, hashlib.sha256(raw).hexdigest())
+
+
+def read_snapshot(path):
+    snapshot = read_snapshot_or_none(path)
+    if snapshot is None:
+        raise AttendanceBindingError('ATTENDANCE_BINDING_UNVERIFIED')
+    return snapshot
 
 
 def save_record(path, record, expected=None):

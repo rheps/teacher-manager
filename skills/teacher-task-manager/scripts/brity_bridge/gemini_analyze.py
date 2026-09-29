@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +18,7 @@ from brity_bridge.message_parse import MediaPart, MessageRecord
 from brity_bridge.rules_loader import load_analysis_rules
 
 API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MODEL_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}"
 TIMEOUT_SECONDS = 60.0
 LONG_TEXT_TRIGGER = 30000
 TEXT_CHUNK_SIZE = 24000
@@ -295,7 +298,7 @@ def ensure_calendar_attachment_names(proposal: dict, attachment_names: tuple[str
 
 
 def _default_transport(url: str, headers: dict, body: bytes, timeout: float) -> tuple[int, str]:
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    request = urllib.request.Request(url, data=body, headers=headers, method="GET" if body is None else "POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read().decode("utf-8")
@@ -606,32 +609,62 @@ def run_gemini_analysis_with_recovery(
             prepared.cleanup()
 
 
+_KEY_CHECK_CACHE_SECONDS = 30 * 60
+_key_check_cache: dict[str, tuple[float, tuple[str, str]]] = {}
+_key_check_cache_lock = threading.Lock()
+
+
+def _key_check_identity(api_key: str, model: str) -> str:
+    return hashlib.sha256(json.dumps([api_key.strip(), model]).encode("utf-8")).hexdigest()
+
+
+def cached_gemini_key_check(api_key: str, model: str) -> tuple[str, str]:
+    """Read recent explicit verification without making any network request.
+
+    Cache only in this process, keyed by a digest rather than the credential.
+    Changing the key/model or restarting never inherits an unrelated success.
+    """
+    if not (api_key or "").strip():
+        return "missing", "키가 비어 있음"
+    identity = _key_check_identity(api_key, model)
+    with _key_check_cache_lock:
+        entry = _key_check_cache.get(identity)
+        if entry is not None:
+            checked_at, result = entry
+            if 0 <= time.monotonic() - checked_at < _KEY_CHECK_CACHE_SECONDS:
+                return result
+            _key_check_cache.pop(identity, None)
+    return "unchecked", "키가 저장되어 있어요. 필요할 때 연결 화면의 [확인]을 눌러 주세요."
+
+
 def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str]:
-    """Check once, with at most two retries for temporary service/transport failure."""
+    result = _check_gemini_key(api_key, model, transport)
+    if (api_key or "").strip():
+        with _key_check_cache_lock:
+            identity = _key_check_identity(api_key, model)
+            _key_check_cache.pop(identity, None)
+            if len(_key_check_cache) >= 128:
+                _key_check_cache.pop(next(iter(_key_check_cache)))
+            _key_check_cache[identity] = (time.monotonic(), result)
+    return result
+
+
+def _check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str]:
+    """Check once, with at most two retries for temporary service/transport failure.
+
+    Read model metadata instead of generating: a busy model must not fail a valid key.
+    """
     api_key = (api_key or "").strip()
     if not api_key:
         return "missing", "키가 비어 있음"
     transport = transport or _default_transport
-    body = json.dumps(
-        {
-            "contents": [{"role": "user", "parts": [{"text": '{"ok": true}를 그대로 돌려줘'}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "object",
-                    "properties": {"ok": {"type": "boolean"}},
-                    "required": ["ok"],
-                },
-            },
-        }
-    ).encode("utf-8")
-    url = API_URL_TEMPLATE.format(model=model)
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    url = MODEL_URL_TEMPLATE.format(model=model)
+    headers = {"x-goog-api-key": api_key}
     for attempt, delay in enumerate((0.0, 1.0, 2.0)):
         if delay:
             time.sleep(delay)
         try:
-            status, reply = transport(url, headers, body, 10.0)
+            status, reply = transport(url, headers, None, 10.0)
         except OSError as error:
             if attempt < 2:
                 continue
@@ -645,16 +678,21 @@ def check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str
         error = json.loads(reply).get("error", {})
         invalid_key = any(row.get("reason") in {"API_KEY_INVALID", "API_KEY_EXPIRED"}
                           for row in error.get("details", []) if isinstance(row, dict))
+        google_status = error.get("status", "")
     except (ValueError, TypeError, AttributeError):
-        invalid_key = False
+        invalid_key, google_status = False, ""
+    # Only Google's enum-shaped status is echoed; free-text messages stay out of the screen.
+    detail = f"http {status}"
+    if isinstance(google_status, str) and re.fullmatch(r"[A-Z_]{1,40}", google_status):
+        detail += f" {google_status}"
     if status == 401 or invalid_key:
-        return "invalid", f"http {status}"
+        return "invalid", detail
     if status == 403:
-        return "forbidden", "http 403"
+        return "forbidden", detail
     if status == 429:
-        return "rate-limited", "http 429"
+        return "rate-limited", detail
     if status == 404:
-        return "model-unavailable", "http 404"
+        return "model-unavailable", detail
     if 500 <= status < 600:
-        return "service-unavailable", f"http {status}"
-    return "request-rejected", f"http {status}"
+        return "service-unavailable", detail
+    return "request-rejected", detail
