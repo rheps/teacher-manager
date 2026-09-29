@@ -4242,6 +4242,7 @@ class Api:
             autostart_enable=self._deps.autostart_enable,
             autostart_disable=self._deps.autostart_disable,
             helper_exists=self._deps.helper_window_exists,
+            stop=self._deps.helper_stop,
         )
 
     @guarded

@@ -1,7 +1,9 @@
 """One active configuration and short owner tokens; never archive account trees.
 
 The original settings remain in place. A confirmed different identity receives a
-fresh editable folder, and returning identities do not restore past folders.
+fresh editable folder. A returning identity reuses its own finished folder in place
+only when exactly one such folder is verifiably its own (ACCT-01, 2026-09-29);
+nothing is copied, moved, merged or deleted.
 Only actual writes and credential changes share the exclusion lock. Reads use
 atomic metadata and compare their owner token again before returning results.
 """
@@ -22,6 +24,7 @@ STATE_NAME = 'account-session.json'
 SETTINGS = 'brity-bridge/settings.json'
 PC_FIELDS = frozenset(('hotkey', 'brity_download_dir', 'error_reports_enabled', 'gws_command'))
 CURRENT_DIR = 'account-current'
+OWNER_MARKER = 'account-owner.json'
 # Compatibility recovery reads only these named settings, never archives/logs.
 ESSENTIAL = frozenset(('profile.generated.json', 'teacher-profile.csv', 'weekly-timetable.xlsx',
     'weekly-timetable.csv', 'setup-state.json', 'attendance-install.generated.json',
@@ -231,6 +234,59 @@ def _legacy_owner(root):
     return next(iter(owners), '') if len(owners) <= 1 else 'conflicting'
 
 
+def _marker_owner(folder):
+    path = component_lock.prepare_direct_file_path(folder / OWNER_MARKER)
+    return _email(_json(path).get('account')) if path.exists() else ''
+
+
+def _write_owner_marker(folder, account):
+    # Advisory evidence for a later return (ACCT-01): a failed write must not
+    # block sign-in; lookups then fall back to the attendance/setup owner fields.
+    try:
+        _write_json(folder / OWNER_MARKER, {'account': account})
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _finished_own_folder(folder, account):
+    """True only for a finished setup whose owner evidence all names ``account``.
+
+    Finished = what makes the dashboard open Home instead of the wizard
+    (setup-state.json ``completed``) plus the saved profile. An owner marker, when
+    present, must name the account and the legacy owner fields must not disagree;
+    without a marker the legacy owner fields must name the account.
+    """
+    try:
+        component_lock.prepare_direct_directory(folder)
+        marker = _marker_owner(folder)
+        legacy = _legacy_owner(folder)
+        if marker:
+            if marker != account or legacy not in ('', account):
+                return False
+        elif legacy != account:
+            return False
+        setup = component_lock.prepare_direct_file_path(folder / 'setup-state.json')
+        profile = component_lock.prepare_direct_file_path(folder / 'profile.generated.json')
+        return setup.exists() and _json(setup).get('completed') is True and profile.exists()
+    except (OSError, ValueError, TypeError, AccountSessionError):
+        return False  # Unreadable or foreign evidence is never reused.
+
+
+def _own_finished_folders(root, account):
+    """Relative locations of this account's finished folders ('' is the root)."""
+    found = [''] if _finished_own_folder(root, account) else []
+    base = root / CURRENT_DIR
+    try:
+        entries = sorted(os.scandir(base), key=lambda entry: entry.name) if base.is_dir() else []
+    except OSError:
+        entries = []
+    for entry in entries:
+        if (re.fullmatch('[0-9a-f]{16}', entry.name) and entry.is_dir(follow_symlinks=False)
+                and _finished_own_folder(root / CURRENT_DIR / entry.name, account)):
+            found.append(CURRENT_DIR + '/' + entry.name)
+    return found
+
+
 def _state(root, phase, account='', **extra):
     value = {'managed': True, 'phase': phase, 'account': account,
              'generation': uuid.uuid4().hex, **extra}
@@ -322,7 +378,16 @@ def activate_verified(config_dir, email, explicit_login=False):
                 _recover_missing_essentials(root, account, state)
                 owner = _legacy_owner(root)
             has_saved_data = any((current / name).exists() for name in ESSENTIAL if name != SETTINGS)
-            if owner == account or (not owner and not has_saved_data and not state.get('settings_owner')):
+            folder = None
+            if not (owner == account and _finished_own_folder(current, account)):
+                # ACCT-01 (2026-09-29): A -> B -> A returns to A's own finished
+                # folder in place, only when exactly one is verifiably A's.
+                found = _own_finished_folders(root, account)
+                if len(found) == 1:
+                    folder = found[0]
+            if folder is not None:
+                pass
+            elif owner == account or (not owner and not has_saved_data and not state.get('settings_owner')):
                 folder = state.get('data_dir', '')
             else:
                 folder = CURRENT_DIR + '/' + uuid.uuid4().hex[:16]
@@ -330,6 +395,7 @@ def activate_verified(config_dir, email, explicit_login=False):
                 settings_path = component_lock.prepare_direct_file_path(current / SETTINGS)
                 pc = {k: v for k, v in _json(settings_path).items() if k in PC_FIELDS} if settings_path.exists() else {}
                 _write_json(target / SETTINGS, pc)
+            _write_owner_marker(root / folder if folder else root, account)
             return {**_state(root, 'active', account, settings_owner=account, data_dir=folder,
                             activated_from=[state['account'], state['generation']]), 'changed': True}
         except (OSError, ValueError, TypeError) as exc:

@@ -277,6 +277,9 @@ function reloadAccountProfile() {
     const info = await call("get_app_info");
     if (epoch !== accountUiEpoch) return false;
     adoptAppInfo(info);
+    // ACCT-01: the reread folder belongs to the account now signed in (its own finished
+    // folder or a new empty one), so its saved Calendar/Tasks choices are not the previous account's.
+    S.invalidatedGoogleTargetFields = new Set();
     accountProfileNeedsReload = false;
     render();
     return true;
@@ -1310,12 +1313,21 @@ async function pollLoginOnce(request) {
   }
   googleLoginVerificationPending = false;
   if (snap.ok === true) {
+    // A different email has already queued its reread through the account token change.
+    const signInFromWizard = S.mode === "wizard" && !googleLoginResumeContext
+      && !accountProfileNeedsReload && !accountProfileReloadPromise;
     request = beginIssueRequest(false);
     delete S.fieldIssues["google-login"];
     clearGoogleDependentState({ preserveResume: true });  // 재승인은 선택을 보존하고 상태만 새로 읽는다
     await refreshSettingsStatus(request, { loginComplete: true, loginEpoch: epoch, googleStatus: snap.google_status });
     if (!ownsIssueRequest(request)) return false;
     if (isGoogleReady(S.google)) {
+      // ACCT-01: a same-email sign-in may return this account to its own finished folder
+      // (only the generation changes), so read the saved screen instead of the empty wizard.
+      if (signInFromWizard && !accountProfileReloadPromise) {
+        accountProfileNeedsReload = true;
+        await reloadAccountProfile();
+      }
       if (!(await resumeInterruptedGoogleScreen(request))) showToast("Google 계정으로 로그인했어요");
       refreshChecks().catch(reportBackgroundFailure);
       googleRecoveryNeeded = true;
@@ -1430,7 +1442,7 @@ bindActions({
   },
   "gws-logout": async () => {
     if (S.login?.logging_out) return;
-    if (!window.confirm("Teacher Manager에서 로그아웃할까요? 기존 자료는 보존됩니다. 다른 계정으로 로그인하면 연결을 다시 선택해야 합니다. Google 시트의 자동 발송은 별도로 관리됩니다.")) return;
+    if (!window.confirm("Teacher Manager에서 로그아웃할까요? 기존 자료는 보존됩니다. 설정을 마친 계정으로 다시 로그인하면 그 계정의 저장된 설정을 그대로 씁니다. 설정을 마치지 않은 계정은 처음 설정부터 진행합니다. 출결은 로그인할 때마다 권한 승인을 다시 받아야 합니다. Google 시트의 자동 발송은 별도로 관리됩니다.")) return;
     if (!(await flushEditSave())) return;
     if (S.login?.logging_out) return;
     const epoch = ++googleLoginEpoch;

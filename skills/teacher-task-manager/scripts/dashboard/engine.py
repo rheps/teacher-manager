@@ -607,6 +607,7 @@ def save_messenger_settings(
     autostart_disable=None,
     push_key=None,
     helper_exists=None,
+    stop=None,
 ) -> dict:
     """메신저 선택을 확인해 저장한 뒤, 도우미 시작은 별도로 회복한다."""
     if not isinstance(updates, dict):
@@ -730,7 +731,8 @@ def save_messenger_settings(
 
     # 설정을 다시 쓰지 않는다. 이미 읽어 확인한 값은 그대로 두고 도우미 시작만 다시 한다.
     restart_result = restart_helper_verified(
-        stop=stop_helper,
+        # Injectable so tests never send WM_CLOSE to the real helper (ST-05).
+        stop=stop or stop_helper,
         start=restart or start_helper,
         exists=helper_exists or helper_window_exists,
         app_version=version.APP_VERSION,

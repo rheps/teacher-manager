@@ -99,7 +99,9 @@
 # one refresh button per window, fewer stuck checking states, safe update over a running app.
 # v4.8: in-app update retries the download once another way when GitHub does not answer,
 # clearer update failure notices, error report footer, grouped workbook picker, Release address.
-APP_VERSION = "4.8"
+# v4.9: a finished account signing back in reuses its own saved settings, the logout notice
+# says so, and tests can no longer close or start the real helper.
+APP_VERSION = "4.9"
 
 BRANDING = {
     "name": "Teacher Manager",
