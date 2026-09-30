@@ -310,7 +310,10 @@ def resolve_attachment_files(download_dir: Path, names: list[str]) -> tuple[Path
     matches = [(name, find_attachment_file(download_dir, name)) for name in names]
     missing = tuple(name for name, path in matches if path is None)
     if missing:
-        raise AttachmentBlocked("missing", missing, "첨부파일을 먼저 내려받아 주세요.")
+        raise AttachmentBlocked(
+            "missing", missing,
+            "첨부파일을 다운로드 폴더에서 확인하지 못했어요. 파일 이름과 저장 위치를 확인해 주세요.",
+        )
     return tuple(Path(path) for _name, path in matches)
 
 

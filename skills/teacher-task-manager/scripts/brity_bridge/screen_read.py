@@ -31,6 +31,9 @@ class ScreenElement:
     w: int
     h: int
     aid: str
+    node_id: str = ""
+    ancestors: tuple[str, ...] = ()
+    hierarchy_observed: bool = False
 
 
 def parse_elements(raw: str) -> list[ScreenElement]:
@@ -53,10 +56,15 @@ def parse_elements(raw: str) -> list[ScreenElement]:
         for key in ("x", "y", "w", "h"):
             value = item.get(key)
             numbers[key] = int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else -1
+        ancestors = item.get("ancestors")
         elements.append(ScreenElement(
             text=text, ctrl=str(item.get("ctrl") or ""),
             x=numbers["x"], y=numbers["y"], w=max(numbers["w"], 0), h=max(numbers["h"], 0),
             aid=str(item.get("aid") or ""),
+            node_id=str(item.get("node_id") or ""),
+            ancestors=tuple(value for value in ancestors if isinstance(value, str) and value)
+            if isinstance(ancestors, list) else (),
+            hierarchy_observed="ancestors" in item,
         ))
     return elements
 
@@ -153,6 +161,68 @@ def _has_attachment_evidence(elements: list[ScreenElement]) -> bool:
     return False
 
 
+def _scoped_attachment_names(content: list[ScreenElement]) -> list[str] | None:
+    """Use a size/name's shared file row, never spatially overlapping body text.
+
+    None is only for legacy captures with no hierarchy field. A failed modern
+    hierarchy read returns no names so capture_brity_text reports a name-read
+    failure before any download lookup, analysis or Google write.
+    """
+    if not any(element.hierarchy_observed for element in content):
+        return None
+    groups: dict[str, list[ScreenElement]] = {}
+    for element in content:
+        scopes = ((element.node_id,) if element.node_id else ()) + element.ancestors
+        for ancestor in dict.fromkeys(scopes):
+            groups.setdefault(ancestor, []).append(element)
+    names: list[str] = []
+    used_scopes: set[str] = set()
+    for size in (element for element in content if _SIZE_RE.fullmatch(element.text.strip())):
+        resolved = False
+        for scope in size.ancestors:
+            members = groups.get(scope, [])
+            sizes = [element for element in members if _SIZE_RE.fullmatch(element.text.strip())]
+            # A page/list spanning several file rows is not a file item.
+            if len(sizes) != 1:
+                continue
+            if any(element.text.strip() == _ATTACHMENT_LABEL for element in members):
+                # Only a size on the header line is a summary. A broad ancestor
+                # containing both the header and an unresolved file is unsafe.
+                if any(element.text.strip() == _ATTACHMENT_LABEL
+                       and abs(element.y - size.y) <= _LINE_TOLERANCE
+                       for element in members):
+                    resolved = True
+                    break
+                return []
+            candidates = [element for element in members
+                          if _is_attachment_name_candidate(element, 2**31 - 1)]
+            if not candidates:
+                continue
+            controls = [element for element in candidates if element.ctrl in ("Button", "CheckBox")]
+            if controls:
+                labels = {element.text.strip() for element in controls}
+                if len(labels) != 1:
+                    return []  # Conflicting labels must not be guessed by length.
+                name = next(iter(labels))
+            else:
+                # Wrapping is allowed only inside this independently bounded row.
+                parts = []
+                for line in _group_lines(candidates):
+                    labels = {element.text.strip() for element in line}
+                    if len(labels) != 1:
+                        return []
+                    parts.append(next(iter(labels)))
+                name = " ".join(parts)
+            if scope not in used_scopes:
+                names.append(name)
+                used_scopes.add(scope)
+            resolved = True
+            break
+        if not resolved:
+            return []
+    return names
+
+
 def assemble_message(elements: list[ScreenElement]) -> tuple[str, list[str]]:
     """요소 덤프에서 (본문 텍스트, 첨부파일명 목록)을 만든다. 순수 함수 — 시험 대상."""
     content = _content_elements(elements)
@@ -160,6 +230,9 @@ def assemble_message(elements: list[ScreenElement]) -> tuple[str, list[str]]:
     body = "\n".join(
         " ".join(element.text.strip() for element in line) for line in text_lines
     ).strip()
+    scoped_names = _scoped_attachment_names(content)
+    if scoped_names is not None:
+        return body, scoped_names
     names: list[str] = []
     attachment_section_seen = False
     pending_fragment: tuple[int, ScreenElement] | None = None
@@ -227,6 +300,30 @@ for ($i = 0; $i -lt 6; $i++) {
   if ($found.Count -gt 30) { break }
 }
 $out = New-Object System.Collections.ArrayList
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+$ancestorCache = @{}
+$rootId = $root.GetRuntimeId() -join ':'
+$ancestorCache[$rootId] = @()
+function Get-ElementAncestors($element, $elementId) {
+  try {
+    if ($ancestorCache.ContainsKey($elementId)) { return $ancestorCache[$elementId] }
+    $parents = New-Object 'System.Collections.Generic.List[string]'
+    $current = $walker.GetParent($element)
+    for ($depth = 0; $null -ne $current -and $depth -lt 32; $depth++) {
+      $parentId = $current.GetRuntimeId() -join ':'
+      if (-not $parentId) { return @() }
+      $parents.Add($parentId)
+      if ($ancestorCache.ContainsKey($parentId)) {
+        foreach ($ancestorId in $ancestorCache[$parentId]) { $parents.Add($ancestorId) }
+        $ancestorCache[$elementId] = $parents.ToArray()
+        return $ancestorCache[$elementId]
+      }
+      $current = $walker.GetParent($current)
+    }
+  } catch { }
+  # A missing hierarchy must not silently re-enable position-only name joining.
+  return @()
+}
 foreach ($e in $found) {
   $n = $e.Current.Name
   if (-not $n) { continue }
@@ -235,9 +332,14 @@ foreach ($e in $found) {
     $r = $e.Current.BoundingRectangle
     if (-not [double]::IsInfinity($r.X)) { $x = [int]$r.X; $y = [int]$r.Y; $w = [int]$r.Width; $h = [int]$r.Height }
   } catch {}
-  [void]$out.Add(@{ text = $n; ctrl = ($e.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''); x = $x; y = $y; w = $w; h = $h; aid = [string]$e.Current.AutomationId })
+  $nodeId = ''; $ancestors = @()
+  try {
+    $nodeId = $e.GetRuntimeId() -join ':'
+    $ancestors = @(Get-ElementAncestors $e $nodeId)
+  } catch { }
+  [void]$out.Add(@{ text = $n; ctrl = ($e.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''); x = $x; y = $y; w = $w; h = $h; aid = [string]$e.Current.AutomationId; node_id = $nodeId; ancestors = $ancestors })
 }
-Write-Output (ConvertTo-Json -InputObject @($out) -Compress -Depth 3)
+Write-Output (ConvertTo-Json -InputObject @($out) -Compress -Depth 5)
 """
 
 _MIN_BODY_CHARS = 10

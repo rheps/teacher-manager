@@ -739,6 +739,12 @@ def _preflight_capture_fields(capture) -> tuple[str, dict, tuple[str, ...]]:
 
 def _attachment_preflight_guidance(message: str) -> tuple[str, str, str]:
     safe_hint = str(message or "")
+    if "다운로드 폴더에서 확인하지 못" in safe_hint:
+        return (
+            "첨부파일을 다운로드 폴더에서 확인하지 못해 등록하지 않았어요.",
+            "첨부파일 이름·저장 위치 확인 필요",
+            "파일 이름과 Brity의 저장 위치가 Teacher Manager에 설정한 다운로드 폴더와 맞는지 확인한 뒤 같은 메시지에서 단축키를 다시 눌러 주세요.",
+        )
     if "먼저 내려받" in safe_hint:
         return (
             "첨부파일이 이 컴퓨터에 없어 등록하지 않았어요.",
