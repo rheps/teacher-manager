@@ -2822,10 +2822,11 @@ def _python_update_info_bytes() -> bytes:
     return bytes(contents)
 
 
-# UPD-01: on a school PC Python (and .NET) HTTPS to GitHub timed out every time
-# while the built-in Windows curl.exe and the browser got 200 in under a second.
-# One Windows curl.exe try is part of the same attempt; the caller's three-attempt
-# budget is unchanged and every host/size/SHA-256 guard still applies.
+# UPD-01/UPD-04: on a school PC Python (and .NET) HTTPS to GitHub timed out every
+# time while the built-in Windows curl.exe and the browser got 200 in under a second.
+# UPD-04 (2026-09-30 user decision): curl.exe goes first and Python urllib is the
+# fallback, once, inside the same attempt; the caller's three-attempt budget is
+# unchanged and every host/size/SHA-256 guard still applies.
 _UPDATE_CURL_RUNNER = None  # tests replace this; None runs the real curl.exe
 _UPDATE_TRANSPORT_LABEL = re.compile(r"^[a-z0-9-]{1,40}$")
 
@@ -2865,6 +2866,20 @@ def _python_fallback_label(error: BaseException) -> str:
     return ""
 
 
+def _python_transport_label(error: BaseException) -> str:
+    """Trail label for the Python fallback's final failure (UPD-04); diagnostics only."""
+    if isinstance(error, urllib.error.HTTPError):
+        code = getattr(error, "code", None)
+        return f"python-http-{int(code)}" if isinstance(code, int) and 100 <= code <= 599 else "python-http"
+    label = _python_fallback_label(error)
+    if label:
+        return label
+    cause = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(cause, (ssl.SSLError, ssl.CertificateError)):
+        return "python-tls"
+    return "python-error"
+
+
 def _attach_update_transport(error: BaseException, trail: list[str]) -> None:
     try:
         error.update_transport = ">".join(trail)
@@ -2885,7 +2900,10 @@ def _curl_fetch(url: str, target: Path, *, max_seconds: float, max_bytes: int) -
         "--output", str(target), "--write-out", f"\\n{marker}%{{url_effective}}\\n", url,
     ]
     runner = _UPDATE_CURL_RUNNER or (lambda values, timeout: process_win.run_captured(values, timeout=timeout))
-    code, output = runner(args, timeout=max_seconds + 10)
+    try:
+        code, output = runner(args, timeout=max_seconds + 10)
+    except Exception:  # noqa: BLE001 - a curl.exe that cannot start is one failed transport (UPD-04)
+        raise _UpdateCurlFailed("curl-error") from None
     if code != 0:
         raise _UpdateCurlFailed(f"curl-exit-{int(code)}")
     finals = [line[len(marker):].strip() for line in str(output or "").splitlines() if line.startswith(marker)]
@@ -2916,31 +2934,28 @@ def _curl_update_info_bytes() -> bytes:
 
 
 def _fetch_update_json() -> dict:
+    # UPD-04: curl.exe first; Python urllib once only when curl did not deliver.
     trail: list[str] = []
+    contents = None
     try:
-        contents = _python_update_info_bytes()
-        trail.append("python-ok")
-    except Exception as error:
-        label = _python_fallback_label(error)
-        if not label:
-            raise
-        trail.append(label)
-        try:
-            contents = _curl_update_info_bytes()
-        except _UpdateCurlFailed as curl_error:
-            trail.append(curl_error.label)
-            if curl_error.label == "host-not-allowed":
-                unsafe = _UpdateInfoUnsafeRedirect("UNSAFE_UPDATE_INFO_REDIRECT")
-                _attach_update_transport(unsafe, trail)
-                raise unsafe from None
-            if curl_error.label == "curl-too-large":
-                too_large = _UpdateInfoTooLarge("UPDATE_INFO_TOO_LARGE")
-                _attach_update_transport(too_large, trail)
-                raise too_large from None
-            # Both transports failed: keep the original Python failure as the cause.
-            _attach_update_transport(error, trail)
-            raise error
+        contents = _curl_update_info_bytes()
         trail.append("curl-ok")
+    except _UpdateCurlFailed as curl_error:
+        trail.append(curl_error.label)
+        if curl_error.label == "curl-too-large":
+            # The same 64 KB cap applies to Python; a second transport cannot help.
+            too_large = _UpdateInfoTooLarge("UPDATE_INFO_TOO_LARGE")
+            _attach_update_transport(too_large, trail)
+            raise too_large from None
+    if contents is None:
+        try:
+            contents = _python_update_info_bytes()
+        except Exception as error:
+            # Both transports failed: the Python failure decides the screen message.
+            trail.append(_python_transport_label(error))
+            _attach_update_transport(error, trail)
+            raise
+        trail.append("python-ok")
     # BOM이 붙어 있어도 읽는다.
     try:
         value = _json.loads(bytes(contents).decode("utf-8-sig"))
@@ -3110,8 +3125,8 @@ def check_update(current: str, fetch=None) -> dict:
 
 
 def record_update_transport(config_dir, stage: str, transport: str) -> None:
-    """Keep a local line when the curl.exe fallback ran (UPD-01). Best effort only."""
-    if config_dir is None or not transport or transport == "python-ok":
+    """Keep a local line unless curl.exe alone succeeded (UPD-02/UPD-04). Best effort only."""
+    if config_dir is None or not transport or transport == "curl-ok":
         return
     try:
         log = paths.bridge_state_dir(Path(config_dir)) / "logs" / "update-transport.jsonl"
@@ -3315,7 +3330,7 @@ def _publish_download_no_overwrite(partial: Path, folder: Path, name: str,
 
 
 def _curl_download_into(url: str, partial: Path, identity: tuple[int, int]) -> str:
-    """UPD-01 fallback: curl.exe overwrites the same owned partial; hash it back here."""
+    """UPD-04 first try: curl.exe overwrites the same owned partial; hash it back here."""
     _curl_fetch(url, partial, max_seconds=_UPDATE_SETUP_DEADLINE_SECONDS,
                 max_bytes=_UPDATE_SETUP_MAX_BYTES)
     digest = hashlib.sha256()
@@ -3334,15 +3349,6 @@ def _curl_download_into(url: str, partial: Path, identity: tuple[int, int]) -> s
         if component_lock.assert_open_file_is_direct(partial, source) != identity:
             raise component_lock.UnsafeLockPathError("받는 중인 설치 파일이 다른 파일로 바뀌었습니다.")
     return digest.hexdigest()
-
-
-def _download_fallback_label(error: BaseException) -> str:
-    # Local file and link-safety failures never switch transport.
-    if isinstance(error, component_lock.UnsafeLockPathError):
-        return ""
-    if not isinstance(error, (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError)):
-        return ""
-    return _python_fallback_label(error)
 
 
 def _download_file(url: str, dest_dir, expected_sha256: str, opener=None, transport_trail=None):
@@ -3366,78 +3372,83 @@ def _download_file(url: str, dest_dir, expected_sha256: str, opener=None, transp
     partial = folder / f".{name}.{os.getpid()}.{uuid.uuid4().hex}.partial"
     partial_identity: tuple[int, int] | None = None
     published: Path | None = None
-    deadline = time.monotonic() + _UPDATE_SETUP_DEADLINE_SECONDS
     digest = hashlib.sha256()
     total = 0
+    final_digest = None
     try:
         trail = transport_trail if transport_trail is not None else []
+        # UPD-04: curl.exe first into an owned partial; Python once only if curl did not deliver.
+        with partial.open("xb") as sink:
+            partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
         try:
+            final_digest = _curl_download_into(url, partial, partial_identity)
+            trail.append("curl-ok")
+        except _UpdateCurlFailed as curl_error:
+            trail.append(curl_error.label)
+            if curl_error.label == "curl-too-large":
+                # Same 256 MB cap on the Python path; do not download it twice.
+                too_large = _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
+                _attach_update_transport(too_large, trail)
+                raise too_large from None
+            # Drop curl's partial (only if it is still the file we made) and give
+            # Python a fresh owned name, so no curl bytes mix into its digest.
+            component_lock.remove_owned_file(partial, partial_identity)
+            partial = folder / f".{name}.{os.getpid()}.{uuid.uuid4().hex}.partial"
+            partial_identity = None
+        if final_digest is None:
+            deadline = time.monotonic() + _UPDATE_SETUP_DEADLINE_SECONDS
             try:
-                response = opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS))
-            except (ssl.SSLError, urllib.error.URLError):
-                raise
-            except OSError as error:
-                raise urllib.error.URLError(error) from error
-            with response as source:
-                _require_https_response(source, url)
-                with partial.open("xb") as sink:
-                    partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
-                    while True:
+                try:
+                    response = opener(url, timeout=min(30, _UPDATE_SETUP_DEADLINE_SECONDS))
+                except (ssl.SSLError, urllib.error.URLError):
+                    raise
+                except OSError as error:
+                    raise urllib.error.URLError(error) from error
+                with response as source:
+                    _require_https_response(source, url)
+                    with partial.open("xb") as sink:
+                        partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
+                        while True:
+                            if time.monotonic() >= deadline:
+                                raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                            remaining = _UPDATE_SETUP_MAX_BYTES - total
+                            try:
+                                chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
+                            except OSError as error:
+                                # A socket read failure is not a local folder permission problem.
+                                raise urllib.error.URLError(error) from error
+                            if time.monotonic() >= deadline:
+                                raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > _UPDATE_SETUP_MAX_BYTES:
+                                raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
+                            # 네트워크를 읽는 동안 다른 이름이 붙거나 경로가 바뀌었는지,
+                            # 실제 쓰기 바로 전에 열린 handle과 경로를 다시 맞춰 본다.
+                            current = component_lock.assert_open_file_is_direct(partial, sink)
+                            if current != partial_identity:
+                                raise component_lock.UnsafeLockPathError(
+                                    "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
+                                )
+                            sink.write(chunk)
+                            digest.update(chunk)
+                        sink.flush()
+                        os.fsync(sink.fileno())
                         if time.monotonic() >= deadline:
                             raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                        remaining = _UPDATE_SETUP_MAX_BYTES - total
-                        try:
-                            chunk = source.read(min(_UPDATE_READ_SIZE, remaining + 1))
-                        except OSError as error:
-                            # A socket read failure is not a local folder permission problem.
-                            raise urllib.error.URLError(error) from error
-                        if time.monotonic() >= deadline:
-                            raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > _UPDATE_SETUP_MAX_BYTES:
-                            raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE")
-                        # 네트워크를 읽는 동안 다른 이름이 붙거나 경로가 바뀌었는지,
-                        # 실제 쓰기 바로 전에 열린 handle과 경로를 다시 맞춰 본다.
                         current = component_lock.assert_open_file_is_direct(partial, sink)
                         if current != partial_identity:
                             raise component_lock.UnsafeLockPathError(
                                 "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
                             )
-                        sink.write(chunk)
-                        digest.update(chunk)
-                    sink.flush()
-                    os.fsync(sink.fileno())
-                    if time.monotonic() >= deadline:
-                        raise _UpdateDownloadTimeout("UPDATE_SETUP_TIMEOUT")
-                    current = component_lock.assert_open_file_is_direct(partial, sink)
-                    if current != partial_identity:
-                        raise component_lock.UnsafeLockPathError(
-                            "받는 중인 설치 파일이 다른 파일로 바뀌었습니다."
-                        )
-            final_digest = digest.hexdigest()
-            trail.append("python-ok")
-        except Exception as error:
-            label = _download_fallback_label(error)
-            if not label:
-                raise
-            trail.append(label)
-            if partial_identity is None:
-                # Own the partial before curl writes it, so every exit path removes it.
-                with partial.open("xb") as sink:
-                    partial_identity = component_lock.assert_open_file_is_direct(partial, sink)
-            try:
-                final_digest = _curl_download_into(url, partial, partial_identity)
-            except _UpdateCurlFailed as curl_error:
-                trail.append(curl_error.label)
+                final_digest = digest.hexdigest()
+                trail.append("python-ok")
+            except Exception as error:
+                # Both transports failed: the Python failure decides the screen message.
+                trail.append(_python_transport_label(error))
                 _attach_update_transport(error, trail)
-                if curl_error.label == "curl-too-large":
-                    raise _UpdateDownloadTooLarge("UPDATE_SETUP_TOO_LARGE") from None
-                if curl_error.label == "host-not-allowed":
-                    raise ValueError("unsafe final update URL") from None
-                raise error
-            trail.append("curl-ok")
+                raise
 
         if final_digest != expected:
             raise _UpdateDownloadHashMismatch("UPDATE_SETUP_HASH_MISMATCH")

@@ -103,7 +103,9 @@
 # says so, and tests can no longer close or start the real helper.
 # v5.0: guide links are named 방법 안내 and shown in the connection window too, the roster
 # guide and [명단 수정] are gone, and roster link/room list wait for a running attendance task.
-APP_VERSION = "5.0"
+# v5.01: in-app update reads version.json and the Setup with Windows curl.exe first and falls back
+# to Python HTTPS (UPD-04); from 5.0 the minor part is always two digits (5.01, 5.02 ...).
+APP_VERSION = "5.01"
 
 BRANDING = {
     "name": "Teacher Manager",
