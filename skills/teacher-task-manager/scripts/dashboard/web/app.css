@@ -467,7 +467,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .chat-space-status.muted { color:var(--tm-faint); }
 .class-space-section { display:block; }
 .class-space-section > .first-setup-head { align-items:flex-start; }
-.class-space-section > .chat-space-existing { margin-top:18px; }
+/* 2026-09-30: one text line (~20px) between the 학급 단톡방 title and the dropdown; the 36px head already leaves it. */
+.class-space-section > .chat-space-existing { margin-top:0; }
 .class-space-section > .chat-space-existing select { width:100%; }
 .class-space-section > .attendance-picture-guide { margin:14px 0 0; }
 .attendance-management .first-setup-subrow,
@@ -565,7 +566,8 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 
 /* 1단계 "화면에서 찾기" — 구글 워크스페이스 위치 캡처 안내 */
 .guide-overlay { position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:20px; background:rgba(15,23,42,.5); }
-.attendance-picture-guide { display:flex; flex-wrap:wrap; align-items:center; gap:5px 12px; }
+/* Guide links always sit on the left (2026-09-30). */
+.attendance-picture-guide { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-start; gap:5px 12px; }
 .attendance-picture-guide .text-link { padding:0; min-height:30px; font-size:13px; }
 .attendance-picture-guide small { font-size:12px; color:var(--tm-faint); }
 .attendance-chat-guide-dialog { padding:0; border:1px solid var(--tm-line); border-radius:16px; width:min(1120px,94vw); max-width:94vw; height:92vh; max-height:92vh; overflow:hidden; background:#fff; }

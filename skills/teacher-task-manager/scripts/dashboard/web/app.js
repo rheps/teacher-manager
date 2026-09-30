@@ -1889,9 +1889,8 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     S.rosterEditor = editor = { ...saved, rows: rosterEditableRows(saved.rows), context, dirty: false, busy: true, workbook: editor.workbook };
     if (sync) {
       requestedRevision = editor.revision;
-      const result = explicitConnect
-        ? await call("sync_roster_editor", requestedRevision, ...(useCurrentWorkbook ? [true] : []))
-        : await call("sync_roster_editor");
+      const args = explicitConnect ? [requestedRevision, ...(useCurrentWorkbook ? [true] : [])] : [];
+      const result = await callRosterSyncWaitingForLock(args, current);
       if (!current()) return false;
       S.rosterEditor = editor = { ...result, rows: rosterEditableRows(result.rows), context, dirty: false, busy: true, workbook: rosterEditorWorkbook() };
       rosterStatus = null;
@@ -1907,8 +1906,15 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
     }
     if (visible()) S.banner = null;
     return true;
-  } catch (_) {
-    if (current()) {
+  } catch (error) {
+    if (current() && error?.issue?.code === "ATTENDANCE_REMOTE_BUSY") {
+      // Refused before any write: not an unconfirmed save (C11, PEND-51).
+      S.rosterEditor.failure_code = "ATTENDANCE_REMOTE_BUSY";
+      S.rosterEditor.detail = "출석부의 다른 작업이 끝나지 않아 학생명단을 아직 연결하지 못했어요.";
+      S.rosterEditor.state = "unavailable";
+      const button = S.mode === "wizard" && S.step === 8 ? "[학생명단 연결]" : "[명단 저장]";
+      if (visible()) setBanner("warn", rosterDetailText(S.rosterEditor, button), "roster-sync");
+    } else if (current()) {
       S.rosterEditor.detail = "명단 저장 결과를 확인하지 못했어요. 입력한 내용은 이 화면에 남아 있어요. 다시 저장해 주세요.";
       S.rosterEditor.state = "unavailable";
       if (visible()) setBanner("warn", S.rosterEditor.detail, "roster-sync");
@@ -2881,7 +2887,7 @@ function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
   return `<section class="svc-subrow class-space-section">
     <div class="first-setup-head"><b>학급 단톡방</b><span class="chat-space-reload-status">${open}${retry}
       <span class="chat-space-status ${S.classSpaceSaving || reading ? "muted" : connected ? "connected" : "warn"}">${S.classSpaceSaving ? "저장 중…" : label}</span></span></div>
-    ${content}${view === "installation" ? studentChatGuideHtml() : ""}${localIssue}</section>`;
+    ${content}${studentChatGuideHtml()}${localIssue}</section>`;
 }
 
 function classSpaceContentHtml(a, view = attendanceViewKind()) {
@@ -3647,7 +3653,7 @@ function firstSetupCardHtml(a, view = attendanceViewKind()) {
     <div class="first-setup-head"><b>${view === "installation" ? "처음 한 번 설정하기" : "출석부 설정 상태"}</b><span class="chat-space-reload-status">${open}${retry}
       <span class="svc-status ${checking ? "muted" : complete ? "ok" : "warn"}">${label}</span></span></div>
     ${problem ? `<p>${esc(problem)}</p>` : ""}
-    ${view === "installation" ? `<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-first-setup-guide" data-preserve-issue="true">설정 방법 그림으로 보기</button></p>` : ""}</div>`;
+    <p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-first-setup-guide" data-preserve-issue="true">설정 방법 안내</button></p></div>`;
 }
 let firstSetupReadContext = "";
 let firstSetupReadVersion = 0;
@@ -3702,6 +3708,19 @@ let rosterAutoSyncAttempt = "";
 let rosterAutoSyncPending = null;
 const ROSTER_SYNC_LOCK_WAIT_MS = 120000;
 const ROSTER_SYNC_LOCK_RETRY_MS = 3000;
+// A busy attendance lock refuses sync_roster_editor before it writes anything, so the
+// explicit [학생명단 연결]/[명단 저장] waits for the running read too (PEND-46, PEND-51).
+async function callRosterSyncWaitingForLock(args, stillCurrent) {
+  const waitUntil = Date.now() + ROSTER_SYNC_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      return await call("sync_roster_editor", ...args);
+    } catch (error) {
+      if (error?.issue?.code !== "ATTENDANCE_REMOTE_BUSY" || Date.now() >= waitUntil || !stillCurrent()) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, ROSTER_SYNC_LOCK_RETRY_MS));
+  }
+}
 function syncPreparedRoster() {
   if (rosterConnecting) return Promise.resolve();
   if (!isHomeroomTeacher() || !attendanceSheetSetupDone()) return Promise.resolve();
@@ -3818,12 +3837,11 @@ function studentRosterSubrowHtml(a, view = attendanceViewKind()) {
     if (status.invalid_rows?.length) missing.push(`${status.invalid_rows.join(", ")}행의 번호·이메일 형식 또는 중복 확인`);
     detail = missing.join(" · ");
   }
-  if (pending) detail = rosterDetailText(S.rosterEditor, "[명단 수정]에서 [명단 저장]") || "저장한 학생명단을 출석부에 반영하고 있어요.";
+  if (pending) detail = rosterDetailText(S.rosterEditor, "홈의 [시간표 · 담임학급 학생명단] → [담임학급 학생명단] 탭의 [명단 저장]") || "저장한 학생명단을 출석부에 반영하고 있어요.";
   return `<div class="svc-subrow student-roster-subrow">
     <div class="first-setup-head"><b>${view === "installation" ? "학생명단 입력" : "학생 명단"}</b><span class="chat-space-reload-status">
-      <button class="btn-tonal" data-action="attendance-roster-edit">${view === "installation" ? `${icon("external-link", "small")} 명단 입력하러 가기` : "명단 수정"}</button>
       <span class="svc-status ${complete ? "ok" : ["checking", "setup"].includes(state) ? "muted" : "warn"}">${esc(label)}</span></span></div>
-    ${detail ? `<p>${esc(detail)}</p>` : ""}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-roster-guide" data-preserve-issue="true">입력 방법 그림으로 보기</button></p></div>`;
+    ${detail ? `<p>${esc(detail)}</p>` : ""}</div>`;
 }
 function openAttendancePictureGuide(kind) { return call("open_picture_guide", kind); }
 let attendanceAccountAuthorizationVersion = 0;
@@ -3975,7 +3993,6 @@ bindActions({
   "google-login-guide": () => openAttendancePictureGuide("login"),
   "attendance-first-setup-guide": () => openAttendancePictureGuide("setup"),
   "attendance-chat-space-guide": () => openAttendancePictureGuide("chat"),
-  "attendance-roster-guide": () => openAttendancePictureGuide("roster"),
 });
 bindActions({"attendance-roster-connect": async () => {
   if (rosterConnecting || !attendanceSheetSetupDone()) return;
@@ -3990,13 +4007,6 @@ bindActions({"attendance-roster-connect": async () => {
       if (current()) await loadAttendanceRosterStatus(true);
     }
   } finally { rosterConnecting = false; if (current()) render(); }
-}});
-bindActions({"attendance-roster-edit": async () => {
-  if (S.mode === "wizard") { await goStepAsync(6); return; }
-  const context = rosterEditorContext();
-  await openCard("timetable");
-  if (context !== rosterEditorContext() || S.mode !== "edit" || S.edit !== "timetable") return;
-  S.timetableTab = "roster"; render();
 }});
 bindActions({"attendance-roster-open": async () => {
   rosterReadVersion += 1;
@@ -5299,7 +5309,7 @@ function googleAccountDecisionHtml() {
 function googleAccountSectionHtml(includeRefresh) {
   return `<div class="section-h section-head google-account-section-head"><span>Google 계정 준비</span>
     <div class="google-account-actions">${includeRefresh ? settingsRecheckButtonHtml() : ""}</div></div>
-    <div class="panel">${googleLoginRowsHtml()}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="google-login-guide" data-preserve-issue="true">Google 로그인 그림 안내</button></p></div>
+    <div class="panel">${googleLoginRowsHtml()}<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="google-login-guide" data-preserve-issue="true">Google 로그인 방법 안내</button></p></div>
     ${googleAccountDecisionHtml()}
     ${loginWaitHtml()}`;
 }
@@ -5528,7 +5538,7 @@ bindActions({
 
 /* The supplied picture guide stays below the initial setup row. */
 function studentChatGuideHtml() {
-  return `<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-chat-space-guide" data-preserve-issue="true">학급 단톡방 준비 방법 그림으로 보기</button></p>`;
+  return `<p class="attendance-picture-guide"><button type="button" class="text-link" data-action="attendance-chat-space-guide" data-preserve-issue="true">학급 단톡방 준비 방법 안내</button></p>`;
 }
 
 /* ---------- 8단계: 모두 저장 ---------- */

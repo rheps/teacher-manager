@@ -133,7 +133,7 @@ _SCREEN_FAILURES = {
     "ensure_tasklist_named": "할 일 목록을 만들지 못했어요.",
     "open_logs": "기록 폴더를 열지 못했어요.",
     "open_url": "안전한 https 주소만 열 수 있어요.",
-    "open_picture_guide": "그림 안내를 기본 브라우저에서 열지 못했어요.",
+    "open_picture_guide": "방법 안내를 기본 브라우저에서 열지 못했어요.",
     "retry_capture": "실패한 항목을 다시 처리하지 못했어요.",
 }
 
@@ -3131,13 +3131,15 @@ class Api:
         error.diagnostic_detail = mismatch
         raise error
 
-    def _run_attendance_chat_action(self, action):
+    def _run_attendance_chat_action(self, action, lock_wait_seconds=None):
         """긴 작업은 별도 잠금으로 직렬화하고 설치 기록 잠금은 짧게만 쓴다."""
 
         from attendance_install_record import attendance_install_record_lock
 
         record_path = paths.attendance_install_record_path(self._config_dir)
         timeout = self._deps.attendance_remote_work_timeout_seconds
+        if timeout is None and lock_wait_seconds is not None:
+            timeout = lock_wait_seconds
         lock_options = {}
         if timeout is not None:
             lock_options["timeout_seconds"] = float(timeout)
@@ -3349,19 +3351,24 @@ class Api:
         )
         return self._open_external_url(auth_url)
 
+    CHAT_SPACES_LOCK_WAIT_SECONDS = 60.0
+
     @guarded
     def attendance_chat_spaces(self, batch=""):
         from dashboard import central_chat
 
         def read_spaces():
             try:
+                # A roster link holds the attendance lock for 30-60 s before this
+                # read starts; wait for it instead of failing (PEND-52, OBS-04).
                 return self._run_attendance_chat_action(
                     lambda run, gws, record: central_chat.list_spaces(
                         self._config_dir,
                         run,
                         gws_executable=gws,
                         attendance_record=record,
-                    )
+                    ),
+                    lock_wait_seconds=self.CHAT_SPACES_LOCK_WAIT_SECONDS,
                 )
             except (recovery.UserActionRequired, recovery.RetryableOperationError):
                 # 원격 출결 기능 확인의 일시 모호함(hold)은 이미 재시도 분류가 끝났다.
@@ -4545,20 +4552,19 @@ class Api:
             "login": "google-login.html",
             "setup": "attendance-first-setup.html",
             "chat": "google-chat-space.html",
-            "roster": "attendance-roster.html",
         }.get(kind) if isinstance(kind, str) else None
         if filename is None:
-            raise ScreenSafeError("열 수 있는 그림 안내를 확인해 주세요.")
+            raise ScreenSafeError("열 수 있는 방법 안내를 확인해 주세요.")
         guide_root = Path(__file__).resolve().parent / "web" / "guides"
         guide = (guide_root / filename).resolve()
         if guide.parent != guide_root or not guide.is_file():
-            raise ScreenSafeError("그림 안내 파일을 찾지 못했어요. 프로그램 설치 상태를 확인해 주세요.")
+            raise ScreenSafeError("방법 안내 파일을 찾지 못했어요. 프로그램 설치 상태를 확인해 주세요.")
         opener = self._deps.url_opener or webbrowser.open
         try:
             if opener(guide.as_uri()) is False:
                 raise RuntimeError()
         except Exception:
-            raise ScreenSafeError("기본 브라우저에서 그림 안내를 열지 못했어요. Windows의 기본 브라우저 설정을 확인해 주세요.") from None
+            raise ScreenSafeError("기본 브라우저에서 방법 안내를 열지 못했어요. Windows의 기본 브라우저 설정을 확인해 주세요.") from None
         return {"opened": True, "method": "default"}
 
     @guarded

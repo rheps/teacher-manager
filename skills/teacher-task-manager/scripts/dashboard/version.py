@@ -101,7 +101,9 @@
 # clearer update failure notices, error report footer, grouped workbook picker, Release address.
 # v4.9: a finished account signing back in reuses its own saved settings, the logout notice
 # says so, and tests can no longer close or start the real helper.
-APP_VERSION = "4.9"
+# v5.0: guide links are named 방법 안내 and shown in the connection window too, the roster
+# guide and [명단 수정] are gone, and roster link/room list wait for a running attendance task.
+APP_VERSION = "5.0"
 
 BRANDING = {
     "name": "Teacher Manager",
