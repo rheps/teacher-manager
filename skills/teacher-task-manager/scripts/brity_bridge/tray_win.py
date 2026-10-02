@@ -491,6 +491,14 @@ class TrayApp:
         failure_message = ""
         try:
             capture = screen_read.capture_brity_text()
+            if getattr(capture, "diagnostic", ""):
+                # Counts only (method, read/expected names, sizes): no file names or text.
+                try:
+                    status_log.append_log(
+                        paths.logs_dir(self.config_dir), capture.ok, "capture", "", capture.diagnostic
+                    )
+                except (OSError, ValueError):
+                    pass
             if not capture.ok:
                 retry = screen_read.capture_failure_message(capture.reason)
                 self._enqueue_capture(capture, (), retry, session_token)

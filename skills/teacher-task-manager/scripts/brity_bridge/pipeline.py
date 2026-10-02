@@ -17,7 +17,7 @@ from attendance_script_update import (
     inspect_attendance_script_update,
     target_bundle_sha256,
 )
-from brity_bridge import atomic_io, account_sessions, bundle_paths, capture_store, message_archive, paths, status_log
+from brity_bridge import atomic_io, account_sessions, bundle_paths, capture_store, message_archive, paths, screen_read, status_log
 from brity_bridge.gemini_analyze import (
     AnalysisError,
     run_gemini_analysis_with_recovery,
@@ -767,12 +767,12 @@ def _attachment_preflight_guidance(message: str) -> tuple[str, str, str]:
         return (
             "첨부파일 이름을 모두 읽지 못해 등록하지 않았어요.",
             "첨부파일 이름을 읽지 못함",
-            "첨부파일 목록이 모두 보이게 한 뒤 같은 메시지에서 단축키를 다시 눌러 주세요.",
+            screen_read.ATTACHMENT_NAME_RETRY,
         )
     return (
         "첨부파일을 확인하지 못해 등록하지 않았어요.",
         "첨부파일을 확인하지 못함",
-        "첨부파일을 다시 내려받고 목록이 모두 보이게 한 뒤 단축키를 다시 눌러 주세요.",
+        "첨부파일을 다시 내려받은 뒤 같은 메시지에서 단축키를 다시 눌러 주세요.",
     )
 
 
@@ -805,10 +805,23 @@ def record_preflight_failure(
     )
 
 
+def _attachment_name_failure_reason(capture) -> str:
+    """Say how many of the `총 N` file names were read (BRITY-ATT-ROWS-01)."""
+    expected = getattr(capture, "attachment_expected", None)
+    read = getattr(capture, "attachment_read", None)
+    if isinstance(expected, int) and isinstance(read, int) and expected > 0 and read != expected:
+        if read == 0:
+            return f"첨부파일 {expected}개의 이름을 읽지 못해 등록하지 않았어요."
+        if read < expected:
+            return f"첨부파일 {expected}개 중 {read}개의 이름만 읽어 등록하지 않았어요."
+        return f"첨부파일은 {expected}개인데 이름이 {read}개로 읽혀 등록하지 않았어요."
+    return "첨부파일 이름을 모두 읽지 못해 등록하지 않았어요."
+
+
 def record_screen_failure(config_dir: Path, capture, retry: str) -> FlowResult:
     source_hash, identity, names = _preflight_capture_fields(capture)
     if "첨부파일 이름" in str(getattr(capture, "reason", "")):
-        reason = "첨부파일 이름을 모두 읽지 못해 등록하지 않았어요."
+        reason = _attachment_name_failure_reason(capture)
         summary = "첨부파일 이름을 읽지 못함"
     else:
         reason = "메시지 내용을 읽지 못해 등록하지 않았어요."

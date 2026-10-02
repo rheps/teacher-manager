@@ -3413,6 +3413,13 @@ function attendanceScriptUpdateHtml(a) {
   ])) return `<div class="attendance-script-update warn">
     <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 다시 확인</button></div>`;
   const update = S.attendanceScriptUpdate;
+  // Google got the new functions; only the final stamp is missing: grey, no update button (ATT-UPD-02).
+  if (update?.state === "finish-pending" || (!update && a.script_finish_pending === true)) {
+    const detail = String(update?.detail || a.detail || "").trim()
+      || "Google 출결 시트의 기능 업데이트는 끝났어요. 마무리 확인만 남았어요. [마무리 확인]을 눌러 주세요.";
+    return `<div class="attendance-script-update"><span>${esc(detail)}</span>
+      <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">마무리 확인</button></div>`;
+  }
   if (update?.state === "verification-unavailable") return `<div class="attendance-script-update warn"><span>${esc(update.detail)}</span><button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   if (update?.state === "ai-action-required") {
     const detail = String(update.detail || "").trim()
@@ -3438,7 +3445,7 @@ function attendanceScriptUpdateHtml(a) {
     return `<div class="attendance-script-update warn"><span>${esc(detail)}</span>
       <button class="btn-quiet" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">다시 확인</button></div>`;
   }
-  return `<div class="attendance-script-update warn"><span>출석부의 자동 처리 기능과 프로그램 버전이 맞지 않아요.</span>
+  return `<div class="attendance-script-update warn"><span>Teacher Manager가 업데이트되어 Google 출결 시트의 기능도 함께 업데이트해야 해요.</span>
     <button class="btn-tonal" data-action="attendance-script-update-resolve" data-busy-text="확인 중…">출결 기능 업데이트</button></div>`;
 }
 function attendanceScriptProtectedMessage(update) {

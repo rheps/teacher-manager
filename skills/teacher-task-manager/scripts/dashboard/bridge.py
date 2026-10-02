@@ -67,6 +67,13 @@ _V1_STEP_TO_V2 = {1: 1, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 9}
 _ATTENDANCE_AUTH_BLOCKED_STATES = {
     "gws-required", "login-required", "account-required", "auth-error"
 }
+_ATTENDANCE_UPDATE_FINISH_PENDING_MESSAGE = (
+    "Google 출결 시트의 기능 업데이트는 끝났어요. 마무리 확인만 남았어요. [마무리 확인]을 눌러 주세요."
+)
+# Server answers that leave the final stamp unwritten for a moment (ATT-UPD-02).
+_ATTENDANCE_STAMP_RETRY_CODES = frozenset({
+    "ATTENDANCE_VERIFY_UNAVAILABLE", "ATTENDANCE_AUTHORITY_UNAVAILABLE", "ATTENDANCE_RATE_LIMITED",
+})
 _ATTENDANCE_UPDATE_PERMISSION_MESSAGE = (
     "출결 기능 업데이트에 필요한 Google 권한을 다시 승인해야 해요. "
     "‘다시 로그인하고 승인’을 눌러 같은 Google 계정으로 승인해 주세요. "
@@ -2353,6 +2360,9 @@ class Api:
                               detail="출석부에서 처음 설정 완료 상태를 확인해 주세요.")
             else:
                 status["automation_state"] = "READY"
+        if status.get("state") == "script-check-required" and self._attendance_update_finish_pending():
+            # The update reached Google; only the final stamp is missing (ATT-UPD-02).
+            status.update(script_finish_pending=True, detail=_ATTENDANCE_UPDATE_FINISH_PENDING_MESSAGE)
         # 다음에 켤 때 "확인하는 중…" 없이 이 상태부터 보여준다. 시트를 읽지 못해
         # 알 수 없는 상태는 저장하지 않는다 — 다음 실행에서 옛 정상 저장본이 먼저 보인다.
         if not layout_unreadable:
@@ -2987,9 +2997,14 @@ class Api:
                 }
             # 업데이트를 시작할 때 읽은 기록이 지금도 정확히 같을 때만 증명을 쓰고
             # 옛판 표식을 함께 지운다. 다른 창의 새 기록은 건드리지 않는다.
-            mark_attendance_script_current(
+            # Google 쪽 일은 위에서 모두 끝났다. 이 마무리 기록(중앙 서버)만 잠깐
+            # 실패하면 최대 세 번 다시 쓰고, 그래도 안 되면 업데이트 실패가 아니라
+            # 마무리 확인만 남은 상태로 알린다(ATT-UPD-02).
+            if not self._stamp_attendance_script_current(
                 record_path, record_snapshot, expected_sha256
-            )
+            ):
+                return {**payload, "state": "finish-pending", "verified": False,
+                        "detail": _ATTENDANCE_UPDATE_FINISH_PENDING_MESSAGE}
             engine._atomic_write_json(finish_path, {})
         elif not apply and not resume and can_resume and payload.get("state") == "current" and payload.get("verified") is True:
             payload["state"] = "verification_required"
@@ -3023,6 +3038,47 @@ class Api:
                 self._require_attendance_binding(record)
             return runner(args, cwd)
         return scoped
+
+    def _stamp_attendance_script_current(self, record_path, record_snapshot, expected_sha256) -> bool:
+        """Write the 'checked with this bundle' stamp; False when the server stays unavailable."""
+        from attendance_install_record import (
+            mark_attendance_script_current,
+            read_attendance_install_snapshot,
+        )
+
+        def connection(record):
+            return {key: value for key, value in record.items()
+                    if key not in ("script_attestation", "script_update_required")}
+
+        sleeper = self._deps.recovery_sleeper or time.sleep
+        snapshot = record_snapshot
+        for attempt, delay in enumerate(recovery.NETWORK_DELAYS):
+            if delay:
+                sleeper(delay)
+            try:
+                if attempt:
+                    # A lost reply may have saved the stamp already: read again and
+                    # stamp only the same connection that was checked above.
+                    snapshot = read_attendance_install_snapshot(record_path)
+                    if connection(snapshot.record) != connection(record_snapshot.record):
+                        raise ScreenSafeError("출결 기능 확인 도중 출석부 연결 기록이 바뀌었어요. 현재 상태를 다시 확인해 주세요.")
+                mark_attendance_script_current(record_path, snapshot, expected_sha256)
+                return True
+            except AttendanceBindingError as error:
+                if error.code not in _ATTENDANCE_STAMP_RETRY_CODES:
+                    raise
+        return False
+
+    def _attendance_update_finish_pending(self) -> bool:
+        """The Google side finished but the final stamp is still missing."""
+        from attendance_workbook_transition import _read_dict
+        finish_path = self._config_dir / "attendance-update-progress.generated.json"
+        try:
+            checkpoint = _read_dict(finish_path) if finish_path.exists() else {}
+            current = engine.current_attendance_script_bundle_sha256()
+        except Exception:  # noqa: BLE001 - 읽지 못하면 기존 안내를 그대로 쓴다.
+            return False
+        return bool(current) and checkpoint.get("bundle_sha256") == current
 
     def _attendance_update_mutation_guard(self, run, gws, expected_account):
         expected = str(expected_account or "").strip().casefold()

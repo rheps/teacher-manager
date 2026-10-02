@@ -20,6 +20,10 @@ _ATTACHMENT_SUMMARY_PARTS = {"총", "합계", "개", "(", ")", "[", "]"}
 _CAPTURE_ATTEMPTS = 3
 _ATTACHMENT_WRAP_GAP = 30
 _ATTACHMENT_WRAP_X_TOLERANCE = 40
+ATTACHMENT_NAME_RETRY = (
+    "Brity에서 같은 메시지를 연 채로 단축키를 다시 눌러 주세요. "
+    "다시 실패하면 이 메시지의 일정과 할 일은 직접 등록해 주세요."
+)
 
 
 @dataclass
@@ -223,6 +227,82 @@ def _scoped_attachment_names(content: list[ScreenElement]) -> list[str] | None:
     return names
 
 
+_ACTION_PREFIXES = tuple(action + " " for action in sorted(_ATTACHMENT_ACTIONS))
+_FILE_EXTENSION_RE = re.compile(r"\.[0-9A-Za-z]{1,8}$")
+
+
+def _file_row_label(element: ScreenElement) -> tuple[str, bool] | None:
+    """(full file name, is the download button) carried by a row control's label."""
+    if element.ctrl not in ("Button", "CheckBox"):
+        return None
+    text = element.text.strip()
+    is_download = False
+    for prefix in _ACTION_PREFIXES:
+        if text.startswith(prefix):
+            text, is_download = text[len(prefix):].strip(), True
+            break
+    if not text or not _is_attachment_name_candidate(
+        ScreenElement(text, element.ctrl, element.x, element.y, element.w, element.h, ""),
+        2**31 - 1,
+    ):
+        return None
+    return text, is_download
+
+
+def _labelled_row_names(content: list[ScreenElement]) -> list[str]:
+    """Names from file-row controls that carry the full name in their own labels.
+
+    BRITY-ATT-ROWS-01. Brity's 쪽지 view (school PC UIA dump 2026-10-01) puts every attachment row
+    element directly under one 상세 보기 Group in the control view, so no ancestor
+    holds exactly one size and the scoped reader gets nothing. Each row does carry
+    its whole name three times: CheckBox, name Button and `다운로드 <name>` Button.
+    A row is two or more controls on one line agreeing on one full label, with a
+    size Text on that line, and either a 다운로드 control or a file extension (so
+    two `더보기` buttons are never a file). The name is a whole control label;
+    Text is never joined, so body text behind a scrolled list cannot leak in.
+    Rows stay separate by line, so two files with one name stay two rows. Every
+    size must be the header total (첨부파일 on its line) or a row's size; any
+    other size makes the whole read fail, as an unresolved scope does above.
+    """
+    sizes_y = [element.y for element in content if _SIZE_RE.fullmatch(element.text.strip())]
+    header_y = [element.y for element in content if element.text.strip() == _ATTACHMENT_LABEL]
+    rows: list[tuple[int, str, int, int, bool]] = []   # (first index, name, y, count, download)
+    for index, element in enumerate(content):
+        label = _file_row_label(element)
+        if label is None:
+            continue
+        name, is_download = label
+        for at, (first, row_name, row_y, count, download) in enumerate(rows):
+            if row_name == name and abs(row_y - element.y) <= _LINE_TOLERANCE:
+                rows[at] = (first, row_name, row_y, count + 1, download or is_download)
+                break
+        else:
+            rows.append((index, name, element.y, 1, is_download))
+    names: list[str] = []
+    row_lines: list[int] = []
+    for _first, name, row_y, count, download in sorted(rows):
+        if count < 2 or not (download or _FILE_EXTENSION_RE.search(name)):
+            continue
+        if any(abs(size_y - row_y) <= _LINE_TOLERANCE for size_y in sizes_y):
+            names.append(name)
+            row_lines.append(row_y)
+    for size_y in sizes_y:
+        if not any(abs(size_y - line_y) <= _LINE_TOLERANCE for line_y in row_lines + header_y):
+            return []
+    return names
+
+
+def _read_attachment_names(content: list[ScreenElement]) -> tuple[list[str], str]:
+    """(names, method). Scoped rows first, full-label rows when no row scope exists."""
+    scoped_names = _scoped_attachment_names(content)
+    if scoped_names is None:
+        return [], "legacy"
+    if scoped_names:
+        return scoped_names, "scoped"
+    labelled = _labelled_row_names(content)
+    return labelled, "label" if labelled else "none"
+
+
 def assemble_message(elements: list[ScreenElement]) -> tuple[str, list[str]]:
     """요소 덤프에서 (본문 텍스트, 첨부파일명 목록)을 만든다. 순수 함수 — 시험 대상."""
     content = _content_elements(elements)
@@ -230,9 +310,9 @@ def assemble_message(elements: list[ScreenElement]) -> tuple[str, list[str]]:
     body = "\n".join(
         " ".join(element.text.strip() for element in line) for line in text_lines
     ).strip()
-    scoped_names = _scoped_attachment_names(content)
-    if scoped_names is not None:
-        return body, scoped_names
+    read_names, method = _read_attachment_names(content)
+    if method != "legacy":
+        return body, read_names
     names: list[str] = []
     attachment_section_seen = False
     pending_fragment: tuple[int, ScreenElement] | None = None
@@ -353,6 +433,23 @@ class ScreenCapture:
     body: str
     attachments: list[str]
     attempt_count: int = 1
+    # `총 N` on the screen and how many file names were read.
+    attachment_expected: int | None = None
+    attachment_read: int | None = None
+    # Counts only (no file names, no message text) for the bridge log.
+    diagnostic: str = ""
+
+
+def _attachment_diagnostic(
+    elements: list[ScreenElement], names: list[str], expected: int | None
+) -> str:
+    content = _content_elements(elements)
+    _names, method = _read_attachment_names(content)
+    sizes = sum(1 for element in content if _SIZE_RE.fullmatch(element.text.strip()))
+    return (
+        f"screen-attachments method={method} read={len(names)} "
+        f"expected={'?' if expected is None else expected} sizes={sizes}"
+    )
 
 
 def _default_ps_runner(script: str, timeout: float) -> tuple[int, str]:
@@ -411,10 +508,15 @@ def capture_brity_text(runner=None, timeout: float = 20.0) -> ScreenCapture:
             names_complete = bool(names)
             if expected_count is not None:
                 names_complete = len(names) == expected_count
+            diagnostic = _attachment_diagnostic(elements, names, expected_count)
             if names_complete:
-                return ScreenCapture(True, "", body, names, attempt_count)
+                return ScreenCapture(
+                    True, "", body, names, attempt_count, expected_count, len(names), diagnostic
+                )
+            # Only an exact `총 N` match registers; a partial list is never guessed (C7).
             attachment_failure = ScreenCapture(
-                False, "첨부파일 이름을 읽지 못했습니다", body, [], attempt_count
+                False, "첨부파일 이름을 읽지 못했습니다", body, [], attempt_count,
+                expected_count, len(names), diagnostic,
             )
             continue
         candidate = ScreenCapture(True, "", body, [], attempt_count)
@@ -435,7 +537,9 @@ def capture_failure_message(reason: str) -> str:
     if "찾지 못" in reason:
         return "브리티 메신저를 열고 읽을 대화방을 띄운 뒤 단축키를 다시 눌러 주세요."
     if "첨부파일 이름" in reason:
-        return "첨부파일 목록이 모두 보이게 한 뒤 단축키를 다시 눌러 주세요."
+        # Rows below the 5-row attachment box are read too (BRITY-ATT-ROWS-01),
+        # so asking the teacher to show every row cannot help.
+        return ATTACHMENT_NAME_RETRY
     if "너무 짧" in reason or "요소를 받지 못" in reason:
         return "읽을 메시지가 화면에 보이게 한 뒤 단축키를 다시 눌러 주세요."
     return (

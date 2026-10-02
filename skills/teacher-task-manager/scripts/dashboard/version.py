@@ -105,7 +105,9 @@
 # guide and [명단 수정] are gone, and roster link/room list wait for a running attendance task.
 # v5.01: in-app update reads version.json and the Setup with Windows curl.exe first and falls back
 # to Python HTTPS (UPD-04); from 5.0 the minor part is always two digits (5.01, 5.02 ...).
-APP_VERSION = "5.01"
+# v5.02: sheet dashboard (출결·메신저 대시보드) in the workbook menu, AI input fixes, Chat send
+# rejection is settled and named, Brity attachment names read from the row labels; Apps Script 5.13.14.
+APP_VERSION = "5.02"
 
 BRANDING = {
     "name": "Teacher Manager",

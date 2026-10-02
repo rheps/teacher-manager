@@ -37,3 +37,15 @@ on a freshly installed Windows whose root store has not yet fetched newer roots.
 Source: https://github.com/certifi/python-certifi
 License: MPL-2.0 (https://www.mozilla.org/MPL/2.0/).  The bundle carries no
 private keys and is used only to verify servers.
+
+The attendance workbook script (assets/Code.gs) includes Preact 10.29.8,
+preact/hooks 10.29.8 and htm 3.1.1 for the sheet dashboard dialog.
+
+Preact and preact/hooks: https://github.com/preactjs/preact
+License: MIT.  Copyright (c) 2015-present Jason Miller.  The complete MIT
+license text is repeated in the comment above the dashboard block in
+assets/Code.gs.
+
+htm: https://github.com/developit/htm
+License: Apache-2.0.  Copyright 2018 Google Inc.  The Apache License 2.0 text
+is the same as licenses/google-workspace-cli-Apache-2.0.txt.

@@ -36,7 +36,7 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         ("v4.5", "3a1d14e914ab86e3cb02841d398742cafa03ea12"),
         ("v4.6", "3b73723e2bcf861b4b1d" "1115a3ff704bfa439419"),
     ),
-    # Exact public v4.7-v5.0 tags (Code.gs 5.13.13), rehashed from the public tags 2026-09-29/30.
+    # Exact public v4.7-v5.01 tags (Code.gs 5.13.13), rehashed from the public tags 2026-09-29/30/10-02.
     (
         "0f2a003a94ba6cdb" "48d01a04b6988510"
         "203f8e71ac432220" "d2b6a88af3cb86b3"
@@ -45,6 +45,7 @@ TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
         ("v4.8", "bb844cf18d803e30249d" "f1d33b53c8b00a66ab25"),
         ("v4.9", "4d26dd588478622658ff" "7d3f0292082cd535dc07"),
         ("v5.0", "36bea52a28c2e4b78403" "47f158397e433cef66f1"),
+        ("v5.01", "c1db35f6a17de49f7fbd" "97740fb3f10ad7c5843d"),
     ),
     # Approved frozen delivery evidence: tests/fixtures/attendance_predecessors.
     '5cb59faafe9e1c0076bbef56703917dbd767debfd5f01ea42d180d272c71c1d8': (('v4.2', '1b5d8289e2f9b2cb06266089ec785e0c00a22c72'),),
@@ -156,6 +157,41 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # New-row category (SHEET-AI-04) was delivered to the school account's workbook by
+    # Candidate 493bd2fa on 2026-10-02; frozen sheet-dashboard-p6-target.
+    'e78e51f500fdc3b3fb4bada3b4816287343c00578b423b352815f09ca9846814': (
+        ('candidate-sheet-dashboard-p6-2026-10-02', '493bd2fa1c2bf3cbb66aeb89ff2925ff5009cd9f'),
+    ),
+    # AI correction read-back (SHEET-AI-03) was delivered to the school account's workbook by
+    # Candidate 9a2ab62e on 2026-10-01; frozen sheet-dashboard-p5-target.
+    '3f29b164b1011c4a2b75ca20feca639b833798b062da1dd625a243e92122289a': (
+        ('candidate-sheet-dashboard-p5-2026-10-01', '9a2ab62e0023dd19129ddbd331343b1bf62825a5'),
+    ),
+    # Sheet-dashboard queue time + Chat rejection (CHAT-REJECT-01) was delivered to the school account's
+    # workbook by Candidate 12de48de on 2026-10-01; frozen sheet-dashboard-p4-target.
+    'f413008ebc4f60d399937e551d7a3c36f241458936644b8dd17c430ceb5c4090': (
+        ('candidate-sheet-dashboard-p4-2026-10-01', '12de48dec7540bb67da8879a1e7e2ca5669f8af6'),
+    ),
+    # Sheet-dashboard result read-back (latest processed messages first) was delivered to the school
+    # account's workbook by Candidate 6e99103e on 2026-10-01; frozen sheet-dashboard-p3-target.
+    'b600ad6e32b7d674f792648d35f6d54d23a6e47a8bc2d5fdfa9c4c7a41df10c8': (
+        ('candidate-sheet-dashboard-p3-2026-10-01', '6e99103e8ba05381dd976d4b4b9a86132a950993'),
+    ),
+    # Sheet-dashboard phase 2 (Google Chat sending from the dashboard) was delivered to the
+    # school account's workbook by Candidate 10642d1a on 2026-10-01; frozen sheet-dashboard-p2-target.
+    'baa20b840dadc4ce870916c25d344b53b8a571ac274323f34e277489d2a98d78': (
+        ('candidate-sheet-dashboard-p2-2026-10-01', '10642d1a4c378102530309fe188ea75902976f1c'),
+    ),
+    # SHEET-AI-02 (AI correction with 오늘, 생리 -> 출석인정) was delivered to the school
+    # account's workbook by Candidate c27349a7 on 2026-10-01; frozen ai-today-menstruation-target.
+    '79f9694b299e73f55c2c9057982a2463552183dd9ebb08241d067c74e0d117a2': (
+        ('candidate-sheet-ai-02-2026-10-01', 'c27349a71f3945fe9aaa00edc4e4ca5faf05c149'),
+    ),
+    # Sheet-dashboard phase 1 (Code.gs 5.13.13 + dashboard) was delivered to the diva
+    # test workbook by Candidate b5f0e8f3 on 2026-10-01; frozen sheet-dashboard-p1-target.
+    'a473df63b5b5e5eeda96f5205c2824939ec1e0958312550991f8bf81b388a4c5': (
+        ('candidate-sheet-dashboard-p1-2026-10-01', 'b5f0e8f30832588fee77f896fe307c98358a2763'),
+    ),
     # Code.gs 5.13.12 (notice for a name not on the roster) was delivered to the
     # T03 test workbook by Candidate 813c6564 on 2026-09-29; frozen ai-roster-notice-target.
     '776f987872bf2978ef8d2690d620707a73f6151c2cd83ca90acf74473dcf0eb2': (
@@ -279,6 +315,30 @@ _DELIVERED_42_ORDER = {
     "776f987872bf2978ef8d2690d620707a73f6151c2cd83ca90acf74473dcf0eb2": 14,
     # Reviewed Code.gs 5.13.13 Candidate target (sheet menu changes, date sort item).
     "0f2a003a94ba6cdb48d01a04b6988510203f8e71ac432220d2b6a88af3cb86b3": 15,
+    # Sheet-dashboard phase 1 Candidate target, delivered to the diva test workbook (Candidates only).
+    # The earlier 4d5222e5 target was never delivered to a sheet.
+    "a473df63b5b5e5eeda96f5205c2824939ec1e0958312550991f8bf81b388a4c5": 16,
+    # SHEET-AI-02 Candidate target (오늘 corrections, 생리 -> 출석인정), delivered by Candidate c27349a7
+    # to the school account's workbook on 2026-10-01 (Candidates only; Code.gs keeps 5.13.13).
+    "79f9694b299e73f55c2c9057982a2463552183dd9ebb08241d067c74e0d117a2": 17,
+    # Sheet-dashboard phase 2 Candidate target, delivered by Candidate 10642d1a to the school
+    # account's workbook on 2026-10-01 (Candidates only; Code.gs keeps 5.13.13).
+    "baa20b840dadc4ce870916c25d344b53b8a571ac274323f34e277489d2a98d78": 18,
+    # Sheet-dashboard result read-back Candidate target, delivered by Candidate 6e99103e to the school
+    # account's workbook on 2026-10-01 (Candidates only; Code.gs keeps 5.13.13).
+    "b600ad6e32b7d674f792648d35f6d54d23a6e47a8bc2d5fdfa9c4c7a41df10c8": 19,
+    # Sheet-dashboard queue time + Chat rejection Candidate target, delivered by Candidate 12de48de to the
+    # school account's workbook on 2026-10-01 (Candidates only; Code.gs keeps 5.13.13).
+    "f413008ebc4f60d399937e551d7a3c36f241458936644b8dd17c430ceb5c4090": 20,
+    # AI correction read-back Candidate target, delivered by Candidate 9a2ab62e to the school account's
+    # workbook on 2026-10-01 (Candidates only; Code.gs keeps 5.13.13).
+    "3f29b164b1011c4a2b75ca20feca639b833798b062da1dd625a243e92122289a": 21,
+    # New-row category Candidate target, delivered by Candidate 493bd2fa to the school account's
+    # workbook on 2026-10-02 (Candidates only; Code.gs keeps 5.13.13).
+    "e78e51f500fdc3b3fb4bada3b4816287343c00578b423b352815f09ca9846814": 22,
+    # Teacher Manager 5.02 release target: the delivered new-row category bundle with Code.gs
+    # APP_VERSION bumped to 5.13.14 for the public release (no other change).
+    "53f991d4962989a4e6259625b88c0b54ca6bb5b27659e093d09c34e6958569a1": 23,
 }
 
 
