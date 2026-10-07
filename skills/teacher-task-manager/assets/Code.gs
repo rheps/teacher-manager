@@ -147,7 +147,7 @@ const CHAT_MESSAGE_LIMIT_BYTES = 30000;
 /*************************************************
  * 메뉴
  *************************************************/
-function onOpen() {
+function onOpen() {  addChatAttendanceMenu_();
   const ui = SpreadsheetApp.getUi();
 
   // 메뉴는 '사전 세팅'과 '교사가 직접 실행하는 일'로 가른다.
@@ -10476,3 +10476,229 @@ const TM_DASHBOARD_JS_ = [
   "})();\n"
 ].join('');
 // ===== END TM DASHBOARD PAGE =====
+
+
+/** Student DM attendance: preserves B1 and existing rows; never sends Chat replies. */
+const CHAT_ATTENDANCE_CONFIG_KEY='CHAT_ATTENDANCE_CONFIG_V1';
+const CHAT_ATTENDANCE_MESSAGE_PREFIX='CHAT_ATTENDANCE_MESSAGE_V1_';
+function addChatAttendanceMenu_(){SpreadsheetApp.getUi().createMenu('학생 Chat 출결').addItem('자동입력 켜기 (새 쪽지부터)','enableChatAttendance').addItem('자동입력 끄기','disableChatAttendance').addItem('처리 상태 확인','showChatAttendanceStatus').addToUi();}
+function chatAttendanceScopeKey_(s){return JSON.stringify([s.protocolVersion,s.spreadsheetId,s.workbookSchoolYear,s.generation,s.monthlySheetIds]);}
+function chatAttendanceHash_(s){return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(s),Utilities.Charset.UTF_8)).replace(/=+$/,'');}
+function chatAttendanceGet_(path){
+ const r=UrlFetchApp.fetch('https://chat.googleapis.com/v1/'+path,{headers:{Authorization:'Bearer '+ScriptApp.getOAuthToken()},muteHttpExceptions:true});
+ if(r.getResponseCode()===404)return null;
+if(r.getResponseCode()!==200){
+ try{
+  const http=r.getResponseCode();
+  let reason='UNCLASSIFIED';
+  try{
+   const parsed=JSON.parse(r.getContentText());
+   const allowed=['SERVICE_DISABLED','ACCESS_TOKEN_SCOPE_INSUFFICIENT'];
+   const details=parsed&&parsed.error&&parsed.error.details;
+   const info=Array.isArray(details)?details.find(v=>v&&v['@type']==='type.googleapis.com/google.rpc.ErrorInfo'&&allowed.includes(v.reason)):null;
+   if(info)reason=info.reason;
+  }catch(_){}
+  if(Number.isInteger(http))console.log('CHAT_READ_DIAGNOSTIC HTTP='+http+' reason='+reason);
+ }catch(_){}
+ throw new Error('CHAT_READ_FAILED');
+}
+ return JSON.parse(r.getContentText());
+}
+function chatAttendanceConfig_(){return JSON.parse(PropertiesService.getScriptProperties().getProperty(CHAT_ATTENDANCE_CONFIG_KEY)||'null');}
+function chatAttendanceAssertCurrent_(source,c,date){
+ const n=chatAttendanceConfig_();
+ if(!n||!n.enabled||n.generation!==c.generation||n.cutoff!==c.cutoff||n.teacher!==c.teacher||n.spreadsheetId!==c.spreadsheetId||n.binding!==c.binding||n.rosterSheetName!==c.rosterSheetName||source.getId()!==c.spreadsheetId)throw new Error('CONTEXT_CHANGED');
+ if(requireGoeduTeacherAccount_({requireEffectiveUser:true})!==c.teacher)throw new Error('ACCOUNT_CHANGED');
+ authorizeAttendanceOperation_('automatic',date);
+ if(chatAttendanceScopeKey_(attendanceManagedScope_('automatic',date,''))!==c.binding)throw new Error('BINDING_CHANGED');
+}
+function enableChatAttendance(){
+ const lock=LockService.getDocumentLock();
+ if(!lock||!lock.tryLock(1000))throw new Error('다른 출결 작업이 끝난 뒤 다시 눌러 주세요.');
+ try{
+  const source=SpreadsheetApp.getActiveSpreadsheet(),teacher=requireGoeduTeacherAccount_({requireEffectiveUser:true});
+  const date=Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd');
+  authorizeAttendanceOperation_('automatic',date);
+  const ports=attendanceAiDefaultPorts_(source),settings=readAttendanceConfigStrict_(source);
+  if(String(ports.getTargetSpreadsheetId())!==source.getId()||!ports.getGeminiApiKey())throw new Error('현재 출결 연결과 AI 설정을 확인해 주세요.');
+  const rosterSheetName=String(settings.ROSTER_SHEET_NAME||'학생명단').trim();
+  const roster=ports.readRosterRows(source,{rosterSheetName:rosterSheetName});
+  chatAttendanceValidateRoster_(roster);
+  const emails=roster.filter(r=>String(r[0]||'').trim()||String(r[1]||'').trim()).map(r=>String(r[2]||'').trim());
+  if(!emails.length||new Set(emails).size!==emails.length||emails.some(e=>!isExactGoeduEmail_(e)))throw new Error('학생 Google 이메일을 중복 없이 확인해 주세요.');
+  let checked=false;
+  for(const email of emails){
+   const dm=chatAttendanceGet_('spaces:findDirectMessage?name='+encodeURIComponent('users/'+email));
+   if(!dm)continue;
+   if(dm.spaceType!=='DIRECT_MESSAGE')throw new Error('CHAT_DM_INVALID');
+   const student=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(email));
+   const own=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(teacher));
+   if(!student||!own||!student.member||!own.member||!/^users\/[^/]+$/.test(String(student.member.name||''))||!/^users\/[^/]+$/.test(String(own.member.name||''))||student.member.name===own.member.name)throw new Error('CHAT_MEMBER_INVALID');
+   const messages=chatAttendanceGet_(dm.name+'/messages?pageSize=1');if(!messages)throw new Error('CHAT_MESSAGES_UNAVAILABLE');checked=true;break;
+  }
+  if(!checked)throw new Error('학생과의 기존 Google Chat 개인 대화가 있어야 켤 수 있어요.');
+  const p=PropertiesService.getScriptProperties();
+  let macKey=p.getProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1');
+  if(!macKey){macKey=Utilities.getUuid();p.setProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1',macKey);}
+  const c={enabled:true,generation:Utilities.getUuid(),teacher:teacher,spreadsheetId:source.getId(),rosterSheetName:rosterSheetName,binding:chatAttendanceScopeKey_(attendanceManagedScope_('automatic',date,'')),cutoff:new Date().toISOString(),macKey:macKey};
+  ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()==='pollChatAttendance').forEach(t=>ScriptApp.deleteTrigger(t));
+  p.setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));
+  try{ScriptApp.newTrigger('pollChatAttendance').timeBased().everyMinutes(10).create();}
+  catch(_){c.enabled=false;p.setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));throw new Error('자동 확인을 예약하지 못했어요. 다시 켜 주세요.');}
+  source.toast('지금부터 오는 학생 개인 쪽지만 확인해요. 기존 쪽지는 입력하지 않아요.','학생 Chat 출결',10);
+ }finally{lock.releaseLock();}
+}
+function disableChatAttendance(){
+ const lock=LockService.getDocumentLock();if(!lock||!lock.tryLock(1000))throw new Error('출결 처리 중이에요. 잠시 뒤 다시 눌러 주세요.');
+ try{
+  const c=chatAttendanceConfig_();
+  if(c&&requireGoeduTeacherAccount_({requireEffectiveUser:true})!==c.teacher)throw new Error('ACCOUNT_CHANGED');
+  if(c){c.enabled=false;PropertiesService.getScriptProperties().setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));}
+  ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()==='pollChatAttendance').forEach(t=>ScriptApp.deleteTrigger(t));
+  SpreadsheetApp.getActiveSpreadsheet().toast('학생 쪽지 자동입력을 껐어요.','학생 Chat 출결',7);
+ }finally{lock.releaseLock();}
+}
+function showChatAttendanceStatus(){
+ const lock=LockService.getDocumentLock();
+ if(!lock||!lock.tryLock(1000)){SpreadsheetApp.getUi().alert('학생 쪽지 출결을 처리 중이에요. 잠시 뒤 다시 확인해 주세요.');return;}
+ try{
+  const c=chatAttendanceConfig_(),teacher=requireGoeduTeacherAccount_({requireEffectiveUser:true});
+  if(c&&c.teacher!==teacher)throw new Error('ACCOUNT_CHANGED');
+  const props=PropertiesService.getScriptProperties(),p=props.getProperties(),counts={applied:0,review:0,uncertain:0},details=[];
+  const sheets=SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  Object.keys(p).filter(k=>k.indexOf(CHAT_ATTENDANCE_MESSAGE_PREFIX)===0).forEach(k=>{
+   const r=JSON.parse(p[k]);
+   if(!c||r.teacher!==c.teacher||r.spreadsheetId!==c.spreadsheetId)return;
+   if(r.state==='writing'){r.state='uncertain';r.code='INTERRUPTED_WRITE';props.setProperty(k,JSON.stringify(r));}
+   if(Object.prototype.hasOwnProperty.call(counts,r.state))counts[r.state]++;
+   if(r.state==='review'||r.state==='uncertain'){
+    const sheet=sheets.find(s=>s.getSheetId()===r.sheetId);
+    const location=r.row?' / '+(sheet?sheet.getName():'출석부')+' '+r.row+'행':'';
+    const reason=r.state==='uncertain'?'입력 결과 확인 필요':r.code==='CORRECTION_REQUIRES_REVIEW'?'학생 정정 쪽지 확인 필요':r.code==='AMBIGUOUS_EDITED_OR_CORRECTED'?'날짜·수정·취소 확인 필요':'기존 출결·분류 확인 필요';
+    details.push((r.student?r.student+'번':'학생 확인 필요')+' '+(r.date||'')+location+' / '+reason);
+   }
+  });
+  SpreadsheetApp.getUi().alert('학생 Chat 출결',(c&&c.enabled?'자동입력 켜짐':'자동입력 꺼짐')+'\n입력 확인: '+counts.applied+'\n선생님 확인 필요: '+counts.review+'\n결과 불확실 (자동 재입력 안 함): '+counts.uncertain+'\n최근 확인: '+(p.CHAT_ATTENDANCE_LAST_POLL_V1||'아직 확인 전')+'\n조회 실패: '+(p.CHAT_ATTENDANCE_LAST_ERROR_V1?'연결을 확인해 주세요.':'없음')+(details.length?'\n\n'+details.slice(-20).join('\n'):''),SpreadsheetApp.getUi().ButtonSet.OK);
+ }finally{lock.releaseLock();}
+}
+function chatAttendanceMessageVersion_(m){return chatAttendanceHash_(JSON.stringify([m.name,m.sender&&m.sender.name,m.createTime,m.lastUpdateTime||'',m.text||'']));}
+function chatAttendanceDay_(m){const d=new Date(m.createTime);if(!Number.isFinite(d.getTime()))throw new Error('MESSAGE_DATE_INVALID');return Utilities.formatDate(d,'Asia/Seoul','yyyy-MM-dd');}
+function chatAttendanceMessages_(space,cutoff){
+ const result=[];let token='',pages=0;
+ const since=new Date(new Date(cutoff).getTime()-1000).toISOString();
+ do{
+  const path=space+'/messages?pageSize=100&orderBy='+encodeURIComponent('createTime ASC')+'&filter='+encodeURIComponent('createTime > "'+since+'"')+(token?'&pageToken='+encodeURIComponent(token):'');
+  const page=chatAttendanceGet_(path);if(!page)throw new Error('CHAT_SPACE_UNAVAILABLE');
+  result.push.apply(result,page.messages||[]);token=page.nextPageToken||'';
+  if(++pages>=5&&token)throw new Error('CHAT_PAGE_LIMIT');
+ }while(token);
+ return result;
+}
+function chatAttendanceCandidate_(s){return /(?:결석|못\s*(?:가|갈)|학교\s*못)/.test(s)&&/(?:아파|아픈|통증|생리|병원|몸살|감기|열이)/.test(s);}
+function chatAttendanceAmbiguous_(s){return /(?:취소|정정|수정|아니|괜찮|갈게|등교할|회복|어제|내일|모레|다음|지난|[월화수목금토일]요일|\d{1,2}[/.]\d{1,2}|["'“”‘’>]|\d{1,2}\s*[월일])/.test(s);}
+function chatAttendanceSetState_(m,state,code,student,c){PropertiesService.getScriptProperties().setProperty(CHAT_ATTENDANCE_MESSAGE_PREFIX+chatAttendanceHash_(m.name),JSON.stringify({state:state,code:code,student:student||null,date:chatAttendanceDay_(m),teacher:c.teacher,spreadsheetId:c.spreadsheetId}));}
+function chatAttendanceCorrection_(s){return /(?:이제.{0,12}괜찮|(?:학교|등교).{0,12}(?:갈게|가겠|할게)|(?:결석|못.{0,3}가).{0,12}(?:취소|아니)|^\s*취소(?:할게요|해요|합니다)?\s*[.!?]?\s*$)/.test(s);}
+function chatAttendanceProxy_(text,row,roster){return /(?:못\s*간대|못\s*갈\s*거래|전해\s*달|전해\s*줘|대신\s*(?:연락|말|전)|친구|걔|그\s*아이)/.test(text)||roster.some(r=>{const name=String(r[1]||'').trim();if(String(r[0])===String(row[0])||!name)return false;if(text.indexOf(name)!==-1)return true;if(/^[가-힣]{3,4}$/.test(name)){const given=name.slice(1);return [given+'가',given+'이가',given+'는',given+'이는'].some(s=>text.indexOf(s)!==-1);}return false;});}
+function chatAttendanceDayMessages_(space,date,sender){const start=date+'T00:00:00+09:00';return chatAttendanceMessages_(space,start).filter(m=>m.sender&&m.sender.name===sender&&chatAttendanceDay_(m)===date);}
+function chatAttendanceReceiptCell_(v,zone){
+ if(v instanceof Date){const p=Utilities.formatDate(v,zone,'yyyy-MM-dd').split('-').map(Number);return{numberValue:Date.UTC(p[0],p[1]-1,p[2])/86400000+25569};}
+ if(v===''||v===null)return{};
+ if(typeof v==='number')return{numberValue:v};
+ if(typeof v==='string')return{stringValue:v};
+ throw new Error('RECEIPT_TYPE_INVALID');
+}
+function chatAttendanceCellDigest_(v,key){return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(JSON.stringify(v),key));}
+function chatAttendanceSameDate_(v,key,zone){
+ if(v instanceof Date)return Utilities.formatDate(v,zone,'yyyy-MM-dd')===key;
+ if(typeof v==='number')return Utilities.formatDate(new Date((v-25569)*86400000),'UTC','yyyy-MM-dd')===key;
+ const text=String(v||'').trim();if(/^\d{4}-\d{2}-\d{2}$/.test(text))return text===key;
+ return true;
+}
+function chatAttendanceWrite_(source,c,student,m,ports,role,record){
+ const p=PropertiesService.getScriptProperties(),key=CHAT_ATTENDANCE_MESSAGE_PREFIX+chatAttendanceHash_(m.name),old=p.getProperty(key);
+ if(old){const saved=JSON.parse(old);if(saved.state==='writing'){saved.state='uncertain';saved.code='INTERRUPTED_WRITE';p.setProperty(key,JSON.stringify(saved));}return;}
+ chatAttendanceAssertCurrent_(source,c,record.date);
+ const settings=readAttendanceConfigStrict_(source);
+ if(String(ports.getTargetSpreadsheetId())!==source.getId()||String(settings.ROSTER_SHEET_NAME||'학생명단').trim()!==c.rosterSheetName)throw new Error('TARGET_OR_ROSTER_CHANGED');
+ const currentRole=attendanceMonthSheetsFor_(source,settings).find(i=>Number(i.month)===Number(record.date.substring(5,7)));
+ if(!currentRole||role.sheet.getParent().getId()!==source.getId()||currentRole.sheet.getSheetId()!==role.sheet.getSheetId())throw new Error('MONTH_TARGET_CHANGED');
+ const matched=ports.readRosterRows(source,{rosterSheetName:c.rosterSheetName}).filter(r=>String(r[2]||'').trim()===student.email);
+ if(matched.length!==1||JSON.stringify(matched[0])!==JSON.stringify(student.row))throw new Error('ROSTER_CHANGED');
+ const zone=source.getSpreadsheetTimeZone(),existing=ports.readExistingAttendanceRows(role.sheet);
+ if(existing.dataRows.some(r=>String(r[1])===String(record.rosterCombined)&&chatAttendanceSameDate_(r[0],record.date,zone)))throw new Error('EXISTING_RECORD');
+ const state=ports.readWriteState(role.sheet);
+ if(JSON.stringify(state.headerRow)!==JSON.stringify(INPUT_HEADERS.concat(MONTHLY_CHAT_RESULT_HEADERS)))throw new Error('HEADER_CHANGED');
+ const batch=buildAttendanceAiBatchUpdate_([record],state);
+ const append=batch&&batch.requests&&batch.requests.length===1&&batch.requests[0].appendCells;
+ if(!append||append.sheetId!==role.sheet.getSheetId()||!Array.isArray(append.rows)||append.rows.length!==1||append.fields!=='userEnteredValue,userEnteredFormat.backgroundColor')throw new Error('BATCH_INVALID');
+ const expected=append.rows[0].values.map(cell=>cell.userEnteredValue||{});
+ if(expected.some(v=>Object.keys(v).some(k=>k!=='numberValue'&&k!=='stringValue')))throw new Error('BATCH_TYPE_INVALID');
+ const fresh=chatAttendanceGet_(m.name);
+ if(!fresh||chatAttendanceMessageVersion_(fresh)!==chatAttendanceMessageVersion_(m))throw new Error('MESSAGE_CHANGED');
+ chatAttendanceAssertCurrent_(source,c,record.date);
+ const row=Math.max(MONTHLY_ATTENDANCE_HEADER_ROW,state.lastDataRow)+1;
+ const receipt={state:'writing',code:'WRITE_STARTED',generation:c.generation,teacher:c.teacher,spreadsheetId:c.spreadsheetId,sheetId:state.sheetId,row:row,student:Number(student.row[0]),date:record.date,digest:chatAttendanceCellDigest_(expected,c.macKey)};
+ p.setProperty(key,JSON.stringify(receipt));
+ try{
+  const response=ports.batchUpdate(source.getId(),batch);
+  if(!response||response.spreadsheetId!==source.getId())throw new Error('WRITE_RESPONSE_UNCERTAIN');
+  SpreadsheetApp.flush();
+  const range=role.sheet.getRange(row,1,1,expected.length);
+  if(range.getFormulas()[0].some(Boolean))throw new Error('WRITE_RECEIPT_UNCERTAIN');
+  const actual=range.getValues()[0].map(v=>chatAttendanceReceiptCell_(v,zone));
+  if(chatAttendanceCellDigest_(actual,c.macKey)!==receipt.digest)throw new Error('WRITE_RECEIPT_UNCERTAIN');
+  const count=ports.readExistingAttendanceRows(role.sheet).dataRows.filter(r=>String(r[1])===String(record.rosterCombined)&&chatAttendanceSameDate_(r[0],record.date,zone)).length;
+  if(count!==1)throw new Error('WRITE_CONFLICT_UNCERTAIN');
+  receipt.state='applied';receipt.code='RECEIPT_CONFIRMED';
+ }catch(error){receipt.state='uncertain';receipt.code=/^WRITE_/.test(String(error.message))?error.message:'WRITE_REQUEST_UNCERTAIN';}
+ p.setProperty(key,JSON.stringify(receipt));
+}
+function pollChatAttendance(){
+ const c=chatAttendanceConfig_();if(!c||!c.enabled)return;
+ if(String(Session.getEffectiveUser().getEmail()||'').trim()!==c.teacher)return;
+ const lock=LockService.getDocumentLock();if(!lock||!lock.tryLock(1000))return;
+ const p=PropertiesService.getScriptProperties();
+ try{
+  const source=SpreadsheetApp.getActiveSpreadsheet(),now=Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd');
+  chatAttendanceAssertCurrent_(source,c,now);
+  const ports=attendanceAiDefaultPorts_(source),settings=readAttendanceConfigStrict_(source),roles=attendanceMonthSheetsFor_(source,settings);
+  if(String(ports.getTargetSpreadsheetId())!==source.getId())throw new Error('TARGET_CHANGED');
+  const roster=ports.readRosterRows(source,{rosterSheetName:c.rosterSheetName}),emails=roster.filter(r=>String(r[0]||'').trim()||String(r[1]||'').trim()).map(r=>String(r[2]||'').trim());
+  chatAttendanceValidateRoster_(roster);
+  if(new Set(emails).size!==emails.length||emails.some(e=>!isExactGoeduEmail_(e)))throw new Error('ROSTER_EMAIL_MISSING_OR_DUPLICATE');
+  for(const row of roster){
+   const email=String(row[2]||'').trim();if(!email)continue;if(!isExactGoeduEmail_(email))throw new Error('ROSTER_EMAIL_INVALID');
+   const dm=chatAttendanceGet_('spaces:findDirectMessage?name='+encodeURIComponent('users/'+email));if(!dm)continue;
+   if(dm.spaceType!=='DIRECT_MESSAGE')throw new Error('CHAT_DM_INVALID');
+   const member=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(email)),own=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(c.teacher));
+   if(!member||!own||!member.member||!own.member||!/^users\/[^/]+$/.test(String(member.member.name||''))||!/^users\/[^/]+$/.test(String(own.member.name||''))||member.member.name===own.member.name)throw new Error('CHAT_MEMBER_INVALID');
+   const cursorKey='CHAT_ATTENDANCE_CURSOR_V1_'+chatAttendanceHash_(c.generation+email),cursor=p.getProperty(cursorKey)||c.cutoff;
+   const messages=chatAttendanceMessages_(dm.name,cursor).filter(m=>m.sender&&m.sender.name===member.member.name&&new Date(m.createTime).getTime()>=new Date(c.cutoff).getTime());
+   for(const m of messages){
+    const key=CHAT_ATTENDANCE_MESSAGE_PREFIX+chatAttendanceHash_(m.name);if(p.getProperty(key))continue;
+    const text=String(m.text||'').trim(),date=chatAttendanceDay_(m);
+    const candidate=chatAttendanceCandidate_(text),correction=chatAttendanceCorrection_(text);
+    if(!candidate&&!correction)continue;
+    const sameDay=chatAttendanceDayMessages_(dm.name,date,member.member.name);
+    if(correction&&!candidate){if(sameDay.some(x=>chatAttendanceCandidate_(String(x.text||''))))chatAttendanceSetState_(m,'review','CORRECTION_REQUIRES_REVIEW',Number(row[0]),c);continue;}
+    if(chatAttendanceProxy_(text,row,roster)||(m.lastUpdateTime&&new Date(m.lastUpdateTime).getTime()>new Date(m.createTime).getTime())||chatAttendanceAmbiguous_(text)||sameDay.some(x=>chatAttendanceCorrection_(String(x.text||'')))||sameDay.filter(x=>chatAttendanceCandidate_(String(x.text||''))).length!==1){chatAttendanceSetState_(m,'review','AMBIGUOUS_EDITED_OR_CORRECTED',Number(row[0]),c);continue;}
+    try{
+     chatAttendanceAssertCurrent_(source,c,date);
+     const role=roles.find(i=>Number(i.month)===Number(date.substring(5,7)));if(!role)throw new Error('MONTH_TARGET_MISSING');
+     const context={schoolYear:String(settings.SCHOOL_YEAR||'').trim(),month:role.month,today:date,sentence:String(row[0])+'번 '+String(row[1])+' '+text};
+     const holidays=ports.readHolidayDateKeys(source,Number(date.substring(0,4)));if(!holidays)throw new Error('HOLIDAY_CONTEXT_MISSING');
+     const request=buildAttendanceAiGeminiRequest_(context.sentence,context,[row]);
+     const payload=extractAttendanceAiGeminiPayload_(attendanceAiDefaultPorts_(source).callGemini(request,ports.getGeminiApiKey()));
+     const records=validateAttendanceAiRecords_(payload,[row],context,holidays);
+     if(!Array.isArray(records)||records.length!==1||records[0].date!==date||records[0].kind!=='결석함')throw new Error('AI_RESULT_REQUIRES_REVIEW');
+     chatAttendanceWrite_(source,c,{email:email,row:row},m,ports,role,records[0]);
+    }catch(_){if(!p.getProperty(key))chatAttendanceSetState_(m,'review','NOT_WRITTEN_REQUIRES_REVIEW',Number(row[0]),c);}
+   }
+   p.setProperty(cursorKey,messages.reduce((max,m)=>m.createTime>max?m.createTime:max,cursor));
+  }
+  p.setProperty('CHAT_ATTENDANCE_LAST_POLL_V1',Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd HH:mm:ss'));p.deleteProperty('CHAT_ATTENDANCE_LAST_ERROR_V1');
+ }catch(_){p.setProperty('CHAT_ATTENDANCE_LAST_ERROR_V1','CHAT_CHECK_FAILED');}
+ finally{lock.releaseLock();}
+}
+
+function chatAttendanceValidateRoster_(roster){const active=roster.filter(r=>String(r[0]||'').trim()||String(r[1]||'').trim());const numbers=active.map(r=>String(r[0]||'').trim());if(!active.length||numbers.some(n=>!/^\d+$/.test(n)||Number(n)<1)||new Set(numbers.map(Number)).size!==numbers.length||active.some(r=>!String(r[1]||'').trim()))throw new Error('ROSTER_INVALID_OR_DUPLICATE_NUMBER');}

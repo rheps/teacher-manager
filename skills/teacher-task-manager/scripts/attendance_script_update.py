@@ -339,6 +339,13 @@ _DELIVERED_42_ORDER = {
     # Teacher Manager 5.02 release target: the delivered new-row category bundle with Code.gs
     # APP_VERSION bumped to 5.13.14 for the public release (no other change).
     "53f991d4962989a4e6259625b88c0b54ca6bb5b27659e093d09c34e6958569a1": 23,
+    # Reviewed Chat attendance Candidate target only; not a delivered predecessor.
+    "6015db30059ae7699cef34d29b4d4f5329667dc34bcdbdc4b2eaca39778ae093": 24,
+    # Reviewed bound Chat API Candidate target only; not a delivered predecessor.
+    "a2d2b754a06b5712615810bce708348e3ba724576447ea3b4237b1aac144b04c": 25,
+    # Reviewed manifest-format Candidate target only; not a delivered predecessor.
+    # Exact saved HEAD/fixed version 20 were read on 2026-10-06; trust roots are unchanged.
+    "da5fa03f94ebf6ee1a38ececce618cfaf4d1f78732c4bc26fbf59aa4b17be309": 26,
 }
 
 

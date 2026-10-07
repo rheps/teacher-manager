@@ -169,6 +169,10 @@ function pendingReadResponse(name, response) {
 const attendanceReads = new Map();
 const pendingGoogleReads = new Set();
 let bootIdentityPending = false;
+// LOGIN-32: grey wait after a failed boot Google check, before showing step 2.
+const BOOT_GOOGLE_RECHECK_DELAYS_MS = [10000, 30000];
+const BOOT_GOOGLE_RECHECK_MESSAGE = "Google 계정 상태를 아직 확인하지 못했어요. 잠시 뒤 자동으로 다시 확인해요. 로그인이 해제된 것으로 판단하지 않았습니다.";
+let bootGoogleRecheckWaiting = false;
 function googleObservationPending() {
   return [...pendingGoogleReads].some(read => read.epoch === accountUiEpoch && read.loginEpoch === googleLoginEpoch);
 }
@@ -821,6 +825,14 @@ function adoptGoogleStatus(status) {
     }
   }
   S.google = status;
+  // LOGIN-32: get_app_info showed the step-2 login screen only because identity was not
+  // verified yet (e.g. the boot check failed before the network was up). The first later
+  // verified check rereads the saved screen; a sign-in in progress does its own reread.
+  if (!previousAccount && nextAccount && !bootIdentityPending && S.mode === "wizard"
+      && S.step <= 2 && S.maxStep <= 2 && !S.login && !loginPollRunning
+      && !googleLoginVerificationPending && !accountProfileReloadPromise) {
+    accountProfileNeedsReload = true;
+  }
   if (isGoogleReady(status)) {
     delete S.fieldIssues["google-login"];
     const oldLoginWarnings = [FIELD_MESSAGES["google-login"], GOEDU_REQUIRED_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE, GOOGLE_AUTH_CHECK_MESSAGE_SETTINGS, previousAuthorizationMessage,
@@ -5607,7 +5619,9 @@ async function applyAllOnce() {
       return;
     }
     await ensureGridLoaded();
-    const results = await call("apply_all", S.draft.profile, S.draft.grid, S.draft.bridge);
+    const bridgeToSave = {...S.draft.bridge};
+    if (bridgeToSave.gemini_api_key === "") delete bridgeToSave.gemini_api_key;
+    const results = await call("apply_all", S.draft.profile, S.draft.grid, bridgeToSave);
     const failed = results.filter((r) => r.status === "failed");
     // 성공이든 실패든 곧장 홈으로 — 실패 항목은 홈 점검과 출결 탭이 이유를 보여준다.
     await call("finish_setup");
@@ -7180,7 +7194,10 @@ function render() {
   }
   if (S.mode !== "home") stopCapturePoll();
   document.body.classList.toggle("win-open", S.mode === "edit" || S.mode === "about");
-  if (S.mode === "loading") { root().innerHTML = '<div class="boot">여는 중이에요…</div>'; return; }
+  if (S.mode === "loading") {
+    root().innerHTML = `<div class="boot">${bootGoogleRecheckWaiting ? esc(BOOT_GOOGLE_RECHECK_MESSAGE) : "여는 중이에요…"}</div>`;
+    return;
+  }
   // 같은 화면을 다시 그릴 때는 스크롤을 유지한다 — 세그먼트·선택 조작으로 위로 튀지 않게.
   // 마법사(.shell)는 .body가, 홈·편집 화면은 문서 전체가 스크롤되므로 둘 다 기억한다.
   const prevBody = document.querySelector(".body");
@@ -7280,14 +7297,45 @@ async function boot() {
     let startupScreen = null;
     if (bootIdentityPending) {
       adoptAppInfo(localInfo);
+      // Step 2 may only mean identity is still unknown; do not render its login
+      // prompt (or start its readiness work) before the first observation ends.
+      if (localInfo.mode === "wizard" && localInfo.step === 2) {
+        S.mode = "loading";
+        bootGoogleRecheckWaiting = true;
+      }
       render();
       startupScreen = screenKey();
     }
     try { await identity; } catch (error) {
       // call() records an unknown observation without declaring logout.
     }
-    const verifiedInfo = await call("get_app_info");
-    if (startupScreen === null || screenKey() === startupScreen) adoptAppInfo(verifiedInfo);
+    let verifiedInfo = await call("get_app_info");
+    // LOGIN-32: a boot check that failed (not a confirmed logout) must not open the
+    // step-2 login screen as if signed out. Wait in grey and recheck; the boot check plus
+    // these rechecks are at most three google_status reads (OBS-04).
+    const bootEpoch = accountUiEpoch;
+    const stillBootScreen = () => bootEpoch === accountUiEpoch && !S.login
+      && (startupScreen === null || screenKey() === startupScreen || S.mode === "loading");
+    for (const delay of BOOT_GOOGLE_RECHECK_DELAYS_MS) {
+      if (!stillBootScreen() || !incompleteGoogleObservation(S.google)
+          || verifiedInfo.mode !== "wizard" || verifiedInfo.step !== 2) break;
+      S.mode = "loading";
+      bootGoogleRecheckWaiting = true;
+      render();
+      await new Promise(resolve => setTimeout(resolve, delay));
+      if (!stillBootScreen() || S.mode !== "loading") break;
+      // A focus check may already have verified the account (shared read, OBS-05).
+      if (incompleteGoogleObservation(S.google)) {
+        try { adoptGoogleStatus(await call("google_status")); } catch (error) {
+          // call() records an unknown observation without declaring logout.
+        }
+      }
+      if (!stillBootScreen()) break;
+      verifiedInfo = await call("get_app_info");
+    }
+    bootGoogleRecheckWaiting = false;
+    if (bootEpoch !== accountUiEpoch && S.mode === "loading") verifiedInfo = await call("get_app_info");
+    if (startupScreen === null || screenKey() === startupScreen || S.mode === "loading") adoptAppInfo(verifiedInfo);
     paintSettingsReadiness();
     watchNetworkStatus();
     askUpdateOnStart();

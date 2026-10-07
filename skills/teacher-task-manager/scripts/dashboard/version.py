@@ -107,7 +107,9 @@
 # to Python HTTPS (UPD-04); from 5.0 the minor part is always two digits (5.01, 5.02 ...).
 # v5.02: sheet dashboard (출결·메신저 대시보드) in the workbook menu, AI input fixes, Chat send
 # rejection is settled and named, Brity attachment names read from the row labels; Apps Script 5.13.14.
-APP_VERSION = "5.02"
+# v5.03: completed desktop/login/window fixes and exact deployed Chat manifest formatting;
+# student Chat automatic attendance remains an opt-in field-test feature, not field-verified.
+APP_VERSION = "5.03"
 
 BRANDING = {
     "name": "Teacher Manager",

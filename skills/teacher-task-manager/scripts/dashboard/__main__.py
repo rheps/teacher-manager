@@ -445,6 +445,7 @@ def _run_app(args, app_name, webview_module, notify, background) -> int:
             js_api=api,
             width=INITIAL_WINDOW_WIDTH,
             height=initial_height,
+            maximized=True,
             min_size=(
                 MINIMUM_WINDOW_WIDTH,
                 min(MINIMUM_WINDOW_HEIGHT, initial_height),

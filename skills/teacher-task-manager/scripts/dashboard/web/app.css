@@ -19,6 +19,7 @@ body {
   font-family:"Pretendard Variable",Pretendard,"Malgun Gothic",sans-serif;
   font-size:15px; letter-spacing:-0.1px;
 }
+button, input, select, textarea { font-family:inherit; }
 #app { height:100%; }
 .boot { display:flex; align-items:center; justify-content:center; height:100%; color:var(--tm-faint); }
 
