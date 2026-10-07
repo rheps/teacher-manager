@@ -109,7 +109,8 @@
 # rejection is settled and named, Brity attachment names read from the row labels; Apps Script 5.13.14.
 # v5.03: completed desktop/login/window fixes and exact deployed Chat manifest formatting;
 # student Chat automatic attendance remains an opt-in field-test feature, not field-verified.
-APP_VERSION = "5.03"
+# v5.04: Sheet attendance dialog fits the available screen and loads real Pretendard webfonts.
+APP_VERSION = "5.04"
 
 BRANDING = {
     "name": "Teacher Manager",

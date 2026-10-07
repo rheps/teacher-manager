@@ -6952,7 +6952,8 @@ function tmDashboardHtml_(viewer) {
   const boot = 'window.TM_DASH_VIEWER=' + tmDashboardScriptLiteral_(String(viewer || '')) + ';'
     + 'var s=document.createElement("script");s.text=' + tmDashboardScriptLiteral_(TM_DASHBOARD_JS_)
     + ';document.body.appendChild(s);';
-  return '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><base target="_top"><style>'
+  return '<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><base target="_top">'
+    + '<link rel="stylesheet" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css"><style>'
     + TM_DASHBOARD_CSS_ + '</style></head><body><div id="app"><p class="boot">시트를 읽는 중…</p></div>'
     + '<script>' + boot + '</script></body></html>';
 }
@@ -8906,8 +8907,8 @@ const TM_DASHBOARD_JS_ = [
   "  }\n",
   "  function fitDialog() {\n",
   "    try {\n",
-  "      const w = Math.min(1200, Math.max(1000, (window.screen.availWidth || 0) - 80));\n",
-  "      const hgt = Math.min(800, Math.max(620, (window.screen.availHeight || 0) - 180));\n",
+  "      const w = Math.max(320, (window.screen.availWidth || 1080) - 80);\n",
+  "      const hgt = Math.max(240, (window.screen.availHeight || 800) - 180);\n",
   "      window.google.script.host.setWidth(w);\n",
   "      window.google.script.host.setHeight(hgt);\n",
   "    } catch (err) { /* 크기를 바꾸지 못하면 처음 크기로 쓴다 */ }\n",

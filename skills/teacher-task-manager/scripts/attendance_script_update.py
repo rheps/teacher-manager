@@ -25,6 +25,10 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Exact public v5.03 Latest tag and unchanged Setup verified on 2026-10-07.
+    "da5fa03f94ebf6ee1a38ececce618cfaf4d1f78732c4bc26fbf59aa4b17be309": (
+        ("v5.03", "c9078a43e471d34de7399be83e7daf381479073c"),
+    ),
     # Exact public v5.02 tag independently rehashed with Python and .NET on 2026-10-07.
     # This is the already published bundle, not the later student Chat Candidate target.
     "53f991d4962989a4e6259625b88c0b54ca6bb5b27659e093d09c34e6958569a1": (
@@ -351,6 +355,8 @@ _DELIVERED_42_ORDER = {
     # Reviewed manifest-format Candidate target only; not a delivered predecessor.
     # Exact saved HEAD/fixed version 20 were read on 2026-10-06; trust roots are unchanged.
     "da5fa03f94ebf6ee1a38ececce618cfaf4d1f78732c4bc26fbf59aa4b17be309": 26,
+    # Reviewed Sheet dialog fit/font Candidate target; not delivered to a workbook yet.
+    "3f19ca43a8360976db0a02d685cdc94b49d53ed27f677d60b0c3963bcabdf303": 27,
 }
 
 
