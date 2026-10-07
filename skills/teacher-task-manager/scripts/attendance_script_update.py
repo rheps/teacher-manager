@@ -25,6 +25,11 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Exact public v5.02 tag independently rehashed with Python and .NET on 2026-10-07.
+    # This is the already published bundle, not the later student Chat Candidate target.
+    "53f991d4962989a4e6259625b88c0b54ca6bb5b27659e093d09c34e6958569a1": (
+        ("v5.02", "9108a25c25b36c743375023de07c5a2ca795ab01"),
+    ),
     # Exact public v4.3-v4.6 tags share this bundle; v4.4/v4.5 reverified 2026-09-16,
     # v4.6 rehashed from the public tag 2026-09-29.
     (
