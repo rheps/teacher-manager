@@ -127,9 +127,11 @@ _SCREEN_FAILURES = {
     "attendance_chat_spaces": "학급 단톡방 목록을 가져오지 못했어요.",
     "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
     "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
+    "attendance_chat_create_group": "학급 그룹 채팅을 만들지 못했어요.",
     "open_attendance_chat": "Google Chat을 열지 못했어요.",
     "student_chat_connect_status": "학생 연결 상태를 읽지 못했어요.",
     "student_chat_connect_send": "학생에게 인사를 보내지 못했어요.",
+    "attendance_chat_group_preview": "학생명단을 읽지 못했어요.",
     "student_chat_connect_resolve": "확인한 결과를 저장하지 못했어요.",
     "open_attendance_roster": "학생명단 시트를 열지 못했어요.",
     "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요.",
@@ -1137,7 +1139,7 @@ _SESSION_GOOGLE_WORK = frozenset({
     "attendance_chat_connect", "attendance_chat_set_space", "attendance_chat_create_space",
     "select_attendance_connection", "select_attendance_connection_by_code",
     "apply_all", "save_profile_grid", "save_gemini", "sync_roster_editor",
-    "student_chat_connect_send",
+    "student_chat_connect_send", "attendance_chat_create_group",
 })
 
 
@@ -1149,6 +1151,7 @@ _SESSION_READS = _SESSION_EMPTY_READS | frozenset({
     "verify_gemini_key", "probe_hotkey", "check_attachment_folder", "choose_attachment_folder",
     "open_attendance_chat", "open_attendance_script_settings", "open_attendance_roster",
     "open_current_attendance", "student_chat_connect_status", "student_chat_connect_progress",
+    "attendance_chat_group_preview",
 })
 
 
@@ -3543,6 +3546,67 @@ class Api:
             "학급 단톡방을 만들지 못했어요.",
             create_or_resume,
             retry_states={"failed", "in-progress"},
+        )
+
+    # ---- 학급 단톡방을 학생들과의 그룹 채팅으로 만들기 (2026-10-30) ----------------
+    @guarded
+    def attendance_chat_group_preview(self):
+        """Read only: how many roster students would join. No email leaves the bridge."""
+        from dashboard import central_chat
+        record = read_attendance_server_record(self._config_dir)
+        if record is None:
+            return {"state": "not-ready"}
+        run, gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+        try:
+            roster = central_chat.scc_read_roster(self._config_dir, record, run, gws)
+        except Exception:  # noqa: BLE001 - a failed read is unknown, never "no students"
+            return {"state": "unavailable"}
+        emails, left_out = central_chat.group_chat_members(roster, account)
+        return {"state": "ready", "count": len(emails), "left_out": left_out,
+                "min": central_chat.GROUP_CHAT_MIN_STUDENTS, "max": central_chat.GROUP_CHAT_MAX_STUDENTS}
+
+    @guarded
+    def attendance_chat_create_group(self, expected_count=0):
+        """Create the class group chat once and save it as the class room.
+
+        The server keeps one idempotent operation per sheet and reuses its Google
+        requestId, so a double press or a lost reply returns the same group chat (C7).
+        Only reads before the create are retried; the create itself is not."""
+        from dashboard import central_chat
+
+        def create(run, gws, record):
+            if record is None:
+                raise ScreenSafeError(central_chat.NOT_PREPARED_MESSAGE)
+            _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            roster = central_chat.scc_read_roster(self._config_dir, record, run, gws)
+            emails, left_out = central_chat.group_chat_members(roster, account)
+            base = {"space_name": "", "display_name": "", "left_out": left_out}
+            if len(emails) != int(expected_count or 0):
+                return {**base, "state": "changed", "detail": central_chat.GROUP_CHAT_ROSTER_CHANGED_MESSAGE}
+            if len(emails) < central_chat.GROUP_CHAT_MIN_STUDENTS:
+                return {**base, "state": "failed", "detail": central_chat.GROUP_CHAT_TOO_FEW_MESSAGE}
+            if len(emails) > central_chat.GROUP_CHAT_MAX_STUDENTS:
+                return {**base, "state": "failed", "detail": central_chat.GROUP_CHAT_TOO_MANY_MESSAGE}
+            result = central_chat.create_class_space(
+                self._config_dir, central_chat.group_chat_label(len(emails)), run,
+                gws_executable=gws, attendance_record=record, group_members=emails,
+            )
+            return {**result, "left_out": left_out}
+
+        def create_once():
+            try:
+                return self._run_attendance_chat_action(create)
+            except central_chat.CentralChatError as error:
+                raise recovery.RetryableOperationError(
+                    "CHAT_GROUP_CREATE",
+                    central_chat._safe_central_error_detail(error),
+                ) from error
+
+        return self._attendance_operation(
+            "attendance_chat_create_group",
+            "학급 그룹 채팅을 만들지 못했어요.",
+            create_once,
+            retry_states=frozenset(),
         )
 
     # ---- 학생과 Chat 처음 연결하기 (2026-10-29) ---------------------------------

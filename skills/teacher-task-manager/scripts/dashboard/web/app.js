@@ -67,6 +67,7 @@ const S = {
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
+  classGroupCreating: false,  // 학생들과 그룹 채팅 만들기가 진행 중인지 (두 번 누름 방지)
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
   chatNewSpaceBrowserOpen: false, // 새 단톡방을 만들려고 Google Chat을 열었는지
   chatNewSpaceBrowserBlurred: false, // 실제로 브라우저로 자리를 옮겼다가 돌아왔는지
@@ -2594,12 +2595,12 @@ function classRoomReadiness() {
   if (!cs || cs === "loading" || S.chatStatusContext !== context) return "unverified";
   if (cs.read_failed || typeof cs.connected !== "boolean") return "read-failed";
   if (!cs.connected) return "account-required";
+  // The class room is one Google Chat group chat made from the roster (2026-10-30): no saved room is "none".
+  if (!cs.class_space_id) return "not-selected";
   if (S.chatSpacesLoading) return "loading";
   if (S.chatSpacesContext !== context) return "unverified";
   if (S.chatSpacesError) return "read-failed";
   if (!Array.isArray(S.chatSpaces)) return "unverified";
-  if (!S.chatSpaces.length) return "empty";
-  if (!cs.class_space_id) return "not-selected";
   return S.chatSpaces.some(room => room.name === cs.class_space_id) ? "ready" : "missing";
 }
 function classRoomReadinessMessage(state = classRoomReadiness()) {
@@ -2609,10 +2610,9 @@ function classRoomReadinessMessage(state = classRoomReadiness()) {
     unverified: "학급 단톡방 연결을 아직 확인하지 못했어요.",
     loading: "학급 단톡방 연결을 확인하고 있어요.",
     "read-failed": "학급 단톡방 연결을 읽지 못했어요. 기존 단톡방 선택은 그대로예요.",
-    "not-selected": "출결 탭의 목록에서 사용할 학급 단톡방을 골라 주세요.",
     // Name the button this screen actually shows (C11).
-    empty: `이 계정에서 참여 중인 스페이스가 없어요. ${attendanceViewKind() === "installation" ? "[단톡방(스페이스) 만들러 가기]" : "[내 Google Chat 화면 열기]"}에서 만든 뒤 돌아와 주세요.`,
-    missing: "저장된 학급 단톡방이 현재 목록에서 확인되지 않아요. 기존 선택은 그대로예요. 출결 탭에서 확인해 주세요.",
+    "not-selected": "출결 탭의 [학생들과 그룹 채팅 만들기]로 학급 단톡방을 만들어 주세요.",
+    missing: "저장된 학급 단톡방을 Google Chat에서 찾지 못했어요. 출결 탭의 [학생들과 그룹 채팅 만들기]로 다시 만들어 주세요.",
   }[state] || "";
 }
 function loadChatStatus(force, renderResult = true) {
@@ -2965,40 +2965,39 @@ function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
   const waiting = state === "unverified" && attendancePresentation(a).pending;
   const reading = state === "loading" || (state === "unverified" && S.attendanceLoading) || waiting;
   const connected = state === "ready";
-  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : waiting ? "출석부 준비 중…" : reading ? "확인 중…" : state === "empty" ? "스페이스 없음" : state === "not-selected" ? "방 선택 필요" : "확인 필요";
+  const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : waiting ? "출석부 준비 중…" : reading ? "확인 중…" : state === "not-selected" ? "없음" : "확인 필요";
   const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
-  // A confirmed room list (empty or not) offers the external Google Chat path in the management view (2026-10-29).
-  const open = view === "installation" || ["empty", "not-selected", "missing", "ready"].includes(state) ? `<button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} ${view === "installation" ? "단톡방(스페이스) 만들러 가기" : "내 Google Chat 화면 열기"}</button>` : "";
+  // Class group chat (2026-10-30 user decision): the class room is only this group chat;
+  // no room dropdown and no external Chat room path. A saved room shows its name only.
+  const group = ["not-selected", "missing"].includes(state)
+    ? `<button class="btn-tonal" data-action="class-space-group-create"${S.classGroupCreating || S.classSpaceSaving || attendanceChatOpenBlockReason() ? " disabled" : ""}>${S.classGroupCreating ? "만드는 중…" : "학생들과 그룹 채팅 만들기"}</button>` : "";
   const retry = state === "read-failed" && S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed
     ? `<button class="btn-tonal" data-action="class-space-reload">다시 확인</button>` : "";
   return `<section class="svc-subrow class-space-section">
-    <div class="first-setup-head"><b>학급 단톡방</b><span class="chat-space-reload-status">${open}${retry}
+    <div class="first-setup-head"><b>학급 단톡방</b><span class="chat-space-reload-status">${group}${retry}
       <span class="chat-space-status ${S.classSpaceSaving || reading ? "muted" : connected ? "connected" : "warn"}">${S.classSpaceSaving ? "저장 중…" : label}</span></span></div>
-    ${content}${studentChatGuideHtml()}${localIssue}</section>`;
+    ${content}${localIssue}</section>`;
 }
 
 function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (S.attendanceLoading) return `<p class="hint">출결 연결 상태를 확인하고 있어요.</p>`;
   if (S.attendanceReadFailed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
   if (a.state === "initial-setup-required") return `<p class="hint">출석부 설정 후 Google Chat을 연결해 주세요.</p>`;
-  if (a.state !== "ready") return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
+  if (a.state !== "ready") return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 학급 단톡방을 만들 수 있어요.</p>` : "";
   const cs = S.chatStatus;
   if (chatStatusAwaitingRead()) return `<p class="hint">Google Chat 연결 상태를 확인하고 있어요.</p>`;
   if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return `<p class="hint">Google Chat 연결 상태를 아직 확인하지 못했어요.</p>`;
   if (cs.read_failed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
-  if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 방 목록을 불러올 수 있어요.</p>` : "";
+  if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 학급 단톡방을 만들 수 있어요.</p>` : "";
+  // One class group chat (2026-10-30): no saved room shows only the create button; a saved one shows its name.
+  if (!cs.class_space_id) return "";
   if (!connectionRefreshActive()) loadChatSpaces();
-  if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">방 목록을 가져오는 중이에요…</p>`;
-  if (S.chatSpacesError) return `<p class="hint">방 목록을 가져오지 못했어요. 기존 선택은 그대로예요.</p>`;
-  if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>
-    <p class="hint">새 방을 만들려면 Google Chat에서 만든 뒤 돌아오세요. 돌아오면 목록을 다시 읽으니 드롭다운에서 고르세요.</p>`;
-  const rooms = S.chatSpaces || [];
-  const savedOutsideList = cs.class_space_id && !rooms.some(s => String(s.name || "") === String(cs.class_space_id));
-  const chosen = String((S.classSpaceSaving && S.classSpaceSavingId) || cs.class_space_id || "");
-  const options = rooms.map(s => `<option value="${esc(s.name)}"${chosen === String(s.name || "") ? " selected" : ""}>${esc(s.displayName)}</option>`).join("");
-  return `<div class="chat-space-existing">
-    <select name="class-space-select" aria-label="학급 단톡방" data-action-change="class-space-pick" data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}><option value="">학급 단톡방</option>${options}</select>
-    ${savedOutsideList ? `<p class="hint">저장된 단톡방이 현재 목록에 없어요. 기존 선택은 그대로예요.</p>` : ""}</div>`;
+  const saved = esc(String(cs.class_space_name || S.chatSpaceName || "학생 그룹 채팅"));
+  if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">${saved} · 확인하고 있어요…</p>`;
+  if (S.chatSpacesError) return `<p class="hint">${saved} · Google Chat에서 확인하지 못했어요. 저장된 학급 단톡방은 그대로예요.</p>`;
+  const rooms = Array.isArray(S.chatSpaces) ? S.chatSpaces : [];
+  if (!rooms.some(s => String(s.name || "") === String(cs.class_space_id))) return `<p class="hint">${saved} · Google Chat에서 찾지 못했어요. [학생들과 그룹 채팅 만들기]로 다시 만들어 주세요.</p>`;
+  return `<p class="hint">${saved}</p>`;
 }
 
 /* 학생과 Chat 처음 연결하기 (2026-10-29). Optional: never a wizard gate, never counted in
@@ -3010,7 +3009,7 @@ const SCC = {
   partial: (failed) => `아직 연결되지 않은 학생이 ${failed}명 있어요. [학생명단] 탭 C열의 이메일을 확인한 뒤 이 학생들만 다시 연결해 주세요.`,
   unknown: (n) => `${n}명은 인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요.`,
   newStudents: (n) => `학생명단에 학생 ${n}명이 새로 추가됐어요. 새로 추가된 학생만 연결해 주세요.`,
-  done: (total) => `학생 ${total}명 모두 연결됐어요. 학생과 대화하려면 [내 Google Chat 화면 열기]를 눌러 주세요.`,
+  done: (total) => `학생 ${total}명 모두 연결됐어요.`,
   previewTitle: "보낼 인사말",
   previewHint: "보내기 전에 인사말을 고칠 수 있어요. 이미 연결된 학생에게는 다시 보내지 않아요.",
   recipients: (n) => `받는 학생 ${n}명`,
@@ -3504,7 +3503,7 @@ function attendanceChatConnectBlockReason(a = S.attendance) {
   if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
   if (cs.connected) {
     if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Google Chat 연결은 끝났어요. 위 출석부에서 [처음 설정 한 번에 끝내기]를 마쳐 주세요.";
-    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [단톡방(스페이스) 만들러 가기]에서 학생을 초대하고 방을 골라 주세요.";
+    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [학생들과 그룹 채팅 만들기]로 학급 단톡방을 만들어 주세요.";
     return "자동발송 계정이 연결됐어요. 다시 연결할 필요가 없어요.";
   }
   // First-time Sheet setup, student invitations and a selected room are not
@@ -4883,6 +4882,58 @@ bindActions({
       }
     }
     render();
+  },
+  "class-space-group-create": async () => {
+    if (S.classGroupCreating || S.classSpaceSaving) return;
+    const context = chatReadContext();
+    S.classGroupCreating = true;
+    render();
+    try {
+      const preview = await call("attendance_chat_group_preview");
+      if (context !== chatReadContext()) return;
+      if (preview?.state !== "ready") {
+        setBanner("warn", "학생명단을 읽지 못해 그룹 채팅을 만들지 않았어요.");
+        return;
+      }
+      if (preview.count < preview.min) {
+        setBanner("warn", "그룹 채팅을 만들려면 [학생명단] 탭에 Google 이메일이 있는 재적 학생이 2명 이상 있어야 해요.");
+        return;
+      }
+      if (preview.count > preview.max) {
+        setBanner("warn", `Google Chat 그룹 채팅에는 선생님 외에 학생을 최대 ${preview.max}명까지 넣을 수 있어요. (지금 ${preview.count}명)`);
+        return;
+      }
+      const leftOut = (preview.left_out || []).length
+        ? `\n\n이메일이 없어 넣지 않는 학생: ${preview.left_out.join(", ")}` : "";
+      const replacing = S.chatStatus?.class_space_id ? "\n지금 고른 학급 단톡방 대신 이 그룹 채팅을 학급 단톡방으로 써요." : "";
+      if (!window.confirm(`학생 ${preview.count}명과 선생님이 들어간 Google Chat 그룹 채팅을 만들까요?\n만든 그룹 채팅을 학급 단톡방으로 골라 둬요.${replacing}${leftOut}`)) return;
+      chatStatusReadVersion += 1;
+      const data = await call("attendance_chat_create_group", preview.count);
+      if (context !== chatReadContext()) return;
+      if (data.state === "ok") {
+        chatStatusReadVersion += 1;
+        S.chatSpaceName = data.display_name;
+        S.chatSpaces = undefined;   // 방금 만든 그룹 채팅이 목록에 잡히게 다시 읽는다
+        if (S.chatStatus && typeof S.chatStatus === "object") {
+          S.chatStatus.class_space_id = data.space_name;
+          S.chatStatus.class_space_name = data.display_name;
+        }
+        const joinedStudents = Number.isInteger(data.joined) ? data.joined - 1 : null;
+        if (joinedStudents !== null && joinedStudents < preview.count) {
+          setBanner("warn", `그룹 채팅을 만들었어요. 다만 Google Chat에 들어간 학생은 ${Math.max(joinedStudents, 0)}명이에요. 나머지 학생은 Google이 넣지 않았어요. Google Chat에서 그룹 채팅을 열어 직접 추가해 주세요.`);
+        } else {
+          showToast("그룹 채팅을 만들고 학급 단톡방으로 골라 뒀어요");
+        }
+      } else {
+        // A failed or unknown result is never sent again automatically (C7). Pressing the
+        // button again reuses the server's Google requestId, so it returns the same chat.
+        if (data.space_name) S.chatSpaces = undefined;
+        setBanner("warn", data.detail || "그룹 채팅을 만들지 못했어요.");
+      }
+    } finally {
+      S.classGroupCreating = false;
+      render();
+    }
   },
   "class-space-reload": async () => {
     beginAttendanceAuthBatch();

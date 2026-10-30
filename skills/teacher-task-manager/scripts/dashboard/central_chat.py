@@ -58,6 +58,21 @@ SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
 # (services/central-chat-sender의 spaceCreateError 기본값).
 SPACE_CREATE_FAILED_MESSAGE = "방 만들기 결과를 확인하지 못했어요. Google Chat에서 방이 만들어졌는지 확인해 주세요."
 SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌었어요. 현재 상태를 다시 확인해 주세요."
+# Class group chat (2026-10-30). Google: at least 2 and at most 49 members besides the teacher.
+GROUP_CHAT_FALLBACK_NAME = "학생 그룹 채팅"
+GROUP_CHAT_MIN_STUDENTS = 2
+GROUP_CHAT_MAX_STUDENTS = 49
+GROUP_CHAT_TOO_FEW_MESSAGE = "그룹 채팅을 만들려면 [학생명단] 탭에 Google 이메일이 있는 재적 학생이 2명 이상 있어야 해요."
+GROUP_CHAT_TOO_MANY_MESSAGE = "Google Chat 그룹 채팅에는 선생님 외에 학생을 최대 49명까지 넣을 수 있어요."
+GROUP_CHAT_ROSTER_CHANGED_MESSAGE = "학생명단이 바뀌었어요. 인원을 다시 확인한 뒤 눌러 주세요."
+GROUP_CHAT_EMAIL_INVALID_MESSAGE = (
+    "학생 이메일 가운데 형식이 맞지 않는 주소가 있어 그룹 채팅을 만들지 않았어요. "
+    "[학생명단] 탭 C열의 이메일을 확인해 주세요."
+)
+GROUP_CHAT_MEMBERS_REJECTED_MESSAGE = (
+    "Google에서 학생 이메일 가운데 받을 수 없는 주소가 있다고 알려 왔어요. "
+    "그룹 채팅은 만들지 않았어요. [학생명단] 탭 C열의 이메일을 확인해 주세요."
+)
 CLASS_SPACE_SELECTION_CHANGED_CODE = "CHAT_SPACE_SELECTION_CHANGED"
 GOEDU_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
 CHAT_AUTH_UNKNOWN_MESSAGE = "Google Chat 발송 권한을 확인하지 못했어요. 기존 연결은 그대로입니다."
@@ -73,6 +88,9 @@ SERVER_ANSWER_MESSAGES = {
     "SPACE_DISPLAY_NAME_REQUIRED": SPACE_NAME_EMPTY_MESSAGE,
     "SPACE_CREATE_FAILED": SPACE_CREATE_FAILED_MESSAGE,
     "SPACE_CREATE_STALE": SPACE_CREATE_STALE_MESSAGE,
+    "GROUP_CHAT_MEMBERS_REJECTED": GROUP_CHAT_MEMBERS_REJECTED_MESSAGE,
+    "GROUP_CHAT_MEMBER_COUNT": GROUP_CHAT_TOO_MANY_MESSAGE,
+    "GROUP_CHAT_MEMBERS_INVALID": GROUP_CHAT_EMAIL_INVALID_MESSAGE,
     "GOEDU_ACCOUNT_REQUIRED": GOEDU_ACCOUNT_REQUIRED_MESSAGE,
     "AUTH_GRANTS_UNKNOWN": CHAT_AUTH_UNKNOWN_MESSAGE,
     "AUTH_CHECK_FAILED": CHAT_AUTH_UNKNOWN_MESSAGE,
@@ -302,10 +320,13 @@ def _validated_spaces(response) -> list[dict]:
         name = space.get("name")
         if not isinstance(name, str) or re.fullmatch(r"spaces/[A-Za-z0-9_-]+", name) is None:
             raise CentralChatError(CHAT_STATUS_FAILURE_MESSAGE)
-        normalized.append({
+        row = {
             "name": name,
             "displayName": str(space.get("displayName", "") or ""),
-        })
+        }
+        if space.get("spaceType") == "GROUP_CHAT":
+            row["group_chat"] = True
+        normalized.append(row)
     return normalized
 
 
@@ -531,8 +552,21 @@ def list_spaces(
     )
     response = http_post(config["url"], "/v1/spaces", {
         "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
+        "includeGroupChats": True,
     })
-    return _validated_spaces(response)
+    # Unnamed group chats appear only when one is this class's saved room (2026-10-30);
+    # the teacher's other group chats would be nameless rows in the dropdown.
+    current = str(config.get("class_space_id", "") or "").strip()
+    rows = []
+    for row in _validated_spaces(response):
+        if row.pop("group_chat", False):
+            if row["name"] != current:
+                continue
+            row["displayName"] = (row["displayName"]
+                                  or str(config.get("class_space_name", "") or "").strip()
+                                  or GROUP_CHAT_FALLBACK_NAME)
+        rows.append(row)
+    return rows
 
 
 def sync_profile_settings(profile, spreadsheet_id, run_command, *, gws_executable, before_write):
@@ -1303,8 +1337,12 @@ def create_class_space(
     *,
     gws_executable: str | None = None,
     attendance_record=_ATTENDANCE_RECORD_NOT_SUPPLIED,
+    group_members: list | None = None,
 ) -> dict:
     """학급 단톡방을 만들고 곧바로 그 방을 학급 단톡방으로 골라 둔다.
+
+    group_members가 있으면 이름 붙은 방 대신 그 학생들이 든 Google Chat 그룹 채팅을
+    만든다(2026-10-30). 다른 경로(/v1/spaces/create-group)라 예전 서버는 404로 거절한다.
 
     만드는 것과 고르는 것을 한 번에 끝낸다 — 만든 뒤 목록에서 또 고르게 하면
     "만들었는데 왜 아직 안 골라졌나" 싶어진다.
@@ -1333,11 +1371,18 @@ def create_class_space(
     _validated_spaces(listed)
     expected_current = str(config.get("class_space_id", "") or "").strip()
     try:
-        response = http_post(config["url"], "/v1/spaces/create", {
+        payload = {
             "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
             "displayName": name,
             "expectedCurrentSpace": expected_current,
-        })
+        }
+        if group_members is not None:
+            payload["groupMembers"] = list(group_members)
+        response = http_post(
+            config["url"],
+            "/v1/spaces/create-group" if group_members is not None else "/v1/spaces/create",
+            payload,
+        )
     except CentralChatError as error:
         detail = _safe_central_error_detail(error)
         # 번역 문구가 아니라 서버가 준 원 코드로 가른다 — 문구에 맥락이 덧붙어도 안 샌다.
@@ -1379,7 +1424,33 @@ def create_class_space(
         reason = _safe_central_error_detail(error)
         return {"state": "failed", "space_name": space_name, "display_name": shown,
                 "detail": "방은 만들었어요. 다만 학급 단톡방으로 저장하지 못했어요. " + reason}
-    return {"state": "ok", "space_name": space_name, "display_name": shown, "detail": ""}
+    joined = space.get("joinedHumanCount")
+    return {"state": "ok", "space_name": space_name, "display_name": shown, "detail": "",
+            "joined": joined if isinstance(joined, int) and not isinstance(joined, bool) else None}
+
+
+def group_chat_members(roster: list[dict], teacher_account: str) -> tuple[list[str], list[str]]:
+    """(emails to add, 번호+이름 labels left out for a missing or invalid email).
+
+    scc_parse_roster already keeps only 재적 or blank 학적 rows. The teacher is added by
+    Google automatically, so the teacher's own address is not a membership."""
+    teacher = str(teacher_account or "").strip().casefold()
+    emails, left_out, seen = [], [], set()
+    for student in roster:
+        email = str(student.get("email") or "").strip()
+        if not email or not _SCC_EMAIL_RE.fullmatch(email):
+            left_out.append(f"{student.get('number', '')}{student.get('name', '')}")
+            continue
+        key = email.casefold()
+        if key == teacher or key in seen:
+            continue
+        seen.add(key)
+        emails.append(email)
+    return emails, left_out
+
+
+def group_chat_label(count: int) -> str:
+    return f"{GROUP_CHAT_FALLBACK_NAME} (학생 {count}명)"
 
 
 def start_auth(
