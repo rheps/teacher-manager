@@ -536,6 +536,16 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-selection-dialog { width:min(680px,calc(100vw - 32px)); }
 .attendance-selection-dialog select { width:100%; min-width:0; max-width:100%; }
 .attendance-selection-dialog .attendance-update-dialog-actions { flex-wrap:wrap; }
+/* 학생과 Chat 처음 연결하기 (2026-10-29) */
+.student-chat-dialog { max-height:calc(100vh - 32px); overflow:auto; box-sizing:border-box; }
+.student-chat-dialog textarea { width:100%; box-sizing:border-box; font-family:inherit; font-size:13.5px; line-height:1.6;
+  padding:9px 11px; border:1.5px solid var(--tm-line); border-radius:10px; resize:vertical; }
+.student-chat-dialog textarea:focus { outline:none; border-color:var(--tm-blue); }
+.student-chat-list { list-style:none; margin:0 0 14px; padding:0; max-height:220px; overflow:auto; font-size:13px; color:var(--tm-ink); }
+.student-chat-list li { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:6px 10px;
+  padding:5px 0; border-bottom:1px solid var(--tm-line); }
+.student-chat-list li small { flex-basis:100%; color:var(--tm-faint); }
+.student-chat-connect .svc-status { white-space:nowrap; }
 .attendance-connection-dialog { width:min(760px,calc(100vw - 32px)); max-height:calc(100vh - 32px); overflow:auto; display:flex; flex-direction:column; box-sizing:border-box; }
 .attendance-connection-dialog > h3,.attendance-connection-dialog > p { flex:none; }
 .attendance-picker-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; padding:2px; }
@@ -581,6 +591,32 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .guide-head b { font-size:16px; }
 .guide-shot { display:block; width:100%; height:auto; border:1px solid var(--tm-line); border-radius:10px; }
 .guide-note { margin:12px 0 0; color:var(--tm-sub); font-size:13.5px; line-height:1.6; word-break:keep-all; }
+
+/* AI 모델 선택과 도움말 (AI-KEY-03) */
+.model-field { position:relative; }
+.model-line { display:flex; align-items:center; gap:8px; }
+.model-line select { flex:1; min-width:0; }
+.model-help-btn { flex:none; width:32px; height:32px; padding:0; border-radius:50%; font-weight:700; }
+.model-help-pop { position:absolute; right:0; top:100%; z-index:60; width:min(720px,92vw); background:#fff; border:1px solid var(--tm-line); border-radius:12px; padding:14px 16px; box-shadow:0 16px 40px rgba(15,23,42,.22); }
+.model-help-pop[hidden] { display:none; }
+/* The open help must not be clipped by the table's overflow:hidden; round the corner cells instead while it is open. */
+.form-table:has(.model-help-pop:not([hidden])) { overflow:visible; }
+.form-table:has(.model-help-pop:not([hidden])) tr:first-child > :first-child { border-top-left-radius:13px; }
+.form-table:has(.model-help-pop:not([hidden])) tr:first-child > :last-child { border-top-right-radius:13px; }
+.form-table:has(.model-help-pop:not([hidden])) tr:last-child > :first-child { border-bottom-left-radius:13px; }
+.form-table:has(.model-help-pop:not([hidden])) tr:last-child > :last-child { border-bottom-right-radius:13px; }
+.model-help-title { display:block; font-size:14px; margin-bottom:10px; }
+.model-help-table { width:100%; border-collapse:collapse; font-size:12.5px; table-layout:fixed; }
+.model-help-table th, .model-help-table td { border:1px solid var(--tm-line); padding:6px 8px; text-align:left; vertical-align:top; word-break:keep-all; }
+/* The help sits inside .form-table, whose "th { width:44% }" made every header claim 44%; fix each column instead. */
+.model-help-table th:nth-child(1) { width:24%; }
+.model-help-table th:nth-child(2) { width:22%; }
+.model-help-table th:nth-child(3) { width:22%; }
+.model-help-table th:nth-child(4) { width:32%; }
+/* .form-table drops the bottom border of its last row; keep it on the help table's last row. */
+.model-help-table tr:last-child td { border-bottom:1px solid var(--tm-line); }
+.model-help-table th { background:var(--tm-surface); font-weight:600; }
+.model-help-notes { margin:10px 0 0; padding-left:18px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; }
 
 /* AI 비서 탭 */
 .ai-rows { margin-top:4px; }
@@ -680,6 +716,8 @@ body.win-open { overflow:hidden; }
 .roster-table th+th,.roster-table td+td { border-left:1px solid var(--tm-line); }
 .roster-table th:first-child,.roster-table td:first-child { width:65px; }
 .roster-table th:nth-child(2) { width:130px; }
+.roster-table th:nth-child(4) { width:110px; }
+.roster-table td select { display:block; width:100%; min-width:0; box-sizing:border-box; border:0; border-radius:0; padding:8px 8px; background:transparent; }
 .roster-table td input { display:block; width:100%; min-width:0; box-sizing:border-box; border:0; border-radius:0; padding:9px 12px; text-align:left; background:transparent; }
 .roster-table td:first-child input,.roster-table th:first-child { text-align:center; }
 .roster-table td input:focus { outline:2px solid var(--tm-blue); outline-offset:-2px; }

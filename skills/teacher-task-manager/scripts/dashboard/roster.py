@@ -24,14 +24,29 @@ class RosterRequestError(RuntimeError):
         super().__init__(code)
 
 
+# 학적(D열): 재적만 우리 반 학생이다. 재적은 칸을 두지 않는 세 칸 행으로 저장해
+# 학적 열이 없던 명단·기록과 같은 모양을 유지한다(전출·자퇴만 네 번째 칸을 둔다).
+STATUS_HEADER = '학적'
+STATUS_ACTIVE = '재적'
+STATUS_OPTIONS = (STATUS_ACTIVE, '전출', '자퇴(퇴학)')
+
+
+def row_status(row):
+    status = str(row[3]).strip() if len(row) > 3 else ''
+    return status or STATUS_ACTIVE
+
+
 def validate_rows(rows):
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_STUDENTS:
         raise ValueError('학생명단은 1명부터 199명까지 입력해 주세요.')
     result, numbers, emails = [], set(), set()
     for index, row in enumerate(rows, 1):
-        if not isinstance(row, list) or len(row) != 3 or any(not isinstance(v, str) for v in row):
-            raise ValueError('번호·이름·이메일 세 칸으로 입력해 주세요.')
-        number, name, email = [v.strip() for v in row]
+        if not isinstance(row, list) or len(row) not in (3, 4) or any(not isinstance(v, str) for v in row):
+            raise ValueError('번호·이름·이메일·학적 칸으로 입력해 주세요.')
+        status = row_status(row)
+        if status not in STATUS_OPTIONS:
+            raise ValueError(f'{index}번째 학생 학적은 재적·전출·자퇴(퇴학) 중에서 골라 주세요.')
+        number, name, email = [v.strip() for v in row[:3]]
         if not re.fullmatch(r'[0-9]{1,4}', number) or int(number) < 1:
             raise ValueError(f'{index}번째 학생 번호를 확인해 주세요.')
         number = str(int(number))
@@ -43,12 +58,12 @@ def validate_rows(rows):
             raise ValueError(f'{index}번째 학생 번호 또는 이메일이 중복돼요.')
         numbers.add(number)
         emails.add(email.casefold())
-        result.append([number, name, email])
+        result.append([number, name, email] + ([] if status == STATUS_ACTIVE else [status]))
     return result
 
 
 def student_choices(rows):
-    return [[f'{row[0]}{row[1]}'] for row in rows if row[0] and row[1]]
+    return [[f'{row[0]}{row[1]}'] for row in rows if row[0] and row[1] and row_status(row) == STATUS_ACTIVE]
 
 
 def digest(rows):
@@ -447,7 +462,7 @@ class Sheet:
         if target is None:
             return None
         title = target['title'].replace("'", "''")
-        ranges = [f"'{title}'!A:C", "'드롭다운'!J2:J200"]
+        ranges = [f"'{title}'!A:D", "'드롭다운'!J2:J200"]
         data = self._request('batchGet', {'spreadsheetId': target['spreadsheet_id'], 'ranges': ranges,
                                          'valueRenderOption': 'FORMATTED_VALUE'})
         blocks = data.get('valueRanges') if isinstance(data, dict) else None
@@ -456,13 +471,21 @@ class Sheet:
         values = blocks[0].get('values', [])
         if not values or values[0][:2] != ['번호', '이름'] or len(values[0]) < 3 or '이메일' not in str(values[0][2]):
             raise ValueError('Roster layout unavailable')
-        rows = [[str(v) for v in (row + ['', '', ''])[:3]] for row in values[1:]]
+        # D열은 제목이 '학적'일 때만 학적으로 읽는다. 다른 내용이 있으면 선생님 자료라 건드리지 않는다.
+        status_header = str(values[0][3]).strip() if len(values[0]) > 3 else ''
+        status_column = status_header == STATUS_HEADER
+        rows = []
+        for row in values[1:]:
+            cells = [str(v) for v in (row + ['', '', '', ''])[:4]]
+            status = cells[3].strip() if status_column else ''
+            rows.append(cells[:3] + ([status] if status and status != STATUS_ACTIVE else []))
         while rows and not any(rows[-1]):
             rows.pop()
         if len(rows) > MAX_STUDENTS:
             raise ValueError('Roster too large')
         dropdown = [[str(row[0])] for row in blocks[1].get('values', []) if row and str(row[0])]
-        return {'target': target, 'rows': rows, 'dropdown': dropdown}
+        return {'target': target, 'rows': rows, 'dropdown': dropdown,
+                'status_column': status_column, 'status_header_free': not status_header}
 
     def write(self, before, rows):
         # A second read detects edits made while the editor was preparing its save.
@@ -475,12 +498,26 @@ class Sheet:
             self._authorize()
         title = before['target']['title'].replace("'", "''")
         count = max(len(before['rows']), len(rows))
-        values = rows + [['', '', ''] for _ in range(count - len(rows))]
         choices = student_choices(rows)
+        status_column = before.get('status_column') is True
+        header = []
+        if not status_column and any(row_status(row) != STATUS_ACTIVE for row in rows):
+            # 전출·자퇴를 적을 학적 열이 없다. D열이 비어 있을 때만 제목을 만들고, 다른 내용은 덮지 않는다.
+            if before.get('status_header_free') is not True:
+                raise ValueError('Roster status column unavailable')
+            status_column = True
+            header = [{'range': f"'{title}'!D1", 'values': [[STATUS_HEADER]]}]
+        if status_column:
+            values = ([row[:3] + [row_status(row)] for row in rows]
+                      + [['', '', '', ''] for _ in range(count - len(rows))])
+            roster_range = f"'{title}'!A2:D{count + 1}"
+        else:
+            values = rows + [['', '', ''] for _ in range(count - len(rows))]
+            roster_range = f"'{title}'!A2:C{count + 1}"
         self._request('batchUpdate', {'spreadsheetId': before['target']['spreadsheet_id']}, {
             'valueInputOption': 'RAW',
-            'data': [
-                {'range': f"'{title}'!A2:C{count + 1}", 'values': values},
+            'data': header + [
+                {'range': roster_range, 'values': values},
                 {'range': "'드롭다운'!J2:J200", 'values': choices + [[''] for _ in range(MAX_STUDENTS - len(choices))]},
             ],
         })

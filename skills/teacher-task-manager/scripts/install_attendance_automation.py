@@ -301,7 +301,7 @@ def build_config_rows(
         [
             "GEMINI_API_KEY",
             str(gemini_api_key or "").strip(),
-            "AI 출결 입력에 필요한 Gemini 연결 키입니다. Teacher Manager에서 저장한 값이 자동으로 들어옵니다.",
+            "AI 출결 입력에 필요한 Gemini 연결 API 키입니다. Teacher Manager에서 저장한 값이 자동으로 들어옵니다.",
             "자동 입력",
         ],
         # Code.gs의 ATTENDANCE_AI_ALLOWED_SETTING/VALUE와 이름·값이 같아야 한다.

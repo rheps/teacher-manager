@@ -75,7 +75,7 @@ from brity_bridge import (
 from brity_bridge.doctor import CheckResult, DoctorDeps, _default_run_command, run_doctor_checks
 from brity_bridge.gemini_analyze import check_gemini_key
 from brity_bridge.hotkey import MODIFIER_ORDER, parse_hotkey
-from brity_bridge.settings import ALLOWED_GEMINI_MODELS, load_settings, save_settings
+from brity_bridge.settings import load_settings, normalize_gemini_model, save_settings
 from dashboard import central_chat, external_url, version
 
 HELPER_WINDOW_CLASS = "BrityBridgeTrayWindow"
@@ -207,9 +207,8 @@ def home_checks(config_dir: Path, deps: HomeCheckDeps | None = None) -> list[Che
 
 
 def verify_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, str]:
-    if model not in ALLOWED_GEMINI_MODELS:
-        raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
-    return check_gemini_key(api_key, model, transport=transport)
+    # AI-KEY-02: any saved or legacy model id is checked as the one Flash-Lite model.
+    return check_gemini_key(api_key, normalize_gemini_model(model), transport=transport)
 
 
 def _default_register(modifiers: int, key: int) -> bool:
@@ -324,8 +323,8 @@ def save_bridge_settings(config_dir: Path, updates: dict) -> None:
     known = asdict(bridge_settings)
     for key, value in updates.items():
         if key in known:
-            if key == "gemini_model" and value not in ALLOWED_GEMINI_MODELS:
-                raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
+            if key == "gemini_model":
+                value = normalize_gemini_model(value)
             setattr(bridge_settings, key, value)
     save_settings(settings_path, bridge_settings)
 
@@ -398,7 +397,7 @@ def push_gemini_key_to_attendance_sheet(
     config_dir = Path(config_dir)
     key = str(load_settings(paths.settings_path(config_dir)).gemini_api_key or "").strip()
     if not key:
-        return {"state": "skipped", "detail": "아직 인공지능 연결 키를 넣지 않았어요."}
+        return {"state": "skipped", "detail": "아직 인공지능 연결 API 키를 넣지 않았어요."}
     runner = run_command or central_chat._default_run_command
     try:
         spreadsheet_id = _attendance_sheet_for_gemini_key(config_dir)
@@ -629,10 +628,7 @@ def save_messenger_settings(
             raise ValueError("Gemini API 키 모양이 올바르지 않아요")
         candidate.gemini_api_key = updates["gemini_api_key"].strip()
     if "gemini_model" in updates:
-        model = updates["gemini_model"]
-        if model not in ALLOWED_GEMINI_MODELS:
-            raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
-        candidate.gemini_model = model
+        candidate.gemini_model = normalize_gemini_model(updates["gemini_model"])
     if "hotkey" in updates:
         if not isinstance(updates["hotkey"], str):
             raise ValueError("단축키 모양이 올바르지 않아요")
@@ -1920,10 +1916,7 @@ def save_gemini(config_dir: Path, updates: dict, *, push_key=None) -> dict:
             raise ValueError("Gemini API 키 모양이 올바르지 않아요")
         candidate.gemini_api_key = value.strip()
     if "gemini_model" in checked:
-        model = checked["gemini_model"]
-        if model not in ALLOWED_GEMINI_MODELS:
-            raise ValueError("목록에 있는 Gemini 모델을 골라 주세요")
-        candidate.gemini_model = model
+        candidate.gemini_model = normalize_gemini_model(checked["gemini_model"])
     save_and_verify_messenger(
         config_dir, candidate, checked, operation="gemini_save"
     )

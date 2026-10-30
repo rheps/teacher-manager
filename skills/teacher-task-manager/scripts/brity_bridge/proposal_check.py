@@ -48,6 +48,11 @@ def task_title_without_period_suffix(title: str) -> str:
     return _TASK_PERIOD_SUFFIX_RE.sub("", str(title or "")).strip()
 
 
+def _real_newlines(text) -> str:
+    """AI가 줄바꿈 대신 적은 역슬래시+n 두 글자를 실제 줄바꿈으로 바꾼다(캘린더 설명·할 일 메모)."""
+    return str(text).replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
 def _check_text(value: str, limit: int, label: str, problems: list[str]) -> None:
     if len(value) > limit:
         problems.append(f"{label}이 {limit:,}자를 넘음")
@@ -124,7 +129,8 @@ def _check_event(event: dict, index: int, profile_calendars: dict, problems: lis
         return None
 
     _check_text(event["summary"], TITLE_MAX, f"{label} 제목", problems)
-    _check_text(event["description"], BODY_MAX, f"{label} 설명", problems)
+    description = _real_newlines(event["description"])
+    _check_text(description, BODY_MAX, f"{label} 설명", problems)
 
     if event["all_day"]:
         start = _parse_date(event["start"], f"{label} 시작", problems)
@@ -136,7 +142,7 @@ def _check_event(event: dict, index: int, profile_calendars: dict, problems: lis
             return None
         payload = {
             "summary": event["summary"],
-            "description": event["description"],
+            "description": description,
             "start": {"date": start.isoformat()},
             "end": {"date": (end + timedelta(days=1)).isoformat()},
         }
@@ -151,7 +157,7 @@ def _check_event(event: dict, index: int, profile_calendars: dict, problems: lis
             return None
         payload = {
             "summary": event["summary"],
-            "description": event["description"],
+            "description": description,
             "start": {"dateTime": event["start"], "timeZone": "Asia/Seoul"},
             "end": {"dateTime": event["end"], "timeZone": "Asia/Seoul"},
         }
@@ -189,7 +195,8 @@ def _check_task(
 
     title = task_title_without_period_suffix(task["title"])
     _check_text(title, TITLE_MAX, f"{label} 제목", problems)
-    _check_text(task["notes"], BODY_MAX, f"{label} 메모", problems)
+    notes = _real_newlines(task["notes"])
+    _check_text(notes, BODY_MAX, f"{label} 메모", problems)
     reference_date = _parse_task_reference_date(
         task["due"], f"{label} due", today, problems
     )
@@ -203,7 +210,7 @@ def _check_task(
         kind="task",
         target=target,
         google_id=google_id,
-        payload={"title": title, "notes": task["notes"]},
+        payload={"title": title, "notes": notes},
         action_key=build_action_key("task", target, reference_date.isoformat(), title),
     )
 

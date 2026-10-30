@@ -25,6 +25,11 @@ EXPECTED_FILE_TYPES = {"Code": "SERVER_JS", "appsscript": "JSON"}
 # 있는 동안 v2.4·v2.5로 설치한 출결이 사용자 수정본으로 잘못 잡혀, 최신판으로
 # 바꿀 단추가 사라졌다.
 TRUSTED_PUBLIC_BUNDLE_PROVENANCE = {
+    # Exact public v5.04 tag (git ls-remote 2026-10-29), rehashed from the public tag files;
+    # same bundle as the reviewed sheet-dialog-fit-font source target below.
+    "3f19ca43a8360976db0a02d685cdc94b49d53ed27f677d60b0c3963bcabdf303": (
+        ("v5.04", "63b988a19b3951e6a280619737e255bab54fd6d3"),
+    ),
     # Exact public v5.03 Latest tag and unchanged Setup verified on 2026-10-07.
     "da5fa03f94ebf6ee1a38ececce618cfaf4d1f78732c4bc26fbf59aa4b17be309": (
         ("v5.03", "c9078a43e471d34de7399be83e7daf381479073c"),
@@ -166,6 +171,34 @@ TRUSTED_PUBLIC_BUNDLE_SHA256 = frozenset(TRUSTED_PUBLIC_BUNDLE_PROVENANCE)
 # AI 계정 확인·사유 정리 고침 두 묶음만 빠졌다. 이 정확한 한 판만 같은 시트에서
 # 복구하며, 다른 미등록 지문은 계속 사용자 수정본으로 보호한다.
 TRUSTED_PRERELEASE_BUNDLE_PROVENANCE = {
+    # Order 32 reached the teacher's test workbook through the 5.05 Candidate built
+    # from 6eef828 (2026-10-30); trust it so that workbook can move to order 33.
+    '6354e19decfd90c14dd805ab32e0582b67b68c711631aca904f0670b7952107b': (
+        ('student-chat-intake-roster-status-candidate-2026-10-30', '6eef82852f46e89e8569e7c87266d50058cea23f'),
+    ),
+    # Order 31 (AI-KEY-02) reached the teacher's test workbook through the 5.05 Candidate
+    # built from 00973a4 (2026-10-29); trust it so that workbook can move to order 32.
+    '9ebd675e7bc5e1d513e77f3605146d08d12e77f240b156c5951c268f4bb8a3ed': (
+        ('gemini-key-flash-lite-candidate-2026-10-29', '00973a4834fc8c38785bf037d2890a89dfcd6565'),
+    ),
+    # AI-KEY-02 (2026-10-28): order 30 delivery is unknown, so trust it to let such a
+    # workbook move to the per-teacher Gemini target instead of becoming `customized`.
+    '3475330727c514baabcfb037878d42392b316b6449310637af8149abba3b7c44': (
+        ('reviewed-central-ai-only-source-2026-10-19', '0c99b3190bcae96e6835756e59254cd314c11d5e'),
+    ),
+    # Preserve reviewed order 29 as source-only; the server pilot did not deliver a Sheet bundle.
+    'e3df4a8f03e444b5ee0bc4cba3dd50cd31e7d67f0d77546b977f3698fa57268e': (
+        ('reviewed-central-ai-source-only-2026-10-19', '6c66b5f490c2b28853b9015b910b00cc58bc8a0e'),
+    ),
+    # Retain the previous independently reviewed source; never claim a delivered workbook.
+    '267d527e0779ab2d5d27478b762b43d00911a99adbebe61b19fba842c447ed29': (
+        ('reviewed-openai-luna-source-only-2026-10-19', '6361d42df6af63dc46d7307189947d1d8042bcf9'),
+    ),
+    # Retained reviewed source only (not a delivered release or workbook). CONN-04: preserve
+    # the previous target's exact frozen source when selecting the next reviewed target.
+    '3f19ca43a8360976db0a02d685cdc94b49d53ed27f677d60b0c3963bcabdf303': (
+        ('reviewed-sheet-dialog-fit-font-source-only-2026-10-07', 'cb15c72591279d1e65c82975fb7441212f59ebc8'),
+    ),
     # New-row category (SHEET-AI-04) was delivered to the school account's workbook by
     # Candidate 493bd2fa on 2026-10-02; frozen sheet-dashboard-p6-target.
     'e78e51f500fdc3b3fb4bada3b4816287343c00578b423b352815f09ca9846814': (
@@ -357,6 +390,21 @@ _DELIVERED_42_ORDER = {
     "da5fa03f94ebf6ee1a38ececce618cfaf4d1f78732c4bc26fbf59aa4b17be309": 26,
     # Reviewed Sheet dialog fit/font Candidate target; not delivered to a workbook yet.
     "3f19ca43a8360976db0a02d685cdc94b49d53ed27f677d60b0c3963bcabdf303": 27,
+    # Reviewed OpenAI source target only; actual delivery and live verification are pending.
+    "267d527e0779ab2d5d27478b762b43d00911a99adbebe61b19fba842c447ed29": 28,
+    # Reviewed central AI source only; not installed or delivered.
+    "e3df4a8f03e444b5ee0bc4cba3dd50cd31e7d67f0d77546b977f3698fa57268e": 29,
+    # Reviewed common-service-only source; no client installation or Sheet delivery.
+    "3475330727c514baabcfb037878d42392b316b6449310637af8149abba3b7c44": 30,
+    # AI-KEY-02: 5.04 per-teacher Gemini source with a fixed Flash-Lite send guard;
+    # delivered to the teacher's test workbook by the 2026-10-29 Candidate (00973a4).
+    "9ebd675e7bc5e1d513e77f3605146d08d12e77f240b156c5951c268f4bb8a3ed": 31,
+    # Always-on student Chat DM intake (no menu), date picker on column A and the 학생명단
+    # 학적 column (only 재적 counts); delivered by the 2026-10-30 Candidate (6eef828).
+    "6354e19decfd90c14dd805ab32e0582b67b68c711631aca904f0670b7952107b": 32,
+    # Student DM intake skips one student's 400/404 read and keeps reading the others;
+    # not delivered yet.
+    "b40c6063f45a63099814dbad2b84f70915411a58171c4c511e03b0d2f7b7f7df": 33,
 }
 
 

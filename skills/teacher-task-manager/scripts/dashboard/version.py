@@ -110,7 +110,8 @@
 # v5.03: completed desktop/login/window fixes and exact deployed Chat manifest formatting;
 # student Chat automatic attendance remains an opt-in field-test feature, not field-verified.
 # v5.04: Sheet attendance dialog fits the available screen and loads real Pretendard webfonts.
-APP_VERSION = "5.04"
+# v5.05: per-teacher Gemini key with Flash-Lite/3.6/3.8 picker for messenger analysis (AI-KEY-02/03).
+APP_VERSION = "5.05"
 
 BRANDING = {
     "name": "Teacher Manager",

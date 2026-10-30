@@ -162,6 +162,7 @@ def save_recovery_stage(
     proposal=_UNSET,
     checked_actions=_UNSET,
     google_results=_UNSET,
+    ai_reference_time=_UNSET,
 ) -> bool:
     """Atomically extend the existing message file with a resumable checkpoint.
 
@@ -198,6 +199,7 @@ def save_recovery_stage(
         ("proposal", proposal),
         ("checked_actions", checked_actions),
         ("google_results", google_results),
+        ("ai_reference_time", ai_reference_time),
     ):
         if value is not _UNSET:
             recovery[key] = value

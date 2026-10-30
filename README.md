@@ -1,5 +1,7 @@
 # Teacher Manager
 
+코드와 개발 도구는 [Codex Cloud 작업 안내](docs/codex-cloud.ko.md)에 따라 클라우드에서 관리합니다. [VirtualBox는 완성 설치파일 시험용](docs/virtualbox-codex-cli.ko.md)으로만 사용하며, 전체 소스·개발 의존성·SDK를 내려받지 않습니다. 실제 Cloud 연결과 Windows 설치파일 제작 경로의 준비 여부는 안내에서 구분합니다.
+
 **경기도교육청 소속 선생님을 위한 Google 업무 자동화 프로그램**
 
 교육청 업무 메신저(Brity)의 쪽지·공지를 Google Calendar와 Tasks에 정리하고,

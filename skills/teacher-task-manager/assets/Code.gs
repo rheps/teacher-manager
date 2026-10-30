@@ -131,6 +131,10 @@ const DEFAULT_CONFIG = Object.freeze({
 
 const INPUT_HEADERS = ['날짜','번호+이름','구분','종류','사유','교시','신고서','첨부'];
 const ROSTER_HEADERS = ['번호','이름','학생 Google 이메일'];
+// 학생명단 D열 학적: 재적만 우리 반 학생으로 센다(빈 칸은 재적). 전입 학생은 재적으로 넣는다.
+const ROSTER_STATUS_HEADER = '학적';
+const ROSTER_STATUS_ACTIVE = '재적';
+const ROSTER_STATUS_OPTIONS = ['재적', '전출', '자퇴(퇴학)'];
 const MESSENGER_PERSONAL_SHEET_NAME = '메신저 개인톡 내용';
 const MESSENGER_CLASS_SHEET_NAME = '메신저 단체톡 내용';
 const LEGACY_PERSONAL_MESSAGE_QUEUE_SHEET_NAMES = ['개인톡 내용', '개인 쪽지 대장'];
@@ -147,7 +151,7 @@ const CHAT_MESSAGE_LIMIT_BYTES = 30000;
 /*************************************************
  * 메뉴
  *************************************************/
-function onOpen() {  addChatAttendanceMenu_();
+function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
   // 메뉴는 '사전 세팅'과 '교사가 직접 실행하는 일'로 가른다.
@@ -536,6 +540,8 @@ function runFirstTimeSetupWork() {
           (connectionCode + ' ' + setupAccount + ' ' + new Date().toISOString()).trim());
         SpreadsheetApp.flush();
         context.sheetReady = true;
+        // 학생 개인 쪽지 출결은 메뉴 없이 늘 켜져 있다. 자동 확인 예약이 실패해도 설정은 막지 않는다.
+        try { ensureChatAttendanceIntake_(); } catch (_) {}
       } catch (err) {
         resultUncertain = true;
         const connectionError = sheetFacingErrorMessage_(err, '출석부 연결 저장');
@@ -605,8 +611,9 @@ function firstTimeSetupRosterStep_() {
     const name = String(readConfigValueReadOnly_('ROSTER_SHEET_NAME') || '학생명단').trim();
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
     if (!sheet || sheet.getLastRow() < 1) throw new Error('Roster unavailable');
-    const rows = sheet.getRange(1, 1, sheet.getLastRow(), 3).getDisplayValues();
-    const header = rows.shift();
+    const allRows = sheet.getRange(1, 1, sheet.getLastRow(), 3).getDisplayValues();
+    const header = allRows.shift();
+    const rows = rosterBlankInactiveRows_(sheet, allRows);
     if (header[0] !== '번호' || header[1] !== '이름' || String(header[2]).indexOf('이메일') < 0) {
       throw new Error('Roster layout unavailable');
     }
@@ -2426,7 +2433,8 @@ function attendanceAiDefaultPorts_(source) {
     readRosterRows: (spreadsheet, context) => {
       const rosterSheet = spreadsheet.getSheetByName(context.rosterSheetName);
       if (!rosterSheet || rosterSheet.getLastRow() < 2) return [];
-      return rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, ROSTER_HEADERS.length).getValues();
+      return rosterBlankInactiveRows_(rosterSheet,
+        rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, ROSTER_HEADERS.length).getValues());
     },
     readHolidayDateKeys: (spreadsheet, calendarYear) => {
       const holidaySheet = spreadsheet.getSheetByName(getHolidaySheetName_());
@@ -2445,7 +2453,9 @@ function attendanceAiDefaultPorts_(source) {
         // 화면 안내가 막혀도 출결행 안전 판단은 그대로 유지한다.
       }
     },
-    callGemini: (request, apiKey) => callAttendanceAiGeminiWithRetry_(
+    // AI-KEY-02: send only the fixed Flash-Lite model; never a Flash/Pro id (gemini-3.5-flash is served as 3.6 Flash).
+    callGemini: (request, apiKey) => request && request.model === ATTENDANCE_AI_MODEL
+      ? callAttendanceAiGeminiWithRetry_(
       () => {
         const response = UrlFetchApp.fetch(ATTENDANCE_AI_INTERACTIONS_URL, {
           method: 'post',
@@ -2458,7 +2468,7 @@ function attendanceAiDefaultPorts_(source) {
       },
       milliseconds => Utilities.sleep(milliseconds),
       geminiBudget
-    ),
+    ) : (() => { throw new Error('Gemini model not allowed'); })(),
     readWriteState: targetSheet => ({
       headerRow: targetSheet
         .getRange(MONTHLY_ATTENDANCE_HEADER_ROW, 1, 1, 12)
@@ -3429,6 +3439,7 @@ function enableAttendanceAiInput(options) {
 
 /** 설치형 감지기가 부르는 함수 — 실패해도 시트에 아무 표시를 남기지 않는다. */
 function onAttendanceAiEdit(e) {
+  try { chatAttendanceEnsureSoon_(); } catch (_) {}
   try {
     return handleAttendanceAiEdit(e);
   } catch (err) {
@@ -3491,6 +3502,8 @@ function ensureRosterSheet_(ss) {
     clearFormerFourthColumn();
   } else {
     sh.getRange(1, 1, 1, ROSTER_HEADERS.length).setValues([ROSTER_HEADERS]);
+    // 학적 열을 두지 못해도 명단 준비는 막지 않는다(그때는 모두 재적으로 센다).
+    try { ensureRosterStatusColumn_(sh); } catch (_) {}
   }
 
   if (String(cfg.STUDENT_DROPDOWN_RANGE || '').trim() !== STUDENT_DROPDOWN_RANGE) {
@@ -3506,6 +3519,41 @@ function ensureRosterSheet_(ss) {
   sh.setColumnWidths(1, 2, 90);
   sh.setColumnWidths(3, 1, 240);
   sh.getDataRange().setWrap(true).setVerticalAlignment('middle');
+}
+
+/** 학생명단 D열에 학적 제목과 선택목록(재적·전출·자퇴(퇴학))을 둔다. D1에 다른 내용이 있으면 건드리지 않는다. */
+function ensureRosterStatusColumn_(sh) {
+  if (sh.getMaxColumns() < 4) sh.insertColumnsAfter(sh.getMaxColumns(), 4 - sh.getMaxColumns());
+  const head = sh.getRange(1, 4);
+  const text = String(head.getDisplayValue() || '').trim();
+  if (text && text !== ROSTER_STATUS_HEADER) return;
+  if (!text) {
+    head.setValue(ROSTER_STATUS_HEADER);
+    sh.getRange(1, 3).copyTo(head, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  }
+  const rows = sh.getMaxRows() - 1;
+  if (rows > 0) {
+    sh.getRange(2, 4, rows, 1).setDataValidation(SpreadsheetApp.newDataValidation()
+      .requireValueInList(ROSTER_STATUS_OPTIONS, true).setAllowInvalid(false).build());
+  }
+}
+
+/** 학생명단 D열이 학적 열인지(제목이 '학적'). 다른 내용이면 선생님 자료라 학적으로 읽지 않는다. */
+function rosterHasStatusColumn_(sheet) {
+  if (!sheet || typeof sheet.getMaxColumns !== 'function' || sheet.getMaxColumns() < 4) return false;
+  const head = sheet.getRange(1, 4);
+  return !!head && typeof head.getDisplayValue === 'function'
+    && String(head.getDisplayValue() || '').trim() === '학적';
+}
+
+/** 2행부터 읽은 학생명단 행에서 재적이 아닌(전출·자퇴) 학생을 빈 행으로 바꾼다. 행 위치와 열 수는 그대로다. */
+function rosterBlankInactiveRows_(sheet, rows) {
+  if (!rows || !rows.length || !rosterHasStatusColumn_(sheet)) return rows;
+  const statuses = sheet.getRange(2, 4, rows.length, 1).getDisplayValues();
+  return rows.map((row, index) => {
+    const status = String(statuses[index][0] || '').trim();
+    return !status || status === '재적' ? row : row.map(() => '');
+  });
 }
 
 function parseStudentLabel_(value) {
@@ -3541,7 +3589,7 @@ function syncStudentDropdownValues_(ss, cfg) {
   }
 
   const rows = roster.getLastRow() > 1
-    ? roster.getRange(2, 1, roster.getLastRow() - 1, 2).getValues()
+    ? rosterBlankInactiveRows_(roster, roster.getRange(2, 1, roster.getLastRow() - 1, 2).getValues())
     : [];
   const labels = buildStudentDropdownValues_(rows);
   const output = Array.from(
@@ -3566,7 +3614,7 @@ function loadStudentRosterForDm_() {
   ensureRosterSheet_(ss);
   const lastRow = roster.getLastRow();
   if (lastRow < 2) return {};
-  const values = roster.getRange(2, 1, lastRow - 1, ROSTER_HEADERS.length).getValues();
+  const values = rosterBlankInactiveRows_(roster, roster.getRange(2, 1, lastRow - 1, ROSTER_HEADERS.length).getValues());
   return buildRosterKeyMap_(values);
 }
 
@@ -6834,10 +6882,10 @@ function onEdit(e) {
     const startCol = range.getColumn();
     const endCol = range.getLastColumn();
 
-    // 학생명단의 번호(A)/이름(B)을 고치면 드롭다운 시트의 숨은 목록만 갱신한다.
+    // 학생명단의 번호(A)/이름(B)/학적(D)을 고치면 드롭다운 시트의 숨은 목록만 갱신한다.
     const cfg = getConfig_();
     if (sheet.getName() === (cfg.ROSTER_SHEET_NAME || '학생명단')) {
-      if (startCol <= 2 && endCol >= 1) {
+      if ((startCol <= 2 && endCol >= 1) || (startCol <= 4 && endCol >= 4)) {
         syncStudentDropdownValues_(e.source || SpreadsheetApp.getActiveSpreadsheet(), cfg);
       }
       return;
@@ -7230,7 +7278,7 @@ function tmDashboardReadRoster_(ss, config, out) {
     return;
   }
   const seen = {};
-  values.slice(1).forEach(row => {
+  rosterBlankInactiveRows_(sheet, values.slice(1)).forEach(row => {
     const number = String(row[0] === null || row[0] === undefined ? '' : row[0]).trim();
     const name = String(row[1] === null || row[1] === undefined ? '' : row[1]).trim();
     if (!number && !name) return;
@@ -7462,6 +7510,7 @@ function tmDashboardReadSnapshot_(ss, account, now) {
 
 /** 머리글 칩 세 개. 표를 늦추지 않도록 스냅숏과 따로 부른다(§3.2). */
 function tmDashboardHealth(req) {
+  try { chatAttendanceEnsureSoon_(); } catch (_) {}
   return tmDashboardServe_(req, ss => {
     const result = { status: 'ok', ai: 'unknown', chat: 'unknown', classRoom: 'unknown', classRoomName: '' };
     let config = null;
@@ -7670,7 +7719,7 @@ function tmDashboardWriteGuard_(sheet) {
 function tmDashboardRosterLabels_(ss, config) {
   const sheet = ss.getSheetByName(String(config.ROSTER_SHEET_NAME || '학생명단').trim());
   if (!sheet || sheet.getLastRow() < 2) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues()
+  return rosterBlankInactiveRows_(sheet, sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues())
     .map(row => combineStudentNumberAndName_(row[0], row[1])).filter(Boolean);
 }
 
@@ -8055,7 +8104,7 @@ function tmDashboardOpenQueue_(ss, spec) {
 function tmDashboardRosterMap_(ss, config) {
   const sheet = ss.getSheetByName(String(config.ROSTER_SHEET_NAME || '학생명단').trim());
   if (!sheet || sheet.getLastRow() < 2) return {};
-  return buildRosterKeyMap_(sheet.getRange(2, 1, sheet.getLastRow() - 1, ROSTER_HEADERS.length).getValues());
+  return buildRosterKeyMap_(rosterBlankInactiveRows_(sheet, sheet.getRange(2, 1, sheet.getLastRow() - 1, ROSTER_HEADERS.length).getValues()));
 }
 
 function tmDashboardTokenOf_(parts) {
@@ -8356,7 +8405,7 @@ function tmDashboardAddQueueItem(input) {
     const label = String(data.student || '').trim();
     const rosterSheet = ss.getSheetByName(String(config.ROSTER_SHEET_NAME || '학생명단').trim());
     const rosterRows = rosterSheet && rosterSheet.getLastRow() >= 2
-      ? rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 2).getValues() : [];
+      ? rosterBlankInactiveRows_(rosterSheet, rosterSheet.getRange(2, 1, rosterSheet.getLastRow() - 1, 2).getValues()) : [];
     const matches = rosterRows.filter(row => combineStudentNumberAndName_(row[0], row[1]) === label);
     if (!label || matches.length !== 1) return { status: 'invalid', message: '학생은 학생명단의 번호+이름으로 골라 주세요.' };
     const number = String(matches[0][0] === null || matches[0][0] === undefined ? '' : matches[0][0]).trim();
@@ -10482,7 +10531,6 @@ const TM_DASHBOARD_JS_ = [
 /** Student DM attendance: preserves B1 and existing rows; never sends Chat replies. */
 const CHAT_ATTENDANCE_CONFIG_KEY='CHAT_ATTENDANCE_CONFIG_V1';
 const CHAT_ATTENDANCE_MESSAGE_PREFIX='CHAT_ATTENDANCE_MESSAGE_V1_';
-function addChatAttendanceMenu_(){SpreadsheetApp.getUi().createMenu('학생 Chat 출결').addItem('자동입력 켜기 (새 쪽지부터)','enableChatAttendance').addItem('자동입력 끄기','disableChatAttendance').addItem('처리 상태 확인','showChatAttendanceStatus').addToUi();}
 function chatAttendanceScopeKey_(s){return JSON.stringify([s.protocolVersion,s.spreadsheetId,s.workbookSchoolYear,s.generation,s.monthlySheetIds]);}
 function chatAttendanceHash_(s){return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(s),Utilities.Charset.UTF_8)).replace(/=+$/,'');}
 function chatAttendanceGet_(path){
@@ -10501,86 +10549,67 @@ if(r.getResponseCode()!==200){
   }catch(_){}
   if(Number.isInteger(http))console.log('CHAT_READ_DIAGNOSTIC HTTP='+http+' reason='+reason);
  }catch(_){}
- throw new Error('CHAT_READ_FAILED');
+ const failed=new Error('CHAT_READ_FAILED');failed.http=r.getResponseCode();throw failed;
 }
  return JSON.parse(r.getContentText());
 }
 function chatAttendanceConfig_(){return JSON.parse(PropertiesService.getScriptProperties().getProperty(CHAT_ATTENDANCE_CONFIG_KEY)||'null');}
 function chatAttendanceAssertCurrent_(source,c,date){
  const n=chatAttendanceConfig_();
- if(!n||!n.enabled||n.generation!==c.generation||n.cutoff!==c.cutoff||n.teacher!==c.teacher||n.spreadsheetId!==c.spreadsheetId||n.binding!==c.binding||n.rosterSheetName!==c.rosterSheetName||source.getId()!==c.spreadsheetId)throw new Error('CONTEXT_CHANGED');
+ if(!n||n.generation!==c.generation||n.cutoff!==c.cutoff||n.teacher!==c.teacher||n.spreadsheetId!==c.spreadsheetId||n.binding!==c.binding||n.rosterSheetName!==c.rosterSheetName||source.getId()!==c.spreadsheetId)throw new Error('CONTEXT_CHANGED');
  if(requireGoeduTeacherAccount_({requireEffectiveUser:true})!==c.teacher)throw new Error('ACCOUNT_CHANGED');
  authorizeAttendanceOperation_('automatic',date);
  if(chatAttendanceScopeKey_(attendanceManagedScope_('automatic',date,''))!==c.binding)throw new Error('BINDING_CHANGED');
 }
-function enableChatAttendance(){
- const lock=LockService.getDocumentLock();
- if(!lock||!lock.tryLock(1000))throw new Error('다른 출결 작업이 끝난 뒤 다시 눌러 주세요.');
- try{
-  const source=SpreadsheetApp.getActiveSpreadsheet(),teacher=requireGoeduTeacherAccount_({requireEffectiveUser:true});
-  const date=Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd');
-  authorizeAttendanceOperation_('automatic',date);
-  const ports=attendanceAiDefaultPorts_(source),settings=readAttendanceConfigStrict_(source);
-  if(String(ports.getTargetSpreadsheetId())!==source.getId()||!ports.getGeminiApiKey())throw new Error('현재 출결 연결과 AI 설정을 확인해 주세요.');
-  const rosterSheetName=String(settings.ROSTER_SHEET_NAME||'학생명단').trim();
-  const roster=ports.readRosterRows(source,{rosterSheetName:rosterSheetName});
-  chatAttendanceValidateRoster_(roster);
-  const emails=roster.filter(r=>String(r[0]||'').trim()||String(r[1]||'').trim()).map(r=>String(r[2]||'').trim());
-  if(!emails.length||new Set(emails).size!==emails.length||emails.some(e=>!isExactGoeduEmail_(e)))throw new Error('학생 Google 이메일을 중복 없이 확인해 주세요.');
-  let checked=false;
-  for(const email of emails){
-   const dm=chatAttendanceGet_('spaces:findDirectMessage?name='+encodeURIComponent('users/'+email));
-   if(!dm)continue;
-   if(dm.spaceType!=='DIRECT_MESSAGE')throw new Error('CHAT_DM_INVALID');
-   const student=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(email));
-   const own=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(teacher));
-   if(!student||!own||!student.member||!own.member||!/^users\/[^/]+$/.test(String(student.member.name||''))||!/^users\/[^/]+$/.test(String(own.member.name||''))||student.member.name===own.member.name)throw new Error('CHAT_MEMBER_INVALID');
-   const messages=chatAttendanceGet_(dm.name+'/messages?pageSize=1');if(!messages)throw new Error('CHAT_MESSAGES_UNAVAILABLE');checked=true;break;
-  }
-  if(!checked)throw new Error('학생과의 기존 Google Chat 개인 대화가 있어야 켤 수 있어요.');
-  const p=PropertiesService.getScriptProperties();
-  let macKey=p.getProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1');
-  if(!macKey){macKey=Utilities.getUuid();p.setProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1',macKey);}
-  const c={enabled:true,generation:Utilities.getUuid(),teacher:teacher,spreadsheetId:source.getId(),rosterSheetName:rosterSheetName,binding:chatAttendanceScopeKey_(attendanceManagedScope_('automatic',date,'')),cutoff:new Date().toISOString(),macKey:macKey};
-  ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()==='pollChatAttendance').forEach(t=>ScriptApp.deleteTrigger(t));
-  p.setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));
-  try{ScriptApp.newTrigger('pollChatAttendance').timeBased().everyMinutes(10).create();}
-  catch(_){c.enabled=false;p.setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));throw new Error('자동 확인을 예약하지 못했어요. 다시 켜 주세요.');}
-  source.toast('지금부터 오는 학생 개인 쪽지만 확인해요. 기존 쪽지는 입력하지 않아요.','학생 Chat 출결',10);
- }finally{lock.releaseLock();}
+/** 학생 개인 쪽지 출결은 메뉴·켜기 단계 없이 늘 켜져 있다. 출석부를 설정한 교사 계정에만 자동 확인(10분)을 하나 둔다. */
+const CHAT_ATTENDANCE_POLL_HANDLER='pollChatAttendance';
+function chatAttendanceTeacherIsSetupAccount_(source,teacher){
+ if(!isExactGoeduEmail_(teacher))return false;
+ try{const cfg=readAttendanceConfigStrict_(source);return attendanceSetupMarkerMatches_(cfg.FIRST_TIME_SETUP_SHEET_DONE||cfg.FIRST_TIME_SETUP_DONE,source.getId(),teacher);}
+ catch(_){return false;}
 }
-function disableChatAttendance(){
- const lock=LockService.getDocumentLock();if(!lock||!lock.tryLock(1000))throw new Error('출결 처리 중이에요. 잠시 뒤 다시 눌러 주세요.');
- try{
-  const c=chatAttendanceConfig_();
-  if(c&&requireGoeduTeacherAccount_({requireEffectiveUser:true})!==c.teacher)throw new Error('ACCOUNT_CHANGED');
-  if(c){c.enabled=false;PropertiesService.getScriptProperties().setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));}
-  ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()==='pollChatAttendance').forEach(t=>ScriptApp.deleteTrigger(t));
-  SpreadsheetApp.getActiveSpreadsheet().toast('학생 쪽지 자동입력을 껐어요.','학생 Chat 출결',7);
- }finally{lock.releaseLock();}
+function chatAttendanceRefreshConfig_(source,teacher){
+ const p=PropertiesService.getScriptProperties();
+ const settings=readAttendanceConfigStrict_(source);
+ const date=Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd');
+ const binding=chatAttendanceScopeKey_(attendanceManagedScope_('automatic',date,''));
+ const rosterSheetName=String(settings.ROSTER_SHEET_NAME||'학생명단').trim();
+ const old=chatAttendanceConfig_();
+ // 예전 켜기/끄기 기록('enabled')은 이어 쓰지 않고 지금부터 새로 시작한다.
+ if(old&&!Object.prototype.hasOwnProperty.call(old,'enabled')&&old.teacher===teacher&&old.spreadsheetId===source.getId()&&old.binding===binding&&old.rosterSheetName===rosterSheetName&&old.generation&&old.cutoff&&old.macKey)return old;
+ let macKey=p.getProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1');
+ if(!macKey){macKey=Utilities.getUuid();p.setProperty('CHAT_ATTENDANCE_RECEIPT_KEY_V1',macKey);}
+ const c={generation:Utilities.getUuid(),teacher:teacher,spreadsheetId:source.getId(),rosterSheetName:rosterSheetName,binding:binding,cutoff:new Date().toISOString(),macKey:macKey};
+ p.setProperty(CHAT_ATTENDANCE_CONFIG_KEY,JSON.stringify(c));
+ return c;
 }
-function showChatAttendanceStatus(){
- const lock=LockService.getDocumentLock();
- if(!lock||!lock.tryLock(1000)){SpreadsheetApp.getUi().alert('학생 쪽지 출결을 처리 중이에요. 잠시 뒤 다시 확인해 주세요.');return;}
+function ensureChatAttendanceIntake_(){
+ const source=SpreadsheetApp.getActiveSpreadsheet(),teacher=String(Session.getEffectiveUser().getEmail()||'').trim();
+ if(!chatAttendanceTeacherIsSetupAccount_(source,teacher))return false;
+ const lock=LockService.getScriptLock();if(!lock||!lock.tryLock(5000))return false;
  try{
-  const c=chatAttendanceConfig_(),teacher=requireGoeduTeacherAccount_({requireEffectiveUser:true});
-  if(c&&c.teacher!==teacher)throw new Error('ACCOUNT_CHANGED');
-  const props=PropertiesService.getScriptProperties(),p=props.getProperties(),counts={applied:0,review:0,uncertain:0},details=[];
-  const sheets=SpreadsheetApp.getActiveSpreadsheet().getSheets();
-  Object.keys(p).filter(k=>k.indexOf(CHAT_ATTENDANCE_MESSAGE_PREFIX)===0).forEach(k=>{
-   const r=JSON.parse(p[k]);
-   if(!c||r.teacher!==c.teacher||r.spreadsheetId!==c.spreadsheetId)return;
-   if(r.state==='writing'){r.state='uncertain';r.code='INTERRUPTED_WRITE';props.setProperty(k,JSON.stringify(r));}
-   if(Object.prototype.hasOwnProperty.call(counts,r.state))counts[r.state]++;
-   if(r.state==='review'||r.state==='uncertain'){
-    const sheet=sheets.find(s=>s.getSheetId()===r.sheetId);
-    const location=r.row?' / '+(sheet?sheet.getName():'출석부')+' '+r.row+'행':'';
-    const reason=r.state==='uncertain'?'입력 결과 확인 필요':r.code==='CORRECTION_REQUIRES_REVIEW'?'학생 정정 쪽지 확인 필요':r.code==='AMBIGUOUS_EDITED_OR_CORRECTED'?'날짜·수정·취소 확인 필요':'기존 출결·분류 확인 필요';
-    details.push((r.student?r.student+'번':'학생 확인 필요')+' '+(r.date||'')+location+' / '+reason);
-   }
-  });
-  SpreadsheetApp.getUi().alert('학생 Chat 출결',(c&&c.enabled?'자동입력 켜짐':'자동입력 꺼짐')+'\n입력 확인: '+counts.applied+'\n선생님 확인 필요: '+counts.review+'\n결과 불확실 (자동 재입력 안 함): '+counts.uncertain+'\n최근 확인: '+(p.CHAT_ATTENDANCE_LAST_POLL_V1||'아직 확인 전')+'\n조회 실패: '+(p.CHAT_ATTENDANCE_LAST_ERROR_V1?'연결을 확인해 주세요.':'없음')+(details.length?'\n\n'+details.slice(-20).join('\n'):''),SpreadsheetApp.getUi().ButtonSet.OK);
+  const triggers=ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()===CHAT_ATTENDANCE_POLL_HANDLER);
+  triggers.slice(1).forEach(t=>ScriptApp.deleteTrigger(t));
+  if(!triggers.length)ScriptApp.newTrigger(CHAT_ATTENDANCE_POLL_HANDLER).timeBased().everyMinutes(10).create();
  }finally{lock.releaseLock();}
+ const doc=LockService.getDocumentLock();
+ if(doc&&doc.tryLock(1000)){try{chatAttendanceRefreshConfig_(source,teacher);}catch(_){}finally{doc.releaseLock();}}
+ return true;
+}
+/** 시트 편집·대시보드 열기 때 자동 확인 예약을 한 시간에 한 번 맞춘다. 실패해도 그 작업은 막지 않는다. */
+function chatAttendanceEnsureSoon_(){
+ try{
+  const cache=CacheService.getUserCache();
+  if(cache.get('CHAT_ATTENDANCE_ENSURED_V1'))return;
+  const ok=ensureChatAttendanceIntake_();
+  cache.put('CHAT_ATTENDANCE_ENSURED_V1',ok?'1':'0',ok?3600:600);
+ }catch(_){}
+}
+/** 새로 명단에 넣은 학생은 그 뒤 첫 확인부터 센다: 직전 확인을 시작한 때 이후의 쪽지를 읽는다. */
+function chatAttendanceStartFor_(c){
+ try{const seen=JSON.parse(PropertiesService.getScriptProperties().getProperty('CHAT_ATTENDANCE_SEEN_SINCE_V1')||'null');
+  if(seen&&seen.generation===c.generation&&typeof seen.at==='string'&&seen.at>c.cutoff)return seen.at;}catch(_){}
+ return c.cutoff;
 }
 function chatAttendanceMessageVersion_(m){return chatAttendanceHash_(JSON.stringify([m.name,m.sender&&m.sender.name,m.createTime,m.lastUpdateTime||'',m.text||'']));}
 function chatAttendanceDay_(m){const d=new Date(m.createTime);if(!Number.isFinite(d.getTime()))throw new Error('MESSAGE_DATE_INVALID');return Utilities.formatDate(d,'Asia/Seoul','yyyy-MM-dd');}
@@ -10655,26 +10684,34 @@ function chatAttendanceWrite_(source,c,student,m,ports,role,record){
  p.setProperty(key,JSON.stringify(receipt));
 }
 function pollChatAttendance(){
- const c=chatAttendanceConfig_();if(!c||!c.enabled)return;
- if(String(Session.getEffectiveUser().getEmail()||'').trim()!==c.teacher)return;
+ const teacher=String(Session.getEffectiveUser().getEmail()||'').trim();
  const lock=LockService.getDocumentLock();if(!lock||!lock.tryLock(1000))return;
- const p=PropertiesService.getScriptProperties();
+ const p=PropertiesService.getScriptProperties(),startedAt=new Date().toISOString();
  try{
   const source=SpreadsheetApp.getActiveSpreadsheet(),now=Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd');
+  if(!chatAttendanceTeacherIsSetupAccount_(source,teacher))return;
+  const c=chatAttendanceRefreshConfig_(source,teacher);
   chatAttendanceAssertCurrent_(source,c,now);
   const ports=attendanceAiDefaultPorts_(source),settings=readAttendanceConfigStrict_(source),roles=attendanceMonthSheetsFor_(source,settings);
   if(String(ports.getTargetSpreadsheetId())!==source.getId())throw new Error('TARGET_CHANGED');
+  // AI 키가 없으면 쪽지를 읽은 것으로 넘기지 않는다. 키를 넣은 뒤의 확인에서 그대로 처리한다.
+  if(!ports.getGeminiApiKey()){p.setProperty('CHAT_ATTENDANCE_LAST_ERROR_V1','GEMINI_KEY_MISSING');return;}
+  const since=chatAttendanceStartFor_(c);
   const roster=ports.readRosterRows(source,{rosterSheetName:c.rosterSheetName}),emails=roster.filter(r=>String(r[0]||'').trim()||String(r[1]||'').trim()).map(r=>String(r[2]||'').trim());
   chatAttendanceValidateRoster_(roster);
   if(new Set(emails).size!==emails.length||emails.some(e=>!isExactGoeduEmail_(e)))throw new Error('ROSTER_EMAIL_MISSING_OR_DUPLICATE');
   for(const row of roster){
    const email=String(row[2]||'').trim();if(!email)continue;if(!isExactGoeduEmail_(email))throw new Error('ROSTER_EMAIL_INVALID');
-   const dm=chatAttendanceGet_('spaces:findDirectMessage?name='+encodeURIComponent('users/'+email));if(!dm)continue;
+   // 학생 한 명의 400·404는 그 학생만 건너뛴다. 401·403·429·5xx는 기존대로 이 회차를 끝낸다.
+   const studentRead=(stage,fn)=>{try{return fn();}catch(e){if(e&&(e.http===400||e.http===404)){console.log('CHAT_STUDENT_SKIPPED no='+String(row[0]).replace(/\D/g,'')+' stage='+stage+' http='+e.http);return undefined;}throw e;}};
+   const dm=studentRead('find',()=>chatAttendanceGet_('spaces:findDirectMessage?name='+encodeURIComponent('users/'+email)));if(!dm)continue;
    if(dm.spaceType!=='DIRECT_MESSAGE')throw new Error('CHAT_DM_INVALID');
-   const member=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(email)),own=chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(c.teacher));
+   const pair=studentRead('members',()=>[chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(email)),chatAttendanceGet_(dm.name+'/members/'+encodeURIComponent(c.teacher))]);if(!pair)continue;
+   const member=pair[0],own=pair[1];
    if(!member||!own||!member.member||!own.member||!/^users\/[^/]+$/.test(String(member.member.name||''))||!/^users\/[^/]+$/.test(String(own.member.name||''))||member.member.name===own.member.name)throw new Error('CHAT_MEMBER_INVALID');
-   const cursorKey='CHAT_ATTENDANCE_CURSOR_V1_'+chatAttendanceHash_(c.generation+email),cursor=p.getProperty(cursorKey)||c.cutoff;
-   const messages=chatAttendanceMessages_(dm.name,cursor).filter(m=>m.sender&&m.sender.name===member.member.name&&new Date(m.createTime).getTime()>=new Date(c.cutoff).getTime());
+   const cursorKey='CHAT_ATTENDANCE_CURSOR_V1_'+chatAttendanceHash_(c.generation+email),cursor=p.getProperty(cursorKey)||since;
+   const read=studentRead('messages',()=>chatAttendanceMessages_(dm.name,cursor));if(!read)continue;
+   const messages=read.filter(m=>m.sender&&m.sender.name===member.member.name&&new Date(m.createTime).getTime()>=new Date(c.cutoff).getTime());
    for(const m of messages){
     const key=CHAT_ATTENDANCE_MESSAGE_PREFIX+chatAttendanceHash_(m.name);if(p.getProperty(key))continue;
     const text=String(m.text||'').trim(),date=chatAttendanceDay_(m);
@@ -10698,6 +10735,7 @@ function pollChatAttendance(){
    p.setProperty(cursorKey,messages.reduce((max,m)=>m.createTime>max?m.createTime:max,cursor));
   }
   p.setProperty('CHAT_ATTENDANCE_LAST_POLL_V1',Utilities.formatDate(new Date(),'Asia/Seoul','yyyy-MM-dd HH:mm:ss'));p.deleteProperty('CHAT_ATTENDANCE_LAST_ERROR_V1');
+  p.setProperty('CHAT_ATTENDANCE_SEEN_SINCE_V1',JSON.stringify({generation:c.generation,at:startedAt}));
  }catch(_){p.setProperty('CHAT_ATTENDANCE_LAST_ERROR_V1','CHAT_CHECK_FAILED');}
  finally{lock.releaseLock();}
 }

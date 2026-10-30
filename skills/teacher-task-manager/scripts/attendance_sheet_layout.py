@@ -19,6 +19,9 @@ HEADERS = ('날짜','번호+이름','구분','종류','사유','교시','신고�
 AI_LABEL = 'AI 출결 입력'
 AI_HINT = '여기에 "3월 12일 김철수 병결" 처럼 적고 Enter를 누르세요'
 STUDENT_RANGE = "='드롭다운'!$J$2:$J$200"
+# 학생명단 D열 학적: 재적만 우리 반 학생이다(빈 칸은 재적으로 본다).
+ROSTER_STATUS_HEADER = '학적'
+ROSTER_STATUS_OPTIONS = ('재적', '전출', '자퇴(퇴학)')
 STUDENT_FORMULA = '=IF(AND(\'학생명단\'!A2<>"",\'학생명단\'!B2<>""),\'학생명단\'!A2&\'학생명단\'!B2,"")'
 # Date stripes are conditional formats computed from column A, so a sort or an
 # inserted row recolours at once. INDIRECT keeps the A3/A2 anchors fixed when a
@@ -193,6 +196,44 @@ def _usage_title_repairs(guide):
                                        'fields': ','.join('userEnteredFormat.' + key for key in title_format)}})
         requests.append({'updateDimensionProperties': {'range': {'sheetId': sid, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': 1},
                                                        'properties': {'pixelSize': 36}, 'fields': 'pixelSize'}})
+    return requests
+
+
+def _date_picker_repairs(sheet, rows):
+    """A열 날짜 칸에 '올바른 날짜' 규칙을 둔다: 두 번 누르면 달력이 뜬다. 날짜 값과 다른 규칙은 그대로 둔다."""
+    first = _cells(sheet, 2)
+    rule = first[0].get('dataValidation') if first else None
+    if ((rule or {}).get('condition') or {}).get('type') == 'DATE_IS_VALID':
+        return []
+    # strict=False: 글자로 적은 날짜(예: 9/19(금))도 막지 않는다.
+    return [{'setDataValidation': {'range': _range(sheet['properties']['sheetId'], 2, rows, 0, 1),
+             'rule': {'condition': {'type': 'DATE_IS_VALID'}, 'strict': False}}}]
+
+
+def _roster_status_repairs(sheet):
+    """학생명단 D열에 학적 제목과 선택목록을 둔다. D1에 다른 내용이 있으면 선생님 자료라 건드리지 않는다."""
+    head = _cells(sheet, 0)
+    d1 = head[3] if len(head) > 3 else {}
+    value = d1.get('userEnteredValue') or {}
+    if (value and value.get('stringValue') != ROSTER_STATUS_HEADER) or d1.get('note'):
+        return []
+    props = sheet['properties']; sid = props['sheetId']
+    rows = max(int(props.get('gridProperties', {}).get('rowCount', 200)), 2)
+    requests = []
+    if int(props.get('gridProperties', {}).get('columnCount', 26)) < 4:
+        requests.append({'appendDimension': {'sheetId': sid, 'dimension': 'COLUMNS', 'length': 1}})
+    if not value:
+        requests.append({'copyPaste': {'source': _range(sid, 0, 1, 2, 3), 'destination': _range(sid, 0, 1, 3, 4),
+                                       'pasteType': 'PASTE_FORMAT'}})
+        requests.append({'updateCells': {'start': {'sheetId': sid, 'rowIndex': 0, 'columnIndex': 3},
+            'rows': [{'values': [{'userEnteredValue': {'stringValue': ROSTER_STATUS_HEADER}}]}], 'fields': 'userEnteredValue'}})
+    second = _cells(sheet, 1)
+    condition = ((second[3].get('dataValidation') if len(second) > 3 else None) or {}).get('condition') or {}
+    if (condition.get('type') != 'ONE_OF_LIST'
+            or [item.get('userEnteredValue') for item in condition.get('values', [])] != list(ROSTER_STATUS_OPTIONS)):
+        requests.append({'setDataValidation': {'range': _range(sid, 1, rows, 3, 4), 'rule': {
+            'condition': {'type': 'ONE_OF_LIST', 'values': [{'userEnteredValue': v} for v in ROSTER_STATUS_OPTIONS]},
+            'strict': True, 'showCustomUi': True}}})
     return requests
 
 
@@ -381,18 +422,21 @@ def plan_layout(snapshot, month_sheet_ids=None, reveal_report_column=False):
         border = {'style':'SOLID','color':_color('A6A6A6')}
         requests.append({'updateBorders':{'range':_range(sid,2,rows), **{k:border for k in ('top','bottom','left','right','innerHorizontal','innerVertical')}}})
         requests.extend(_stripe_rule_repairs(sheet, rows))
+        requests.extend(_date_picker_repairs(sheet, rows))
     # Current months also lose the old $A$3 stripes that a sort or row edit left wrong.
     for name in MONTHS:
         if name not in todo:
             sheet = sheets[name]
             rows = int(sheet['properties'].get('gridProperties',{}).get('rowCount',250))
             requests.extend(_stripe_rule_repairs(sheet, rows))
+            requests.extend(_date_picker_repairs(sheet, rows))
             if reveal_report_column and _column_hidden(sheet, 6):
                 # 신고서(G) used to ship hidden. Show it once; other columns stay as the teacher left them (R11-2).
                 requests.append({'updateDimensionProperties':{'range':{'sheetId':sheet['properties']['sheetId'],
                     'dimension':'COLUMNS','startIndex':6,'endIndex':7},'properties':{'hiddenByUser':False},'fields':'hiddenByUser'}})
     for name in MONTHS:
         requests.extend(_tail_header_repairs(sheets[name], kinds[name] == 'one-header-row'))
+    requests.extend(_roster_status_repairs(sheets['학생명단']))
     return requests
 
 
@@ -424,7 +468,7 @@ def ensure_layout(runner, workdir, spreadsheet_id, gws, *, month_sheet_ids=None,
         return "'" + title.replace("'", "''") + "'"
     def read():
         params = {'spreadsheetId':spreadsheet_id,'includeGridData':True,
-                  'ranges':[f"{quote(title)}!1:3" for title in titles]+["'드롭다운'!J1:J2","'학생명단'!A1:C1"],
+                  'ranges':[f"{quote(title)}!1:3" for title in titles]+["'드롭다운'!J1:J2","'학생명단'!A1:D2"],
                   'fields':'spreadsheetId,sheets(properties,merges,conditionalFormats,data(startRow,startColumn,columnMetadata(hiddenByUser),rowData(values(userEnteredValue,note,dataValidation,userEnteredFormat(backgroundColor,backgroundColorStyle)))))'}
         reply = process_win.parse_first_json(runner([gws,'sheets','spreadsheets','get','--params',json.dumps(params,ensure_ascii=False),'--format','json'],workdir))
         if not isinstance(reply,dict) or reply.get('spreadsheetId') != spreadsheet_id:

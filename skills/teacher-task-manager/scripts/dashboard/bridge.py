@@ -128,6 +128,9 @@ _SCREEN_FAILURES = {
     "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
     "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
     "open_attendance_chat": "Google Chat을 열지 못했어요.",
+    "student_chat_connect_status": "학생 연결 상태를 읽지 못했어요.",
+    "student_chat_connect_send": "학생에게 인사를 보내지 못했어요.",
+    "student_chat_connect_resolve": "확인한 결과를 저장하지 못했어요.",
     "open_attendance_roster": "학생명단 시트를 열지 못했어요.",
     "computer_status": "이 컴퓨터의 준비 상태를 확인하지 못했어요.",
     "google_status": "Google 연결 상태를 확인하지 못했어요.",
@@ -585,15 +588,18 @@ def _attendance_workbook_layout_is_current(
         return values + [""] * (4 - len(values))
 
     rows = [row4(row) for row in roster]
+    # D열은 학적('학적' 제목) 또는 빈 열이다. 재적(빈 칸 포함)만 학생 선택목록에 들어간다.
+    status_column = bool(rows) and rows[0][3] == "학적"
     if (
         not rows
         or rows[0][:3] != ["번호", "이름", "학생 Google 이메일"]
-        or any(row[3] for row in rows)
+        or (not status_column and any(row[3] for row in rows))
         or len(rows) - 1 > 199
     ):
         return False
 
-    combined = [row[0] + row[1] for row in rows[1:] if row[0] and row[1]]
+    combined = [row[0] + row[1] for row in rows[1:]
+                if row[0] and row[1] and (not status_column or row[3] in ("", "재적"))]
     if first_column(values_by_range["'드롭다운'!J1:J200"]) != [
         "학생_번호이름",
         *combined,
@@ -762,7 +768,8 @@ def _migrate_attendance_roster_layout(
     rows = [row4(row) for row in before]
     headers = rows[0][:3]
     current_headers = ["번호", "이름", "학생 Google 이메일"]
-    if headers == current_headers and all(not row[3] for row in rows):
+    status_column = rows[0][3] == "학적"
+    if headers == current_headers and (status_column or all(not row[3] for row in rows)):
         migrated = rows
     elif headers == ["번호", "이름", "번호+이름"]:
         migrated = [current_headers + [""]]
@@ -845,6 +852,7 @@ def _migrate_attendance_roster_layout(
         row[0] + row[1]
         for row in migrated[1:]
         if str(row[0]).strip() and str(row[1]).strip()
+        and (not status_column or row[3] in ("", "재적"))
     ]
     hidden_students = [["학생_번호이름"]]
     hidden_students.extend([[value] for value in combined])
@@ -1129,6 +1137,7 @@ _SESSION_GOOGLE_WORK = frozenset({
     "attendance_chat_connect", "attendance_chat_set_space", "attendance_chat_create_space",
     "select_attendance_connection", "select_attendance_connection_by_code",
     "apply_all", "save_profile_grid", "save_gemini", "sync_roster_editor",
+    "student_chat_connect_send",
 })
 
 
@@ -1139,7 +1148,7 @@ _SESSION_READS = _SESSION_EMPTY_READS | frozenset({
     "list_calendars", "list_tasklists", "google_target_statuses", "verify_google_target_candidate",
     "verify_gemini_key", "probe_hotkey", "check_attachment_folder", "choose_attachment_folder",
     "open_attendance_chat", "open_attendance_script_settings", "open_attendance_roster",
-    "open_current_attendance",
+    "open_current_attendance", "student_chat_connect_status", "student_chat_connect_progress",
 })
 
 
@@ -1185,7 +1194,8 @@ def _can_continue_read(name, error, transport_pending=False):
 _AUTH_BATCH_ARG = {"list_calendars": 0, "list_tasklists": 0, "google_target_statuses": 1,
                    "attendance_status": 0, "attendance_first_setup_status": 0,
                    "attendance_roster_status": 0, "attendance_chat_status": 0,
-                   "attendance_chat_spaces": 0, "home_checks": 0}
+                   "attendance_chat_spaces": 0, "home_checks": 0,
+                   "student_chat_connect_status": 0}
 AUTH_BATCH_TTL_SECONDS = 300.0
 
 
@@ -2614,8 +2624,6 @@ class Api:
     @guarded
     def open_attendance_chat(self):
         """Open Chat with the verified school account that owns this setup."""
-        from urllib.parse import urlencode
-
         self._require_safe_gws_account_storage()
         run = self._attendance_remote_run()
         gws = engine.resolve_gws(run)
@@ -2624,8 +2632,9 @@ class Api:
         owner = str(saved.get("account") or "").strip()
         if owner and owner.casefold() != account.casefold():
             raise ScreenSafeError(engine.ATTENDANCE_ACCOUNT_MESSAGE)
+        # A bare authuser falls back to the browser's default account (LOGIN-23).
         return self._open_external_url(
-            "https://chat.google.com/?" + urlencode({"authuser": account})
+            external_url.with_google_account("https://chat.google.com/", account)
         )
 
     @guarded
@@ -3535,6 +3544,66 @@ class Api:
             create_or_resume,
             retry_states={"failed", "in-progress"},
         )
+
+    # ---- 학생과 Chat 처음 연결하기 (2026-10-29) ---------------------------------
+    @guarded
+    def student_chat_connect_status(self, batch=""):
+        """Read only: the roster, this PC's record and the default greeting."""
+        from dashboard import central_chat
+        record = read_attendance_server_record(self._config_dir)
+        if record is None:
+            return {"state": "not-ready"}
+        run, gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+        try:
+            roster = central_chat.scc_read_roster(self._config_dir, record, run, gws)
+            students = central_chat.scc_load_students(self._config_dir, account, record["spreadsheet_id"],
+                                                          record["binding_generation"])
+        except Exception:  # noqa: BLE001 - a failed read is unknown, never "nobody connected"
+            return {"state": "unavailable"}
+        profile = engine.read_profile_values(self._config_dir)
+        return {**central_chat.scc_summarize(roster, students), "greeting": central_chat.scc_default_greeting(profile)}
+
+    @guarded
+    def student_chat_connect_progress(self):
+        done, total = getattr(self, "_student_connect_progress", (0, 0))
+        return {"done": done, "total": total}
+
+    @guarded
+    def student_chat_connect_send(self, text="", keys=None):
+        """One greeting per confirmed student; never wrapped in automatic retries (C7, OBS-04)."""
+        from dashboard import central_chat
+        body = str(text or "").strip()
+        chosen = [str(key) for key in (keys or []) if isinstance(key, str)]
+        if not body or not chosen:
+            raise ScreenSafeError("보낼 학생과 인사말을 확인하지 못했어요.")
+        self._student_connect_progress = (0, len(chosen))
+
+        def send(run, gws, record):
+            if record is None:
+                raise ScreenSafeError(central_chat.NOT_PREPARED_MESSAGE)
+            _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            config = central_chat.read_central_config(
+                self._config_dir, run, gws_executable=gws, attendance_record=record)
+            roster = central_chat.scc_read_roster(self._config_dir, record, run, gws)
+            return central_chat.scc_send_greetings(
+                self._config_dir, account, record, config, roster, chosen, body,
+                progress=lambda done, total: setattr(self, "_student_connect_progress", (done, total)))
+
+        try:
+            return self._run_attendance_chat_action(send)
+        finally:
+            self._student_connect_progress = (0, 0)
+
+    @guarded
+    def student_chat_connect_resolve(self, key="", received=False):
+        from dashboard import central_chat
+        with engine.attendance_remote_work_lock(self._config_dir, **self._attendance_remote_lock_options()):
+            record = read_attendance_server_record(self._config_dir)
+            if record is None:
+                raise ScreenSafeError(central_chat.NOT_PREPARED_MESSAGE)
+            _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            central_chat.scc_resolve(self._config_dir, account, record, str(key), received is True)
+        return {"ok": True}
 
     @guarded
     def computer_status(self):

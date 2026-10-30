@@ -7,6 +7,8 @@ sheetId + sheetSecret을 보낸다.
 from __future__ import annotations
 
 import base64
+import hashlib
+import time
 import attendance_reference_storage as attendance_references
 import ctypes
 import json
@@ -15,9 +17,10 @@ import re
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-from brity_bridge import component_lock, google_account, gws_env, paths, process_win, recovery, tool_runtime
+from brity_bridge import component_lock, google_account, gws_env, paths, process_win, recovery, tls, tool_runtime
 
 SETTINGS_RANGE = "설정!A1:D200"
 
@@ -435,7 +438,7 @@ def _post(url: str, path: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"}, method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with tls.urlopen_failover(request, timeout=TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as error:
         # 서버가 답을 준 것이다 — 인터넷은 멀쩡하다.
@@ -1473,3 +1476,280 @@ def chat_status(
         "moved": moved,
         "reason": reason,
     }
+
+
+# ---- 학생과 Chat 처음 연결하기 (2026-10-29) ----
+# 학생과 Google Chat 처음 연결하기 — 학생마다 환영 인사 한 통으로 1:1 채팅을 연다.
+#
+# The desktop posts each greeting to the central sender's ``/v1/send/personal`` with the
+# sheet's own central config and the current attendance scope. The requestId depends only
+# on (workbook, generation, student email, attempt), never on text or time, so a resend of
+# the same request is always safe: never admitted -> sends; confirmed -> the server replays
+# without sending; unknown -> 409. The text used for an attempt is pinned with it (the
+# server fingerprint includes the text). Nothing here retries a send automatically (C7).
+#
+# The local record keeps, per account folder and per (spreadsheet, generation), only the
+# SHA-256 of each casefolded email, the state, attempt, request id and the exact text.
+# Student emails, numbers and names are never stored here and never reach the screen
+# except the roster's 번호+이름 label.
+SCC_RECORD_NAME = "student-chat-connect.generated.json"
+SCC_REQUEST_PREFIX = "tm-student-chat-connect-v1"
+SCC_SEND_TIMEOUT_SECONDS = 60
+SCC_PACE_SECONDS = 1.0
+_SCC_EMAIL_RE = re.compile(r'[^@\s<>,;:"()[\]{}\\/]+@[^@\s<>,;:"()[\]{}\\/.]+(?:\.[^@\s<>,;:"()[\]{}\\/.]+)+')
+
+# 2026-10-29 user wording for the first line; the rest is the bsv-korean-output-quality
+# receipt (scratchpad sfc/receipt/final.ko.txt, greeting.l2-l4).
+SCC_GREETING_FIRST_LINE = "안녕하세요. {학년}학년 {반}반 담임 {교사명} 선생님입니다."
+SCC_GREETING_REST = (
+    "앞으로 이 채팅으로 출결 서류 안내와 우리 반 소식을 보낼게요.",
+    "궁금한 점이 있으면 여기에 편하게 답장해 주세요.",
+    "앞으로 함께 잘 지내 봐요.",
+)
+# CHAT-REJECT-01 wording, identical to Code.gs centralChatErrorMessage_.
+SCC_RECIPIENT_REJECTED_MESSAGE = (
+    "학생의 Google Chat 계정으로 보낼 수 없어요. [학생명단] 탭 C열의 이메일이 맞는지 확인해 주세요. "
+    "보내지 않았으니 이메일을 고친 뒤 다시 보내면 돼요."
+)
+SCC_MESSAGE_REJECTED_MESSAGE = "Google Chat이 이 메시지를 받지 않았어요. 보내지 않았으니 내용을 확인한 뒤 다시 보내 주세요."
+SCC_UNKNOWN_MESSAGE = "인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요."
+SCC_STOPPED_MESSAGE = "Google Chat 연결을 확인해야 해서 보내기를 멈췄어요. 아직 보내지 않은 학생은 그대로 남아 있어요."
+
+# Answers the server gives before anything reaches Google Chat, or that google-chat.js
+# proved undelivered: the student failed, a later attempt uses a new request id.
+_SCC_REJECTED = {
+    "STUDENT_CHAT_RECIPIENT_REJECTED": SCC_RECIPIENT_REJECTED_MESSAGE,
+    "STUDENT_CHAT_ACCOUNT_REQUIRED": SCC_RECIPIENT_REJECTED_MESSAGE,
+    "CHAT_MESSAGE_REJECTED": SCC_MESSAGE_REJECTED_MESSAGE,
+    "MESSAGE_TOO_LARGE": SCC_MESSAGE_REJECTED_MESSAGE,
+    "MESSAGE_TARGET_AND_TEXT_REQUIRED": SCC_MESSAGE_REJECTED_MESSAGE,
+}
+# Connection-level answers before (or proven without) delivery: stop the run.
+_SCC_STOP = {"CHAT_NOT_CONNECTED", "SHEET_AUTH_REQUIRED", "SHEET_MOVED", "SHEET_ID_INVALID",
+         "REQUEST_ID_REQUIRED"}
+# Everything else (ATTENDANCE_SEND_RESULT_UNKNOWN, ATTENDANCE_REQUEST_CONFLICT, 429, 5xx,
+# timeouts, resets, unreadable replies) is unknown and never resent automatically.
+
+
+def scc_email_key(email: str) -> str:
+    return hashlib.sha256(str(email or "").strip().casefold().encode("utf-8")).hexdigest()
+
+
+def scc_request_id(spreadsheet_id: str, generation, email: str, attempt: int) -> str:
+    seed = "|".join([SCC_REQUEST_PREFIX, str(spreadsheet_id), str(generation),
+                     str(email or "").strip().casefold(), str(int(attempt))])
+    return "req-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:48]
+
+
+def scc_default_greeting(profile: dict) -> str:
+    first = (SCC_GREETING_FIRST_LINE
+             .replace("{학년}", str(profile.get("담임학년") or "").strip())
+             .replace("{반}", str(profile.get("담임반") or "").strip())
+             .replace("{교사명}", str(profile.get("선생님이름") or "").strip()))
+    return "\n".join((first, *SCC_GREETING_REST))
+
+
+def _scc_path(config_dir) -> Path:
+    return Path(config_dir) / SCC_RECORD_NAME
+
+
+def scc_load_students(config_dir, account: str, spreadsheet_id: str, generation) -> dict:
+    """The record of this account + workbook + generation only (C6·C8)."""
+    try:
+        data = json.loads(_scc_path(config_dir).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        # An unreadable record is not "nobody connected": keep it, refuse to send.
+        raise ValueError("student chat record unreadable")
+    if (not isinstance(data, dict) or str(data.get("account", "")).casefold() != str(account).casefold()
+            or data.get("spreadsheet_id") != spreadsheet_id or data.get("generation") != generation):
+        return {}
+    students = data.get("students")
+    return dict(students) if isinstance(students, dict) else {}
+
+
+def scc_save_students(config_dir, account: str, spreadsheet_id: str, generation, students: dict) -> None:
+    payload = {"account": account, "spreadsheet_id": spreadsheet_id, "generation": generation,
+               "students": students}
+    component_lock.atomic_write_text_unique(
+        _scc_path(config_dir), json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=1) + "\n")
+
+
+def scc_parse_roster(rows) -> list[dict] | None:
+    """[{number, name, email}] from 학생명단 A:D, or None when the shape is unknown.
+
+    Only 재적 students are returned: a 학적 (D) of 전출 or 자퇴(퇴학) is no longer in the class.
+    """
+    if (not isinstance(rows, list) or not rows or not isinstance(rows[0], list)
+            or rows[0][:2] != ["번호", "이름"] or len(rows[0]) < 3 or "이메일" not in str(rows[0][2])):
+        return None
+    status_column = len(rows[0]) > 3 and str(rows[0][3]).strip() == "학적"
+    result = []
+    for row in rows[1:]:
+        if not isinstance(row, list):
+            return None
+        number, name, email, status = [str(v if v is not None else "").strip() for v in (row + ["", "", "", ""])[:4]]
+        if not (number or name or email):
+            continue
+        if status_column and status not in ("", "재적"):
+            continue
+        result.append({"number": number, "name": name, "email": email})
+    return result
+
+
+def scc_read_roster(config_dir, record: dict, run_command, gws_executable: str) -> list[dict]:
+    from dashboard import engine
+    spreadsheet_id = str(record.get("spreadsheet_id") or "")
+    title = engine._verified_attendance_roster_name(
+        record, config_dir, run_command, gws_executable).replace("'", "''")
+    output = _command_output(run_command, [
+        gws_executable, "sheets", "spreadsheets", "values", "get", "--params",
+        json.dumps({"spreadsheetId": spreadsheet_id, "range": f"'{title}'!A:D",
+                    "valueRenderOption": "FORMATTED_VALUE"}, ensure_ascii=False),
+        "--format", "json",
+    ])
+    response = process_win.parse_first_json(output)
+    roster = scc_parse_roster(response.get("values") if isinstance(response, dict) else None)
+    if roster is None:
+        raise ValueError("roster shape unknown")
+    return roster
+
+
+def _scc_label(student: dict) -> str:
+    return f"{student['number']}{student['name']}"
+
+
+def scc_summarize(roster: list[dict], students: dict) -> dict:
+    """Counts and 번호+이름 labels for the screen; emails never leave this function."""
+    targets, unknown, failed, no_email, seen = [], [], [], [], set()
+    sent = total = 0
+    for student in roster:
+        email = student["email"]
+        if not email or not _SCC_EMAIL_RE.fullmatch(email):
+            no_email.append({"label": _scc_label(student)})
+            continue
+        key = scc_email_key(email)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += 1
+        state = str((students.get(key) or {}).get("state") or "")
+        row = {"key": key, "label": _scc_label(student)}
+        if state == "sent":
+            sent += 1
+        elif state in ("unknown", "pending"):
+            unknown.append(row)
+        else:
+            row["failed"] = state == "rejected"
+            if row["failed"]:
+                failed.append(row)
+            targets.append(row)
+    fresh = len(targets) - len(failed)
+    return {"state": "ready", "total": total, "sent": sent, "targets": targets,
+            "failed": len(failed), "new": fresh if sent else 0, "unknown": unknown, "no_email": no_email}
+
+
+def _scc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def scc_post_personal(url: str, payload: dict) -> tuple[str, str]:
+    """One send, no retry. Returns (outcome, server code); outcome is sent|rejected|stop|unknown."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url.rstrip("/") + "/v1/send/personal", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=SCC_SEND_TIMEOUT_SECONDS) as response:
+            reply = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as error:
+        try:
+            code = str((json.loads(error.read().decode("utf-8", "replace") or "{}") or {}).get("error") or "")
+        except Exception:  # noqa: BLE001 - an unreadable answer is unknown
+            code = ""
+        if code in _SCC_REJECTED:
+            return "rejected", code
+        if code in _SCC_STOP:
+            return "stop", code
+        return "unknown", code or f"HTTP_{error.code}"
+    except Exception:  # noqa: BLE001 - timeout/reset after dispatch may have delivered (C7)
+        return "unknown", "NO_ANSWER"
+    if isinstance(reply, dict) and reply.get("ok") is True:
+        return "sent", ""
+    return "unknown", "UNREADABLE_REPLY"
+
+
+def scc_send_greetings(config_dir, account: str, record: dict, config: dict, roster: list[dict],
+                   keys: list[str], text: str, progress=None, poster=scc_post_personal,
+                   sleeper=time.sleep) -> dict:
+    """Send to the students the teacher confirmed (``keys``) that are still targets."""
+    spreadsheet_id = str(record["spreadsheet_id"])
+    generation = record["binding_generation"]
+    scope = {"protocolVersion": 1, "spreadsheetId": spreadsheet_id,
+             "workbookSchoolYear": int(record["school_year"]), "generation": generation,
+             "monthlySheetIds": record["monthly_sheet_ids"], "purpose": "automatic", "operationId": ""}
+    students = scc_load_students(config_dir, account, spreadsheet_id, generation)
+    by_key = {}
+    for student in roster:
+        if student["email"] and _SCC_EMAIL_RE.fullmatch(student["email"]):
+            by_key.setdefault(scc_email_key(student["email"]), student)
+    current = {row["key"] for row in scc_summarize(roster, students)["targets"]}
+    chosen = [key for key in dict.fromkeys(keys) if key in current and key in by_key]
+    results, stopped = [], False
+    for index, key in enumerate(chosen):
+        student = by_key[key]
+        entry = dict(students.get(key) or {})
+        attempt = int(entry.get("attempt") or 0)
+        rid = scc_request_id(spreadsheet_id, generation, student["email"], attempt)
+        # The text of an attempt stays pinned with its request id (server fingerprint).
+        pinned = entry.get("request_id") == rid and isinstance(entry.get("text"), str) and entry["text"]
+        body = entry["text"] if pinned else text
+        entry.update(state="pending", attempt=attempt, request_id=rid, text=body, code="", at=_scc_now())
+        students[key] = entry
+        scc_save_students(config_dir, account, spreadsheet_id, generation, students)  # crash => unknown
+        if index:
+            sleeper(SCC_PACE_SECONDS)
+        outcome, code = poster(config["url"], {
+            "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"], "requestId": rid,
+            "studentEmail": student["email"], "text": body, **scope,
+            "meta": {"source": "student-chat-connect"},
+        })
+        if outcome == "sent":
+            entry.update(state="sent", code="")
+        elif outcome == "rejected":
+            entry.update(state="rejected", code=code, attempt=attempt + 1)
+        elif outcome == "stop":
+            entry.update(state="not_sent", code=code)
+        else:
+            entry.update(state="unknown", code=code)
+        entry["at"] = _scc_now()
+        students[key] = entry
+        scc_save_students(config_dir, account, spreadsheet_id, generation, students)
+        detail = (_SCC_REJECTED.get(code, SCC_MESSAGE_REJECTED_MESSAGE) if outcome == "rejected"
+                  else SCC_UNKNOWN_MESSAGE if outcome == "unknown" else "")
+        results.append({"key": key, "label": _scc_label(student), "state": entry["state"], "detail": detail})
+        if progress:
+            progress(index + 1, len(chosen))
+        if outcome == "stop":
+            stopped = True
+            break
+    summary = scc_summarize(roster, students)
+    return {**summary, "results": results, "stopped": stopped,
+            "stopped_detail": SCC_STOPPED_MESSAGE if stopped else ""}
+
+
+def scc_resolve(config_dir, account: str, record: dict, key: str, received: bool) -> None:
+    spreadsheet_id = str(record["spreadsheet_id"])
+    generation = record["binding_generation"]
+    students = scc_load_students(config_dir, account, spreadsheet_id, generation)
+    entry = dict(students.get(key) or {})
+    if entry.get("state") not in ("unknown", "pending"):
+        raise ValueError("not an unknown student")
+    if received:
+        entry.update(state="sent", at=_scc_now())
+    else:
+        # The teacher saw no greeting: the next send is a new request with fresh text.
+        entry.update(state="not_sent", attempt=int(entry.get("attempt") or 0) + 1,
+                     request_id="", text="", at=_scc_now())
+    students[key] = entry
+    scc_save_students(config_dir, account, spreadsheet_id, generation, students)

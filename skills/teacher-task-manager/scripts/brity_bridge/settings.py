@@ -7,13 +7,27 @@ from pathlib import Path
 # 새 설치는 PATH의 gws를 절대 기본 실행 대상으로 삼지 않는다. 이 목록 필드는
 # 예전 settings.json을 읽고 다시 저장하기 위해서만 남겨 둔다.
 DEFAULT_GWS_COMMAND: list[str] = []
-ALLOWED_GEMINI_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite")
-DEFAULT_GEMINI_MODEL = ALLOWED_GEMINI_MODELS[0]
+# AI-KEY-02 (2026-10-28): Flash-Lite only. Requesting gemini-3.5-flash was served as
+# gemini-3.6-flash (free tier 20 requests/day), so no Flash/Pro id may ever be sent.
+# AI-KEY-03 (2026-10-28 evening): the teacher picks one of three explicit ids. The alias
+# "gemini-3.5-flash" stays forbidden (it is silently served as 3.6).
+# 2026-10-29 user decision: gemini-3.8-flash removed (it was offered for paid keys, which
+# conflicts with the no-billing rule); a saved 3.8 value becomes Flash-Lite like any other.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+ALLOWED_GEMINI_MODELS = (GEMINI_MODEL, "gemini-3.6-flash")
+DEFAULT_GEMINI_MODEL = GEMINI_MODEL
 DEFAULT_HOTKEY = "ctrl+alt+win"
 
 
 def normalize_gemini_model(value: object) -> str:
     return value if isinstance(value, str) and value in ALLOWED_GEMINI_MODELS else DEFAULT_GEMINI_MODEL
+
+
+def require_allowed_gemini_model(value: object) -> str:
+    """Last check before a request URL is built: refuse instead of sending another model."""
+    if not (isinstance(value, str) and value in ALLOWED_GEMINI_MODELS):
+        raise ValueError("Gemini model not allowed")
+    return value
 
 
 @dataclass

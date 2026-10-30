@@ -215,7 +215,7 @@ def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
         "invalid": GEMINI_KEY_INVALID_FIX,
         "network": GEMINI_NETWORK_FIX,
         "service-unavailable": "Google Gemini가 일시적으로 응답하지 못했어요. 키를 바꾸지 말고 잠시 후 다시 확인해 주세요.",
-        "model-unavailable": "선택한 AI 모델을 사용할 수 없어요. 다른 모델을 선택해 확인해 주세요.",
+        "model-unavailable": "Gemini 3.5 Flash-Lite 모델을 사용할 수 없어요. 키를 발급한 계정에서 이 모델을 쓸 수 있는지 확인해 주세요.",
         "forbidden": "Google AI Studio에서 키의 사용 권한을 확인해 주세요.",
     }.get(key_status, "Google이 키 확인 요청을 처리하지 못했어요. 키 오류로 확인된 것은 아닙니다.")
     detail = "아직 입력하지 않았어요" if key_status == "missing" else (key_detail or key_status)

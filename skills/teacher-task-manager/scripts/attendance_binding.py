@@ -15,8 +15,9 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from typing import Callable
-from brity_bridge import recovery
+from brity_bridge import recovery, tls
 
 from attendance_context import AttendanceScope, AttendanceScopeError, HistoricalPublicationReceipt, PROTOCOL_VERSION
 
@@ -30,6 +31,15 @@ RATE_LIMIT_DELAYS = (2.0, 5.0)
 OPERATION_NAMES = frozenset({'capabilities', 'current', 'discover', 'adopt', 'adoption-candidate',
     'replacement-check', 'start', 'operation-read', 'claim', 'authorize', 'dispatch', 'checkpoint',
     'evidence', 'reject', 'publish', 'register-sheet', 'auth-start', 'auth-status'})
+AI_ERROR_CODES = frozenset({
+    'AI_NOT_CONFIGURED', 'AI_NOT_ENABLED', 'AI_AUTH_REQUIRED', 'AI_SHEET_AUTH_REQUIRED',
+    'AI_BINDING_REQUIRED', 'AI_BINDING_STALE', 'AI_IDENTITY_MISMATCH', 'AI_REQUEST_INVALID',
+    'AI_MODEL_NOT_ALLOWED', 'AI_REQUEST_TOO_LARGE', 'AI_MEDIA_UNSUPPORTED', 'AI_LIMIT_REACHED',
+    'AI_QUEUE_FULL', 'AI_QUEUE_EXPIRED', 'AI_REQUEST_CONFLICT', 'AI_REQUEST_UNKNOWN',
+    'AI_RESULT_EXPIRED', 'AI_PROVIDER_CONFIGURATION', 'AI_PROVIDER_BILLING',
+    'AI_PROVIDER_RATE_LIMIT', 'AI_STORAGE_UNAVAILABLE', 'AI_REQUEST_CANCELLED',
+})
+_AI_HTTP_DEADLINE = ContextVar('ai_http_deadline', default=None)
 
 
 class AttendanceBindingError(AttendanceScopeError):
@@ -103,7 +113,7 @@ class AttendanceBindingError(AttendanceScopeError):
             "ATTENDANCE_OPERATION_INVALID", "ATTENDANCE_OPERATION_STALE",
         }
         self.diagnostic_code = (
-            code if code in messages or code in generic_codes else "ATTENDANCE_UNKNOWN_ERROR"
+            code if code in messages or code in generic_codes or code in AI_ERROR_CODES else "ATTENDANCE_UNKNOWN_ERROR"
         )
 
 
@@ -116,7 +126,15 @@ def _http_request(method, url, body, headers):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.build_opener(_NoRedirect).open(request, timeout=25) as response:
+        ai_route = urllib.parse.urlsplit(url).path in ('/v1/ai/analyze', '/v1/ai/status')
+        timeout = 120.0 if ai_route else 25.0
+        deadline = _AI_HTTP_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OSError('AI request deadline exceeded')
+            timeout = min(timeout, remaining)
+        with urllib.request.build_opener(_NoRedirect, tls.FailoverHTTPSHandler()).open(request, timeout=timeout) as response:
             raw = response.read(2_000_001)
             status = response.status
     except urllib.error.HTTPError as error:
@@ -126,7 +144,7 @@ def _http_request(method, url, body, headers):
             payload = json.loads(error.read(100_000))
             remote_error = payload.get("error")
             remote_code = payload.get("code") or (remote_error if isinstance(remote_error, str) else (remote_error or {}).get("code"))
-            if isinstance(remote_code, str) and remote_code.startswith("ATTENDANCE_") and remote_code.replace("_", "").isalnum():
+            if isinstance(remote_code, str) and ((remote_code.startswith("ATTENDANCE_") and remote_code.replace("_", "").isalnum()) or remote_code in AI_ERROR_CODES):
                 code = remote_code
             controlled = {key: payload.get(key, '') for key in ('failure_domain', 'failure_stage', 'recovery_action')}
         except (AttributeError, ValueError, OSError):
@@ -142,7 +160,8 @@ def _http_request(method, url, body, headers):
         value = json.loads(raw)
     except (ValueError, UnicodeError):
         raise AttendanceBindingError("ATTENDANCE_INVALID_RESPONSE") from None
-    if status != 200 or not isinstance(value, dict) or value.get("ok") is False:
+    allowed_status = status == 200 or (status == 202 and urllib.parse.urlsplit(url).path in ('/v1/ai/analyze', '/v1/ai/status'))
+    if not allowed_status or not isinstance(value, dict) or value.get("ok") is False:
         raise AttendanceBindingError("ATTENDANCE_INVALID_RESPONSE")
     return value
 
@@ -175,6 +194,23 @@ class AttendanceBindingClient:
     @property
     def email(self):
         return self._email
+
+    def ai_status(self, request_id="", *, timeout=25.0):
+        body = {'requestId': request_id} if request_id else {}
+        token = _AI_HTTP_DEADLINE.set(time.monotonic() + max(0.1, min(25.0, timeout)))
+        try:
+            return self._request('POST', '/v1/ai/status', body)
+        finally:
+            _AI_HTTP_DEADLINE.reset(token)
+
+    def ai_analyze(self, request_id, kind, request, *, operation_id="", timeout=120.0):
+        token = _AI_HTTP_DEADLINE.set(time.monotonic() + max(0.1, min(120.0, timeout)))
+        try:
+            return self._request('POST', '/v1/ai/analyze', {
+                'requestId': request_id, 'operationId': operation_id or request_id,
+                'kind': kind, 'request': request})
+        finally:
+            _AI_HTTP_DEADLINE.reset(token)
 
     @staticmethod
     def _valid_until(value, now):

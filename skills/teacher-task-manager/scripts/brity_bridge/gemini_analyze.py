@@ -9,19 +9,25 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from brity_bridge import gemini_files
 from brity_bridge.local_attachment_links import attachment_display_name
 from brity_bridge.message_parse import MediaPart, MessageRecord
 from brity_bridge.rules_loader import load_analysis_rules
+from brity_bridge.settings import normalize_gemini_model, require_allowed_gemini_model
 
 API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MODEL_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}"
 TIMEOUT_SECONDS = 60.0
 LONG_TEXT_TRIGGER = 30000
 TEXT_CHUNK_SIZE = 24000
+# Analysis reasoning depth (AI-KEY-02 follow-up 2026-10-28). Free tier is request-based.
+ANALYSIS_THINKING_LEVEL = "high"
+ANALYSIS_MODEL_WITH_THINKING = "gemini-3.5-flash-lite"
+DATE_TABLE_DAYS = 60
+WEEKDAYS_KO = "월화수목금토일"
 
 PROPOSAL_KEYS = {"source_hash", "calendar_events", "tasks", "student_notices"}
 REQUIRED_PROPOSAL_KEYS = {"source_hash", "calendar_events", "tasks"}
@@ -44,7 +50,11 @@ RESPONSE_SCHEMA = {
                     "summary": {"type": "string"},
                     "description": {"type": "string"},
                     "start": {"type": "string"},
-                    "end": {"type": "string"},
+                    "end": {
+                        "type": "string",
+                        "description": "timed: end time ISO +09:00. all-day: the final calendar day the event occurs on "
+                        "(inclusive), same as start for a one-day event. Never the day after.",
+                    },
                     "all_day": {"type": "boolean"},
                 },
                 "required": ["target", "summary", "description", "start", "end", "all_day"],
@@ -88,6 +98,33 @@ class AnalysisError(Exception):
         self.attempt_count = attempt_count
 
 
+def _day_text(day) -> str:
+    return f"{day.isoformat()}({WEEKDAYS_KO[day.weekday()]})"
+
+
+def build_date_table(now: datetime) -> str:
+    """오늘부터 DATE_TABLE_DAYS일 뒤까지의 날짜·요일표와 상대 날짜 풀이.
+
+    모델이 요일을 스스로 계산하다 틀리는 일(이번 주 금요일 → 토요일)을 막는다.
+    """
+    today = now.date()
+    days = [today + timedelta(days=offset) for offset in range(DATE_TABLE_DAYS + 1)]
+    monday = today - timedelta(days=today.weekday())
+    lines = [" ".join(_day_text(day) for day in days[index : index + 7]) for index in range(0, len(days), 7)]
+    lines.append(
+        f"오늘={_day_text(today)}, 내일={_day_text(today + timedelta(days=1))}, "
+        f"모레={_day_text(today + timedelta(days=2))}"
+    )
+    for label, start in (("이번 주", monday), ("다음 주", monday + timedelta(days=7))):
+        lines.append(
+            ", ".join(
+                f"{label} {WEEKDAYS_KO[index]}요일={(start + timedelta(days=index)).isoformat()}"
+                for index in range(7)
+            )
+        )
+    return "\n".join(lines)
+
+
 def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, rules_text: str) -> str:
     homeroom = profile.get("homeroom", {})
     reference = {
@@ -127,7 +164,7 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
                 "summary": "제목",
                 "description": "설명",
                 "start": "시간 일정은 +09:00 붙은 ISO, 종일 일정은 YYYY-MM-DD",
-                "end": "끝 (종일 일정은 마지막 날, 포함 기준)",
+                "end": "시간 일정은 끝 시각(+09:00 ISO). 종일 일정은 일정이 열리는 마지막 날 그 자체(포함 기준, YYYY-MM-DD). 하루짜리는 start와 같은 날짜",
                 "all_day": "true 또는 false",
             }
         ],
@@ -167,6 +204,17 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
         "  자연스럽게 이어 읽는다.",
         "- homeroom_enabled가 false이면 tasks는 항상 빈 배열이다.",
         "- 기준 정보의 now로 오늘·내일·이번 주 토요일과 일요일을 실제 날짜로 계산한다.",
+        "  날짜와 요일은 직접 계산하지 말고 아래 `날짜표`에서 찾는다. 오늘·내일·모레·이번 주/다음 주",
+        "  X요일은 날짜표의 풀이를 그대로 쓴다. 원문에 없는 날짜를 새로 만들지 않는다.",
+        "- 종일 일정의 end는 일정이 열리는 마지막 날 그 자체다. 예: `3월 9일(월)~13일(금) 수련활동`은",
+        "  start YYYY-03-09, end YYYY-03-13(금요일). 하루짜리 `4월 1일 체육대회`는 start와 end 모두 YYYY-04-01.",
+        "  스킬 규칙의 `end = end_date + 1일` 변환은 프로그램이 등록할 때 한다. 직접 하루를 더하지 않는다.",
+        "- 원문에 서로 다른 마감·날짜가 여럿이면 날짜마다 따로 일정이나 할 일로 만든다. 여러 마감을",
+        "  한 일정·한 기간 일정으로 묶거나 설명 속에만 남기지 않는다.",
+        "- 선생님이 할 일도, 학생 안내도, 학사일정(시험·행사·휴업 등)도 아닌 단순 알림(시설 점검·정전·",
+        "  공사 안내 등)은 등록하지 않는다.",
+        "- student_notices의 content에 `오늘`·`내일`을 쓰지 않고 `M월 D일(요일)`처럼 실제 날짜로 쓴다.",
+        "- description과 notes의 줄바꿈은 실제 줄바꿈으로 쓰고, 역슬래시와 n 두 글자를 적지 않는다.",
         "- 업무 시간 배치는 기준 정보의 현재 free_periods와 시간표, 근무시간, 조회·종례 시간을 적용한다.",
         "  제공되지 않은 시간 설정은 추측하지 않고 기존 시간 분석 규칙을 따른다.",
         "- tasks의 due는 YYYY-MM-DD로만 쓰고, 기한이 전혀 없으면 빈 문자열로 둔다.",
@@ -181,6 +229,9 @@ def build_analysis_prompt(record: MessageRecord, profile: dict, now: datetime, r
         "",
         "출력 JSON 모양:",
         json.dumps(schema, ensure_ascii=False, indent=2),
+        "",
+        "날짜표 (날짜와 요일은 여기서 찾는다):",
+        build_date_table(now),
         "",
         "기준 정보:",
         json.dumps(reference, ensure_ascii=False, indent=2),
@@ -198,6 +249,7 @@ def build_request_body(
     prompt: str,
     media_parts: tuple[MediaPart, ...] = (),
     prepared_parts: tuple[dict, ...] | None = None,
+    model: str = ANALYSIS_MODEL_WITH_THINKING,
 ) -> dict:
     parts = [{"text": prompt}]
     if prepared_parts is not None:
@@ -212,14 +264,15 @@ def build_request_body(
                     }
                 }
             )
-    return {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-            "responseSchema": RESPONSE_SCHEMA,
-        },
+    config = {
+        "temperature": 0,
+        "responseMimeType": "application/json",
+        "responseSchema": RESPONSE_SCHEMA,
     }
+    # AI-KEY-03: only Flash-Lite was tested with "high"; 3.6 keeps its default.
+    if require_allowed_gemini_model(model) == ANALYSIS_MODEL_WITH_THINKING:
+        config["thinkingConfig"] = {"thinkingLevel": ANALYSIS_THINKING_LEVEL}
+    return {"contents": [{"role": "user", "parts": parts}], "generationConfig": config}
 
 
 def extract_json_object(text: str) -> dict:
@@ -426,7 +479,8 @@ def run_gemini_analysis(
     transport = transport or _default_transport
     now = now or datetime.now().astimezone()
     rules_text = load_analysis_rules(Path(skill_root))
-    url = API_URL_TEMPLATE.format(model=bridge_settings.gemini_model)
+    model = require_allowed_gemini_model(normalize_gemini_model(bridge_settings.gemini_model))
+    url = API_URL_TEMPLATE.format(model=model)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     analysis_record = record
     if len(record.plain_text) > LONG_TEXT_TRIGGER:
@@ -463,7 +517,7 @@ def run_gemini_analysis(
         raise AnalysisError("network", str(error)) from error
     try:
         body = json.dumps(
-            build_request_body(prompt, prepared_parts=prepared.parts), ensure_ascii=False
+            build_request_body(prompt, prepared_parts=prepared.parts, model=model), ensure_ascii=False
         ).encode("utf-8")
         try:
             status, reply_body = transport(url, headers, body, TIMEOUT_SECONDS)
@@ -658,7 +712,7 @@ def _check_gemini_key(api_key: str, model: str, transport=None) -> tuple[str, st
     if not api_key:
         return "missing", "키가 비어 있음"
     transport = transport or _default_transport
-    url = MODEL_URL_TEMPLATE.format(model=model)
+    url = MODEL_URL_TEMPLATE.format(model=require_allowed_gemini_model(normalize_gemini_model(model)))
     headers = {"x-goog-api-key": api_key}
     for attempt, delay in enumerate((0.0, 1.0, 2.0)):
         if delay:

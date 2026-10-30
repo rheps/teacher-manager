@@ -542,7 +542,7 @@ const FIELD_MESSAGES = {
   "학사일정캘린더ID": "학사 일정을 등록할 Calendar를 골라 주세요.",
   "업무Tasks목록ID": "개인 업무를 등록할 Tasks 목록을 골라 주세요.",
   "담임안내Tasks목록ID": "조종례 전달사항을 등록할 Tasks 목록을 골라 주세요.",
-  "gemini_api_key": "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
+  "gemini_api_key": "Gemini 연결 API 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
   "google-login": "Google 로그인이 필요해요. 설정에서 Google 계정으로 로그인해 주세요.",
 };
 // 사용자가 직접 고치는 입력칸의 name — 편집 중엔 저장된 점검 대신 현재 입력을 본다.
@@ -1815,7 +1815,14 @@ function rosterDetailText(editor, button) {
   const later = ["ATTENDANCE_RATE_LIMITED", "GOOGLE_429"].includes(editor.failure_code) ? "잠시 뒤 " : "";
   return `${text} ${later}${button}을 다시 눌러 주세요.`;
 }
-function rosterRowHasStudent(row) { return row.slice(1).some(value => String(value || "").trim()); }
+function rosterRowHasStudent(row) { return [row[1], row[2]].some(value => String(value || "").trim()); }
+// 학적: 재적만 우리 반 학생이다. 재적은 세 칸 행으로 저장해 학적 열이 없던 명단과 같은 모양을 쓴다.
+const ROSTER_STATUSES = ["재적", "전출", "자퇴(퇴학)"];
+function rosterSaveRow(row) {
+  const cells = row.slice(0, 3).map(value => String(value ?? "").trim());
+  const status = String(row[3] ?? "").trim();
+  return status && status !== "재적" ? [...cells, status] : cells;
+}
 async function loadRosterEditor(refresh = false) {
   if (!isHomeroomTeacher()) return;
   const context = rosterEditorContext();
@@ -1854,6 +1861,7 @@ function rosterInputProblem() {
     if (!name) return `${i + 1}번째 학생 이름을 입력해 주세요.`;
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return `${i + 1}번째 학생 이메일을 빠짐없이 입력해 주세요.`;
     if (numbers.has(Number(number)) || emails.has(email.toLowerCase())) return `${i + 1}번째 학생 번호 또는 이메일이 중복돼요.`;
+    if (!ROSTER_STATUSES.includes(String(rows[i][3] || "재적").trim())) return `${i + 1}번째 학생 학적은 재적·전출·자퇴(퇴학) 중에서 골라 주세요.`;
     numbers.add(Number(number)); emails.add(email.toLowerCase());
   }
   return "";
@@ -1870,7 +1878,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
   // The saved editor can outlive its screen; a replacement editor cannot inherit this request.
   const current = () => context === rosterEditorContext() && S.rosterEditor === editor;
   const visible = () => owner === screenKey();
-  const rows = editor.rows.filter(rosterRowHasStudent).map(row => row.map(value => String(value).trim()));
+  const rows = editor.rows.filter(rosterRowHasStudent).map(rosterSaveRow);
   editor.busy = true;
   // A new attempt ends the previous attempt's failure notice (R09, R5-2/R5-5).
   if (S.banner?.topic === "roster-sync") S.banner = null;
@@ -1883,7 +1891,7 @@ async function saveRosterEditor(sync = false, authorize = true, explicitConnect 
           || S.attendance?.spreadsheet_id || S.attendance?.spreadsheet_url || "")) return false;
       const unchanged = !editor.dirty && editor.revision === requestedRevision
         && editor.pending === pending && Boolean(editor.linked) === linked
-        && JSON.stringify(editor.rows.filter(rosterRowHasStudent).map(row => row.map(value => String(value).trim()))) === JSON.stringify(rows);
+        && JSON.stringify(editor.rows.filter(rosterRowHasStudent).map(rosterSaveRow)) === JSON.stringify(rows);
       if (!unchanged || fresh?.revision_accepted !== true || !fresh.revision
           || fresh.pending !== pending || Boolean(fresh.linked) !== linked
           || JSON.stringify(fresh.rows) !== JSON.stringify(rows)) {
@@ -1962,7 +1970,12 @@ function stepRoster() {
   const editor = S.rosterEditor || { state: "loading", rows: [] };
   if (editor.state === "loading") return `<h1>담임학급 학생명단</h1><p class="sub">명단을 불러오고 있어요…</p>`;
   const disabled = editor.busy ? " disabled" : "";
-  const rows = editor.rows.map((row, index) => `<tr>${row.map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}</tr>`).join("");
+  const rows = editor.rows.map((row, index) => {
+    const status = String(row[3] || "재적").trim();
+    const options = (ROSTER_STATUSES.includes(status) ? ROSTER_STATUSES : [...ROSTER_STATUSES, status])
+      .map(value => `<option value="${esc(value)}"${value === status ? " selected" : ""}>${esc(value)}</option>`).join("");
+    return `<tr>${row.slice(0, 3).map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}<td><select data-roster-cell="${index}:3" aria-label="${index + 1}번째 학생 학적"${disabled}>${options}</select></td></tr>`;
+  }).join("");
   const reloadShown = editor.state === "conflict" || (editor.state === "unavailable" && !editor.dirty && !editor.pending);
   // 입력 중이거나 보관한 명단이 있으면 [다시 불러오기]를 두지 않는다 — 그 안내 문장도 함께 뺀다
   // (없는 버튼을 누르라고 하지 않는다, 2026-09-27 새 설치 확인).
@@ -1970,7 +1983,7 @@ function stepRoster() {
     : String(rosterDetailText(editor, "[명단 저장]")).replace(/\s*다시 불러오기를 눌러 주세요\.?$/, "");
   return `<h1>담임학급 학생명단</h1>
     <p class="sub">학생 이메일은 경기도교육청 클라우드 계정(@goedu.kr)을 권장합니다.<br>엑셀·구글시트에서 복사·붙여넣기 가능합니다.</p>
-    <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th><th scope="col">학적</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="roster-actions"><button class="btn-tonal" data-action="roster-add"${editor.busy || editor.rows.length >= 199 ? " disabled" : ""}>행 추가</button>
       ${reloadShown ? `<button class="btn-quiet" data-action="roster-reload"${disabled}>${editor.state === "conflict" ? "시트 명단 다시 불러오기" : "다시 불러오기"}</button>` : ""}
       <button class="btn" data-action="roster-save"${disabled}>${editor.busy ? "저장 중…" : "명단 저장"}</button>
@@ -2037,13 +2050,13 @@ bindActions({
 
 /* ---------- 연결·설정 공통 ---------- */
 const KEY_MESSAGES = {
-  ok: "연결 키가 정상이에요",
-  missing: "Gemini 연결 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
-  invalid: "Gemini 연결 키가 맞지 않아요. Google AI Studio에서 다시 복사해 주세요.",
+  ok: "연결 API 키가 정상이에요",
+  missing: "Gemini 연결 API 키가 입력되지 않았어요. 발급받은 값을 붙여넣어 주세요.",
+  invalid: "Gemini 연결 API 키가 맞지 않아요. Google AI Studio에서 다시 복사해 주세요.",
   "rate-limited": "Gemini 사용 한도에 도달했어요. 한도가 언제 다시 열리는지는 확인하지 못했습니다. Google AI Studio에서 사용량을 확인해 주세요.",
   network: "Gemini 응답을 받지 못했어요. 잠시 후 다시 확인해 주세요.",
   "service-unavailable": "Google Gemini가 일시적으로 응답하지 못했어요. 키를 바꾸지 말고 잠시 후 다시 확인해 주세요.",
-  "model-unavailable": "선택한 AI 모델을 사용할 수 없어요. 다른 모델을 선택해 확인해 주세요.",
+  "model-unavailable": "선택한 AI 모델을 사용할 수 없어요. 키를 발급한 계정에서 이 모델을 쓸 수 있는지 확인해 주세요.",
   forbidden: "Google에서 이 키의 사용을 허용하지 않았어요. Google AI Studio에서 키의 사용 권한을 확인해 주세요.",
   "request-rejected": "Google이 키 확인 요청을 처리하지 못했어요. 키 오류로 확인된 것은 아닙니다. 잠시 후 다시 확인해 주세요.",
 };
@@ -2203,26 +2216,87 @@ document.addEventListener("keyup", (event) => {
 const API_KEY_URL = "https://aistudio.google.com/apikey";
 const API_KEY_GUIDE_URL = "https://youtube.com/shorts/FMZmdpcLlM0?si=KT-_oblorYxE5ZE4";
 function apiKeyLinkRow() {
-  return `<div class="section-note" style="margin:0 0 4px">Gemini 연결 키 발급받기</div>
+  return `<div class="section-note" style="margin:0 0 4px">Gemini 연결 API 키 발급받기</div>
     <div class="linkrow"><span class="url" title="${esc(API_KEY_URL)}">${esc(API_KEY_URL)}</span>
     <span class="acts">
       <button class="btn-tonal" data-action="link-open" data-url="${esc(API_KEY_URL)}">${icon("external-link", "small blue")} 열기</button>
       <button class="btn-tonal youtube" data-action="link-open" data-url="${esc(API_KEY_GUIDE_URL)}">${icon("youtube", "small")} 발급방법</button>
     </span></div>`;
 }
+const GEMINI_MODEL_CHOICES = [
+  ["gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (기본)", "하루 약 500건 · 가끔 날짜를 틀릴 수 있어요"],
+  ["gemini-3.6-flash", "Gemini 3.6 Flash", "학교 계정 키로 하루 약 20건 · Flash-Lite보다 정확해요"],
+];
+function geminiModelNote(id) {
+  return (GEMINI_MODEL_CHOICES.find(([value]) => value === id) || GEMINI_MODEL_CHOICES[0])[2];
+}
+// Static text only (AI-KEY-03): limits and times measured on a goedu.kr key on 2026-10-28.
+// No per-message cost: the user found it misleading.
+const GEMINI_MODEL_HELP_HTML = `<div class="model-help-pop" data-model-help-pop role="dialog" aria-label="모델별 하루 사용량과 특징" hidden>
+  <b class="model-help-title">모델별 하루 사용량과 특징</b>
+  <table class="model-help-table">
+    <thead><tr><th>모델</th><th>학교 계정(무료) 하루 사용량</th><th>처리 시간(쪽지 1건)</th><th>정확도</th></tr></thead>
+    <tbody>
+      <tr><td>Gemini 3.5 Flash-Lite (기본)</td><td>약 500건</td><td>15~30초</td><td>가끔 날짜를 틀릴 수 있어요</td></tr>
+      <tr><td>Gemini 3.6 Flash</td><td>약 20건</td><td>약 30초</td><td>자체 시험에서 Flash-Lite보다 정확했어요</td></tr>
+    </tbody>
+  </table>
+  <ul class="model-help-notes">
+    <li><b>무료 API 키는 하루 사용량에 한도가 있고, 보낸 내용이 서비스 개선에 쓰일 수 있어요. 유료 API 키는 쓸 때마다 요금이 나가지만, 보낸 내용은 서비스 개선에 쓰이지 않아요. 학생 개인정보가 담긴 쪽지를 자주 분석한다면 유료 API 키를 권장해요.</b></li>
+    <li>하루 사용량과 처리 시간은 2026년 10월 28일 학교 계정으로 측정했어요.</li>
+    <li>무료 하루 사용량은 매일 오후 4~5시(한국 시간)쯤 다시 채워져요.</li>
+    <li>이 수치는 Google 정책에 따라 바뀔 수 있어요.</li>
+  </ul>
+</div>`;
+function setModelHelpOpen(button, open) {
+  const pop = button?.closest(".model-field")?.querySelector("[data-model-help-pop]");
+  if (!pop) return;
+  pop.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+  if (open && pop.scrollIntoView) pop.scrollIntoView({ block: "nearest" });
+}
+function closeModelHelp() {
+  let closed = false;
+  document.querySelectorAll("[data-model-help]").forEach((button) => {
+    if (button.getAttribute("aria-expanded") === "true") { setModelHelpOpen(button, false); closed = true; }
+  });
+  return closed;
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest && event.target.closest("[data-model-help]");
+  if (button) { setModelHelpOpen(button, button.getAttribute("aria-expanded") !== "true"); return; }
+  if (!(event.target.closest && event.target.closest("[data-model-help-pop]"))) closeModelHelp();
+});
+// Capture phase: Esc closes the help first and must not also close the window.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && closeModelHelp()) { event.preventDefault(); event.stopPropagation(); }
+}, true);
+document.addEventListener("change", (event) => {
+  if (event.target.name !== "gemini_model") return;
+  S.draft.bridge.gemini_model = event.target.value;
+  const note = event.target.closest(".model-field")?.querySelector("[data-model-note]");
+  if (note) note.textContent = geminiModelNote(event.target.value);
+});
 function geminiSectionHtml(d) {
   const keyLine = S.keyStatus ? badge(S.keyStatus.kind, S.keyStatus.text) : "";
-  const model = d.gemini_model || "gemini-3.5-flash";
-  const modelRow = rawRow("AI 모델", `<div class="field"><select name="gemini_model">
-    <option value="gemini-3.5-flash" ${model === "gemini-3.5-flash" ? "selected" : ""}>Gemini 3.5 Flash · 추천</option>
-    <option value="gemini-3.1-flash-lite" ${model === "gemini-3.1-flash-lite" ? "selected" : ""}>Gemini 3.1 Flash-Lite · 빠른 처리</option>
-  </select></div>`);
-  return `<div class="section-h">Gemini 연결 키</div>
-    <p class="sub" style="margin-bottom:10px">AI 분석을 위해 선택한 메시지와 첨부파일 내용을 Google Gemini로 보냅니다. 이 키는 이 컴퓨터에 저장됩니다. AI 출결 입력을 사용하면 연결한 출석부의 [설정] 탭에도 저장되며, 그 출석부를 편집할 수 있는 사람도 키를 볼 수 있습니다.</p>
+  // AI-KEY-03: two explicit ids only (3.8 removed 2026-10-29); the alias that is served as 3.6 is never offered.
+  const chosen = GEMINI_MODEL_CHOICES.some(([id]) => id === d.gemini_model) ? d.gemini_model : GEMINI_MODEL_CHOICES[0][0];
+  const options = GEMINI_MODEL_CHOICES.map(([id, label]) =>
+    `<option value="${esc(id)}"${id === chosen ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const modelRow = rawRow("AI 모델", `<div class="field model-field"><div class="model-line">
+      <select name="gemini_model" aria-label="AI 모델">${options}</select>
+      <button type="button" class="btn-quiet model-help-btn" data-model-help aria-label="모델별 하루 사용량과 특징" aria-expanded="false">?</button>
+    </div><span class="hint" data-model-note>${esc(geminiModelNote(chosen))}</span>${GEMINI_MODEL_HELP_HTML}</div>`);
+  return `<div class="section-h">Gemini 연결 API 키</div>
+    <div class="sheet-guide"><b>API 키는 반드시 경기도교육청 goedu.kr 계정으로 로그인해 발급받아 주세요.</b> API 키는 결제를 연결했는지에 따라 두 가지로 나뉘어요.
+      <ul style="margin:4px 0;padding-left:18px">
+        <li>무료 API 키(결제 연결 안 함): 요금은 나가지 않지만 하루 사용량에 한도가 있어요. 보낸 내용은 Google이 서비스 개선에 쓸 수 있고, 사람이 검토할 수도 있어요.</li>
+        <li>유료 API 키(Google AI Studio에서 결제 연결): 쓴 만큼 요금이 나가지만, 보낸 내용은 서비스 개선에 쓰이지 않아요. 쪽지 1건에 약 30원이 들어요(Gemini 3.5 Flash-Lite 기준).</li>
+      </ul>Gemini 앱 유료 구독(Google AI Pro 등)을 하고 있어도 무료 API 키는 무료 API 키예요. 유료 API 키를 쓰려면 결제를 따로 연결해야 해요.</div>
     ${apiKeyLinkRow()}
     <div style="margin-top:12px"></div>
     ${formTable(
-      fieldRow("gemini_api_key", "Gemini 연결 키", d.gemini_api_key || "", { type: "password", placeholder: "붙여넣기" }) +
+      fieldRow("gemini_api_key", "Gemini 연결 API 키", d.gemini_api_key || "", { type: "password", placeholder: "붙여넣기" }) +
       modelRow
     )}
     <div class="action-line">${keyLine}<button class="btn-tonal" data-action="check-key" data-busy-text="확인 중…">키 확인</button></div>`;
@@ -2426,8 +2500,7 @@ function googleTargetCheckFailedMessage() {
 }
 function listsErrorNoticeHtml() {
   if (!S.listsError) return "";
-  return `<div class="banner warn"><span>목록을 가져오지 못했어요. 설정에서 다시 점검해 주세요.</span>
-    <button class="btn-quiet" data-action="goto-settings">설정 열기</button></div>`;
+  return `<div class="banner warn"><span>목록을 가져오지 못했어요. ${connectionRefreshHint()} 눌러 목록을 다시 불러와 주세요.</span></div>`;
 }
 
 /* ---------- 연결 세 탭 — 이름은 짧게, 설명은 아랫줄로 ----------
@@ -2537,7 +2610,8 @@ function classRoomReadinessMessage(state = classRoomReadiness()) {
     loading: "학급 단톡방 연결을 확인하고 있어요.",
     "read-failed": "학급 단톡방 연결을 읽지 못했어요. 기존 단톡방 선택은 그대로예요.",
     "not-selected": "출결 탭의 목록에서 사용할 학급 단톡방을 골라 주세요.",
-    empty: "이 계정에서 참여 중인 스페이스가 없어요. [단톡방(스페이스) 만들기]에서 만든 뒤 돌아와 주세요.",
+    // Name the button this screen actually shows (C11).
+    empty: `이 계정에서 참여 중인 스페이스가 없어요. ${attendanceViewKind() === "installation" ? "[단톡방(스페이스) 만들러 가기]" : "[내 Google Chat 화면 열기]"}에서 만든 뒤 돌아와 주세요.`,
     missing: "저장된 학급 단톡방이 현재 목록에서 확인되지 않아요. 기존 선택은 그대로예요. 출결 탭에서 확인해 주세요.",
   }[state] || "";
 }
@@ -2893,7 +2967,8 @@ function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
   const connected = state === "ready";
   const label = S.classSpaceSaving ? "저장 중…" : connected ? "연결됨" : waiting ? "출석부 준비 중…" : reading ? "확인 중…" : state === "empty" ? "스페이스 없음" : state === "not-selected" ? "방 선택 필요" : "확인 필요";
   const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
-  const open = view === "installation" ? `<button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} 단톡방(스페이스) 만들러 가기</button>` : "";
+  // A confirmed room list (empty or not) offers the external Google Chat path in the management view (2026-10-29).
+  const open = view === "installation" || ["empty", "not-selected", "missing", "ready"].includes(state) ? `<button class="btn-tonal" data-action="open-chat-new-space"${attendanceChatOpenBlockReason() ? " disabled" : ""}>${icon("external-link", "small")} ${view === "installation" ? "단톡방(스페이스) 만들러 가기" : "내 Google Chat 화면 열기"}</button>` : "";
   const retry = state === "read-failed" && S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed
     ? `<button class="btn-tonal" data-action="class-space-reload">다시 확인</button>` : "";
   return `<section class="svc-subrow class-space-section">
@@ -2915,7 +2990,8 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (!connectionRefreshActive()) loadChatSpaces();
   if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">방 목록을 가져오는 중이에요…</p>`;
   if (S.chatSpacesError) return `<p class="hint">방 목록을 가져오지 못했어요. 기존 선택은 그대로예요.</p>`;
-  if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>`;
+  if (Array.isArray(S.chatSpaces) && !S.chatSpaces.length) return `<p class="hint">이 계정에서 참여 중인 스페이스가 없어요.</p>
+    <p class="hint">새 방을 만들려면 Google Chat에서 만든 뒤 돌아오세요. 돌아오면 목록을 다시 읽으니 드롭다운에서 고르세요.</p>`;
   const rooms = S.chatSpaces || [];
   const savedOutsideList = cs.class_space_id && !rooms.some(s => String(s.name || "") === String(cs.class_space_id));
   const chosen = String((S.classSpaceSaving && S.classSpaceSavingId) || cs.class_space_id || "");
@@ -2923,6 +2999,198 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   return `<div class="chat-space-existing">
     <select name="class-space-select" aria-label="학급 단톡방" data-action-change="class-space-pick" data-current-space="${esc(cs.class_space_id || "")}"${S.classSpaceSaving ? " disabled" : ""}><option value="">학급 단톡방</option>${options}</select>
     ${savedOutsideList ? `<p class="hint">저장된 단톡방이 현재 목록에 없어요. 기존 선택은 그대로예요.</p>` : ""}</div>`;
+}
+
+/* 학생과 Chat 처음 연결하기 (2026-10-29). Optional: never a wizard gate, never counted in
+   effectiveChecks. Strings come from the bsv-korean-output-quality receipts. */
+const SCC = {
+  notConnected: "학생마다 짧은 인사를 한 번 보내 1:1 채팅을 열어요. 그다음부터 출결 서류 안내가 이 채팅으로 학생에게 가요.",
+  precondition: "학생명단과 Google Chat을 연결하면 학생과 연결할 수 있어요.",
+  inProgress: (done, total) => `학생에게 인사를 보내고 있어요. (${done}/${total}명)`,
+  partial: (failed) => `아직 연결되지 않은 학생이 ${failed}명 있어요. [학생명단] 탭 C열의 이메일을 확인한 뒤 이 학생들만 다시 연결해 주세요.`,
+  unknown: (n) => `${n}명은 인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요.`,
+  newStudents: (n) => `학생명단에 학생 ${n}명이 새로 추가됐어요. 새로 추가된 학생만 연결해 주세요.`,
+  done: (total) => `학생 ${total}명 모두 연결됐어요. 학생과 대화하려면 [내 Google Chat 화면 열기]를 눌러 주세요.`,
+  previewTitle: "보낼 인사말",
+  previewHint: "보내기 전에 인사말을 고칠 수 있어요. 이미 연결된 학생에게는 다시 보내지 않아요.",
+  recipients: (n) => `받는 학생 ${n}명`,
+  noEmail: "[학생명단] 탭에 이 학생의 Google 이메일이 없어 인사를 보내지 않아요.",
+  resultTitle: "인사 보내기 결과",
+  resultSummary: (sent, failed) => `${sent}명에게 보냈어요. ${failed}명에게는 보내지 못했어요.`,
+  resultUnknown: "인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요.",
+  confirm: (n) => `학생 ${n}명에게 환영 인사를 보내 Chat을 연결할까요?`,
+  irreversible: "보낸 메시지는 되돌릴 수 없어요.",
+  readFailed: "학생 연결 상태를 읽지 못했어요.",
+};
+let studentConnect = null;
+let studentConnectVersion = 0;
+function studentConnectReady(a) {
+  return a.state === "ready" && !S.attendanceLoading && !S.attendanceReadFailed && S.chatStatusContext === chatReadContext()
+    && S.chatStatus && typeof S.chatStatus === "object" && S.chatStatus.connected === true && attendanceRosterReady();
+}
+function loadStudentConnect(force) {
+  const context = chatReadContext();
+  if (!force && studentConnect?.context === context) return studentConnect.promise;
+  const version = ++studentConnectVersion;
+  const entry = studentConnect = { context, state: "loading", promise: null };
+  entry.promise = attendanceRead("student_chat_connect_status").then(data => {
+    if (version !== studentConnectVersion || context !== chatReadContext()) return;
+    studentConnect = { ...data, context, state: data?.state === "ready" ? "ready" : "unavailable", promise: entry.promise };
+  }).catch(error => {
+    console.error(error);
+    if (version === studentConnectVersion && context === chatReadContext()) studentConnect = { context, state: "unavailable", promise: entry.promise };
+  }).finally(() => { if (context === chatReadContext()) render(); });
+  return entry.promise;
+}
+function studentChatConnectSubrowHtml(a) {
+  if (!isHomeroomTeacher() || a.state !== "ready") return "";
+  const ready = studentConnectReady(a);
+  // Read only while the 출결 tab itself is on screen (tab badges also build this HTML).
+  if (ready && S.connectTab === "attendance" && !S.studentConnectSending && !connectionRefreshActive()
+      && studentConnect?.context !== chatReadContext()) loadStudentConnect(false);
+  const d = ready && studentConnect?.context === chatReadContext() ? studentConnect : null;
+  const connectButton = (mode, label, disabled) => `<button class="btn-tonal" data-action="student-chat-connect" data-mode="${mode}"${disabled ? " disabled" : ""}>${label}</button>`;
+  let chip = "", tone = "muted", sub = "", buttons = "";
+  if (!ready) {
+    sub = SCC.precondition;
+    buttons = connectButton("new", "처음 발송하기", true);
+  } else if (S.studentConnectSending) {
+    const p = S.studentConnectProgress || { done: 0, total: 0 };
+    chip = "보내는 중…";
+    sub = SCC.inProgress(p.done, p.total);
+    buttons = connectButton("new", "처음 발송하기", true);
+  } else if (!d || d.state === "loading") {
+    chip = "확인 중…";
+  } else if (d.state !== "ready") {
+    chip = "확인 필요"; tone = "warn"; sub = SCC.readFailed;
+    buttons = `<button class="btn-tonal" data-action="student-chat-recheck">다시 확인</button>`;
+  } else {
+    const failed = d.failed || 0, fresh = d.targets.length - failed;
+    if (d.unknown.length) {
+      chip = "결과 확인 필요"; tone = "warn"; sub = SCC.unknown(d.unknown.length);
+      buttons = `<button class="btn-tonal" data-action="student-chat-unknown">확인하기</button>`;
+    } else if (!d.targets.length) {
+      chip = `${d.total}/${d.total}명 연결됨`; tone = "ok"; sub = SCC.done(d.total);
+    } else {
+      chip = d.sent ? `${d.sent}/${d.total}명 연결됨` : "연결 필요"; tone = "warn";
+      sub = failed ? SCC.partial(failed) : d.sent ? SCC.newStudents(fresh) : SCC.notConnected;
+      buttons = (failed ? connectButton("failed", "실패한 학생에게 다시 발송하기", false) : "")
+        + (fresh ? connectButton("new", "처음 발송하기", false) : "");
+    }
+  }
+  return `<section class="svc-subrow class-space-section student-chat-connect">
+    <div class="first-setup-head"><b>학생에게 Google Chat 처음 발송하여 친구맺기</b><span class="chat-space-reload-status">${buttons}
+      ${chip ? `<span class="svc-status ${tone}">${esc(chip)}</span>` : ""}</span></div>
+    ${sub ? `<p class="hint">${esc(sub)}</p>` : ""}</section>`;
+}
+function studentChatConnectDialogHtml() {
+  const dlg = S.studentConnectDialog;
+  if (!dlg) return "";
+  const list = rows => `<ul class="student-chat-list">${rows.map(row => `<li>${esc(row.label)}</li>`).join("")}</ul>`;
+  let body = "", actions = "";
+  if (dlg.kind === "preview") {
+    body = `<h3>${esc(SCC.previewTitle)}</h3><p>${esc(SCC.previewHint)}</p>
+      <textarea name="student-greeting" rows="6" aria-label="${esc(SCC.previewTitle)}">${esc(dlg.text)}</textarea>
+      <p><b>${esc(SCC.recipients(dlg.rows.length))}</b></p>${list(dlg.rows)}
+      ${dlg.noEmail.length ? `${list(dlg.noEmail)}<p class="attendance-update-dialog-note">${esc(SCC.noEmail)}</p>` : ""}`;
+    actions = `<button class="btn-quiet" data-action="student-chat-dialog-close">취소</button>
+      <button class="btn" data-action="student-chat-next"${dlg.rows.length ? "" : " disabled"}>다음</button>`;
+  } else if (dlg.kind === "confirm") {
+    body = `<h3>${esc(SCC.confirm(dlg.rows.length))}</h3><p>${esc(SCC.irreversible)}</p>`;
+    actions = `<button class="btn-quiet" data-action="student-chat-dialog-close">취소</button>
+      <button class="btn" data-action="student-chat-send">보내기</button>`;
+  } else if (dlg.kind === "result") {
+    const label = { sent: "보냄", rejected: "실패", unknown: "확인 필요", pending: "확인 필요", not_sent: "실패" };
+    const sent = dlg.results.filter(row => row.state === "sent").length;
+    body = `<h3>${esc(SCC.resultTitle)}</h3><p>${esc(SCC.resultSummary(sent, dlg.results.length - sent))}</p>
+      ${dlg.stopped ? `<p>${esc(dlg.stopped)}</p>` : ""}
+      <ul class="student-chat-list">${dlg.results.map(row => `<li><span>${esc(row.label)}</span>
+        <span class="svc-status ${row.state === "sent" ? "ok" : "warn"}">${esc(label[row.state] || "확인 필요")}</span>
+        ${row.detail ? `<small>${esc(row.detail)}</small>` : ""}</li>`).join("")}</ul>`;
+    actions = `<button class="btn" data-action="student-chat-dialog-close">닫기</button>`;
+  } else if (dlg.kind === "unknown") {
+    body = `<h3>결과를 확인하지 못한 메시지</h3><p>${esc(SCC.resultUnknown)}</p>
+      <ul class="student-chat-list">${dlg.rows.map(row => `<li><span>${esc(row.label)}</span>
+        <span class="chat-space-reload-status"><button class="btn-tonal" data-action="student-chat-received" data-key="${esc(row.key)}">받았어요</button>
+        <button class="btn-tonal" data-action="student-chat-not-received" data-key="${esc(row.key)}">받지 못했어요 · 다시 보낼 목록에 넣기</button></span></li>`).join("")}</ul>`;
+    actions = `<button class="btn" data-action="student-chat-dialog-close">닫기</button>`;
+  }
+  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-selection-dialog student-chat-dialog" role="dialog" aria-modal="true">
+    ${body}<div class="attendance-update-dialog-actions">${actions}</div></section></div>`;
+}
+document.addEventListener("input", (event) => {
+  if (event.target.matches?.('textarea[name="student-greeting"]') && S.studentConnectDialog?.kind === "preview") {
+    S.studentConnectDialog.text = event.target.value;
+  }
+});
+bindActions({
+  "student-chat-open": () => call("open_attendance_chat"),
+  "student-chat-recheck": () => loadStudentConnect(true),
+  "student-chat-connect": async (el) => {
+    const mode = el.dataset.mode === "failed" ? "failed" : "new";
+    const context = chatReadContext();
+    await loadStudentConnect(true);
+    const d = studentConnect;
+    if (context !== chatReadContext() || d?.state !== "ready") return;
+    // Confirmed-rejected students and never-sent (new) students are separate buttons.
+    const rows = (d.targets || []).filter(row => Boolean(row.failed) === (mode === "failed"));
+    if (!rows.length) return;
+    S.studentConnectDialog = { kind: "preview", context, text: d.greeting || "", rows, noEmail: d.no_email || [] };
+    render();
+  },
+  "student-chat-next": () => {
+    const dlg = S.studentConnectDialog;
+    const box = document.querySelector('textarea[name="student-greeting"]');
+    if (!dlg || dlg.kind !== "preview") return;
+    const text = (box ? box.value : dlg.text).trim();
+    if (!text || dlg.context !== chatReadContext()) return;
+    S.studentConnectDialog = { ...dlg, kind: "confirm", text };
+    render();
+  },
+  "student-chat-dialog-close": () => { if (!S.studentConnectSending) { S.studentConnectDialog = null; render(); } },
+  "student-chat-send": async () => {
+    const dlg = S.studentConnectDialog;
+    if (!dlg || dlg.kind !== "confirm" || S.studentConnectSending || dlg.context !== chatReadContext()) return;
+    const context = dlg.context;
+    S.studentConnectDialog = null;
+    S.studentConnectSending = true;
+    S.studentConnectProgress = { done: 0, total: dlg.rows.length };
+    const timer = setInterval(() => {
+      call("student_chat_connect_progress").then(p => {
+        if (S.studentConnectSending && p?.total) { S.studentConnectProgress = p; render(); }
+      }).catch(() => {});
+    }, 1500);
+    try {
+      render();
+      const data = await call("student_chat_connect_send", dlg.text, dlg.rows.map(row => row.key));
+      if (context !== chatReadContext()) return;
+      studentConnect = { ...data, context, state: "ready", promise: Promise.resolve() };
+      S.studentConnectDialog = { kind: "result", results: data.results || [], stopped: data.stopped_detail || "" };
+    } catch (error) {
+      studentConnect = null;  // re-read this PC's record; never resend on our own (C7)
+      throw error;
+    } finally {
+      clearInterval(timer);
+      S.studentConnectSending = false;
+      render();
+    }
+  },
+  "student-chat-unknown": () => {
+    const d = studentConnect;
+    if (d?.state !== "ready" || !d.unknown?.length) return;
+    S.studentConnectDialog = { kind: "unknown", context: d.context, rows: d.unknown };
+    render();
+  },
+  "student-chat-received": (el) => resolveStudentConnect(el.dataset.key, true),
+  "student-chat-not-received": (el) => resolveStudentConnect(el.dataset.key, false),
+});
+async function resolveStudentConnect(key, received) {
+  const dlg = S.studentConnectDialog;
+  if (!dlg || dlg.kind !== "unknown" || dlg.context !== chatReadContext()) return;
+  await call("student_chat_connect_resolve", key, received);
+  dlg.rows = dlg.rows.filter(row => row.key !== key);
+  if (!dlg.rows.length) S.studentConnectDialog = null;
+  await loadStudentConnect(true);
 }
 
 let attendanceReplacementAttempt = null;
@@ -3135,7 +3403,7 @@ function attendanceHasConnectedWorkbook(a) {
   return a?.state === "ready" || a?.state === "initial-setup-required";
 }
 function serviceSubrowsHtml(entry, a, view = attendanceViewKind()) {
-  if (entry.service === "chat") return classSpaceSubrowHtml(a, view);
+  if (entry.service === "chat") return classSpaceSubrowHtml(a, view) + studentChatConnectSubrowHtml(a);
   if (entry.service === "sheet" && attendanceHasConnectedWorkbook(a)) return firstSetupCardHtml(a, view) + studentRosterSubrowHtml(a, view);
   return "";
 }
@@ -3236,7 +3504,7 @@ function attendanceChatConnectBlockReason(a = S.attendance) {
   if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
   if (cs.connected) {
     if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Google Chat 연결은 끝났어요. 위 출석부에서 [처음 설정 한 번에 끝내기]를 마쳐 주세요.";
-    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [단톡방(스페이스) 만들기]에서 학생을 초대하고 방을 골라 주세요.";
+    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [단톡방(스페이스) 만들러 가기]에서 학생을 초대하고 방을 골라 주세요.";
     return "자동발송 계정이 연결됐어요. 다시 연결할 필요가 없어요.";
   }
   // First-time Sheet setup, student invitations and a selected room are not
@@ -4199,7 +4467,7 @@ function attendanceTabHtml() {
     ])
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
       : ""}
-    ${attendanceScriptUpdateDialogHtml()}${attendanceConnectionDialogHtml()}`;
+    ${attendanceScriptUpdateDialogHtml()}${attendanceConnectionDialogHtml()}${studentChatConnectDialogHtml()}`;
 }
 function attendanceStaleNoticeHtml() {
   if (S.mode !== "wizard" || !S.attendanceStaleNotice
@@ -5576,7 +5844,7 @@ stepBodies[9] = function stepFinish() {
       ${summaryRow("학사일정 캘린더", p["학사일정캘린더이름"])}
       ${summaryRow("업무 할일 목록", p["업무Tasks목록이름"])}
       ${summaryRow("조종례 안내 목록", p["담임여부"] === "예" ? p["담임안내Tasks목록이름"] : "비담임 — 없음")}
-      ${summaryRow("Gemini API key", S.draft.bridge.gemini_api_key ? "입력됨" : "나중에 (홈에서 안내)")}
+      ${summaryRow("Gemini 연결 API 키", S.draft.bridge.gemini_api_key ? "입력됨" : "나중에 (홈에서 안내)")}
       ${summaryRow("단축키", S.draft.bridge.hotkey || DEFAULT_HOTKEY)}
     </div>
     <div class="foot">
@@ -6220,7 +6488,7 @@ const CARDS = [
   { key: "identity", icon: "user", title: "내 정보", detail: "이름 · 학교 · 담임 · 하루 일과" },
   { key: "timetable", icon: "table", title: "시간표 · 담임학급 학생명단", detail: "주간 시간표 수정" },
   { key: "settings", icon: "sliders", title: "설정", detail: "컴퓨터 준비 · Google 로그인 · 단축키 · 자동 실행" },
-  { key: "connect", icon: "link", title: "연결", detail: "Calendar · Tasks · Gemini API key · 출결 시트" },
+  { key: "connect", icon: "link", title: "연결", detail: "Calendar · Tasks · Gemini 연결 API 키 · 출결 시트" },
 ];
 function cardStatus(card) {
   if (checksRetry.dirtyCards.has(card.key)) return checksRetry.failedAt
@@ -6240,7 +6508,7 @@ function cardBadges(card) {
 }
 function cardDetail(card) {
   if (card.key === "connect" && !attendanceUiEnabled()) {
-    return "Calendar · Tasks · Gemini API key";
+    return "Calendar · Tasks · Gemini 연결 API 키";
   }
   return card.detail;
 }
@@ -6427,7 +6695,7 @@ function refreshConnectionStatus(options = {}) {
   return pending.promise;
 }
 // Keep a Calendar/Tasks choice or Gemini key typed on this screen before the re-read.
-bindActions({ "connection-refresh": () => { syncConnectFields(); return refreshConnectionStatus(); } });
+bindActions({ "connection-refresh": () => { syncConnectFields(); if (!S.studentConnectSending) studentConnect = null; return refreshConnectionStatus(); } });
 function homeHtml(behind) {
   const info = S.info;
   const visibleChecks = effectiveChecks().filter(
@@ -6508,6 +6776,8 @@ function windowHtml(title, body, big) {
    저장을 마친 뒤에만 닫힌다. 저장이 실패하면 창은 남고 배너에 이유가 적힌다. */
 async function closeWindow() {
   if (S.rosterEditor?.busy) return;
+  // 이름·이메일을 하나도 넣지 않은 명단은 저장할 것이 없으니 그대로 닫는다(빈 명단 창이 ✕로 닫히지 않던 문제).
+  if (S.mode === "edit" && S.edit === "timetable" && S.rosterEditor?.dirty && !S.rosterEditor.rows.some(rosterRowHasStudent)) S.rosterEditor = null;
   if (S.mode === "edit" && S.edit === "timetable" && S.rosterEditor?.dirty && !(await saveRosterEditor(true))) return;
   if (S.mode !== "edit" && S.mode !== "about") return true;
   const request = beginIssueRequest(Boolean(settingsAutoSavePromise || editAutoSavePromise));

@@ -479,9 +479,9 @@ Google Chat 발신 연결과 학생 수신에는 도메인에 관계없이 Googl
 
 사용자가 `Brity`, `브리티`, `메신저 자동 등록`, `단축키 등록`을 말하면 이 섹션을 따른다.
 
-학교 Windows PC에서 Brity Messenger 메시지를 화면에 띄우고 `Ctrl+Alt+Win`을 누르면, 화면의 글과 첨부파일을 직접 읽어 이 스킬의 판단 규칙으로 Google Calendar/Tasks에 등록하는 작업표시줄 도우미다. 소스는 이 스킬의 `scripts/brity_bridge`에 있다. 분석은 Gemini API를 사용한다 — 별도 코딩 CLI 설치가 필요 없다.
+학교 Windows PC에서 Brity Messenger 메시지를 화면에 띄우고 `Ctrl+Alt+Win`을 누르면, 화면의 글과 첨부파일을 직접 읽어 이 스킬의 판단 규칙으로 Google Calendar/Tasks에 등록하는 작업표시줄 도우미다. 소스는 이 스킬의 `scripts/brity_bridge`에 있다. 분석은 Gemini API의 `gemini-3.5-flash-lite` 한 모델만 사용한다(AI 출결 입력도 같다) — 별도 코딩 CLI 설치가 필요 없다.
 
-먼저 개인 설정 JSON(`profile.generated.json`)과 gws CLI 로그인, Gemini API key가 있어야 한다. 셋 다 `설정 대시보드`가 안내한다. key 발급은 연결의 Brity 메신저 탭에서 `Google API key 발급 URL`을 열어 진행한다.
+먼저 개인 설정 JSON(`profile.generated.json`)과 gws CLI 로그인, Gemini API key가 있어야 한다. 셋 다 `설정 대시보드`가 안내한다. key는 학교 goedu.kr Google 계정으로 무료 발급하며, 연결의 Brity 메신저 탭에서 `Google API key 발급 URL`을 열어 진행한다.
 
 정식 프로그램이 설치되면 도우미도 함께 들어오며, 설정 화면에서 자동실행을 켜거나 바로 시작한다. 터미널에서 직접 시작해야 할 때만 설치 폴더의 실행 파일을 쓴다.
 
