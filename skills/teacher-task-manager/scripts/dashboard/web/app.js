@@ -67,7 +67,8 @@ const S = {
   chatStatus: null,          // attendance_chat_status 응답 (null=미조회, "loading"=질의 중)
   spaceDraftName: undefined,  // 방 이름칸에 쓴 값 (undefined면 내 정보로 만든 기본값을 쓴다)
   spaceCreate: null,          // null | "ok" | "blocked" | 실패 사유 문자열
-  classGroupCreating: false,  // 학생들과 그룹 채팅 만들기가 진행 중인지 (두 번 누름 방지)
+  classGroupCreating: false,  // [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]가 진행 중인지 (두 번 누름 방지)
+  classChatStart: null,       // [환영 인사 보내면서 Google Chat 대화 상대로 연결하기] 창 {kind: edit|sending|result}
   chatSpacesError: false,     // 방 목록을 못 읽었는지 — "방이 없다"와 갈라 놓는다
   chatNewSpaceBrowserOpen: false, // 새 단톡방을 만들려고 Google Chat을 열었는지
   chatNewSpaceBrowserBlurred: false, // 실제로 브라우저로 자리를 옮겼다가 돌아왔는지
@@ -2611,8 +2612,8 @@ function classRoomReadinessMessage(state = classRoomReadiness()) {
     loading: "학급 단톡방 연결을 확인하고 있어요.",
     "read-failed": "학급 단톡방 연결을 읽지 못했어요. 기존 단톡방 선택은 그대로예요.",
     // Name the button this screen actually shows (C11).
-    "not-selected": "출결 탭의 [학생들과 그룹 채팅 만들기]로 학급 단톡방을 만들어 주세요.",
-    missing: "저장된 학급 단톡방을 Google Chat에서 찾지 못했어요. 출결 탭의 [학생들과 그룹 채팅 만들기]로 다시 만들어 주세요.",
+    "not-selected": "출결 탭의 [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]로 학급 단톡방을 만들어 주세요.",
+    missing: "저장된 학급 단톡방을 Google Chat에서 찾지 못했어요. 출결 탭의 [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]로 다시 만들어 주세요.",
   }[state] || "";
 }
 function loadChatStatus(force, renderResult = true) {
@@ -2970,7 +2971,7 @@ function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
   // Class group chat (2026-10-30 user decision): the class room is only this group chat;
   // no room dropdown and no external Chat room path. A saved room shows its name only.
   const group = ["not-selected", "missing"].includes(state)
-    ? `<button class="btn-tonal" data-action="class-space-group-create"${S.classGroupCreating || S.classSpaceSaving || attendanceChatOpenBlockReason() ? " disabled" : ""}>${S.classGroupCreating ? "만드는 중…" : "학생들과 그룹 채팅 만들기"}</button>` : "";
+    ? `<button class="btn-tonal" data-action="class-space-group-create"${S.classGroupCreating || S.classSpaceSaving || attendanceChatOpenBlockReason() ? " disabled" : ""}>${S.classGroupCreating ? "만드는 중…" : "환영 인사 보내면서 Google Chat 대화 상대로 연결하기"}</button>` : "";
   const retry = state === "read-failed" && S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed
     ? `<button class="btn-tonal" data-action="class-space-reload">다시 확인</button>` : "";
   return `<section class="svc-subrow class-space-section">
@@ -2996,7 +2997,7 @@ function classSpaceContentHtml(a, view = attendanceViewKind()) {
   if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">${saved} · 확인하고 있어요…</p>`;
   if (S.chatSpacesError) return `<p class="hint">${saved} · Google Chat에서 확인하지 못했어요. 저장된 학급 단톡방은 그대로예요.</p>`;
   const rooms = Array.isArray(S.chatSpaces) ? S.chatSpaces : [];
-  if (!rooms.some(s => String(s.name || "") === String(cs.class_space_id))) return `<p class="hint">${saved} · Google Chat에서 찾지 못했어요. [학생들과 그룹 채팅 만들기]로 다시 만들어 주세요.</p>`;
+  if (!rooms.some(s => String(s.name || "") === String(cs.class_space_id))) return `<p class="hint">${saved} · Google Chat에서 찾지 못했어요. [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]로 다시 만들어 주세요.</p>`;
   return `<p class="hint">${saved}</p>`;
 }
 
@@ -3191,6 +3192,56 @@ async function resolveStudentConnect(key, received) {
   if (!dlg.rows.length) S.studentConnectDialog = null;
   await loadStudentConnect(true);
 }
+
+// [환영 인사 보내면서 Google Chat 대화 상대로 연결하기] dialog (2026-10-30, CLASS-GROUP-01). No counts and no emails on screen.
+function classChatStartDialogHtml() {
+  const dlg = S.classChatStart;
+  if (!dlg) return "";
+  let body = "", actions = "";
+  if (dlg.kind === "edit" || dlg.kind === "sending") {
+    const sending = dlg.kind === "sending";
+    const p = S.studentConnectProgress || { done: 0, total: 0 };
+    const off = sending ? " disabled" : "";
+    body = `<h3>환영 인사 보내면서 Google Chat 대화 상대로 연결하기</h3><p>학생들에게 첫 인사를 보내면 Google Chat으로 연락할 수 있어요.</p>
+      <div class="class-chat-start-panes">
+        <label class="class-chat-start-pane"><b>학생 각자에게 (1:1)</b>
+          <textarea name="class-chat-personal-text" rows="8" aria-label="학생 각자에게 (1:1)"${off}>${esc(dlg.personalText)}</textarea></label>
+        <label class="class-chat-start-pane"><b>우리 반 단톡방</b>
+          <textarea name="class-chat-group-text" rows="8" aria-label="우리 반 단톡방"${off}>${esc(dlg.groupText)}</textarea></label>
+      </div>
+      <p class="attendance-update-dialog-note">학생명단의 이메일이 틀리면 그 학생에게는 가지 않아요.</p>
+      ${sending ? `<p class="hint">${p.total ? `학생에게 1:1 인사를 보내고 있어요. (${p.done}/${p.total}명)` : "그룹 채팅을 만들고 인사를 보내고 있어요…"}</p>` : ""}`;
+    actions = `<button class="btn-quiet" data-action="class-chat-start-close"${off}>취소</button>
+      <button class="btn class-chat-start-send" data-action="class-chat-start-send"${off}>${sending ? "보내는 중…" : "환영 인사 보내면서 Google Chat 대화 상대로 연결하기"}</button>`;
+  } else if (dlg.kind === "result") {
+    const d = dlg.data || {};
+    const personal = d.personal || null;
+    const results = personal?.results || [];
+    const labels = rows => rows.map(row => row.label).join(", ");
+    const rejected = results.filter(row => ["rejected", "not_sent"].includes(row.state));
+    const unknown = results.filter(row => ["unknown", "pending"].includes(row.state));
+    const lines = [];
+    if (d.group === "sent") lines.push(["ok", "✓ 단톡방과 1:1 채팅에 인사를 보냈어요."]);
+    else if (d.group === "rejected") lines.push(["warn", "! 단톡방에 인사를 보내지 못했어요."]);
+    else if (d.group === "stop") lines.push(["warn", "! Google Chat 연결을 확인해야 해서 단톡방과 1:1 인사를 보내지 않았어요."]);
+    else lines.push(["warn", "! 단톡방에 인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 확인해 주세요."]);
+    if (rejected.length) lines.push(["warn", `! 받지 못한 학생: ${labels(rejected)} — 학생명단의 이메일을 확인해 주세요.`]);
+    if (unknown.length) lines.push(["warn", `! 전달됐는지 확인하지 못한 학생: ${labels(unknown)} — 다시 보내지 말고 Google Chat에서 받았는지 확인해 주세요.`]);
+    if (personal?.stopped) lines.push(["warn", `! ${personal.stopped_detail || ""}`]);
+    if (d.send_error) lines.push(["warn", `! ${d.send_error}`]);
+    body = `<h3>환영 인사 보내면서 Google Chat 대화 상대로 연결하기</h3>${d.space_name ? "<p>학급 단톡방을 만들었어요.</p>" : ""}
+      ${lines.map(([tone, text]) => `<p class="class-chat-start-result ${tone}">${esc(text)}</p>`).join("")}`;
+    actions = `<button class="btn" data-action="class-chat-start-close">닫기</button>`;
+  }
+  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-selection-dialog student-chat-dialog class-chat-start-dialog" role="dialog" aria-modal="true">
+    ${body}<div class="attendance-update-dialog-actions">${actions}</div></section></div>`;
+}
+document.addEventListener("input", (event) => {
+  const dlg = S.classChatStart;
+  if (dlg?.kind !== "edit") return;
+  if (event.target.matches?.('textarea[name="class-chat-group-text"]')) dlg.groupText = event.target.value;
+  if (event.target.matches?.('textarea[name="class-chat-personal-text"]')) dlg.personalText = event.target.value;
+});
 
 let attendanceReplacementAttempt = null;
 function attendanceReplacementScope(a) {
@@ -3503,7 +3554,7 @@ function attendanceChatConnectBlockReason(a = S.attendance) {
   if (cs.moved) return "출결 연결이 바뀌었어요. 현재 출결 자료를 먼저 확인해 주세요.";
   if (cs.connected) {
     if (S.mode === "wizard" && !attendanceSheetSetupDone()) return "Google Chat 연결은 끝났어요. 위 출석부에서 [처음 설정 한 번에 끝내기]를 마쳐 주세요.";
-    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [학생들과 그룹 채팅 만들기]로 학급 단톡방을 만들어 주세요.";
+    if (S.mode === "wizard" && !cs.class_space_id) return "계정 연결은 끝났어요. 아래 학급 단톡방의 [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]로 학급 단톡방을 만들어 주세요.";
     return "자동발송 계정이 연결됐어요. 다시 연결할 필요가 없어요.";
   }
   // First-time Sheet setup, student invitations and a selected room are not
@@ -4466,7 +4517,7 @@ function attendanceTabHtml() {
     ])
       ? `<div class="attendance-action"><button class="btn" data-action="attendance-prepare-retry" data-busy-text="다시 시작하는 중…">다시 시도</button></div>`
       : ""}
-    ${attendanceScriptUpdateDialogHtml()}${attendanceConnectionDialogHtml()}${studentChatConnectDialogHtml()}`;
+    ${attendanceScriptUpdateDialogHtml()}${attendanceConnectionDialogHtml()}${studentChatConnectDialogHtml()}${classChatStartDialogHtml()}`;
 }
 function attendanceStaleNoticeHtml() {
   if (S.mode !== "wizard" || !S.attendanceStaleNotice
@@ -4883,8 +4934,11 @@ bindActions({
     }
     render();
   },
+  // [환영 인사 보내면서 Google Chat 대화 상대로 연결하기] (2026-10-30, CLASS-GROUP-01): one dialog with the 1:1 greeting
+  // and the group greeting side by side. The send button creates the group chat, sends the
+  // group greeting once and the 1:1 greeting once per student; nothing is resent on its own (C7).
   "class-space-group-create": async () => {
-    if (S.classGroupCreating || S.classSpaceSaving) return;
+    if (S.classGroupCreating || S.classSpaceSaving || S.classChatStart) return;
     const context = chatReadContext();
     S.classGroupCreating = true;
     render();
@@ -4903,37 +4957,65 @@ bindActions({
         setBanner("warn", `Google Chat 그룹 채팅에는 선생님 외에 학생을 최대 ${preview.max}명까지 넣을 수 있어요. (지금 ${preview.count}명)`);
         return;
       }
-      const leftOut = (preview.left_out || []).length
-        ? `\n\n이메일이 없어 넣지 않는 학생: ${preview.left_out.join(", ")}` : "";
-      const replacing = S.chatStatus?.class_space_id ? "\n지금 고른 학급 단톡방 대신 이 그룹 채팅을 학급 단톡방으로 써요." : "";
-      if (!window.confirm(`학생 ${preview.count}명과 선생님이 들어간 Google Chat 그룹 채팅을 만들까요?\n만든 그룹 채팅을 학급 단톡방으로 골라 둬요.${replacing}${leftOut}`)) return;
-      chatStatusReadVersion += 1;
-      const data = await call("attendance_chat_create_group", preview.count);
-      if (context !== chatReadContext()) return;
-      if (data.state === "ok") {
-        chatStatusReadVersion += 1;
-        S.chatSpaceName = data.display_name;
-        S.chatSpaces = undefined;   // 방금 만든 그룹 채팅이 목록에 잡히게 다시 읽는다
-        if (S.chatStatus && typeof S.chatStatus === "object") {
-          S.chatStatus.class_space_id = data.space_name;
-          S.chatStatus.class_space_name = data.display_name;
-        }
-        const joinedStudents = Number.isInteger(data.joined) ? data.joined - 1 : null;
-        if (joinedStudents !== null && joinedStudents < preview.count) {
-          setBanner("warn", `그룹 채팅을 만들었어요. 다만 Google Chat에 들어간 학생은 ${Math.max(joinedStudents, 0)}명이에요. 나머지 학생은 Google이 넣지 않았어요. Google Chat에서 그룹 채팅을 열어 직접 추가해 주세요.`);
-        } else {
-          showToast("그룹 채팅을 만들고 학급 단톡방으로 골라 뒀어요");
-        }
-      } else {
-        // A failed or unknown result is never sent again automatically (C7). Pressing the
-        // button again reuses the server's Google requestId, so it returns the same chat.
-        if (data.space_name) S.chatSpaces = undefined;
-        setBanner("warn", data.detail || "그룹 채팅을 만들지 못했어요.");
-      }
+      S.classChatStart = { kind: "edit", context, count: preview.count,
+        groupText: preview.group_text || "", personalText: preview.personal_text || "" };
     } finally {
       S.classGroupCreating = false;
       render();
     }
+  },
+  "class-chat-start-close": () => { if (S.classChatStart?.kind !== "sending") { S.classChatStart = null; render(); } },
+  "class-chat-start-send": async () => {
+    const dlg = S.classChatStart;
+    if (!dlg || dlg.kind !== "edit" || S.classGroupCreating || dlg.context !== chatReadContext()) return;
+    const groupBox = document.querySelector('textarea[name="class-chat-group-text"]');
+    const personalBox = document.querySelector('textarea[name="class-chat-personal-text"]');
+    const groupText = (groupBox ? groupBox.value : dlg.groupText).trim();
+    const personalText = (personalBox ? personalBox.value : dlg.personalText).trim();
+    if (!groupText || !personalText) return;
+    const context = dlg.context;
+    S.classChatStart = { ...dlg, kind: "sending", groupText, personalText };
+    S.classGroupCreating = true;
+    S.studentConnectProgress = { done: 0, total: 0 };
+    const timer = setInterval(() => {
+      call("student_chat_connect_progress").then(p => {
+        if (S.classChatStart?.kind === "sending" && p?.total) { S.studentConnectProgress = p; render(); }
+      }).catch(() => {});
+    }, 1500);
+    let data = null;
+    try {
+      render();
+      chatStatusReadVersion += 1;
+      data = await call("attendance_chat_start", dlg.count, groupText, personalText);
+    } catch (error) {
+      // Unknown outcome: re-read the state, never resend on our own (C7).
+      if (S.classChatStart?.kind === "sending") S.classChatStart = null;
+      studentConnect = null;
+      S.chatSpaces = undefined;
+      throw error;
+    } finally {
+      clearInterval(timer);
+      S.classGroupCreating = false;
+      render();
+    }
+    if (context !== chatReadContext()) { S.classChatStart = null; render(); return; }
+    if (data?.state === "ok") {
+      chatStatusReadVersion += 1;
+      S.chatSpaceName = data.display_name;
+      S.chatSpaces = undefined;   // 방금 만든 그룹 채팅이 목록에 잡히게 다시 읽는다
+      if (S.chatStatus && typeof S.chatStatus === "object") {
+        S.chatStatus.class_space_id = data.space_name;
+        S.chatStatus.class_space_name = data.display_name;
+      }
+      studentConnect = null;      // 1:1 결과는 이 PC 기록에서 다시 읽는다
+      S.classChatStart = { kind: "result", data };
+    } else {
+      // A failed or unknown create is never sent again automatically (C7).
+      if (data?.space_name) S.chatSpaces = undefined;
+      S.classChatStart = null;
+      setBanner("warn", data?.detail || "그룹 채팅을 만들지 못했어요.");
+    }
+    render();
   },
   "class-space-reload": async () => {
     beginAttendanceAuthBatch();

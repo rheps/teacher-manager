@@ -54,6 +54,7 @@ _OPERATION_KINDS = {
     "attendance_chat_set_space": KIND_GOOGLE_WRITE,
     "attendance_chat_create_space": KIND_GOOGLE_WRITE,
     "attendance_chat_create_group": KIND_GOOGLE_WRITE,
+    "attendance_chat_start": KIND_GOOGLE_WRITE,
     "gws_login_start": KIND_GOOGLE_WRITE,
     "gws_logout": KIND_GOOGLE_WRITE,
     "save_identity": KIND_LOCAL,

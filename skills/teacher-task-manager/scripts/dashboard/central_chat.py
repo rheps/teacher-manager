@@ -58,6 +58,13 @@ SPACE_NAME_EMPTY_MESSAGE = "방 이름을 적어 주세요."
 # (services/central-chat-sender의 spaceCreateError 기본값).
 SPACE_CREATE_FAILED_MESSAGE = "방 만들기 결과를 확인하지 못했어요. Google Chat에서 방이 만들어졌는지 확인해 주세요."
 SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌었어요. 현재 상태를 다시 확인해 주세요."
+# CLASS-GROUP-01 (2026-11-02): a create rejected as stale changed nothing. Name that, and give
+# the steps that can work: no screen button reconciles the sheet and server rooms, so no ↻ hint.
+SPACE_CREATE_STALE_CREATE_MESSAGE = (
+    "출석부 설정과 발송 서버에 저장된 학급 단톡방이 서로 달라 새로 만들지 않았어요. "
+    "다른 창이나 컴퓨터에서 만드는 중이었다면 끝난 뒤 다시 시도해 주세요. "
+    "계속 같은 안내가 나오면 contact@big-silver.xyz로 문의해 주세요."
+)
 # Class group chat (2026-10-30). Google: at least 2 and at most 49 members besides the teacher.
 GROUP_CHAT_FALLBACK_NAME = "학생 그룹 채팅"
 GROUP_CHAT_MIN_STUDENTS = 2
@@ -1392,11 +1399,14 @@ def create_class_space(
             else "stale" if code == "SPACE_CREATE_STALE"
             else "failed"
         )
+        if state == "stale":
+            detail = SPACE_CREATE_STALE_CREATE_MESSAGE
         return {"state": state, "space_name": "", "display_name": name, "detail": detail}
     response_state = str((response or {}).get("state", "") or "")
     if response_state in {"in-progress", "stale"}:
         return {"state": response_state, "space_name": "", "display_name": name,
-                "detail": "방 만들기 상태를 다시 확인하고 있어요."}
+                "detail": SPACE_CREATE_STALE_CREATE_MESSAGE if response_state == "stale"
+                else "방 만들기 상태를 다시 확인하고 있어요."}
     space = (response or {}).get("space") or {}
     space_name = str(space.get("name", "") or "").strip()
     if not space_name:
@@ -1727,8 +1737,12 @@ def _scc_now() -> str:
 
 def scc_post_personal(url: str, payload: dict) -> tuple[str, str]:
     """One send, no retry. Returns (outcome, server code); outcome is sent|rejected|stop|unknown."""
+    return _scc_post_send(url, "/v1/send/personal", payload)
+
+
+def _scc_post_send(url: str, path: str, payload: dict) -> tuple[str, str]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url.rstrip("/") + "/v1/send/personal", data=body,
+    request = urllib.request.Request(url.rstrip("/") + path, data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=SCC_SEND_TIMEOUT_SECONDS) as response:
@@ -1807,6 +1821,57 @@ def scc_send_greetings(config_dir, account: str, record: dict, config: dict, ros
     summary = scc_summarize(roster, students)
     return {**summary, "results": results, "stopped": stopped,
             "stopped_detail": SCC_STOPPED_MESSAGE if stopped else ""}
+
+
+# ---- 환영 인사 보내면서 Google Chat 대화 상대로 연결하기 (2026-10-30, CLASS-GROUP-01) ----
+# After the class group chat is created, one greeting goes to the group chat and one 1:1
+# greeting to each student (the 1:1 part reuses scc_send_greetings and its record). The
+# class greeting's requestId depends only on (workbook, generation, space), never on text or
+# time: a second press replays a confirmed send, 409s an unknown one, and a changed text
+# conflicts (unknown). Nothing here resends on its own (C7).
+CLASS_GREETING_REQUEST_PREFIX = "tm-class-group-greeting-v1"
+CLASS_GREETING_DEFAULT = (
+    "안녕하세요, {반이름} 여러분! 담임 선생님이에요. 이 채팅방은 우리 반 단톡방이에요. "
+    "학급 공지와 안내는 앞으로 여기에 올릴게요. 결석·지각·조퇴 같은 출결이나 개인적인 일은 "
+    "이 방이 아니라 선생님과의 1:1 채팅으로 보내 주세요. 잘 부탁해요!"
+)
+PERSONAL_GREETING_DEFAULT = (
+    "안녕하세요, 담임 선생님이에요. 이 채팅은 선생님과 1:1로 이야기하는 곳이에요. "
+    "결석·지각·조퇴 같은 출결이나 개인적인 일은 여기로 보내 주세요."
+)
+_CLASS_GREETING_REJECTED = {"CHAT_MESSAGE_REJECTED", "MESSAGE_TOO_LARGE",
+                            "CLASS_SPACE_AND_TEXT_REQUIRED", "CLASS_SPACE_REQUIRED"}
+
+
+def class_greeting_defaults(profile: dict) -> tuple[str, str]:
+    grade = str(profile.get("담임학년") or "").strip()
+    room = str(profile.get("담임반") or "").strip()
+    label = f"{grade}학년 {room}반" if grade and room else "우리 반"
+    return CLASS_GREETING_DEFAULT.replace("{반이름}", label), PERSONAL_GREETING_DEFAULT
+
+
+def class_greeting_request_id(spreadsheet_id: str, generation, space_name: str) -> str:
+    seed = "|".join([CLASS_GREETING_REQUEST_PREFIX, str(spreadsheet_id), str(generation), str(space_name)])
+    return "req-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:48]
+
+
+def send_class_greeting(config: dict, record: dict, space_name: str, text: str,
+                        poster=_scc_post_send) -> tuple[str, str]:
+    """One class send, no retry. Returns (sent|rejected|stop|unknown, server code)."""
+    spreadsheet_id = str(record["spreadsheet_id"])
+    generation = record["binding_generation"]
+    outcome, code = poster(config["url"], "/v1/send/class", {
+        "sheetId": config["sheet_id"], "sheetSecret": config["sheet_secret"],
+        "requestId": class_greeting_request_id(spreadsheet_id, generation, space_name),
+        "spaceName": str(space_name), "text": text,
+        "protocolVersion": 1, "spreadsheetId": spreadsheet_id,
+        "workbookSchoolYear": int(record["school_year"]), "generation": generation,
+        "monthlySheetIds": record["monthly_sheet_ids"], "purpose": "automatic", "operationId": "",
+        "meta": {"source": "class-group-greeting"},
+    })
+    if outcome == "rejected" or (outcome == "unknown" and code in _CLASS_GREETING_REJECTED):
+        return "rejected", code
+    return outcome, code
 
 
 def scc_resolve(config_dir, account: str, record: dict, key: str, received: bool) -> None:

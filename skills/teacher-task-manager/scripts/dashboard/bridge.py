@@ -128,6 +128,7 @@ _SCREEN_FAILURES = {
     "attendance_chat_set_space": "학급 단톡방 선택을 저장하지 못했어요.",
     "attendance_chat_create_space": "학급 단톡방을 만들지 못했어요.",
     "attendance_chat_create_group": "학급 그룹 채팅을 만들지 못했어요.",
+    "attendance_chat_start": "학생들과 채팅을 시작하지 못했어요.",
     "open_attendance_chat": "Google Chat을 열지 못했어요.",
     "student_chat_connect_status": "학생 연결 상태를 읽지 못했어요.",
     "student_chat_connect_send": "학생에게 인사를 보내지 못했어요.",
@@ -1139,7 +1140,7 @@ _SESSION_GOOGLE_WORK = frozenset({
     "attendance_chat_connect", "attendance_chat_set_space", "attendance_chat_create_space",
     "select_attendance_connection", "select_attendance_connection_by_code",
     "apply_all", "save_profile_grid", "save_gemini", "sync_roster_editor",
-    "student_chat_connect_send", "attendance_chat_create_group",
+    "student_chat_connect_send", "attendance_chat_create_group", "attendance_chat_start",
 })
 
 
@@ -3562,11 +3563,16 @@ class Api:
         except Exception:  # noqa: BLE001 - a failed read is unknown, never "no students"
             return {"state": "unavailable"}
         emails, left_out = central_chat.group_chat_members(roster, account)
+        group_text, personal_text = central_chat.class_greeting_defaults(engine.read_profile_values(self._config_dir))
         return {"state": "ready", "count": len(emails), "left_out": left_out,
-                "min": central_chat.GROUP_CHAT_MIN_STUDENTS, "max": central_chat.GROUP_CHAT_MAX_STUDENTS}
+                "min": central_chat.GROUP_CHAT_MIN_STUDENTS, "max": central_chat.GROUP_CHAT_MAX_STUDENTS,
+                "group_text": group_text, "personal_text": personal_text}
 
     @guarded
     def attendance_chat_create_group(self, expected_count=0):
+        return self._create_class_group(expected_count)
+
+    def _create_class_group(self, expected_count=0):
         """Create the class group chat once and save it as the class room.
 
         The server keeps one idempotent operation per sheet and reuses its Google
@@ -3608,6 +3614,58 @@ class Api:
             create_once,
             retry_states=frozenset(),
         )
+
+    @guarded
+    def attendance_chat_start(self, expected_count=0, group_text="", personal_text=""):
+        """[환영 인사 보내면서 Google Chat 대화 상대로 연결하기] (row button) → [환영 인사 보내면서 Google Chat 대화 상대로 연결하기] (send button) (2026-10-30, CLASS-GROUP-01).
+
+        1) create the class group chat (same path as attendance_chat_create_group),
+        2) send group_text to it once, 3) send personal_text 1:1 to each student still to
+        greet (scc_send_greetings, its record and request ids). The sends are outside the
+        three-cycle retry and are never repeated automatically (C7)."""
+        from dashboard import central_chat
+        group_body = str(group_text or "").strip()
+        personal_body = str(personal_text or "").strip()
+        if not group_body or not personal_body:
+            raise ScreenSafeError("보낼 인사말을 확인하지 못했어요.")
+        created = self._create_class_group(expected_count)
+        if not isinstance(created, dict) or created.get("state") != "ok":
+            return {**(created if isinstance(created, dict) else {}), "group": None, "personal": None}
+        space_name = str(created.get("space_name") or "")
+        self._student_connect_progress = (0, 0)
+        outcome = {"group": "", "group_code": ""}
+
+        def send(run, gws, record):
+            if record is None:
+                raise ScreenSafeError(central_chat.NOT_PREPARED_MESSAGE)
+            _run, _gws, account = self._resolve_attendance_goedu_gws_context_or_fail()
+            config = central_chat.read_central_config(
+                self._config_dir, run, gws_executable=gws, attendance_record=record)
+            outcome["group"], outcome["group_code"] = central_chat.send_class_greeting(
+                config, record, space_name, group_body)
+            if outcome["group"] == "stop":
+                return {"results": [], "stopped": True, "stopped_detail": central_chat.SCC_STOPPED_MESSAGE}
+            roster = central_chat.scc_read_roster(self._config_dir, record, run, gws)
+            students = central_chat.scc_load_students(
+                self._config_dir, account, record["spreadsheet_id"], record["binding_generation"])
+            teacher = central_chat.scc_email_key(account)
+            keys = [row["key"] for row in central_chat.scc_summarize(roster, students)["targets"]
+                    if row["key"] != teacher]
+            self._student_connect_progress = (0, len(keys))
+            return central_chat.scc_send_greetings(
+                self._config_dir, account, record, config, roster, keys, personal_body,
+                progress=lambda done, total: setattr(self, "_student_connect_progress", (done, total)))
+
+        personal, send_error = None, ""
+        try:
+            personal = self._run_attendance_chat_action(send)
+        except Exception:  # noqa: BLE001 - the group chat exists; report, never resend (C7)
+            send_error = ("그룹 채팅은 만들었어요. 다만 인사를 보내는 중 문제가 생겨 결과를 확인하지 못했어요. "
+                          "다시 보내지 말고 Google Chat에서 받은 학생이 있는지 확인해 주세요.")
+        finally:
+            self._student_connect_progress = (0, 0)
+        return {**created, "group": outcome["group"] or ("unknown" if send_error else ""),
+                "group_code": outcome["group_code"], "personal": personal, "send_error": send_error}
 
     # ---- 학생과 Chat 처음 연결하기 (2026-10-29) ---------------------------------
     @guarded

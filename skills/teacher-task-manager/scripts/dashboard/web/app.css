@@ -478,6 +478,11 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .class-space-section > .svc-subrow { padding:8px 0; border:0; }
 .class-space-section .problem-panel { margin:12px 0 0; }
 .class-space-section .chat-space-status { width:64px; text-align:right; }
+/* The long class-room button sits on the right and may wrap (CLASS-GROUP-01, 2026-10-30). */
+.class-space-section > .first-setup-head > .chat-space-reload-status { flex:0 1 auto; min-width:0; justify-content:flex-end; }
+.class-space-section > .first-setup-head > b { flex:none; white-space:nowrap; }
+.class-space-section .btn-tonal[data-action="class-space-group-create"] { white-space:normal; flex-shrink:1; min-width:0;
+  height:auto; max-height:none; min-height:30px; padding:6px 15px; text-align:center; }
 .class-space-section .class-space-actions { justify-content:flex-end; flex-wrap:wrap; }
 .class-space-section select { max-width:100%; }
 .chat-new-space-guide { grid-column:1 / -1; margin-top:0; margin-left:auto; }
@@ -538,6 +543,16 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-selection-dialog .attendance-update-dialog-actions { flex-wrap:wrap; }
 /* 학생과 Chat 처음 연결하기 (2026-10-29) */
 .student-chat-dialog { max-height:calc(100vh - 32px); overflow:auto; box-sizing:border-box; }
+.class-chat-start-dialog { width:min(820px,calc(100vw - 32px)); }
+.class-chat-start-panes { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.class-chat-start-pane { display:flex; flex-direction:column; gap:6px; min-width:0; }
+.class-chat-start-dialog p.attendance-update-dialog-note { margin:10px 0 20px; }
+@media (max-width:640px) { .class-chat-start-panes { grid-template-columns:1fr; } }
+.class-chat-start-dialog .btn.class-chat-start-send { white-space:normal; flex-shrink:1; min-width:0; max-width:100%; text-align:center;
+  height:auto; max-height:none; min-height:30px; padding:6px 16px; }
+.class-chat-start-result { margin:6px 0; font-size:13.5px; line-height:1.6; }
+.class-chat-start-result.ok { color:var(--tm-green); font-weight:600; }
+.class-chat-start-result.warn { color:var(--tm-amber); font-weight:600; }
 .student-chat-dialog textarea { width:100%; box-sizing:border-box; font-family:inherit; font-size:13.5px; line-height:1.6;
   padding:9px 11px; border:1.5px solid var(--tm-line); border-radius:10px; resize:vertical; }
 .student-chat-dialog textarea:focus { outline:none; border-color:var(--tm-blue); }
