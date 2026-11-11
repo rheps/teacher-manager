@@ -111,7 +111,9 @@
 # student Chat automatic attendance remains an opt-in field-test feature, not field-verified.
 # v5.04: Sheet attendance dialog fits the available screen and loads real Pretendard webfonts.
 # v5.05: per-teacher Gemini key with Flash-Lite/3.6/3.8 picker for messenger analysis (AI-KEY-02/03).
-APP_VERSION = "5.05"
+# v5.06: attendance on the Teacher Manager server (no Sheet, Apps Script or gws), server Google sign-in,
+# student absence-report link, AI tab removed (P6-RULES-01).
+APP_VERSION = "5.06"
 
 BRANDING = {
     "name": "Teacher Manager",

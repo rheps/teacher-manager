@@ -328,11 +328,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None, webview_module=_IMPORT, notify=None, background=None,
          single_instance=None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_argv[:1] == ["--ai-process-worker"]:
-        # 사용자 설정이나 화면을 읽기 전에 시작 신호를 기다리는 내부 작업자로 갈라진다.
-        from brity_bridge import process_supervision
-
-        return process_supervision.worker_main(raw_argv[1:])
     if "--probe-webview2" in raw_argv:
         # 이 검사는 사용자 설정·도우미·바로가기보다 먼저 갈라진다. pywebview를
         # 읽기 전 Stable 채널만 고정해 Beta/Dev/Canary를 준비 완료로 세지 않는다.
@@ -351,12 +346,9 @@ def main(argv=None, webview_module=_IMPORT, notify=None, background=None,
 
     app_identity.apply_app_identity()  # 트레이와 같은 이름표를 써야 한 프로그램으로 보인다
 
-    from brity_bridge import gws_env
-
-    gws_env.prepare_gws_env()  # gws 로그인이 수시로 풀리지 않게 키 보관 방식을 고정한다
     args = build_parser().parse_args(raw_argv)
     # 화면을 여는 실행만 한 개로 제한한다. 설치 확인(--verify-settings-only)과 위에서 먼저
-    # 갈라진 --ai-process-worker·--probe-webview2는 제외한다. 시험처럼 가짜 화면 모듈을
+    # 갈라진 --probe-webview2는 제외한다. 시험처럼 가짜 화면 모듈을
     # 넘긴 실행과 Windows가 아닌 환경에서는 기본으로 확인하지 않는다.
     if single_instance is None and webview_module is _IMPORT and sys.platform == "win32":
         single_instance = _acquire_single_instance

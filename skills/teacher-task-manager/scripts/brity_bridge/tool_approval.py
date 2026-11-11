@@ -1,7 +1,7 @@
-"""세 공식 도구의 승인 증거를 검사하고 제품 입력을 한 번에 조립한다.
+"""공식 도구(WebView2)의 승인 증거를 검사하고 제품 입력을 한 번에 조립한다.
 
 승인 파일은 다운로드나 설치를 하는 명령서가 아니다. 이미 별도 확인 단계에서 만든
-JSON을 엄격하게 다시 읽고, 세 파일이 모두 온전할 때에만 제품 manifest와 공개 상태
+JSON을 엄격하게 다시 읽고, 모든 파일이 온전할 때에만 제품 manifest와 공개 상태
 문서를 바꾼다.
 """
 from __future__ import annotations
@@ -14,7 +14,6 @@ import stat
 import subprocess
 import time
 import uuid
-import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -23,20 +22,16 @@ from urllib.parse import urlparse
 
 from brity_bridge import component_lock, process_win
 from brity_bridge.tool_manifest import (
-    BundledGwsSpec,
-    ManagedNodeSpec,
     ManifestError,
     ToolsManifest,
     WebView2Spec,
-    _validate_archive_url,
-    _validate_node_spec,
     _validate_webview2_spec,
     load_tools_manifest,
     require_build_complete,
 )
 
 
-_TOOLS = ("gws", "node", "webview2")
+_TOOLS = ("webview2",)
 _TOP_KEYS = (
     "approval_schema_version",
     "tool",
@@ -45,29 +40,6 @@ _TOP_KEYS = (
     "spec",
     "evidence",
     "field_verification",
-)
-_GWS_SPEC_KEYS = (
-    "version", "platform", "architecture", "archive_url", "archive_filename",
-    "archive_sha256", "executable_sha256", "executable_relative_path",
-    "license_id", "license_file",
-)
-_GWS_EVIDENCE_KEYS = (
-    "release_page_url", "checksum_url", "checksum_file_sha256", "checksum_line",
-    "archive_bytes", "archive_local_sha256", "archive_hash_matches", "executable_bytes",
-    "license_source_url", "license_source_sha256", "license_file_sha256",
-    "license_exact_byte_match", "smoke_checks",
-)
-_NODE_SPEC_KEYS = (
-    "version", "platform", "architecture", "archive_url", "archive_filename",
-    "archive_sha256", "node_relative_path", "npm_relative_path", "npx_relative_path",
-    "skills_cli_package", "skills_cli_version", "license_id", "license_file",
-)
-_NODE_EVIDENCE_KEYS = (
-    "shasums_url", "shasums_file_sha256", "checksum_line", "archive_bytes",
-    "archive_local_sha256", "archive_hash_matches", "license_source_path",
-    "license_source_sha256", "tag_license_url", "tag_license_sha256",
-    "license_normalized_match", "license_copy_policy", "license_file_sha256",
-    "smoke_checks",
 )
 _WEBVIEW2_SPEC_KEYS = (
     "file_version", "minimum_runtime_version", "platform", "architecture",
@@ -99,7 +71,6 @@ _WEBVIEW_SDK_FILES = (
 _WEBVIEW_LOADER_FILES = tuple(
     path for path in _WEBVIEW_SDK_FILES if path.endswith("WebView2Loader.dll")
 )
-_SMOKE_KEYS = ("command", "exit_code", "observed")
 _FIELD_KEYS = ("status", "items")
 _NOTICE_POLICY_KEYS = ("policy", "verification")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -122,18 +93,8 @@ _PLACEHOLDERS = {
     "placeholder", "tbd", "todo", "unknown", "pending", "not-set", "not set",
     "changeme", "temporary", "temp",
 }
-_GWS_LICENSE_SHA256_BY_VERSION = {
-    "0.22.5": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-}
-_NODE_LICENSE_SHA256 = "d9c4eeda951d6d08f4aa1316b61aafcf67e6da5f79b18f8edeb56fa6abdc038c"
-_NODE_TAG_LICENSE_SHA256 = "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5"
 _WEBVIEW_TERMS_SHA256 = "e15b53f476b66f8335c18436998256dc9862b210242a8e4c7f7e14d2de53591d"
 _WEBVIEW_TERMS_URL = "https://developer.microsoft.com/microsoft-edge/api/eula/webview2?locale=en-us"
-_GWS_ARCHIVE_SHA256 = "407705d695dc83d48b1c5f50d71b5aa64095bf6f17d5b439b2e9a373bbe67ec2"
-_GWS_CHECKSUM_FILE_SHA256 = "5afe908e068d5e8b1ad723445fde7f24309f61f7dec2e8a6e2a44ca397b0c341"
-_GWS_EXECUTABLE_SHA256 = "82ad48dd28564be969174aaef3e3f99816f959bf2519eeeb4ab77d84f9fa9c67"
-_NODE_ARCHIVE_SHA256 = "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73"
-_NODE_SHASUMS_FILE_SHA256 = "be0629ee2bcd8e40bb856abdd3407f0762101b76bd60a36b8867f637733631c0"
 _WEBVIEW_BOOTSTRAPPER_SHA256 = "e99838c51bb3379b244654aa77e33032d42fc2b5d224c5babce432d9fd3dcb28"
 _WEBVIEW_BOOTSTRAPPER_FILE_VERSION = "1.3.251.21"
 _WEBVIEW_EVIDENCE_PATHS = {
@@ -183,28 +144,12 @@ class ToolApprovalError(ValueError):
 @dataclass(frozen=True)
 class ToolSourceApproval:
     approval_schema_version: int
-    tool: Literal["gws", "node", "webview2"]
+    tool: Literal["webview2"]
     verified_at_utc: str
     source_approval_status: Literal["approved"]
     spec: dict[str, object]
     evidence: dict[str, object]
     field_verification: dict[str, object]
-
-
-@dataclass(frozen=True)
-class GwsSourceFiles:
-    archive: Path
-    checksum: Path
-    official_license: Path
-    packaged_license: Path
-
-
-@dataclass(frozen=True)
-class NodeSourceFiles:
-    archive: Path
-    shasums: Path
-    tag_license: Path
-    packaged_license: Path
 
 
 @dataclass(frozen=True)
@@ -220,8 +165,6 @@ class WebView2SourceFiles:
 
 @dataclass(frozen=True)
 class ToolSourceFiles:
-    gws: GwsSourceFiles
-    node: NodeSourceFiles
     webview2: WebView2SourceFiles
 
 
@@ -256,25 +199,6 @@ def _require_file_sha(path: Path, expected: str, label: str) -> bytes:
     if actual != expected:
         _fail(f"{label} 실제 파일 SHA-256이 공식 고정값과 다릅니다: {actual}")
     return value
-
-
-def _read_single_zip_member(archive_path: Path, member: str, label: str) -> bytes:
-    try:
-        with zipfile.ZipFile(archive_path) as archive:
-            if archive.namelist().count(member) != 1:
-                _fail(f"{label} ZIP에 {member} 파일이 정확히 하나 있어야 합니다.")
-            return archive.read(member)
-    except ToolApprovalError:
-        raise
-    except (OSError, KeyError, zipfile.BadZipFile) as error:
-        _fail(f"{label} 실제 ZIP을 읽을 수 없습니다: {error}")
-
-
-def _checksum_lines(value: bytes, label: str) -> list[str]:
-    try:
-        return [line.strip() for line in value.decode("utf-8").splitlines() if line.strip()]
-    except UnicodeDecodeError as error:
-        _fail(f"{label} 공식 checksum 파일이 UTF-8이 아닙니다: {error}")
 
 
 def _read_pe_machine(path: Path) -> int:
@@ -508,84 +432,6 @@ def _validate_utc(value: object, label: str) -> str:
     return value
 
 
-def _validate_sha_line(line: object, expected_sha: str, expected_filename: str, label: str) -> None:
-    if not isinstance(line, str):
-        _fail(f"{label}은 글자여야 합니다.")
-    parts = line.strip().split()
-    if parts != [expected_sha, expected_filename]:
-        _fail(f"{label}이 승인한 SHA와 파일 이름을 정확히 가리키지 않습니다.")
-
-
-def _command_tokens(value: object) -> tuple[str, ...]:
-    if isinstance(value, str):
-        tokens = value.strip().split()
-    elif isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value):
-        tokens = list(value)
-    else:
-        _fail("smoke_checks.command는 비어 있지 않은 글자 목록이어야 합니다.")
-    if not tokens:
-        _fail("smoke_checks.command가 비어 있습니다.")
-    first = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return (first, *tokens[1:])
-
-
-def _validate_smoke_checks(value: object, required: set[tuple[str, ...]], label: str) -> None:
-    if not isinstance(value, list) or not value:
-        _fail(f"{label}.smoke_checks는 비어 있지 않은 목록이어야 합니다.")
-    observed_commands = set()
-    for index, item in enumerate(value):
-        item = _exact_keys(item, _SMOKE_KEYS, f"{label}.smoke_checks[{index}]")
-        command = _command_tokens(item["command"])
-        if command in observed_commands:
-            _fail(f"{label}.smoke_checks에 같은 명령이 두 번 있습니다.")
-        observed_commands.add(command)
-        if type(item["exit_code"]) is not int or item["exit_code"] != 0:
-            _fail(f"{label}.smoke_checks의 모든 명령은 종료값 0이어야 합니다.")
-        _require_text(item, "observed", f"{label}.smoke_checks[{index}].observed")
-    if observed_commands != required:
-        _fail(f"{label}.smoke_checks의 필수 명령이 빠졌거나 바뀌었습니다.")
-
-
-def _gws_model(spec: dict[str, object]) -> BundledGwsSpec:
-    values = {key: _require_text(spec, key, f"gws.spec.{key}") for key in _GWS_SPEC_KEYS}
-    model = BundledGwsSpec(**values)
-    try:
-        _validate_archive_url(model)
-    except ManifestError as error:
-        _fail(str(error))
-    if model.platform != "windows" or model.architecture != "x86_64":
-        _fail("GWS는 Windows x64 자료여야 합니다.")
-    if not _SHA256.fullmatch(model.archive_sha256) or not _SHA256.fullmatch(model.executable_sha256):
-        _fail("GWS SHA-256 두 값은 소문자 64글자여야 합니다.")
-    if "0" * 64 in (model.archive_sha256, model.executable_sha256):
-        _fail("GWS에 0으로 채운 임시 SHA-256을 쓸 수 없습니다.")
-    if model.archive_sha256 != _GWS_ARCHIVE_SHA256 or model.executable_sha256 != _GWS_EXECUTABLE_SHA256:
-        _fail("GWS ZIP 또는 실행 파일 SHA-256이 공식 고정값과 다릅니다.")
-    if model.archive_filename != "google-workspace-cli-x86_64-pc-windows-msvc.zip":
-        _fail("GWS Windows x64 ZIP 파일 이름이 맞지 않습니다.")
-    if model.executable_relative_path != "gws.exe":
-        _fail("GWS 실행 파일 경로는 gws.exe여야 합니다.")
-    if model.license_id != "Apache-2.0" or model.license_file != "licenses/google-workspace-cli-Apache-2.0.txt":
-        _fail("GWS Apache-2.0 라이선스 파일 정보가 맞지 않습니다.")
-    return model
-
-
-def _node_model(spec: dict[str, object]) -> ManagedNodeSpec:
-    values = {key: _require_text(spec, key, f"node.spec.{key}") for key in _NODE_SPEC_KEYS}
-    model = ManagedNodeSpec(**values)
-    try:
-        _validate_node_spec(model)
-    except ManifestError as error:
-        _fail(str(error))
-    if model.version != "24.19.0":
-        _fail("현재 승인 계약의 Node 버전은 24.19.0이어야 합니다.")
-    if model.archive_sha256 == "0" * 64:
-        _fail("Node에 0으로 채운 임시 SHA-256을 쓸 수 없습니다.")
-    if model.archive_sha256 != _NODE_ARCHIVE_SHA256:
-        _fail("Node ZIP SHA-256이 공식 고정값과 다릅니다.")
-    return model
-
-
 def _webview2_model(spec: dict[str, object]) -> WebView2Spec:
     arguments = spec.get("install_arguments")
     if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
@@ -607,107 +453,6 @@ def _webview2_model(spec: dict[str, object]) -> WebView2Spec:
     if model.file_version != _WEBVIEW_BOOTSTRAPPER_FILE_VERSION:
         _fail("WebView2 Bootstrapper 파일 버전이 공식 고정값과 다릅니다.")
     return model
-
-
-def _validate_gws_evidence(
-    spec: BundledGwsSpec,
-    evidence: dict[str, object],
-    source: GwsSourceFiles,
-) -> None:
-    expected_release = f"https://github.com/googleworkspace/cli/releases/tag/v{spec.version}"
-    if _require_text(evidence, "release_page_url") != expected_release:
-        _fail("GWS 공식 Release 페이지 주소가 버전과 맞지 않습니다.")
-    if _require_text(evidence, "checksum_url") != spec.archive_url + ".sha256":
-        _fail("GWS 공식 checksum 주소가 ZIP 주소와 맞지 않습니다.")
-    if _require_sha(evidence, "checksum_file_sha256") != _GWS_CHECKSUM_FILE_SHA256:
-        _fail("GWS 공식 checksum 파일 SHA-256이 고정값과 다릅니다.")
-    _validate_sha_line(evidence["checksum_line"], spec.archive_sha256, spec.archive_filename, "GWS checksum_line")
-    archive_bytes = _require_file_sha(source.archive, _GWS_ARCHIVE_SHA256, "GWS ZIP")
-    checksum_bytes = _require_file_sha(source.checksum, _GWS_CHECKSUM_FILE_SHA256, "GWS checksum")
-    if evidence["checksum_line"].strip() not in _checksum_lines(checksum_bytes, "GWS checksum"):
-        _fail("GWS 승인 checksum_line이 실제 공식 checksum 파일에 없습니다.")
-    if _require_positive_int(evidence, "archive_bytes") != len(archive_bytes):
-        _fail("GWS ZIP 실제 바이트 수가 승인 JSON과 다릅니다.")
-    if _require_sha(evidence, "archive_local_sha256") != spec.archive_sha256:
-        _fail("GWS 로컬 ZIP SHA-256이 spec과 다릅니다.")
-    _require_true(evidence, "archive_hash_matches")
-    executable = _read_single_zip_member(source.archive, spec.executable_relative_path, "GWS")
-    if _sha256_bytes(executable) != _GWS_EXECUTABLE_SHA256:
-        _fail("GWS ZIP 안 gws.exe SHA-256이 공식 고정값과 다릅니다.")
-    if _require_positive_int(evidence, "executable_bytes") != len(executable):
-        _fail("GWS ZIP 안 gws.exe 실제 바이트 수가 승인 JSON과 다릅니다.")
-    expected_license_url = f"https://raw.githubusercontent.com/googleworkspace/cli/v{spec.version}/LICENSE"
-    if _require_text(evidence, "license_source_url") != expected_license_url:
-        _fail("GWS 공식 LICENSE 주소가 버전과 맞지 않습니다.")
-    source_sha = _require_sha(evidence, "license_source_sha256")
-    approved_license_sha = _GWS_LICENSE_SHA256_BY_VERSION.get(spec.version)
-    if approved_license_sha is None or source_sha != approved_license_sha:
-        _fail("이 GWS 버전의 공식 LICENSE SHA-256이 승인값과 다릅니다.")
-    if _require_sha(evidence, "license_file_sha256") != source_sha:
-        _fail("GWS 제품 LICENSE가 공식 원문과 바이트 단위로 같지 않습니다.")
-    official_license = _require_file_sha(source.official_license, approved_license_sha, "GWS 공식 LICENSE")
-    packaged_license = _require_file_sha(source.packaged_license, approved_license_sha, "GWS 제품 LICENSE")
-    if packaged_license != official_license:
-        _fail("GWS 제품 LICENSE가 공식 원문과 바이트 단위로 같지 않습니다.")
-    _require_true(evidence, "license_exact_byte_match")
-    required = {
-        ("gws.exe", "--version"),
-        *(("gws.exe", name, "--help") for name in ("auth", "calendar", "tasks", "drive", "sheets", "script")),
-    }
-    _validate_smoke_checks(evidence["smoke_checks"], required, "gws.evidence")
-
-
-def _validate_node_evidence(
-    spec: ManagedNodeSpec,
-    evidence: dict[str, object],
-    source: NodeSourceFiles,
-) -> None:
-    expected_shasums = f"https://nodejs.org/dist/v{spec.version}/SHASUMS256.txt"
-    if _require_text(evidence, "shasums_url") != expected_shasums:
-        _fail("Node SHASUMS256.txt 주소가 버전과 맞지 않습니다.")
-    if _require_sha(evidence, "shasums_file_sha256") != _NODE_SHASUMS_FILE_SHA256:
-        _fail("Node 공식 SHASUMS256.txt SHA-256이 고정값과 다릅니다.")
-    _validate_sha_line(evidence["checksum_line"], spec.archive_sha256, spec.archive_filename, "Node checksum_line")
-    archive_bytes = _require_file_sha(source.archive, _NODE_ARCHIVE_SHA256, "Node ZIP")
-    shasums_bytes = _require_file_sha(source.shasums, _NODE_SHASUMS_FILE_SHA256, "Node SHASUMS256.txt")
-    if evidence["checksum_line"].strip() not in _checksum_lines(shasums_bytes, "Node SHASUMS256.txt"):
-        _fail("Node 승인 checksum_line이 실제 공식 SHASUMS256.txt에 없습니다.")
-    if _require_positive_int(evidence, "archive_bytes") != len(archive_bytes):
-        _fail("Node ZIP 실제 바이트 수가 승인 JSON과 다릅니다.")
-    if _require_sha(evidence, "archive_local_sha256") != spec.archive_sha256:
-        _fail("Node 로컬 ZIP SHA-256이 spec과 다릅니다.")
-    _require_true(evidence, "archive_hash_matches")
-    expected_license_path = f"node-v{spec.version}-win-x64/LICENSE"
-    if _require_text(evidence, "license_source_path") != expected_license_path:
-        _fail("Node ZIP 안 전체 LICENSE 경로가 맞지 않습니다.")
-    if _require_sha(evidence, "license_source_sha256") != _NODE_LICENSE_SHA256:
-        _fail("Node ZIP 안 전체 LICENSE SHA-256이 승인값과 다릅니다.")
-    archive_license = _read_single_zip_member(source.archive, expected_license_path, "Node")
-    if _sha256_bytes(archive_license) != _NODE_LICENSE_SHA256:
-        _fail("Node ZIP 안 실제 전체 LICENSE SHA-256이 공식 고정값과 다릅니다.")
-    expected_tag_url = f"https://raw.githubusercontent.com/nodejs/node/v{spec.version}/LICENSE"
-    if _require_text(evidence, "tag_license_url") != expected_tag_url:
-        _fail("Node 공식 tag LICENSE 주소가 버전과 맞지 않습니다.")
-    if _require_sha(evidence, "tag_license_sha256") != _NODE_TAG_LICENSE_SHA256:
-        _fail("Node 공식 tag LICENSE SHA-256이 승인값과 다릅니다.")
-    tag_license = _require_file_sha(source.tag_license, _NODE_TAG_LICENSE_SHA256, "Node tag LICENSE")
-    if archive_license.replace(b"\r\n", b"\n") != tag_license.replace(b"\r\n", b"\n"):
-        _fail("Node ZIP LICENSE와 공식 tag LICENSE가 줄바꿈을 맞춘 뒤에도 다릅니다.")
-    _require_true(evidence, "license_normalized_match")
-    if _require_text(evidence, "license_copy_policy") != "archive-member-byte-for-byte":
-        _fail("Node LICENSE는 ZIP 안 원본을 바이트 그대로 복사해야 합니다.")
-    if _require_sha(evidence, "license_file_sha256") != _NODE_LICENSE_SHA256:
-        _fail("Node 제품 LICENSE가 ZIP 안 전체 LICENSE와 바이트 단위로 다릅니다.")
-    packaged_license = _require_file_sha(source.packaged_license, _NODE_LICENSE_SHA256, "Node 제품 LICENSE")
-    if packaged_license != archive_license:
-        _fail("Node 제품 LICENSE가 ZIP 안 실제 전체 LICENSE와 바이트 단위로 다릅니다.")
-    required = {
-        ("node.exe", "--version"),
-        ("npm.cmd", "--version"),
-        ("npx.cmd", "--version"),
-        ("npx.cmd", "--yes", "skills@1.5.21", "--help"),
-    }
-    _validate_smoke_checks(evidence["smoke_checks"], required, "node.evidence")
 
 
 def _validate_build_proof(
@@ -873,10 +618,6 @@ def _validate_webview2_evidence(
 
 
 def _spec_model(tool: str, spec: dict[str, object]):
-    if tool == "gws":
-        return _gws_model(spec)
-    if tool == "node":
-        return _node_model(spec)
     return _webview2_model(spec)
 
 
@@ -884,7 +625,7 @@ def _load_tool_source_approval_with_bytes(
     path: Path,
     *,
     expected_tool: str,
-    source_files: GwsSourceFiles | NodeSourceFiles | WebView2SourceFiles | None = None,
+    source_files: WebView2SourceFiles | None = None,
     authenticode_verifier: Callable[[Path], AuthenticodeEvidence] = _verify_windows_authenticode,
     package_version_reader: Callable[[str], str] | None = None,
     file_version_reader: Callable[[Path], str] | None = None,
@@ -904,38 +645,25 @@ def _load_tool_source_approval_with_bytes(
     field = _exact_keys(raw["field_verification"], _FIELD_KEYS, "field_verification")
     if field != {"status": "not-run", "items": []}:
         _fail("source 승인 단계의 field_verification은 not-run과 빈 items여야 합니다.")
-    spec_keys = {"gws": _GWS_SPEC_KEYS, "node": _NODE_SPEC_KEYS, "webview2": _WEBVIEW2_SPEC_KEYS}[expected_tool]
-    evidence_keys = {
-        "gws": _GWS_EVIDENCE_KEYS,
-        "node": _NODE_EVIDENCE_KEYS,
-        "webview2": _WEBVIEW2_EVIDENCE_KEYS,
-    }[expected_tool]
+    spec_keys = _WEBVIEW2_SPEC_KEYS
+    evidence_keys = _WEBVIEW2_EVIDENCE_KEYS
     spec = _exact_keys(raw["spec"], spec_keys, f"{expected_tool}.spec")
     evidence = _exact_keys(raw["evidence"], evidence_keys, f"{expected_tool}.evidence")
     _reject_empty_null_placeholder(spec, f"{expected_tool}.spec")
     _reject_empty_null_placeholder(evidence, f"{expected_tool}.evidence")
     model = _spec_model(expected_tool, spec)
-    if expected_tool == "gws":
-        if not isinstance(source_files, GwsSourceFiles):
-            _fail("GWS 실제 입력 파일 경로를 명시해야 합니다.")
-        _validate_gws_evidence(model, evidence, source_files)
-    elif expected_tool == "node":
-        if not isinstance(source_files, NodeSourceFiles):
-            _fail("Node 실제 입력 파일 경로를 명시해야 합니다.")
-        _validate_node_evidence(model, evidence, source_files)
-    else:
-        if not isinstance(source_files, WebView2SourceFiles):
-            _fail("WebView2 실제 입력 파일 경로를 명시해야 합니다.")
-        _validate_webview2_evidence(
-            Path(path),
-            model,
-            evidence,
-            source_files,
-            authenticode_verifier=authenticode_verifier,
-            package_version_reader=package_version_reader,
-            file_version_reader=file_version_reader,
-            bootstrapper_file_version_reader=bootstrapper_file_version_reader,
-        )
+    if not isinstance(source_files, WebView2SourceFiles):
+        _fail("WebView2 실제 입력 파일 경로를 명시해야 합니다.")
+    _validate_webview2_evidence(
+        Path(path),
+        model,
+        evidence,
+        source_files,
+        authenticode_verifier=authenticode_verifier,
+        package_version_reader=package_version_reader,
+        file_version_reader=file_version_reader,
+        bootstrapper_file_version_reader=bootstrapper_file_version_reader,
+    )
     approval = ToolSourceApproval(
         approval_schema_version=1,
         tool=expected_tool,
@@ -952,7 +680,7 @@ def load_tool_source_approval(
     path: Path,
     *,
     expected_tool: str,
-    source_files: GwsSourceFiles | NodeSourceFiles | WebView2SourceFiles | None = None,
+    source_files: WebView2SourceFiles | None = None,
     authenticode_verifier: Callable[[Path], AuthenticodeEvidence] = _verify_windows_authenticode,
     package_version_reader: Callable[[str], str] | None = None,
     file_version_reader: Callable[[Path], str] | None = None,
@@ -981,7 +709,7 @@ def _load_approval_set(
     bootstrapper_file_version_reader: Callable[[Path], str] | None,
 ):
     if not isinstance(source_files, ToolSourceFiles):
-        _fail("세 도구의 실제 입력 파일 경로를 명시해야 합니다.")
+        _fail("동봉 도구의 실제 입력 파일 경로를 명시해야 합니다.")
     approvals_dir = Path(approvals_dir)
     approvals = {}
     hashes = {}
@@ -1016,35 +744,18 @@ def _table(rows) -> str:
 
 
 def _status_section(tool: str, approval: ToolSourceApproval) -> str:
-    title = {"gws": "GWS", "node": "Node", "webview2": "WebView2"}[tool]
+    title = {"webview2": "WebView2"}[tool]
     evidence = approval.evidence
-    smoke_checks = evidence.get("smoke_checks", [])
-    if smoke_checks:
-        automatic_rows = [
-            (_display_value(check["command"]), f"종료값 {check['exit_code']} / {check['observed']}")
-            for check in smoke_checks
-        ]
-    else:
-        automatic_rows = [
-            ("Authenticode", evidence["authenticode_status"]),
-            ("build proof", f"{evidence['build_proof_path']} / {evidence['build_proof_sha256']}"),
-            ("설치 명령", "실행하지 않음" if evidence["install_command_not_run"] else "실행함"),
-        ]
-    if tool == "gws":
-        license_keys = (
-            "license_source_url", "license_source_sha256", "license_file_sha256", "license_exact_byte_match",
-        )
-    elif tool == "node":
-        license_keys = (
-            "license_source_path", "license_source_sha256", "tag_license_url", "tag_license_sha256",
-            "license_copy_policy", "license_file_sha256",
-        )
-    else:
-        license_keys = (
-            "terms_source_url", "terms_locale", "terms_json_field", "terms_source_sha256",
-            "license_file_sha256", "end_user_terms_acceptance", "smartscreen_notice_location",
-            "windows_7_8_1_notice_policy",
-        )
+    automatic_rows = [
+        ("Authenticode", evidence["authenticode_status"]),
+        ("build proof", f"{evidence['build_proof_path']} / {evidence['build_proof_sha256']}"),
+        ("설치 명령", "실행하지 않음" if evidence["install_command_not_run"] else "실행함"),
+    ]
+    license_keys = (
+        "terms_source_url", "terms_locale", "terms_json_field", "terms_source_sha256",
+        "license_file_sha256", "end_user_terms_acceptance", "smartscreen_notice_location",
+        "windows_7_8_1_notice_policy",
+    )
     license_rows = [
         ("license_id", approval.spec["license_id"]),
         ("license_file", approval.spec["license_file"]),
@@ -1066,10 +777,10 @@ def render_tool_input_status(
     *,
     generated_at_utc: str,
 ) -> str:
-    """검증된 세 승인 JSON 값만 사용해 공개 상태 문서를 만든다."""
+    """검증된 승인 JSON 값만 사용해 공개 상태 문서를 만든다."""
     generated_at = _validate_utc(generated_at_utc, "generated_at_utc")
     if set(approvals) != set(_TOOLS) or set(approval_hashes) != set(_TOOLS):
-        _fail("상태 문서에는 GWS, Node, WebView2 승인 세 개가 모두 필요합니다.")
+        _fail("상태 문서에는 WebView2 승인이 필요합니다.")
     for tool in _TOOLS:
         digest = approval_hashes[tool]
         if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
@@ -1107,7 +818,7 @@ def write_tool_input_status(
     file_version_reader: Callable[[Path], str] | None = None,
     bootstrapper_file_version_reader: Callable[[Path], str] | None = None,
 ) -> Path:
-    """세 승인 파일이 모두 유효할 때만 상태 문서를 원자 교체한다."""
+    """승인 파일이 모두 유효할 때만 상태 문서를 원자 교체한다."""
     approvals, hashes = _load_approval_set(
         approvals_dir,
         source_files,
@@ -1126,14 +837,10 @@ def write_tool_input_status(
 
 
 def _manifest_bytes(
-    gws: BundledGwsSpec,
-    node: ManagedNodeSpec,
     webview2: WebView2Spec,
 ) -> bytes:
     data = {
         "schema_version": 1,
-        "gws": asdict(gws),
-        "node": asdict(node),
         "webview2": asdict(webview2),
     }
     data["webview2"]["install_arguments"] = list(webview2.install_arguments)
@@ -1263,10 +970,8 @@ def assemble_tool_approvals(
         hashes,
         generated_at_utc=generated_at_utc or _now_utc(),
     )
-    gws = _gws_model(approvals["gws"].spec)
-    node = _node_model(approvals["node"].spec)
     webview2 = _webview2_model(approvals["webview2"].spec)
-    manifest_value = _manifest_bytes(gws, node, webview2)
+    manifest_value = _manifest_bytes(webview2)
     status_value = status_text.encode("utf-8")
     manifest_candidate = None
     status_candidate = None

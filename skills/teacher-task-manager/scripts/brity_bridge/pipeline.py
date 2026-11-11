@@ -9,24 +9,16 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from attendance_install_record import (
-    attendance_script_is_attested,
-    load_attendance_install_record,
-)
-from attendance_script_update import (
-    inspect_attendance_script_update,
-    target_bundle_sha256,
-)
-from brity_bridge import atomic_io, account_sessions, bundle_paths, capture_store, message_archive, paths, screen_read, status_log
+from brity_bridge import atomic_io, account_sessions, capture_store, message_archive, paths, screen_read, status_log
 from brity_bridge.gemini_analyze import (
     AnalysisError,
     run_gemini_analysis_with_recovery,
 )
 from brity_bridge.rules_loader import load_analysis_rules
-from brity_bridge.gws_exec import (
+from brity_bridge.outbox import (
     RESULT_RECORD_FAILURE_DETAIL,
     ExecutionReport,
-    execute_actions,
+    execute as execute_outbox,
 )
 from brity_bridge.history import HistoryStore, HistoryUnavailableError
 from brity_bridge.local_attachment_links import (
@@ -515,7 +507,9 @@ def _account_work(method):
         config_dir = bound.arguments["config_dir"]
         expected = account_sessions.token(config_dir)
         try:
-            with account_sessions.work(config_dir, expected_token=expected) as state:
+            with account_sessions.work(config_dir, expected_token=expected, require_active=False) as state:
+                if state.get("managed") and state.get("phase") not in {"active", "signed_out"}:
+                    raise account_sessions.AccountSessionError()
                 bound.arguments["config_dir"] = account_sessions.active_config_dir(config_dir, state)
                 return method(*bound.args, **bound.kwargs)
         except account_sessions.AccountSessionError as error:
@@ -530,9 +524,6 @@ def retry_saved_capture(
     source_hash: str,
     *,
     capture_when: str = "",
-    gws_runner=None,
-    gws_executable: str | None = None,
-    attendance_script_inspector=None,
     _operation_locked: bool = False,
 ) -> FlowResult:
     """Retry only unfinished actions from a saved message run."""
@@ -548,9 +539,6 @@ def retry_saved_capture(
                     config_dir,
                     source_hash,
                     capture_when=capture_when,
-                    gws_runner=gws_runner,
-                    gws_executable=gws_executable,
-                    attendance_script_inspector=attendance_script_inspector,
                     _operation_locked=True,
                 )
         except MessageOperationBusy:
@@ -601,26 +589,12 @@ def retry_saved_capture(
     if not pending:
         return FlowResult(True, "duplicate", "이미 모든 항목이 처리되어 새로 만들지 않았어요.")
 
-    report = execute_actions(
+    report = execute_outbox(
+        config_dir,
         pending,
         history,
-        runner=gws_runner,
-        source_hash=source_hash,
-        gws_executable=gws_executable,
-        notice_unavailable_message=notice_unavailable_message,
-        expected_account=_load_attendance_owner(config_dir),
-        notice_preflight=(
-            (
-                lambda runner, executable: _remote_notice_script_preflight(
-                    config_dir,
-                    runner,
-                    executable,
-                    attendance_script_inspector,
-                )
-            )
-            if notice_sheet_id
-            else None
-        ),
+        source_hash,
+        datetime.strptime(message.get("first_seen", "2000-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=KOREA_TIME),
     )
     summary = _summarize_report(report)
     items = capture_store.merge_retry_items(capture.get("items"), _items_from_report(report, profile))
@@ -865,98 +839,9 @@ def record_unexpected_failure(config_dir: Path, capture) -> FlowResult:
     )
 
 
-NOTICE_SETUP_REQUIRED_DETAIL = "학생 안내표가 준비되지 않았어요 · 처음 설정 필요"
-NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL = (
-    "학생 안내표의 출결 기능 확인 또는 업데이트가 먼저 필요해요 · 출결 탭에서 최신 상태를 확인해 주세요"
-)
-
-
 def _load_notice_sheet(config_dir: Path) -> tuple[str, str]:
-    """학생 안내 Sheet ID와 쓸 수 없을 때 보여 줄 이유를 함께 읽는다."""
-    try:
-        raw = load_attendance_install_record(
-            paths.attendance_install_record_path(config_dir)
-        )
-        current_sha256 = target_bundle_sha256(
-            bundle_paths.bundle_root() / "assets"
-        )
-    except (OSError, ValueError):
-        return "", NOTICE_SETUP_REQUIRED_DETAIL
-    if (
-        raw.get("script_update_required") is True
-        or not attendance_script_is_attested(raw, current_sha256)
-    ):
-        return "", NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL
-    sheet_id = str(raw.get("spreadsheet_id") or "")
-    return sheet_id, "" if sheet_id else NOTICE_SETUP_REQUIRED_DETAIL
-
-
-def _remote_notice_script_preflight(
-    config_dir: Path,
-    runner,
-    gws_executable: str,
-    inspector=None,
-) -> tuple[bool, str]:
-    """학생 안내 줄을 쓰기 직전에 원격 원본과 실제 사용판을 다시 읽는다."""
-
-    try:
-        record = load_attendance_install_record(
-            paths.attendance_install_record_path(config_dir)
-        )
-        expected_sha256 = target_bundle_sha256(
-            bundle_paths.bundle_root() / "assets"
-        )
-        inspect = inspector or inspect_attendance_script_update
-
-        def cwd_runner(args, _cwd):
-            return runner(list(args))
-
-        result = inspect(
-            record.get("spreadsheet_id"),
-            record.get("script_id"),
-            record.get("deployment_id"),
-            assets_dir=bundle_paths.bundle_root() / "assets",
-            runner=cwd_runner,
-            gws_executable=gws_executable,
-        )
-        value = (
-            (lambda key: result.get(key))
-            if isinstance(result, dict)
-            else (lambda key: getattr(result, key, None))
-        )
-        exact_ids = all(
-            value(key) == record.get(key)
-            for key in ("spreadsheet_id", "script_id", "deployment_id")
-        )
-        exact_hashes = (
-            value("current_bundle_sha256") == expected_sha256
-            and value("target_bundle_sha256") == expected_sha256
-        )
-        if (
-            value("state") == "current"
-            and value("verified") is True
-            and exact_ids
-            and exact_hashes
-        ):
-            return True, ""
-    except Exception:  # noqa: BLE001 - 원격 결과가 모호하면 쓰지 않고 쉬운 안내만 보인다
-        pass
-    return False, NOTICE_SCRIPT_UPDATE_REQUIRED_DETAIL
-
-
-def _load_attendance_owner(config_dir: Path) -> str:
-    """이 설정 폴더에서 처음 출결을 준비한 Google 계정. 옛 기록은 빈 값이다."""
-
-    session = account_sessions.read_state(config_dir)
-    if session.get("managed"):
-        return str(session.get("account") or "")
-    try:
-        raw = json.loads(
-            paths.attendance_setup_status_path(config_dir).read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return ""
-    return str(raw.get("account", "") or "").strip() if isinstance(raw, dict) else ""
+    """Checked notices are queued on the server, never written to a sheet (P6)."""
+    return "server-attendance", ""
 
 
 def _summarize_report(report: ExecutionReport) -> str:
@@ -1057,13 +942,10 @@ def run_capture_flow(
     config_dir: Path,
     bridge_settings,
     gemini_transport=None,
-    gws_runner=None,
     now: datetime | None = None,
     record=None,
     progress=None,
     *,
-    gws_executable: str | None = None,
-    attendance_script_inspector=None,
     attachment_link_ready: bool = True,
     attachment_link_failure: str = "",
     _operation_locked: bool = False,
@@ -1097,12 +979,9 @@ def run_capture_flow(
                     config_dir,
                     bridge_settings,
                     gemini_transport=gemini_transport,
-                    gws_runner=gws_runner,
                     now=now,
                     record=record,
                     progress=progress,
-                    gws_executable=gws_executable,
-                    attendance_script_inspector=attendance_script_inspector,
                     attachment_link_ready=attachment_link_ready,
                     attachment_link_failure=attachment_link_failure,
                     _operation_locked=True,
@@ -1452,27 +1331,7 @@ def run_capture_flow(
             run=run,
         )
 
-    report = execute_actions(
-        actions,
-        history,
-        runner=gws_runner,
-        source_hash=record.source_hash,
-        gws_executable=gws_executable,
-        notice_unavailable_message=notice_unavailable_message,
-        expected_account=_load_attendance_owner(config_dir),
-        notice_preflight=(
-            (
-                lambda runner, executable: _remote_notice_script_preflight(
-                    config_dir,
-                    runner,
-                    executable,
-                    attendance_script_inspector,
-                )
-            )
-            if notice_sheet_id
-            else None
-        ),
-    )
+    report = execute_outbox(config_dir, actions, history, record.source_hash, now)
     summary = _summarize_report(report)
     items = _items_from_report(report, profile)
     run["created"] = _created_rows(report)

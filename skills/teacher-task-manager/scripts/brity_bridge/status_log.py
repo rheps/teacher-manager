@@ -106,7 +106,7 @@ def read_last_status(state_dir: Path) -> dict | None:
 
 # 도우미(TeacherManagerHelper.exe)가 켜지고 끝난 까닭 (PEND-43, R7-3).
 # 끝난 까닭 줄이 없이 시작 줄만 남으면 밖에서 강제로 끝났거나 프로그램 자체가 멈춘 것이다.
-HELPER_EVENTS = ("start", "already-running", "stop-requested", "session-end", "exception", "exit")
+HELPER_EVENTS = ("start", "already-running", "stop-requested", "session-end", "exception", "exit", "student-report-wait")
 
 
 def helper_log_path(logs_dir: Path, now: datetime | None = None) -> Path:

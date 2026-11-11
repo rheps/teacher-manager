@@ -1,3 +1,4 @@
 .gitattributes text eol=lf
 licenses/google-workspace-cli-Apache-2.0.txt text eol=lf
 tools-manifest.json text eol=lf
+scripts/dashboard/web/vendor/** text eol=lf

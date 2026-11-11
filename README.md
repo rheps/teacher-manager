@@ -13,8 +13,9 @@
 
 ## 설치 전에 준비할 것
 
-Teacher Manager는 현재 **경기도교육청 소속 교사 전용**이며, Google 로그인은
-정확히 `@goedu.kr`로 끝나는 계정만 받을 수 있습니다. 개인 Gmail 계정으로는 진행할 수 없습니다.
+Teacher Manager는 **경기도교육청 소속 교사**를 위해 만들었으며, Google 로그인에는 학교 `@goedu.kr`
+계정을 권장합니다. `@gmail.com` 같은 다른 Google 계정으로도 로그인할 수 있지만, 학교 계정이 아닌
+Google 계정으로 모든 기능을 사용하는 과정은 아직 충분히 확인하지 못했습니다.
 
 선생님은 설치 전에 다음 순서로 가입과 신청을 마쳐 주세요.
 
@@ -24,7 +25,7 @@ Teacher Manager는 현재 **경기도교육청 소속 교사 전용**이며, Goo
 
 Google Chat으로 학생 개인톡이나 학급 단체톡을 보낼 때는 아래 준비도 필요합니다.
 
-학생 수신 계정은 학교 계정(`@goedu.kr`)을 권장하며 일반 Gmail(`@gmail.com`)도 사용할 수 있습니다. 선생님 로그인과 발신은 `@goedu.kr`만 지원합니다.
+학생 수신 계정은 학교 계정(`@goedu.kr`)을 권장하며 일반 Gmail(`@gmail.com`) 등 다른 Google 계정도 사용할 수 있습니다. 선생님 로그인과 발신도 학교 계정을 권장하며, 다른 Google 계정으로도 할 수 있습니다.
 
 1. 학교 계정을 준비할 학생은 **교육디지털원패스 가입 → 교육용 클라우드 추가 가입 → 클라우드 안에서 Google Workspace 별도 가입**을 모두 마칩니다. 원패스의 **회원 정보 → 학생 회원 가입 → 학생 회원 가입 현황**에서 확인하는 것은 원패스 ID입니다. 원패스 ID로 클라우드에 가입하고 Google Workspace 신청까지 마쳐야 학교 Google 계정이 생기며, 학교 이메일은 보통 `원패스 ID@goedu.kr`입니다. [학생 클라우드 서비스 가입 안내](https://www.goedu.kr/bbs/2/view/55)도 참고해 주세요.
 2. 선생님이 [Google Chat](https://chat.google.com/)의 **새 채팅 → 한 명 이상을 추가하세요** 칸에 학생 이메일을 붙여 넣어 직접 초대합니다. 이메일은 한 줄에 하나씩 또는 쉼표와 띄어쓰기로 구분합니다. 띄어쓰기만으로 구분하면 인식되지 않습니다.
@@ -50,7 +51,7 @@ Release 페이지에서 `TeacherManager-Setup-3.0.exe`를 받습니다.
 2. 파란 **Windows의 PC 보호** 창이 뜨면 **추가 정보 → 실행** 순서로 누릅니다.
 3. 한국어 설치 화면에서 안내를 읽고 **다음**을 눌러 설치합니다.
 4. 설치가 끝나면 Teacher Manager를 실행합니다.
-5. 왼쪽에 보이는 9단계 순서를 따라 `@goedu.kr` 계정으로 Google 로그인과 설정을 마칩니다.
+5. 왼쪽에 보이는 9단계 순서를 따라 Google 계정(학교 `@goedu.kr` 계정 권장)으로 Google 로그인과 설정을 마칩니다.
 
 처음 설정의 왼쪽에는 아래 순서가 계속 보여서 지금 어디까지 했는지 확인할 수 있습니다.
 
@@ -99,7 +100,7 @@ Calendar·Tasks·메신저·출결 연결 설정을 보존하도록 되어 있�
 
 - 64비트 Windows 10 또는 Windows 11
 - 인터넷 연결
-- 선생님의 `@goedu.kr` Google Workspace 계정
+- 선생님의 Google 계정(학교 `@goedu.kr` Google Workspace 계정 권장)
 
 컴퓨터에 Python, Node.js, npm, Google Workspace CLI를 따로 설치할 필요는 없습니다.
 필요한 Google Workspace CLI는 Setup 안에 함께 들어 있습니다.

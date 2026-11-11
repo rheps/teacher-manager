@@ -239,13 +239,32 @@ def _marker_owner(folder):
     return _email(_json(path).get('account')) if path.exists() else ''
 
 
-def _write_owner_marker(folder, account):
+def _marker_subject_key(folder, account):
+    try:
+        path = component_lock.prepare_direct_file_path(folder / OWNER_MARKER)
+        saved = _json(path) if path.exists() else {}
+        return str(saved.get('subjectKey') or '') if saved and _email(saved.get('account')) == account else ''
+    except (OSError, ValueError, TypeError, AccountSessionError):
+        return ''
+
+
+def _write_owner_marker(folder, account, subject_key=''):
     # Advisory evidence for a later return (ACCT-01): a failed write must not
     # block sign-in; lookups then fall back to the attendance/setup owner fields.
     try:
-        _write_json(folder / OWNER_MARKER, {'account': account})
+        value = {'account': account}
+        kept = subject_key or _marker_subject_key(folder, account)
+        if kept:
+            value['subjectKey'] = kept
+        _write_json(folder / OWNER_MARKER, value)
     except (OSError, ValueError, TypeError):
         pass
+
+
+def record_subject_key(config_dir, email, subject_key):
+    """The server-verified subject joins the owner record (SIGN-IN ACCT-01 step 4)."""
+    root = root_config_dir(config_dir)
+    _write_owner_marker(active_config_dir(root), _email(email), str(subject_key or ''))
 
 
 def _finished_own_folder(folder, account):

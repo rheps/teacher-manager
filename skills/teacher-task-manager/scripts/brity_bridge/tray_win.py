@@ -20,6 +20,7 @@ from brity_bridge import (
     hotkey,
     hotkey_win,
     local_attachment_server,
+    outbox,
     paths,
     pipeline,
     screen_read,
@@ -280,6 +281,7 @@ class TrayApp:
             attachment_server_factory or local_attachment_server.LocalAttachmentServer
         )
         self._attachment_server = None
+        self._outbox_stop = threading.Event()
         self._attachment_link_ready = False
         self._attachment_link_failure = ""
         self.on_ready = None  # 트레이 아이콘 등록 직후 한 번 부른다 (부팅 시 대시보드 동반 실행)
@@ -416,7 +418,7 @@ class TrayApp:
     def on_hotkey(self) -> None:
         try:
             session = account_sessions.peek_state(self.config_dir)
-            if session.get("managed") and session.get("phase") != "active":
+            if session.get("managed") and (session.get("phase") not in {"active", "signed_out"} or not session.get("account")):
                 raise account_sessions.AccountSessionError("설정에서 Google 로그인을 마친 뒤 쪽지를 등록해 주세요.")
             session_token = (session["account"], session["generation"])
         except account_sessions.AccountSessionError as error:
@@ -599,7 +601,7 @@ class TrayApp:
             try:
                 if queued.session_token is None and account_sessions.read_state(self._account_root).get("managed"):
                     raise account_sessions.AccountSessionError("이 쪽지를 읽은 계정을 확인하지 못해 보내지 않았어요.")
-                with account_sessions.work(self._account_root, expected_token=queued.session_token):
+                with account_sessions.work(self._account_root, expected_token=queued.session_token, require_active=False):
                     self.settings = settings_module.load_settings(paths.settings_path(self.config_dir))
                     writer = capture_store.ProgressWriter(paths.bridge_state_dir(self.config_dir))
                     writer.emit("capture")
@@ -961,6 +963,9 @@ class TrayApp:
         user32 = ctypes.windll.user32
         self._setup_window_and_icon()
         self._start_attachment_server()
+        threading.Thread(target=self._drain_outbox_loop, daemon=True).start()
+        threading.Thread(target=self._intake_loop, daemon=True).start()
+        threading.Thread(target=self._student_report_loop, daemon=True).start()
 
         # 도우미 창이 이미 있으므로, 여기서 뜨는 대시보드가 도우미를 또 띄우지 않는다.
         if self.on_ready is not None:
@@ -1001,6 +1006,60 @@ class TrayApp:
                 break
             user32.TranslateMessage(ctypes.byref(message))
             user32.DispatchMessageW(ctypes.byref(message))
+
+    def _drain_outbox_loop(self):
+        while not self._outbox_stop.is_set():
+            if self.busy.acquire(blocking=False):
+                try:
+                    outbox.drain_active(self._account_root)
+                except Exception:
+                    # Entries are durable. Do not log bodies, account identifiers or credentials.
+                    status_log.append_helper_event(paths.logs_dir(self._account_root), "outbox-wait")
+                finally:
+                    self.busy.release()
+            self._outbox_stop.wait(60)
+
+    def _intake_loop(self):
+        """Student DM intake (MAIN §7.13): a round at helper start, then every 10 minutes."""
+        reason = "start"
+        while not self._outbox_stop.wait(20 if reason == "start" else 600):
+            try:
+                from brity_bridge import account_sessions
+                from brity_bridge.settings import load_settings
+                from dashboard.intake_runner import run_intake_round
+                folder = account_sessions.active_config_dir(self._account_root)
+                client = outbox.helper_for_folder(folder)
+                if client is not None:
+                    run_intake_round(lambda route, body: client.data_call(route, body).reply(),
+                                     lambda: load_settings(paths.settings_path(folder)).gemini_api_key, reason)
+                    reason = "timer"
+            except Exception:
+                # No message text, names or identifiers in the log (R17).
+                status_log.append_helper_event(paths.logs_dir(self._account_root), "intake-wait")
+
+    def _student_report_loop(self):
+        """A notification per new student absence submission (2026-11-11 link design, Q-L11): a look
+        30 seconds after helper start, then every 5 minutes. The server is read only when it changed."""
+        first = True
+        while not self._outbox_stop.wait(30 if first else 300):
+            first = False
+            try:
+                from brity_bridge import account_sessions
+                from dashboard.student_report_notice import new_submissions
+                folder = account_sessions.active_config_dir(self._account_root)
+                client = outbox.helper_for_folder(folder)
+                if client is None:
+                    continue
+                texts = new_submissions(lambda route, body: client.data_call(route, body).reply(), folder)
+                for index, text in enumerate(texts[:5]):
+                    if index and self._outbox_stop.wait(5):
+                        return
+                    self.notify("Teacher Manager", text)
+                if len(texts) > 5 and not self._outbox_stop.wait(5):
+                    self.notify("Teacher Manager", f"학생 결석 신고가 {len(texts) - 5}건 더 왔어요.")
+            except Exception:
+                # No names, notes, tokens or links in the log (R17, LINK-02).
+                status_log.append_helper_event(paths.logs_dir(self._account_root), "student-report-wait")
 
     def _window_proc(self, hwnd, message_id, wparam, lparam):
         user32 = ctypes.windll.user32
@@ -1044,6 +1103,7 @@ class TrayApp:
                 ).start()
             return 0
         if message_id == WM_DESTROY:
+            self._outbox_stop.set()
             self._stop_attachment_server()
             with self._icon_lock:
                 ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._icon_data))

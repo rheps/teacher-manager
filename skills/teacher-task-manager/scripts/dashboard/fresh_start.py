@@ -16,7 +16,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from brity_bridge import paths, process_win, tool_runtime
+from brity_bridge import paths
 
 _KEEP_NAMES = {"dev-fresh-start.flag", "last-run-version.txt"}
 _PROFILE_NAME = "profile.generated.json"
@@ -31,19 +31,8 @@ def _record_version(config_dir: Path, app_version: str) -> None:
     paths.last_run_version_path(config_dir).write_text(app_version + "\n", encoding="utf-8")
 
 
-def _default_logout(
-    run=process_win.run_captured,
-    *,
-    gws_executable: str | None = None,
-) -> None:
-    """구글 로그인은 설정 폴더가 아니라 gws에 있다 — 진짜 처음 흐름을 보려면 함께 지운다.
-
-    PATH에 설치된 다른 GWS는 보지 않고 제품이 검증한 실행 파일만 쓴다.
-    """
-    executable = str(gws_executable or tool_runtime.resolve_gws_executable())
-    if not Path(executable).is_absolute():
-        raise ValueError("Google Workspace CLI 실행 파일은 전체 경로여야 합니다.")
-    run([executable, "auth", "logout"], timeout=30)
+def _default_logout() -> None:
+    """Sign-in lives on the server (P6): there is no local Google tool to log out of."""
 
 
 def _default_stop_helper() -> None:
@@ -259,7 +248,7 @@ def prepare_for_start(config_dir: Path, app_version: str, *, installed: bool) ->
 def maybe_fresh_start(config_dir: Path, app_version: str, now: datetime | None = None,
                       logout=None, stop_helper=None) -> Path | None:
     # 기본 동작은 부를 때 찾는다. 정의 때 묶어 두면 시험이 가짜로 바꿔 끼울 수 없어
-    # 실제 `gws auth logout`과 실제 도우미 정지가 개발 컴퓨터에서 그대로 돌아 버린다.
+    # 실제 도우미 정지가 개발 컴퓨터에서 그대로 돌아 버린다.
     logout = logout or _default_logout
     stop_helper = stop_helper or _default_stop_helper
     config_dir = Path(config_dir)

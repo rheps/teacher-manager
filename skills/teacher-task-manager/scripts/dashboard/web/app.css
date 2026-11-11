@@ -183,6 +183,11 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .row .st.ok { color:var(--tm-green); font-weight:600; }
 /* 설정 점검 행: 사용자가 버튼을 눌러야 끝나는 항목은 주황(PEND-48). 다른 .st.warn 행의 회색은 그대로 둔다. */
 .row[data-settings-check] .st.warn { color:var(--tm-amber); font-weight:600; }
+/* 선생님이 눌러야 끝나는 로그인·권한 줄 */
+.row .st.act { color:var(--tm-amber); font-weight:600; }
+.login-code { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; }
+.login-code input { flex:1 1 240px; min-width:0; padding:8px 12px; border:1px solid var(--tm-line); border-radius:10px; font:inherit; }
+.login-code .field-error { flex-basis:100%; }
 .row .st.new { color:var(--tm-blue); font-weight:700; }
 .row .ver { color:var(--tm-faint); font-size:13px; font-weight:500; }
 .action-line { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:14px; }
@@ -222,6 +227,9 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .foot .btn, .foot .btn-quiet { margin-left:auto; }
 /* 8단계: 건너뛰기(조용한 버튼)도 본문 두 버튼과 같은 크기로 */
 .foot .btn-quiet { padding:0 24px; }
+/* Why a locked 다음 stays locked, beside it. Grey while reading, amber when the teacher has something to do. */
+.foot-why { flex:1; min-width:0; padding:0 16px; text-align:right; font-size:13px; line-height:1.45; color:var(--tm-sub); overflow-wrap:anywhere; }
+.foot-why.warn { color:var(--tm-amber); font-weight:600; }
 
 /* 입력 */
 .field { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
@@ -281,6 +289,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .attendance-account-consent > span { flex:1 1 260px; }
 .attendance-account-consent > button { margin-left:auto; flex:0 0 auto; }
 .banner.warn { background:var(--tm-amber-soft); color:#8a5a10; }
+.banner.muted { background:var(--tm-fill); color:var(--tm-sub); }
 .attendance-script-permission { align-items:center; flex-wrap:wrap; }
 .attendance-script-permission > span { flex:1 1 240px; }
 .attendance-script-permission > button { margin-left:auto; }
@@ -316,6 +325,7 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .tiles { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:13px; }
 .tile { border:1px solid var(--tm-line); border-radius:18px; padding:16px 18px; background:#fff; box-shadow:0 2px 8px rgba(25,31,40,.05); display:flex; gap:13px; align-items:flex-start; text-align:left; font-family:inherit; cursor:pointer; }
 .tile:hover { border-color:var(--tm-frame); }
+.tile-wide { grid-column:1 / -1; }
 .tile.warn { border:1.5px solid var(--tm-amber-line); background:#FFFDF7; }
 .tile .tx { flex:1; min-width:0; }
 .tile .tt { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:15.5px; font-weight:700; margin:1px 0 4px; }
@@ -634,12 +644,6 @@ h1, .sub { word-break:keep-all; overflow-wrap:anywhere; }
 .model-help-notes { margin:10px 0 0; padding-left:18px; color:var(--tm-sub); font-size:12.5px; line-height:1.6; word-break:keep-all; }
 
 /* AI 비서 탭 */
-.ai-rows { margin-top:4px; }
-.ai-row { display:flex; align-items:center; gap:12px; border:1px solid var(--tm-line); border-radius:13px; padding:12px 15px; margin-bottom:8px; font-size:14px; cursor:pointer; background:#fff; }
-.ai-row input { width:17px; height:17px; accent-color:var(--tm-blue); flex:none; }
-.ai-row.off { opacity:.55; cursor:default; }
-.ai-row .st { margin-left:auto; font-size:12.5px; font-weight:700; color:var(--tm-faint); }
-.ai-row .st.ok { color:var(--tm-green); }
 .tab-optional { font-size:12px; color:var(--tm-faint); font-weight:600; }
 .ai-cmd { display:flex; align-items:center; gap:10px; margin-top:10px; padding:11px 14px; border:1px solid var(--tm-line); border-radius:11px; background:var(--tm-surface); }
 .ai-cmd code { font-size:12px; color:var(--tm-ink); overflow-x:auto; white-space:nowrap; flex:1; }
@@ -739,3 +743,10 @@ body.win-open { overflow:hidden; }
 .roster-actions { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:8px; margin:16px 0; }
 .timetable-tabs .connect-tab:disabled { opacity:.45; cursor:default; }
 .step:disabled { opacity:.45; cursor:default; }
+/* 학생 Google Chat 연결 (2026-11-02, CLASS-GROUP-01) */
+.student-chat-row .chat-space-status { width:auto; white-space:nowrap; }
+.student-chat-row .class-space-actions { display:flex; margin-top:6px; }
+.class-chat-start-panes.single { grid-template-columns:1fr; }
+.roster-table input.roster-email-fix, .roster-table td input.roster-email-fix:focus { outline:2px solid var(--tm-amber); outline-offset:-2px;
+  animation:roster-email-fix-pulse 0.7s ease-in-out 3; }
+@keyframes roster-email-fix-pulse { 50% { outline-color:transparent; } }

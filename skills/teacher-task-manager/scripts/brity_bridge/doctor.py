@@ -7,13 +7,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from brity_bridge import paths, process_win, tool_runtime
+from brity_bridge import paths, process_win
 from brity_bridge.gemini_analyze import cached_gemini_key_check
-from brity_bridge.google_account import (
-    GOEDU_ACCOUNT_REQUIRED_MESSAGE,
-    extract_email,
-    is_goedu_email,
-)
+from brity_bridge.google_account import extract_email
 from brity_bridge.hotkey import parse_hotkey
 from brity_bridge.settings import load_settings
 
@@ -23,7 +19,7 @@ GEMINI_NETWORK_FIX = "Gemini 응답을 받지 못했어요. 잠시 후 다시 �
 GEMINI_RATE_LIMIT_DETAIL = "Gemini 사용 한도에 도달했어요. 한도가 언제 다시 열리는지는 확인하지 못했습니다. AI Studio에서 사용량을 확인해 주세요."
 HOTKEY_FIX = "설정에서 메신저 단축키를 다시 눌러 주세요."
 GOOGLE_LOGIN_FIX = "설정에서 Google 계정으로 로그인해 주세요."
-GWS_CLI_FIX = "설정에서 Google Workspace CLI를 준비해 주세요."
+GRANT_MISSING_TEXT = "Google 권한을 다시 승인해 주세요."
 # The settings window saves automatically; it has no [저장] button (C11, R5-3).
 HELPER_FIX = "Teacher Manager의 [설정]에서 [메신저 단축키 다시 켜기]를 눌러 주세요."
 
@@ -38,6 +34,7 @@ class CheckResult:
     card: str = ""       # identity | timetable | connect | settings
     tab: str = ""        # messenger | attendance | 빈 문자열
     target: str = ""     # 실제 입력 name 또는 google-login 같은 화면 줄 이름
+    unread: bool = False  # 확인 자체를 하지 못했다: 실패도 정상도 아니다 (회색, C6·C8)
 
 
 def _default_run_command(args: list[str]) -> tuple[int, str]:
@@ -62,11 +59,11 @@ def _default_autostart_checker() -> bool:
 
 @dataclass
 class DoctorDeps:
+    # No check runs a local Google tool any more.
     run_command: object = _default_run_command
     gemini_checker: object = cached_gemini_key_check
     find_helper_window: object = _default_find_helper_window
     autostart_checker: object = _default_autostart_checker
-    gws_resolver: object = tool_runtime.resolve_gws_executable
     python_version: tuple = field(default_factory=lambda: sys.version_info[:3])
 
 
@@ -74,10 +71,6 @@ def _extract_email(text: str) -> str:
     """옛 호출 자리도 공통 계정 판정과 같은 방식으로 이메일을 읽는다."""
 
     return extract_email(text)
-
-
-def _gws_status(deps: DoctorDeps, gws_executable: str) -> tuple[int, str]:
-    return deps.run_command([gws_executable, "auth", "status"])
 
 
 def _read_profile_csv_values(config_dir: Path) -> dict[str, str]:
@@ -190,13 +183,44 @@ def _connect_checks(profile: dict[str, str], statuses: dict | None = None) -> li
         value = profile.get(target, "")
         status = (statuses or {}).get(target, {})
         state = status.get("state") if status.get("id") == value else None
-        ok = False if not value or state in {"unavailable", "check_failed"} else True if state == "ready" else None
+        # Only an answer from the server says ready or unavailable; a failed check says neither (C6, C8).
+        ok = False if not value or state == "unavailable" else True if state == "ready" else None
         detail = status.get("detail", "저장된 연결을 아직 확인하지 못했어요.") if value else "아직 고르지 않았어요"
         results.append(CheckResult(
             key, label, ok, detail,
-            ("" if ok is True else detail) if value else fix, card="connect", tab="messenger", target=target,
+            ("" if ok is not False else detail) if value else fix, card="connect", tab="messenger", target=target,
+            unread=ok is None,
         ))
     return results
+
+
+def saved_target_ids(config_dir: Path) -> dict[str, str]:
+    """The Google targets this profile uses; the homeroom list only for a homeroom teacher."""
+    profile = _read_profile_csv_values(Path(config_dir))
+    fields = list(_CONNECT_LINK_FIELDS)
+    if profile.get("담임여부", "") in _HOMEROOM_YES:
+        fields.append(_HOMEROOM_TASKS_FIELD)
+    return {target: profile[target] for _key, _label, target, _fix in fields if profile.get(target)}
+
+
+def _signin_checks(identity: dict | None) -> list[CheckResult]:
+    """The rows of GET /v1/me. A check that did not finish is not a logout (LOGIN-17, LOGIN-32)."""
+    common = {"card": "settings", "target": "google-login"}
+    if not identity or identity.get("login_state") == "error":
+        detail = "서버에 연결하지 못했어요" if (identity or {}).get("server_unreachable") else "확인하지 못했어요"
+        return [CheckResult("settings.google-login", "Google 로그인과 권한", None, detail, unread=True, **common)]
+    if not identity.get("logged_in"):
+        return [CheckResult(
+            "settings.google-login", "Google 로그인과 권한", False,
+            identity.get("authorization_detail") or GOOGLE_LOGIN_FIX, GOOGLE_LOGIN_FIX, **common,
+        )]
+    rows = [CheckResult("settings.google-login", "Google 로그인과 권한", True, str(identity.get("user") or ""), **common)]
+    grant = (identity.get("grant") or {}).get("state")
+    if grant in {"partial", "refresh-required"}:
+        rows.append(CheckResult("settings.grant", "Google 권한", False, GRANT_MISSING_TEXT, GRANT_MISSING_TEXT, **common))
+    elif grant == "check-failed":
+        rows.append(CheckResult("settings.grant", "Google 권한", None, "확인하지 못했어요", unread=True, **common))
+    return rows
 
 
 def _gemini_check(deps: DoctorDeps, bridge_settings) -> CheckResult:
@@ -226,18 +250,12 @@ def run_doctor_checks(
     config_dir: Path,
     deps: DoctorDeps | None = None,
     *,
-    gws_executable: str | None = None,
+    identity: dict | None = None,
+    target_statuses: dict | None = None,
 ) -> list[CheckResult]:
+    """`identity` is this PC's reading of GET /v1/me and `target_statuses` its check of the saved
+    targets. Without them the sign-in rows say 확인하지 못했어요: nothing here calls a local tool."""
     deps = deps or DoctorDeps()
-    gws_damage = False
-    if gws_executable is None:
-        try:
-            gws_executable = str(deps.gws_resolver())
-        except tool_runtime.GwsRuntimeError:
-            gws_executable = ""
-            gws_damage = True
-    else:
-        gws_executable = str(gws_executable)
     config_dir = Path(config_dir)
     profile = _read_profile_csv_values(config_dir)
 
@@ -246,56 +264,8 @@ def run_doctor_checks(
 
     bridge_settings = load_settings(paths.settings_path(config_dir))
     results.append(_gemini_check(deps, bridge_settings))
-
-    code, output = _gws_status(deps, gws_executable) if gws_executable else (127, "")
-    cli_found = bool(gws_executable) and code != 127
-    cli_detail = (
-        "설치 파일이 손상됐어요"
-        if gws_damage
-        else ("준비됨" if cli_found else "설치가 필요해요")
-    )
-    cli_fix = (
-        "Teacher Manager 설치 파일을 다시 실행해 복구해 주세요."
-        if gws_damage
-        else ("" if cli_found else GWS_CLI_FIX)
-    )
-    results.append(CheckResult(
-        "settings.gws-cli", "Google Workspace CLI", cli_found,
-        cli_detail,
-        cli_fix,
-        card="settings", target="gws-cli",
-    ))
-    # Share the desktop decision without making a second Google request.
-    from dashboard.engine import gws_auth_status, google_target_statuses
-    auth = gws_auth_status(lambda _args: (code, output), gws_executable, config_dir=config_dir)
-    email = auth["user"]
-    logged_in = auth["logged_in"]
-    ready = auth.get("authorization_state") == "ready"
-    targets = dict(profile)
-    if profile.get("담임여부", "") not in _HOMEROOM_YES:
-        targets.pop("담임안내Tasks목록ID", None)
-    statuses = google_target_statuses(deps.run_command, gws_executable, targets, auth=auth) if ready else {}
-    results.extend(_connect_checks(profile, statuses))
-    if cli_found:
-        results.append(CheckResult(
-            "settings.google-login", "Google 로그인과 권한", ready,
-            email if ready else auth["authorization_detail"],
-            "" if ready else GOOGLE_LOGIN_FIX,
-            card="settings", target="google-login",
-        ))
-    else:
-        results.append(CheckResult(
-            "settings.google-login", "Google 로그인", None,
-            "Google Workspace CLI를 먼저 준비해 주세요.",
-            card="settings", target="google-login",
-        ))
-    if logged_in and not is_goedu_email(email):
-        results.append(CheckResult(
-            "settings.goedu-account", "Google 계정", False,
-            f"{email} — {GOEDU_ACCOUNT_REQUIRED_MESSAGE}",
-            GOEDU_ACCOUNT_REQUIRED_MESSAGE,
-            card="settings", target="google-login",
-        ))
+    results.extend(_connect_checks(profile, target_statuses))
+    results.extend(_signin_checks(identity))
 
     try:
         parse_hotkey(bridge_settings.hotkey)

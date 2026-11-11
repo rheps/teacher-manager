@@ -8,13 +8,24 @@ import re
 import stat
 import tempfile
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 from brity_bridge import bundle_paths
-from attendance_workbook_identity import current_school_year
+
+_SEOUL = timezone(timedelta(hours=9), name="Asia/Seoul")
+
+
+def current_school_year(today=None) -> str:
+    """한국 학년도는 3월 1일에 바뀐다(표시용, 생성 근거 아님)."""
+    day = today or datetime.now(_SEOUL).date()
+    if isinstance(day, datetime):
+        if day.tzinfo is None:
+            raise ValueError("An aware instant is required for the school year.")
+        day = day.astimezone(_SEOUL).date()
+    return str(day.year if day.month >= 3 else day.year - 1)
 
 
 DAYS = ["월", "화", "수", "목", "금"]

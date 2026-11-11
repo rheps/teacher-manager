@@ -8,11 +8,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from brity_bridge import account_sessions, autostart_win, gws_env, paths, process_win, status_log
+from brity_bridge import account_sessions, autostart_win, paths, process_win, status_log
 
 
 def main(argv=None) -> int:
-    gws_env.prepare_gws_env()  # gws 로그인이 수시로 풀리지 않게 키 보관 방식을 고정한다
     parser = argparse.ArgumentParser(prog="brity_bridge", description="Brity 메시지 캘린더 연결 도우미")
     parser.add_argument("command", choices=["run", "setup", "doctor", "status", "enable-autostart", "disable-autostart"])
     parser.add_argument("--config-dir", default=str(paths.default_config_dir()))
