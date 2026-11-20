@@ -964,7 +964,7 @@ class TrayApp:
         self._setup_window_and_icon()
         self._start_attachment_server()
         threading.Thread(target=self._drain_outbox_loop, daemon=True).start()
-        threading.Thread(target=self._intake_loop, daemon=True).start()
+        # No student DM intake loop: dropped for the absence link (Q-L12, 2026-11-12).
         threading.Thread(target=self._student_report_loop, daemon=True).start()
 
         # 도우미 창이 이미 있으므로, 여기서 뜨는 대시보드가 도우미를 또 띄우지 않는다.
@@ -1018,24 +1018,6 @@ class TrayApp:
                 finally:
                     self.busy.release()
             self._outbox_stop.wait(60)
-
-    def _intake_loop(self):
-        """Student DM intake (MAIN §7.13): a round at helper start, then every 10 minutes."""
-        reason = "start"
-        while not self._outbox_stop.wait(20 if reason == "start" else 600):
-            try:
-                from brity_bridge import account_sessions
-                from brity_bridge.settings import load_settings
-                from dashboard.intake_runner import run_intake_round
-                folder = account_sessions.active_config_dir(self._account_root)
-                client = outbox.helper_for_folder(folder)
-                if client is not None:
-                    run_intake_round(lambda route, body: client.data_call(route, body).reply(),
-                                     lambda: load_settings(paths.settings_path(folder)).gemini_api_key, reason)
-                    reason = "timer"
-            except Exception:
-                # No message text, names or identifiers in the log (R17).
-                status_log.append_helper_event(paths.logs_dir(self._account_root), "intake-wait")
 
     def _student_report_loop(self):
         """A notification per new student absence submission (2026-11-11 link design, Q-L11): a look

@@ -46,7 +46,9 @@ _MAX_ERROR_BYTES = 100_000
 
 _ROUTE = re.compile(r"/v1/(?:data/[A-Za-z0-9_\-/]+|me(?:/[A-Za-z0-9_\-/]+)?)")
 _GET_ROUTES = frozenset({"/v1/me", "/v1/me/devices", "/v1/data/export"})
-_SAFE_READS = frozenset({"/v1/data/read", "/v1/data/check", "/v1/me", "/v1/me/devices", "/v1/data/chat/status", "/v1/data/greetings"})
+_SAFE_READS = frozenset({"/v1/data/read", "/v1/data/check", "/v1/me", "/v1/me/devices", "/v1/data/chat/status", "/v1/data/greetings",
+                         "/v1/data/student-links/current", "/v1/data/students/contacts",
+                         "/v1/data/student-links/current-all", "/v1/data/phone-handoff/status"})
 # No screen offers the full disconnect in this release (SIGN-IN 'Revocation').
 _REFUSED_ROUTES = frozenset({"/v1/me/disconnect"})
 # Database writes (MAIN §6.2, §12 OBS-04): for the same requestId and body the server returns the

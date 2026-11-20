@@ -41,11 +41,11 @@ SPACE_CREATE_STALE_MESSAGE = "학급 단톡방 선택이 다른 창에서 바뀌
 GROUP_CHAT_TOO_MANY_MESSAGE = "Google Chat 그룹 채팅에는 선생님 외에 학생을 최대 49명까지 넣을 수 있어요."
 GROUP_CHAT_EMAIL_INVALID_MESSAGE = (
     "학생 이메일 가운데 형식이 맞지 않는 주소가 있어 그룹 채팅을 만들지 않았어요. "
-    "[학생명단] 탭 C열의 이메일을 확인해 주세요."
+    "학생-학부모 명단에서 학생 이메일을 확인해 주세요."
 )
 GROUP_CHAT_MEMBERS_REJECTED_MESSAGE = (
     "Google에서 학생 이메일 가운데 받을 수 없는 주소가 있다고 알려 왔어요. "
-    "그룹 채팅은 만들지 않았어요. [학생명단] 탭 C열의 이메일을 확인해 주세요."
+    "그룹 채팅은 만들지 않았어요. 학생-학부모 명단에서 학생 이메일을 확인해 주세요."
 )
 GOEDU_ACCOUNT_REQUIRED_MESSAGE = google_account.GOEDU_ACCOUNT_REQUIRED_MESSAGE
 CHAT_AUTH_UNKNOWN_MESSAGE = "Google Chat 발송 권한을 확인하지 못했어요. 기존 연결은 그대로입니다."

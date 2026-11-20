@@ -3019,21 +3019,43 @@ _EXPORT_COLUMNS = {
     "sendLog": {"at": "때", "kind": "종류", "targetLabel": "받는 사람", "spaceLabel": "단톡방", "preview": "내용", "result": "결과", "error": "오류"},
     "greetings": {"studentId": "학생", "state": "상태", "sentAt": "보낸 때", "result": "결과"},
     "holidays": {"id": "날짜", "name": "명칭", "type": "구분", "status": "상태", "note": "비고", "source": "출처", "deletedAt": "삭제한 때"},
+    # Student and guardian submissions (owner 2026-11-17): the report content only, never a link, email or phone.
+    "studentReports": {"dateStart": "시작 날짜", "dateEnd": "끝 날짜", "dates": "날짜", "studentLabel": "번호+이름", "kind": "종류",
+                       "category": "구분", "note": "사유", "periods": "교시", "reporter": "등록한 사람", "submittedAt": "등록한 때",
+                       "state": "상태"},
     "settings": {"schoolName": "학교 이름", "grade": "학년", "classNumber": "반", "classLabel": "반 이름", "teacherName": "담임 이름",
                  "reportTemplateName": "결석신고서 양식", "taskListTitle": "할 일 목록"},
 }
 
 
+# A sheet listed here keeps only its named columns (no other stored field follows).
+_EXPORT_ONLY_KNOWN = {"studentReports"}
+_REPORT_STATE = {"submitted": "기록 전", "recorded": "기록함", "withdrawn": "취소함", "not-recorded": "기록 안 함"}
+
+
+def _export_report_row(row: dict) -> dict:
+    out = dict(row)
+    out["reporter"] = "학부모" if row.get("reporter") == "guardian" else "학생"
+    out["state"] = _REPORT_STATE.get(row.get("state"), row.get("state"))
+    for field in ("dates", "periods"):
+        if isinstance(row.get(field), list):
+            out[field] = ", ".join(str(item) for item in row[field])
+    return out
+
+
 def write_attendance_export(path: Path, data: dict) -> None:
-    labels = {"students": "학생명단", "attendance": "출결 기록", "messages": "메시지", "sendLog": "발송기록", "effects": "처리결과", "greetings": "환영 인사", "holidays": "휴일", "settings": "학급 설정"}
+    labels = {"students": "학생명단", "attendance": "출결 기록", "studentReports": "학생·학부모 신고", "messages": "메시지", "sendLog": "발송기록",
+              "effects": "처리결과", "greetings": "환영 인사", "holidays": "휴일", "settings": "학급 설정"}
     sheets = []
     for year in data["years"]:
         for key, label in labels.items():
             values = [year[key]] if key == "settings" else year.get(key, [])
+            if key == "studentReports":
+                values = [_export_report_row(value) for value in values]
             fields = {field for value in values for field in value}
             # Teacher-facing columns first under Korean names; every other field follows, unchanged.
             known = [field for field in _EXPORT_COLUMNS.get(key, ()) if field in fields]
-            columns = known + sorted(fields - set(known))
+            columns = known + ([] if key in _EXPORT_ONLY_KNOWN else sorted(fields - set(known)))
             rows = [[_EXPORT_COLUMNS[key][field] if field in known else field for field in columns]] + [[_json.dumps(value.get(field), ensure_ascii=False, sort_keys=True) if isinstance(value.get(field), (dict, list)) else ("" if value.get(field) is None else str(value.get(field))) for field in columns] for value in values]
             sheets.append((f"{year['year']} {label}", rows))
     if not sheets:

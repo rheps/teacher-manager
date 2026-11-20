@@ -2,14 +2,10 @@
    other. Colours are the app's tokens and the --lit-* literals of the sheet dashboard, no new colour
    (SCREENS rule 6, app.css:1). Geometry follows the screens mockup. */
 .att{
-  --tm-blue:#3182F6; --tm-blue-soft:#E8F3FF;
-  --tm-ink:#191F28; --tm-sub:#6B7684; --tm-faint:#8B95A1;
-  --tm-frame:#D1D6DB; --tm-line:#E5E8EB; --tm-fill:#F2F4F6; --tm-surface:#F9FAFB;
-  --tm-green:#00A05C; --tm-green-soft:#E6F6EE;
-  --tm-amber:#D9820B; --tm-amber-soft:#FFF4DE; --tm-amber-line:#FFD591;
-  --lit-ink2:#333D4B; --lit-amber-text:#8A5A10; --lit-amber-bg:#FFFDF7;
-  --lit-green-text:#087443; --lit-green-line:#BDE8D3;
-  --att-day-shade:#ECEEF1;
+  /* The --tm-* tokens come from app.css :root (one set, DESIGN.md). Old names stay as aliases for now. */
+  --lit-ink2:var(--tm-ink2); --lit-amber-text:var(--tm-amber-text); --lit-amber-bg:var(--tm-amber-bg);
+  --lit-green-text:var(--tm-green-text); --lit-green-line:var(--tm-green-line);
+  --att-day-shade:var(--tm-day-shade);
   --att-font:"Pretendard Variable",Pretendard,"Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;
   font-family:var(--att-font);font-size:14px;letter-spacing:-0.1px;color:var(--tm-ink);line-height:normal;text-align:left;
 }
@@ -30,7 +26,7 @@
 .att-overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:40}
 .att-modal{position:absolute;inset:0;margin:auto;width:960px;height:760px;max-width:100%;max-height:100%;background:#fff;border:1px solid var(--tm-line);border-radius:16px;box-shadow:0 24px 64px rgba(15,23,42,.28);display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .att-modal :focus-visible{outline:2px solid var(--tm-blue);outline-offset:1px}
-.att-head{display:flex;align-items:center;gap:12px;padding:11px 14px 10px 20px;border-bottom:1px solid var(--tm-line);flex:none;min-height:50px}
+.att-head{display:flex;align-items:center;gap:12px;padding:11px 14px 10px 20px;flex:none;min-height:50px}
 .att-title{flex:1;font-size:17px;font-weight:700;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .att-save{font-size:13.5px;color:var(--tm-faint);white-space:nowrap}
 .att-refresh{display:inline-flex;align-items:center;justify-content:center;background:none;border:0;border-radius:8px;padding:7px;cursor:pointer}
@@ -42,17 +38,20 @@
 @media (prefers-reduced-motion:reduce){.att-checking .att-refresh-ic{animation:none}}
 .att-x{background:none;border:none;cursor:pointer;font-size:15px;color:var(--tm-faint);padding:6px 9px;border-radius:8px;line-height:1}
 .att-x:hover{background:var(--tm-fill);color:var(--tm-ink)}
-.att-tabs{display:flex;gap:6px;padding:7px 16px 8px;border-bottom:1px solid var(--tm-line);flex:none;white-space:nowrap;overflow:hidden;min-height:46px;align-items:center}
+.att-tabs{display:flex;gap:6px;padding:7px 16px 8px;flex:none;white-space:nowrap;overflow:hidden;min-height:46px;align-items:center}
 .att-tab{flex:none;border:1.5px solid var(--tm-line);background:#fff;border-radius:10px;padding:5px 12px;font-size:14px;font-weight:700;color:var(--tm-ink);cursor:pointer;display:inline-flex;align-items:center;gap:6px;line-height:1.4}
 .att-tab:hover:not(.att-on){border-color:var(--tm-frame);background:var(--tm-fill)}
 .att-tab.att-on{border-color:var(--tm-blue);background:var(--tm-blue-soft);color:var(--tm-blue)}
-.att-cnt{min-width:20px;padding:0 6px;border-radius:999px;font-size:11.5px;line-height:17px;text-align:center;background:var(--tm-amber-soft);color:var(--lit-amber-text);border:1px solid var(--tm-amber-line);font-weight:700}
+.att-cnt{min-width:20px;padding:0 6px;border-radius:999px;font-size:12px;line-height:17px;text-align:center;background:var(--tm-amber-soft);color:var(--lit-amber-text);border:1px solid var(--tm-amber-line);font-weight:700}
 .att-band{flex:none;display:flex;align-items:center;gap:10px;padding:7px 16px;font-size:13px;border-bottom:1px solid var(--tm-line)}
 .att-band.att-muted{background:var(--tm-fill);color:var(--lit-ink2)}
 .att-band.att-warn{background:var(--tm-amber-soft);color:var(--lit-amber-text)}
 .att-body{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:16px;container-type:inline-size;--noteh:0px}
 .att-body:not(.att-body-rec){scrollbar-gutter:stable}
-.att-body:not(.att-body-rec) > *{min-width:911px}
+/* 2026-11-20: 907px, not 911px. A window snapped to half of a 1920px screen is 958px wide (content 909px with a 15px
+   scrollbar gutter, 907px with a 17px one), and at 911px every tab showed a sideways scrollbar for those 2px.
+   Below that the content still keeps its layout and scrolls sideways (owner 2026-11-05). */
+.att-body:not(.att-body-rec) > *{min-width:907px}
 .att-short .att-head{min-height:44px;padding-top:8px;padding-bottom:7px}
 .att-short .att-tabs{min-height:38px;padding-top:4px;padding-bottom:4px}
 .att-short .att-tab{padding:3px 10px}
@@ -63,11 +62,12 @@
 .att-chip.att-warn{background:var(--tm-amber-soft);color:var(--lit-amber-text);border-color:var(--tm-amber-line)}
 .att-chip.att-ok{background:var(--tm-green-soft);color:var(--lit-green-text);border-color:var(--lit-green-line)}
 .att-chip-wrap{white-space:normal;word-break:keep-all;border-radius:8px;line-height:14px;padding:2px 6px}
-.att-ai-mark{display:inline-block;padding:0 5px;border-radius:4px;font-size:11px;font-weight:700;color:var(--tm-sub);box-shadow:inset 0 0 0 1px var(--tm-frame)}
-.att-btn{border:0;border-radius:8px;background:var(--tm-blue);color:#fff;font-weight:600;padding:8px 14px;cursor:pointer;white-space:nowrap;font-size:14px}
+.att-ai-mark{display:inline-block;padding:0 5px;border-radius:4px;font-size:12px;font-weight:700;color:var(--tm-sub);box-shadow:inset 0 0 0 1px var(--tm-frame)}
+.att-btn{border:0;border-radius:8px;background:var(--tm-blue);color:#fff;font-weight:700;padding:8px 14px;cursor:pointer;white-space:nowrap;font-size:14px}
 .att-btn:hover{filter:brightness(.95)}
 .att-btn-tonal{border:0;border-radius:8px;background:var(--tm-blue-soft);color:var(--tm-blue);font-weight:600;padding:7px 12px;cursor:pointer;white-space:nowrap;font-size:13.5px}
-.att-btn-quiet{border:1px solid var(--tm-line);border-radius:8px;background:#fff;color:var(--lit-ink2);font-weight:500;padding:6px 11px;cursor:pointer;white-space:nowrap;font-size:13.5px}
+/* 2026-11-16 (owner): an enabled quiet button has a dark border so it reads as pressable; disabled stays gray. */
+.att-btn-quiet{border:1px solid var(--tm-ink2);border-radius:8px;background:#fff;color:var(--tm-ink);font-weight:500;padding:6px 11px;cursor:pointer;white-space:nowrap;font-size:13.5px}
 .att-btn-quiet:hover,.att-btn-tonal:hover{filter:brightness(.97)}
 .att-btn-sm{padding:4px 9px;font-size:12.5px;border-radius:7px}
 .att-btn[aria-disabled="true"],.att-btn-tonal[aria-disabled="true"],.att-btn-quiet[aria-disabled="true"],
@@ -100,6 +100,8 @@
 .att-resl > .att-btn-quiet,.att-resl > .att-ic-btn{flex:none}
 /* Two lines of status, always reserved, so nothing below moves when it fills or empties. */
 .att-q{display:grid;align-content:start;gap:4px;margin-top:8px;height:45px;overflow-y:auto}
+/* No reserved strip while the AI queue has no line (DESIGN.md order 8). */
+.att-q:empty{display:none}
 .att-q-grow{height:auto;min-height:45px;max-height:124px}
 .att-q .att-resl{margin-top:0}
 .att-q-said{color:var(--tm-sub)}
@@ -110,9 +112,10 @@
 /* ---------- period bar and filter bar ---------- */
 .att-pbar,.att-fbar{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;margin:10px 0}
 .att-fbar{margin-top:0}
-.att-seg{display:inline-flex;background:#fff;border:1px solid var(--tm-line);border-radius:9px;padding:2px;max-width:100%;overflow-x:auto;scrollbar-width:none}
+.att-seg{display:inline-flex;background:var(--tm-fill);border:1px solid var(--tm-line);border-radius:9px;padding:2px;max-width:100%;overflow-x:auto;scrollbar-width:none}
 .att-seg button{border:0;background:none;padding:5px 10px;border-radius:7px;cursor:pointer;color:var(--tm-sub);font-weight:600;font-size:13px;white-space:nowrap;flex:none}
-.att-seg button.att-on{background:var(--tm-ink);color:#fff}
+.att-seg button{color:var(--tm-ink2)}
+.att-seg button.att-on{background:var(--tm-white);color:var(--tm-ink);font-weight:700;box-shadow:inset 0 0 0 1.5px var(--tm-ink)}
 .att-fl{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--tm-sub);font-weight:600;white-space:nowrap}
 .att-fl select,.att-fsel{border:1px solid var(--tm-line);border-radius:8px;background:#fff;padding:5px 7px;font-size:13px;color:var(--tm-ink);font-weight:400}
 .att-ckl input{width:15px;height:15px;accent-color:var(--tm-blue);margin:0}
@@ -178,9 +181,12 @@
 .att-short .att-entry{padding:5px 10px;align-items:center}
 .att-short .att-el{padding-top:0}
 .att-short .att-btn{padding:6px 12px}
-.att-sheetbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px}
+.att-sheetbar{display:flex;align-items:center;flex-wrap:wrap;gap:12px 10px}
 .att-sheetbar .att-tl{margin-right:auto}
 .att-sheetbar .att-ta{margin-left:0;flex-wrap:nowrap}
+.att-recbar{flex-direction:column;align-items:stretch;gap:8px}
+.att-recrow{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px}
+.att-recbar .att-ta{flex-wrap:wrap}
 .att-months{flex:none}
 .att-months button{padding:5px 8px}
 .att-sheetwrap{overflow:auto;overscroll-behavior:contain;border:1px solid var(--tm-line);border-radius:10px;background:#fff;scroll-padding:36px 0 0 190px}
@@ -246,11 +252,12 @@ input.att-cell[readonly]{cursor:default}
 .att-pop{max-height:254px;overflow-y:auto}
 
 /* ---------- 조치할 일: cards in the language of 종합 (D28) ---------- */
-.att-wgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+.att-wgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
 .att-wfull{grid-column:1/-1}
 .att-wcard-h{justify-content:flex-start;margin-bottom:6px}
-.att-sn{min-width:20px;padding:0 6px;border-radius:999px;font-size:11.5px;line-height:18px;text-align:center;font-weight:700}
+.att-sn{min-width:20px;padding:0 6px;border-radius:999px;font-size:12px;line-height:18px;text-align:center;font-weight:700}
 .att-sn.att-warn{background:var(--tm-amber-soft);color:var(--lit-amber-text);border:1px solid var(--tm-amber-line)}
+.att-sn.att-muted{background:var(--tm-fill);color:var(--tm-ink2);border:1px solid var(--tm-line)}
 .att-whead{grid-column:1/-1;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 2px 0}
 .att-whead h3{font-size:15px;font-weight:700}
 .att-meta{font-size:13px;color:var(--tm-sub)}
@@ -265,15 +272,21 @@ input.att-cell[readonly]{cursor:default}
 .att-mini .att-rt{font-size:12.5px}
 .att-mini .att-rt th{position:static;font-size:12px;padding:4px 3px}
 .att-mini .att-rt td{height:32px;padding:2px 3px}
+.att-mini .att-rt td:first-child,.att-mini .att-rt th:first-child{padding-left:10px}
+.att-mini .att-rt td.att-ck,.att-mini .att-rt th.att-ck{padding:0 0 0 8px}
+.att-scard-ck{width:auto;min-height:0;flex:none}
+.att-missbar{grid-column:1/-1;position:sticky;top:calc(var(--noteh) - 16px);z-index:6;background:var(--tm-window);display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;padding:6px 2px}
+.att-missbar .att-lck{width:auto;min-height:0;gap:5px;flex:none;font-size:13px;color:var(--tm-ink)}
+.att-missbar .att-tl b{font-size:13.5px}
 .att-mini .att-vc{width:100%;padding-left:4px;padding-right:3px;font-size:12px}
 .att-mini .att-ic-btn{width:auto;padding:0 2px;font-size:12px}
-.att-more-in{display:flex;justify-content:flex-end;padding:4px 0 0}
+.att-more-in{display:flex;justify-content:flex-end;gap:8px;padding:4px 0 0}
 .att-empty-msg{color:var(--tm-ink);margin:22px 2px}
 .att-sec-more{display:flex;justify-content:flex-end}
 
 /* ---------- 종합 ---------- */
 .att-kgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;margin-top:6px}
-.att-kg{font-size:12px;font-weight:700;color:var(--tm-faint);padding-bottom:4px;border-bottom:1px solid var(--tm-line);display:flex;justify-content:space-between;gap:8px}
+.att-kg{font-size:12px;font-weight:700;color:var(--tm-ink2);padding-bottom:4px;display:flex;justify-content:space-between;gap:8px}
 .att-kg span{font-weight:500}
 .att-kg-a{grid-column:span 1}
 .att-kg-b{grid-column:span 2}
@@ -313,15 +326,17 @@ input.att-cell[readonly]{cursor:default}
 .att-meter-fill{height:100%;background:var(--tm-green);border-radius:4px}
 .att-meter-foot{font-size:12px;color:var(--tm-sub);display:flex;align-items:center;gap:6px}
 .att-tbtn{border:0;background:none;color:var(--tm-sub);font-size:12px;cursor:pointer;text-decoration:underline;padding:0}
+.att-tbtn:disabled{color:var(--tm-faint);cursor:default;text-decoration:none}
 .att-micard{grid-column:1/-1}
 .att-milist{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px 18px}
 .att-milist > div{display:flex;align-items:center;gap:8px;font-size:13px;padding:3px 0;border-bottom:1px solid var(--tm-fill);min-width:0}
 .att-milist .att-nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---------- 학급 설정 ---------- */
-.att-sgrp{margin-top:16px}
+.att-sgrp{margin-top:16px;background:#fff;border:1px solid var(--tm-line);border-radius:12px;padding:12px 16px 4px}
+.att-sgrp .att-srow:last-child{border-bottom:0}
 .att-nslot:not(.att-nslot-on) + .att-sgrp{margin-top:0}
-.att-sgrp-h{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;color:var(--tm-faint);padding:0 2px 6px;border-bottom:1px solid var(--tm-line)}
+.att-sgrp-h{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;color:var(--tm-faint);padding:0 2px 6px}
 .att-srow{display:flex;align-items:center;gap:12px;padding:9px 2px;border-bottom:1px solid var(--tm-line);font-size:13.5px;min-height:46px}
 .att-sk{width:150px;flex:none;color:var(--tm-sub);font-weight:600;font-size:13px}
 .att-sv{flex:1;min-width:0;overflow-wrap:anywhere;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -343,6 +358,16 @@ input.att-cell[readonly]{cursor:default}
 .att-q-meta{font-size:12px;color:var(--tm-faint)}
 .att-fgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px;margin-top:12px}
 .att-fld{display:grid;gap:5px;font-size:12.5px;color:var(--tm-sub);font-weight:600}
+/* 2026-11-12 (owner): a field or a summary line never touches the block above it in a dialog. */
+.att-dlg > .att-fld{margin-top:12px}
+.att-dlg > :is(.att-fld,.att-fgrid,.att-message-grid,.att-mdel,.att-radio) + p{margin-top:10px}
+/* The period picker in a dialog: inline boxes, not the sheet's full-width check cell. */
+.att-fld .att-chips{margin-left:0;gap:6px 14px}
+.att-fld .att-ckl{width:auto;min-height:0;gap:5px;justify-content:flex-start;font-weight:400;color:var(--tm-ink);font-size:13.5px}
+.att-fld .att-ckl input{width:15px;padding:0;border:0}
+.att-why-note{display:block;margin-top:3px;font-size:12px;color:var(--tm-amber-text)}
+.att-rname{font-weight:600;color:var(--tm-ink)}
+.att-rrest{color:var(--tm-sub)}
 .att-fld input,.att-fld select,.att-fld textarea{border:1px solid var(--tm-line);border-radius:8px;padding:7px 9px;font-weight:400;color:var(--tm-ink);background:#fff;font-size:13.5px;min-width:0;width:100%}
 .att-radio{display:flex;flex-direction:column;gap:6px;margin:10px 0 4px}
 .att-radio label{display:flex;align-items:center;gap:7px;font-size:13.5px;cursor:pointer}
@@ -352,16 +377,25 @@ input.att-cell[readonly]{cursor:default}
 .att-lb-opt.att-on{background:var(--tm-blue-soft)}
 .att-chk{color:var(--tm-blue);font-weight:700}
 .att-toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);background:var(--tm-ink);color:#fff;border-radius:12px;padding:11px 18px;font-size:14px;display:flex;z-index:90;max-width:90%;box-shadow:0 8px 22px rgba(25,31,40,.25);align-items:center;gap:14px}
+.att-toast-fade{animation:att-toast-fade 2.6s ease forwards}
+@keyframes att-toast-fade{0%{opacity:0}8%{opacity:1}75%{opacity:1}100%{opacity:0}}
 .att-toast button{background:none;border:0;color:#fff;font-weight:700;text-decoration:underline;cursor:pointer;font-size:14px;padding:0}
 .att-message-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
 .att-message{padding:10px 0;border-bottom:1px solid var(--tm-line)}
+.att-results{margin:12px 0 4px;border:1px solid var(--tm-line);border-radius:10px;overflow:hidden}
+.att-results-h{padding:9px 12px;background:var(--tm-fill,#F5F6F8);font-size:13px;font-weight:700;border-bottom:1px solid var(--tm-line)}
+.att-result{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;border-top:1px solid var(--tm-line);font-size:13.5px}
+.att-results-h + .att-result{border-top:0}
+.att-result-who{font-weight:600;min-width:0}
+.att-result-st{display:flex;flex-direction:column;align-items:flex-end;gap:3px;text-align:right}
+.att-result-st small{font-size:12px;color:var(--tm-sub);max-width:340px;word-break:keep-all}
 .att-message-text{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.55;margin:8px 0}
 .att-chat-health{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;font-size:13px}
 .att-chat-health .att-muted{color:var(--tm-sub)}
 .att-chat-health .att-ok{color:var(--lit-green-text)}
 .att-chat-health .att-warn{color:var(--lit-amber-text)}
 .att-sheet .att-acts{white-space:nowrap;overflow:hidden}
-.att-sheet .att-acts .att-link{font-size:11px;white-space:nowrap}
+.att-sheet .att-acts .att-link{font-size:12px;white-space:nowrap}
 /* 메시지 보내기 tab */
 .att-mtab{display:flex;flex-direction:column;gap:12px}
 .att-mhero-r{display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -408,3 +442,72 @@ input.att-cell[readonly]{cursor:default}
 .att-linkshow-r{flex:1;min-width:220px;display:flex;flex-direction:column;gap:8px}
 .att-linkshow-url{width:100%;font:inherit;font-size:12.5px;padding:6px 8px;border:1px solid var(--tm-frame);border-radius:6px;background:var(--tm-fill);color:var(--tm-ink)}
 .att-qr{flex:none;width:200px;height:200px;background:#fff;border:1px solid var(--tm-line);border-radius:6px}
+
+/* 2026-11-12 (owner): a very light grey window, white cards and white tab chips; no lines around the tab row. */
+.att-modal{background:var(--tm-window)}
+.att-entry{background:#fff}
+.att-mlog td.att-mlog-err{white-space:normal;overflow:visible;text-overflow:clip;word-break:keep-all;line-height:1.4}
+
+/* Owner 2026-11-13: delete is light red. */
+.att-btn-danger{background:var(--tm-red-soft);border-color:var(--tm-red-line);color:var(--tm-red-text)}
+.att-btn-danger:hover:not(:disabled){border-color:var(--tm-red)}
+.att-link-danger{color:var(--tm-red-text)}
+/* Owner 2026-11-13: month row and the bulk buttons below it are a size larger. */
+.att-seg.att-months button{padding:7px 13px;font-size:14px}
+.att-sheetbar .att-btn-sm{padding:6px 12px;font-size:13.5px;border-radius:8px}
+/* Owner 2026-11-13: the attendance tabs look like the homepage tabs (text, black 3px underline on the selected one). */
+.att-tabs{gap:24px;padding:12px 20px 0;min-height:0;align-items:flex-end}
+.att-tab{position:relative;border:0;background:none;border-radius:0;padding:0 0 9px;font-size:14px;font-weight:500;color:var(--tm-sub)}
+.att-tab::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:transparent}
+.att-tab:hover:not(.att-on){border:0;background:none;color:var(--tm-ink)}
+.att-tab.att-on{border:0;background:none;color:#000;font-weight:700}
+.att-tab.att-on::after{background:#000}
+.att-short .att-tabs{padding-top:8px;min-height:0}
+.att-short .att-tab{padding:0 0 7px}
+.att-btn-quiet.att-btn-danger[aria-disabled="true"],.att-btn-quiet.att-btn-danger:disabled{background:var(--tm-red-soft);border-color:var(--tm-red-line);color:var(--tm-red-text);opacity:.55}
+/* 2026-11-13 (owner): the month like NEIS's daily attendance screen and its 출결마감구분 window */
+.att-dlg.att-dlg-wide{width:min(1180px,96%)}
+.att-neis-bar{display:flex;align-items:center;gap:12px;margin:10px 0 4px}
+.att-neis-body{max-height:62vh;overflow:auto;padding-right:4px}
+.att-neis-day{background:var(--tm-white);margin-top:12px}
+.att-neis-day h5{font-size:14px;font-weight:700;margin:0 0 6px}
+.att-neis{width:100%;border-collapse:collapse;font-size:13.5px}
+.att-neis th,.att-neis td{border:1px solid var(--tm-line);padding:6px 8px;text-align:left;white-space:nowrap}
+.att-neis th{background:var(--tm-fill);font-weight:600;color:var(--tm-ink2)}
+.att-neis td:last-child{white-space:normal}
+.att-neis .att-neis-c{text-align:center;min-width:44px}
+.att-neis-opts{display:inline-flex;gap:10px;color:var(--tm-faint)}
+.att-neis-opts .att-neis-on{color:var(--tm-ink);font-weight:700}
+.att-neis-days{table-layout:fixed}.att-neis-days th:nth-child(1){width:52px}.att-neis-days th:nth-child(2){width:88px}.att-neis-days th:nth-child(3){width:120px}
+.att-neis-box{display:grid;grid-template-columns:44px repeat(4,76px);gap:0;width:max-content;border:1px solid var(--tm-line);border-radius:6px;background:var(--tm-white);margin:0 0 8px;font-size:13.5px}
+.att-neis-box>*{padding:6px 8px;border-top:1px solid var(--tm-line);color:var(--tm-faint);white-space:nowrap}
+.att-neis-who{grid-column:1/-1;border-top:0;color:var(--tm-ink);font-weight:700;background:var(--tm-fill)}
+.att-neis-box .att-neis-l{color:var(--tm-ink2);font-weight:600;background:var(--tm-fill)}
+.att-neis-box .att-neis-on{color:var(--tm-ink);font-weight:700}
+.att-neis-box .att-neis-r{grid-column:span 4;color:var(--tm-ink);white-space:normal}
+/* 2026-11-16 (owner): the link card in its tab is one card, its left edge with the other cards (no nested box, no 54px indent). */
+.att-rep-links .svc-group{border:0;border-radius:0;overflow:visible}
+.att-rep-links .svc-subrow{padding:0 0 8px;border-top:0}
+.att-rep-links .att-link-list{padding:0 0 2px}
+.att-rep-links .att-lt{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* 2026-11-16 (owner): one action bar over the link list; 2026-11-17 it stays in place while the list scrolls. */
+.att-rep-links .att-linkbar{margin:2px 0 6px;justify-content:flex-end;position:sticky;top:calc(var(--noteh) - 16px);z-index:6;background:var(--tm-white);padding:4px 0}
+/* 2026-11-20: the count always has its own line above the buttons, so the buttons do not move when its digits change. */
+.att-rep-links .att-linkbar .att-tl{margin-right:0;flex:0 0 100%;justify-content:flex-end}
+/* 2026-11-17 (owner): the link list is a grid like a timetable. Column 1 is 번호+이름, then 학생 and 학부모. A header selects its
+   column, a name selects both cells of that student, a cell toggles itself; a selected cell is light blue. */
+.att-lgrid{display:grid;grid-template-columns:minmax(72px,max-content) minmax(0,1fr) minmax(0,1fr);border:1px solid var(--tm-line);border-radius:var(--tm-radius-md);overflow:hidden;background:var(--tm-white)}
+.att-lgrid > button{border:0;border-top:1px solid var(--tm-line);border-left:1px solid var(--tm-line);border-radius:0;background:var(--tm-white);font:inherit;color:var(--tm-ink);text-align:left;padding:6px 10px;margin:0;min-width:0;cursor:pointer}
+.att-lgrid > button:hover{background:var(--tm-surface)}
+.att-lgrid > button:focus-visible{outline:2px solid var(--tm-blue);outline-offset:-2px}
+.att-lgrid > .att-lg-h,.att-lg-corner{border-top:0;background:var(--tm-surface);font-size:12.5px;font-weight:600;color:var(--tm-sub);padding:6px 10px}
+.att-lgrid > .att-lg-n{border-left:0;font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-lg-c{display:flex;flex-direction:column;gap:3px}
+.att-lg-url{font-size:12.5px;color:var(--tm-ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.att-lg-t{display:flex;align-items:center;gap:6px;min-width:0;font-size:12.5px;color:var(--tm-sub)}
+.att-lg-t .att-chip{flex:none}
+.att-lg-tail{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-lgrid > .att-lg-off{background:var(--tm-surface)}
+.att-lg-off .att-lg-url,.att-lg-off .att-lg-tail{color:var(--tm-faint)}
+.att-lgrid > button.att-on,.att-lgrid > button.att-on:hover{background:var(--tm-blue-soft)}
+.att-rep-links .att-linkbar .att-ta{flex-wrap:wrap}

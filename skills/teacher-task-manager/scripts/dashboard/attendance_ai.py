@@ -41,7 +41,7 @@ The returned dict::
     fix               the one fix for "blocked" and "signin_required", or "":
                       gemini-key   연결 → Brity 메신저 열기
                       class-settings   학급 설정 열기
-                      roster       학생명단 고치기
+                      roster       학생-학부모 명단 고치기
                       holidays     휴일 추가
                       sign-in      다시 로그인
     record_id         the existing row a duplicate was refused against, or ""
@@ -49,6 +49,7 @@ The returned dict::
     resume            only with unknown: keep it in memory, never on disk, and pass it back as
                       resume= on ↻, never by itself
     year              the school year of this input, when known
+    confirm           with state confirm: {studentLabel, from, to, reportStatus?, attachmentStatus?}; None otherwise
 
 The states, and what each means for the sentence box:
 
@@ -60,6 +61,9 @@ The states, and what each means for the sentence box:
     unknown           amber 결과 확인 못 함 with the G4 text. Lock the box until ↻ or an edit.
     unavailable       server not reached before anything was sent to Gemini. The box stays.
     signin_required   the session ended before the server read the request. The box stays.
+    confirm           a 신고서/첨부 change over a range (owner 2026-11-16). Nothing was written; rows are the
+                      rows to change (recordId, version, date, kind, reportStatus, attachmentStatus) and
+                      the screen writes them only when the teacher confirms (C7).
 
 There is no 다른 입력 처리 중 state: the server has no shared lock that an input waits for.
 """
@@ -95,7 +99,7 @@ STALE_MESSAGE = "다른 컴퓨터에서 먼저 바뀌어 저장하지 않고 다
 
 _FIX_BY_CODE = {"AI_INPUT_OFF": "class-settings", "ROSTER_EMPTY": "roster", "HOLIDAYS_MISSING": "holidays"}
 _NOT_ENTERED_CODES = frozenset({"AI_INPUT_EXPIRED", "AI_INPUT_REJECTED"})
-_ANSWER_STATES = frozenset({"applied", "rejected", "needs-new-entry"})
+_ANSWER_STATES = frozenset({"applied", "rejected", "needs-new-entry", "needs-confirm"})
 
 
 def run_attendance_ai_input(data_call, get_gemini_key, sentence="", month=None, *, year=None, resume=None,
@@ -114,10 +118,10 @@ def _default_transport(url, headers, body, timeout):
 
 
 def _outcome(state, message, *, rows=None, updated_existing=False, unknown=False, code="", fix="",
-             record_id="", calendar_year=None, resume=None, year=None) -> dict:
+             record_id="", calendar_year=None, resume=None, year=None, confirm=None) -> dict:
     return {"state": state, "message": message, "rows": rows or [], "updated_existing": updated_existing,
             "unknown": unknown, "code": code, "fix": fix, "record_id": record_id, "calendar_year": calendar_year,
-            "resume": resume, "year": year}
+            "resume": resume, "year": year, "confirm": confirm}
 
 
 def _answered(reply) -> bool:
@@ -242,6 +246,8 @@ class _Run:
             return self._applied(answer, year)
         if state == "rejected":
             return self._turned_down(answer, year)
+        if state == "needs-confirm":
+            return self._to_confirm(answer, year)
         # needs-new-entry: send the server-built request at once, inside the same budget (§7.3).
         if self.fallback_taken:
             return _outcome("check_required", FAILED_MESSAGE, year=year)
@@ -258,6 +264,16 @@ class _Run:
         if not message:
             message = f"출결 기록의 {len(rows)}줄을 고쳤어요." if updated else f"출결 기록에 {len(rows)}줄을 입력했어요."
         return _outcome("applied", str(message), rows=rows, updated_existing=updated, year=year)
+
+    @staticmethod
+    def _to_confirm(answer, year) -> dict:
+        rows = [row for row in answer.get("rows") or [] if isinstance(row, dict) and isinstance(row.get("recordId"), str)]
+        if not rows:
+            # A replayed answer keeps no rows; nothing was written, so the sentence can go in again.
+            return _outcome("check_required", FAILED_MESSAGE, year=year)
+        confirm = {key: answer[key] for key in ("studentLabel", "from", "to", "reportStatus", "attachmentStatus")
+                   if isinstance(answer.get(key), str)}
+        return _outcome("confirm", "", rows=rows, year=year, confirm=confirm)
 
     @staticmethod
     def _turned_down(answer, year) -> dict:

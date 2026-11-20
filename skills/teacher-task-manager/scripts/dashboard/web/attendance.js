@@ -64,7 +64,9 @@
   const READ = '/v1/data/read', CHECK = '/v1/data/check', TASKLISTS = '/v1/data/targets/tasklists';
   const REPORTS = '/v1/data/student-reports', LINKS = '/v1/data/student-links';
   // 메시지 보내기 comes with Chat in P3.
-  const TABS = [['rec', '출결 기록'], ['work', '조치할 일'], ['msg', '메시지 보내기'], ['sum', '종합']];
+  // 2026-11-12 (owner): student reports and the paper reminders have their own tabs; 조치할 일 keeps only problems.
+  // 2026-11-16 (owner): the two Chat tabs say what they send, and 조치할 일 sits next to 종합.
+  const TABS = [['rec', '출결 기록'], ['rep', '학생-학부모가 직접 등록한 출결 내역'], ['miss', '미제출 서류 독려 Google Chat 보내기'], ['msg', '메신저 학생안내 Google Chat 보내기'], ['work', '조치할 일'], ['sum', '종합']];
 
   const T = {
     RO: '서버에 연결되면 쓸 수 있어요.',
@@ -83,7 +85,7 @@
     NO_YEAR: '처음 설정이 끝나지 않았어요.',
     AI_LABEL: '자유로운 문장으로 입력하여 AI로 기록하기',
     AI_OFF: 'AI 출결 입력을 쓸 수 없어요.',
-    ROSTER_EMPTY: '학생명단이 비어 있어요.',
+    ROSTER_EMPTY: '학생-학부모 명단이 비어 있어요.',
     AI_LOCKED: '등록 결과를 확인하지 못한 문장이에요. 창 위쪽 [새로 읽기] 버튼(↻)을 누르거나 문장을 고친 뒤 다시 해 주세요.',
     AI_FAILED: 'AI 출결 입력을 처리하지 못했어요. 잠시 뒤 [AI로 입력]을 다시 눌러 주세요.',
     NOT_ENTERED: '입력되지 않았어요',
@@ -160,7 +162,9 @@
     };
     const students = (res.students || []).map(s => ({
       id: s.id, version: s.version, n: Number(s.number) || 9999, name: String(s.name || ''),
-      raw: String(s.label || ((s.number || '') + (s.name || ''))), label: s.number && s.name ? s.number + '번 ' + s.name : spaceLabel(s.label), hasEmail: !!String(s.email || '').trim(), status: String(s.status || '재적')
+      raw: String(s.label || ((s.number || '') + (s.name || ''))), label: s.number && s.name ? s.number + '번 ' + s.name : spaceLabel(s.label), hasEmail: !!String(s.email || '').trim(), status: String(s.status || '재적'),
+      hasPhone: s.hasPhone === true,
+      guardian: s.guardian && typeof s.guardian === 'object' ? { relation: String(s.guardian.relation || ''), email: String(s.guardian.email || ''), hasPhone: s.guardian.hasPhone === true } : null
     })).sort((a, b) => a.n - b.n || (a.label > b.label ? 1 : -1));
     const byId = new Map(students.map(s => [s.id, s]));
     const toRow = r => {
@@ -173,7 +177,8 @@
         cat: String(r.category || ''), kind: String(r.kind || ''), reason: String(r.reason || ''), period: String(r.period || ''),
         g: String(r.reportStatus || ''), h: String(r.attachmentStatus || ''), reminder: r.reminder || null, remUnknown: remUnknown(r.reminder),
         ai: !!r.aiInputId || r.source === 'ai' || r.source === 'intake', student: r.source === 'student', source: String(r.source || ''), hasReport: !!r.reportDocId,
-        raw: r.raw || null, needsReview: !!r.needsReview, updatedBy: r.updatedBy || null, updatedAt: r.updatedAt || '', deletedAt: r.deletedAt || ''
+        raw: r.raw || null, needsReview: !!r.needsReview, updatedBy: r.updatedBy || null, updatedAt: r.updatedAt || '', deletedAt: r.deletedAt || '',
+        createdAt: String(r.createdAt || ''), imported: !!r.importedFrom
       };
     };
     const rows = (res.attendance || []).map(r => toRow(prior(r, 'reminder')));
@@ -187,8 +192,9 @@
     const reports = (res.studentReports || []).filter(x => x && typeof x === 'object').map(x => reportOf(x, byId))
       .filter(x => x.id).sort((a, b) => String(a.at).localeCompare(String(b.at)) || (a.id > b.id ? 1 : -1));
     const links = new Map((res.studentLinks || []).filter(x => x && typeof x === 'object' && (x.studentId || x.id)).map(x => [String(x.studentId || x.id), x]));
+    const glinks = new Map((res.guardianLinks || []).filter(x => x && typeof x === 'object' && (x.studentId || x.id)).map(x => [String(x.studentId || x.id), x]));
     return {
-      reports, links,
+      reports, links, glinks,
       raw: { ...res, messages: (res.messages || []).map(r => prior(r, 'message')) }, year: res.year, doc, today, cal, students, byId, rows, deleted, holidays,
       rowById: new Map(rows.concat(deleted).map(r => [r.id, r])),
       hasReminders: rows.concat(deleted).some(r => !!r.reminder && !!r.reminder.state),
@@ -214,17 +220,32 @@
       id: String(x.id || x.reportId || ''), version: x.version, state: String(x.state || 'submitted'), studentId: st ? st.id : String(x.studentId || ''), st,
       label: st ? st.label : spaceLabel(x.studentLabel), kind, periods: (Array.isArray(x.periods) ? x.periods : x.period ? [x.period] : []).map(String).filter(v => PERIODS.indexOf(v) > 0),
       cat, rawCat: raw, note, start, end, dates: dates.length ? dates : start ? [start] : [], at: String(x.submittedAt || x.createdAt || ''), generation: Number(x.generation) || 0,
-      olderLink: x.olderLink === true
+      olderLink: x.olderLink === true, decidedAt: String(x.decidedAt || ''), reporter: x.reporter === 'guardian' ? 'guardian' : 'student'
     };
   }
   const reportRange = r => (r.start && r.end && r.end !== r.start ? mdw(r.start) + '~' + mdw(r.end) + ' ' + r.dates.length + '일' : r.start ? mdw(r.start) : '');
-  const reportText = (r, today) => [r.label, kindWord(r.kind) || '—', reportRange(r), r.periods.join('·'), r.cat, r.note || '—', '학생', atLong(r.at)]
+  const reportLine = (r, today) => { const t = reportText(r, today), i = t.indexOf(' · '); return i < 0 ? t : html`<b class="att-rname">${t.slice(0, i)}</b><span class="att-rrest">${t.slice(i)}</span>`; };
+  const reportText = (r, today) => [r.label, kindWord(r.kind) || '—', reportRange(r), r.periods.join('·'), r.cat, r.note || '—', r.reporter === 'guardian' ? '학부모' : '학생', atLong(r.at)]
     .filter(Boolean).join(' · ');
+  // The other role's pending reports for any of the same dates (owner 2026-11-16): never merged or picked by itself.
+  const reportRivals = (rep, D) => (D ? D.reports.filter(x => x.id !== rep.id && x.state === 'submitted' && x.studentId === rep.studentId
+    && x.reporter !== rep.reporter && x.dates.some(d => rep.dates.indexOf(d) >= 0)) : []);
+  // A report and the other role's report for the same dates sit next to each other, the teacher picks one.
+  function pairRivals(items, D) {
+    const out = [], seen = new Set(), ids = new Set(items.map(x => x.id));
+    for (const rep of items) {
+      if (seen.has(rep.id)) continue;
+      out.push(rep); seen.add(rep.id);
+      for (const other of reportRivals(rep, D)) if (ids.has(other.id) && !seen.has(other.id)) { out.push(other); seen.add(other.id); }
+    }
+    return out;
+  }
   // Rows the report becomes: one per school day, and for 결과 one per period (design §6.1).
   const reportRowCount = r => r.dates.length * (r.kind === '결과함' ? Math.max(1, r.periods.length) : 1);
   const sourceMark = r => (!r ? null : r.student ? html`<span class="att-ai-mark" title="학생 결석 신고">학생</span>` : r.ai ? html`<span class="att-ai-mark" title="AI 출결 입력">AI</span>` : null);
 
-  const classLabelOf = doc => String(doc.classLabel || (doc.grade && doc.classNumber ? doc.grade + '학년 ' + doc.classNumber + '반' : ''));
+  // 2026-11-13 (owner): no separate 반 이름; the class is always called by its grade and number.
+  const classLabelOf = doc => doc.grade && doc.classNumber ? doc.grade + '학년 ' + doc.classNumber + '반' : String(doc.classLabel || '');
   const titleOf = D => D.year + '학년도 ' + (classLabelOf(D.doc) ? classLabelOf(D.doc) + ' ' : '') + '출결·메신저';
   const dlab = r => (r.date ? mdw(r.date) : '(' + r.dateRaw + ')');
   const docPair = r => (r.g === '미제출' && r.h === '미제출' ? '신고서·첨부 미제출' : '신고서 ' + (r.g || '비움') + ' · 첨부 ' + (r.h || '비움'));
@@ -244,7 +265,21 @@
     remProblem: r => r.remUnknown || (!!r.reminder && r.reminder.state === '실패'),
     needs: r => !r.deletedAt && (E.missing(r) || E.remProblem(r) || !E.inRoster(r) || E.review(r)),
     canDelete: r => !r.deletedAt && !(r.reminder && r.reminder.state === '발송중'),
+    // A paper reminder the server will send now; one already sent may go again (owner 2026-11-13).
+    remSendable: r => !r.deletedAt && !!r.date && E.missing(r) && E.inRoster(r) && !!r.st.hasEmail && !r.remUnknown
+      && (!r.reminder || !r.reminder.state || r.reminder.state === '보냄'),
   };
+  // Why no paper reminder can go for these rows, or null when one can (owner 2026-11-13: never a bare 0건).
+  function remWhy(rows) {
+    const live = rows.filter(r => !r.deletedAt && E.missing(r));
+    if (live.some(E.remSendable)) return null;
+    if (!live.length) return { text: '미제출 서류가 있는 줄이 없어요.', tone: 'muted' };
+    if (live.some(r => r.remUnknown)) return { text: '보낸 결과를 확인하지 못한 독려가 있어요. 그 줄의 [확인하기]로 먼저 확인해 주세요.' };
+    if (live.some(r => r.reminder && r.reminder.state === '실패')) return { text: '보내지 못한 독려예요. 미제출 서류 독려 탭의 [독려를 보내지 못한 학생]에서 [다시 보내기]로 보내 주세요.' };
+    if (live.some(r => r.reminder && r.reminder.state === '발송중')) return { text: '독려를 보내는 중이에요.', tone: 'muted' };
+    if (live.some(r => r.st && !r.st.hasEmail)) return { text: '학생-학부모 명단에 이 학생의 이메일이 없어요. 학생-학부모 명단에서 이메일을 넣어 주세요.' };
+    return { text: '보낼 독려가 없어요.', tone: 'muted' };
+  }
   const holidayYears = D => [D.cal.sy, D.cal.sy + 1];
   const holidaysMissing = D => holidayYears(D).filter(y => !D.holidays.some(x => x.d.slice(0, 4) === String(y)));
   const holidayPreset = (D, y) => (y === D.cal.sy ? y + '-03-01' : y + '-01-01');
@@ -273,29 +308,33 @@
     });
     const s4 = Array.from(byStudent.entries()).map(e => ({ id: e[0], label: e[1][0].label, st: e[1][0].st, rows: e[1].sort((a, b) => (a.date < b.date ? -1 : 1)) }))
       .sort((a, b) => (a.rows[0].date < b.rows[0].date ? -1 : a.rows[0].date > b.rows[0].date ? 1 : a.st.n - b.st.n));
+    // 2026-11-16 (owner): 조치할 일 lists only what is handled right here (a dialog, or the roster window). A row whose
+    // student is not in the roster is flagged in 출결 기록 (명단에 없음), and a message to review is listed in 메신저 학생안내.
     const s5 = [];
-    const noRoster = D.rows.filter(r => !E.inRoster(r));
-    if (noRoster.length) s5.push({ t: 'noroster', k: 'noroster', n: noRoster.length });
     const noEmail = D.students.filter(s => !s.hasEmail && s.status === '재적');
     if (noEmail.length) s5.push({ t: 'email', k: 'email', list: noEmail });
     const missRows = s4.reduce((a, g) => a + g.rows.length, 0);
     const queue = D.raw.messages || [];
-    const unmatched = queue.filter(x=>x.channel==='personal' && !x.studentId);
-    if (unmatched.length) s5.push({ t:'message-student',k:'message-student',n:unmatched.length });
-    const invalid = queue.filter(x=>x.needsReview || !x.date || !x.type || !x.status);
-    if (invalid.length) s5.push({ t:'message-value',k:'message-value',n:invalid.length });
-    const s3 = queue.filter(x=>x.status==='실패').map(x=>({id:x.id,label:D.byId.get(x.studentId)?.label||spaceLabel(x.studentLabel)||'학급 단톡방',effectId:x.effectId,mode:'queue'}));
-    D.rows.filter(r=>r.reminder?.state==='실패').forEach(r=>s3.push({id:r.id,label:r.label,effectId:r.reminder.effectId,mode:'reminders'}));
+    const s3 = queue.filter(x=>x.status==='실패').map(x=>({id:x.id,label:D.byId.get(x.studentId)?.label||spaceLabel(x.studentLabel)||'학급 단톡방',effectId:x.effectId,mode:'queue',cls:x.channel==='class'}));
+    // Failed paper reminders belong to 미제출 서류 독려, the tab that sent them.
+    // One line per failed send: a student's dates go in one message (owner 2026-11-13), so one effect can hold several rows.
+    const s3rBy = new Map();
+    D.rows.filter(r=>r.reminder?.state==='실패').forEach(r=>{ const k=r.reminder.effectId||r.id; if(!s3rBy.has(k)) s3rBy.set(k,{id:r.id,ids:[],label:r.label,effectId:r.reminder.effectId,mode:'reminders'}); s3rBy.get(k).ids.push(r.id); });
+    const s3r = [...s3rBy.values()];
     const s7 = D.effects.filter(x=>(x.phase==='CLAIMED' && x.leaseUntil>nowMs) || (x.phase==='DISPATCHED_OR_UNKNOWN' && nowMs-Date.parse(x.admittedAt)<UNKNOWN_AFTER_MS));
-    const due = (D.raw.messages || []).filter(x => x.status === '대기' && x.date && x.date <= D.today && x.type && (x.channel === 'class' || x.studentId));
+    const unknownIds = new Set(s1.map(x => x.id).filter(Boolean));
+    const due = (D.raw.messages || []).filter(x => x.status === '대기' && !(x.effectId && unknownIds.has(x.effectId)) && x.date && x.date <= D.today && x.type && (x.channel === 'class' || x.studentId));
     // AL9 (MAIN §7.13): student DMs the server could not turn into a row by itself.
     const s9 = (D.raw.intakeItems || []).filter(x => x.state === 'review').sort((a, b) => String(a.sentAt).localeCompare(String(b.sentAt)))
       .map(x => ({ id: x.id, k: 'q:' + x.id, label: D.byId.get(x.studentId)?.label || spaceLabel(x.studentLabel), date: x.date, text: x.text || '', code: x.reasonCode || '', studentId: x.studentId }));
     const catchUp = D.doc && D.doc.intakeCatchUp;
     // AL10 (2026-11-11 design §6.3): a student's submission waits for the teacher's 기록하기 (O5).
     const s10 = D.reports.filter(x => x.state === 'submitted');
-    const count = s1.length + s3.length + s4.length + s5.length + s7.length + s9.length + s10.length + (due.length ? 1 : 0);
-    return { s1, s3, s4, s5, s7, s9, s10, catchUp, due, missRows, count, partial: !D.complete };
+    // Each tab counts only its own lines; the home tile adds them up.
+    const workCount = s1.length + s3.length + s5.length + s7.length;
+    const repCount = s10.length + s9.length, missCount = s4.length + s3r.length;
+    const count = workCount + repCount + missCount + (due.length ? 1 : 0);
+    return { s1, s3, s3r, s4, s5, s7, s9, s10, catchUp, due, missRows, workCount, repCount, missCount, count, partial: !D.complete };
   }
 
   // The home tile's badge and detail line, from the same functions as the window (SCREENS "Home tile").
@@ -304,13 +343,13 @@
     const D = prepare(answer), W = workItems(D);
     if (!D.complete) return { tone: 'muted', text: T.NOT_READ, detail: '', count: null };
     const parts = [];
-    if (W.s10.length) parts.push('학생 결석 신고 ' + W.s10.length);
-    if (W.s4.length) parts.push('신고서·첨부 미제출 ' + W.s4.length + '명');
+    if (W.repCount) parts.push('학생-학부모가 직접 등록한 출결 내역 ' + W.repCount);
+    if (W.missCount) parts.push('미제출 서류 독려 ' + W.missCount);
     if (W.due.length) parts.push('오늘 보낼 메시지 ' + W.due.length);
-    if (W.s1.length) parts.push('전달됐는지 모르는 메시지 ' + W.s1.length);
+    if (W.workCount) parts.push('확인할 일 ' + W.workCount);
     return W.count
-      ? { tone: 'warn', text: '조치할 일 ' + W.count + '개', detail: parts.join(' · '), count: W.count }
-      : { tone: 'ok', text: '조치할 일 없음', detail: '', count: 0 };
+      ? { tone: 'warn', text: '할 일 ' + W.count + '개', detail: parts.join(' · '), count: W.count }
+      : { tone: 'ok', text: '할 일 없음', detail: '', count: 0 };
   }
 
   /* ---------- views over the rows ---------- */
@@ -520,7 +559,7 @@
     if (worker.gen !== memo.gen || memo.aiWorker !== worker) return;
     memo.aiWorker = null;
     memo.aiq = memo.aiq.map(e => e.id === entry.id ? Object.assign({}, e, { state: 'completed', outcome: out, doneAt: Date.now() }) : e);
-    const state = out.state === 'applied' ? 'success' : out.state === 'unknown' ? 'uncertain' : out.state === 'blocked' ? 'blocked' : out.state === 'stale' ? 'stale' : 'error';
+    const state = out.state === 'applied' || out.state === 'confirm' ? 'success' : out.state === 'unknown' ? 'uncertain' : out.state === 'blocked' ? 'blocked' : out.state === 'stale' ? 'stale' : 'error';
     uiEvent(entry.owner, 'answer', { queueId: entry.id, stage: 'answer', state });
     publishQueue();
     pumpAcceptedAi();
@@ -582,10 +621,12 @@
   function aiOutcome(raw) {
     const r = raw && typeof raw === 'object' ? raw : {};
     const rows = (Array.isArray(r.rows) ? r.rows : []).filter(x => x && typeof x === 'object');
-    const state = ['applied', 'check_required', 'blocked', 'stale', 'expired', 'unavailable', 'signin_required'].indexOf(r.state) >= 0 ? r.state : 'unknown';
+    const state = ['applied', 'confirm', 'check_required', 'blocked', 'stale', 'expired', 'unavailable', 'signin_required'].indexOf(r.state) >= 0 ? r.state : 'unknown';
+    const confirm = r.confirm && typeof r.confirm === 'object' ? r.confirm : null;
     return {
       state, message: String(r.message || ''), rows, updated: r.updated_existing === true, code: String(r.code || ''),
-      fix: String(r.fix || ''), recordId: String(r.record_id || ''), replay: r.resume || null, calendarYear: Number(r.calendar_year) || 0
+      fix: String(r.fix || ''), recordId: String(r.record_id || ''), replay: r.resume || null, calendarYear: Number(r.calendar_year) || 0,
+      confirm: state === 'confirm' && confirm && rows.length ? confirm : null
     };
   }
   const CHANGE_LABEL = { date: '날짜', studentLabel: '번호+이름', category: '구분', kind: '종류', reason: '사유', period: '교시', reportStatus: '신고서', attachmentStatus: '첨부' };
@@ -615,8 +656,8 @@
       liveEl.textContent = '';
       setTimeout(() => { if (liveEl) liveEl.textContent = text; }, 30);
     }
-    function toast(text, act) {
-      set({ toast: { text, act: act || null } });
+    function toast(text, act, opts) {
+      set({ toast: { text, act: act || null, fade: !!(opts && opts.fade), id: Date.now() } });
       clearTimeout(toastTimer.id);
       toastTimer.id = setTimeout(() => { if (alive.current) set({ toast: null }); }, act ? UNDO_MS : TOAST_MS);
       announce(text);
@@ -1459,8 +1500,7 @@
     function setAiText(text) { memo.aiText = text; set({ aiText: text }); }
     function aiFix(kind, year) {
       if (kind === 'gemini-key') return { label: '연결 → Brity 메신저 열기', run: () => link({ kind: 'brity' }) };
-      if (kind === 'class-settings') return { label: '내 정보 열기', run: () => link({ kind: 'profile' }) };
-      if (kind === 'roster') return { label: '학생명단 고치기', run: () => link({ kind: 'roster' }) };
+      if (kind === 'roster') return { label: '학생-학부모 명단 고치기', run: () => link({ kind: 'roster' }) };
       if (kind === 'holidays') return { label: '휴일·학사일정 열기', run: () => link({ kind: 'holidays' }) };
       if (kind === 'sign-in') return { label: '다시 로그인', run: relogin };
       return null;
@@ -1472,7 +1512,7 @@
       if (!D) return null;
       const info = opts.pcInfo ? opts.pcInfo() || {} : {};
       if (info.hasGeminiKey === false) return { text: T.AI_OFF, fix: aiFix('gemini-key') };
-      if (D.doc.aiInputAllowed !== true) return { text: T.AI_OFF, fix: aiFix('class-settings') };
+      // 2026-11-17 (owner): no on/off switch; the AI box works whenever a Gemini key exists (aiInputAllowed is no longer read).
       if (!D.students.length) return { text: T.ROSTER_EMPTY, fix: aiFix('roster') };
       const y = thisCalendarYear(D);
       if (!D.holidays.some(x => x.d.slice(0, 4) === String(y))) return { soft: true, text: y + '년 휴일이 없어 ' + y + '년 날짜의 AI 출결 입력이 멈춰요.', fix: aiFix('holidays', y) };
@@ -1511,6 +1551,22 @@
         // 입력함 shows for a few seconds and clears; nothing about it is kept.
         setTimeout(() => dismissAi(entry.id), Math.max(0, (entry.doneAt || Date.now()) + AI_DONE_MS - Date.now()));
         read().then(() => { if (alive.current) flash(ids); });
+        return;
+      }
+      // 서류 상태 한 번에 바꾸기 (owner 2026-11-16): nothing was written. The table's docs dialog opens on
+      // the answered rows with the values preset, and only its button writes (versioned, C7).
+      if (out.state === 'confirm' && out.confirm) {
+        const c = out.confirm, ids = out.rows.map(x => x.recordId);
+        dismissAi(entry.id);
+        read().then(() => {
+          if (!alive.current || !data()) return;
+          const live = ids.filter(id => data().rowById.has(id));
+          if (!live.length) { set({ notice: { text: T.STALE, tone: 'warn' } }); return; }
+          const m = x => Number(String(x).slice(5, 7));
+          const span = m(c.from) === m(c.to) ? m(c.from) + '월' : m(c.from) + '월~' + m(c.to) + '월';
+          openDialog({ kind: 'docs', ids: live, g: c.reportStatus, h: c.attachmentStatus,
+            title: (spaceLabel(c.studentLabel || '') ? spaceLabel(c.studentLabel) + '의 ' : '') + span + ' ' + live.length + '줄 서류 상태를 바꿀까요?' });
+        });
         return;
       }
       if (out.state === 'unknown') {
@@ -1696,6 +1752,10 @@
       setIn('busy', { [key]: true });
       const body = { action: 'record', reportId: rep.id, version: rep.version };
       if (edits && Object.keys(edits).length) body.edits = edits;
+      // Owner 2026-11-16: recording this one sets aside the other role's pending reports for the same dates,
+      // which the card shows side by side. The server checks they are exactly those.
+      const others = reportRivals(rep, data());
+      if (others.length) body.setAside = others.map(x => x.id);
       const out = await runWrite({ route: REPORTS, body, lockKey: key });
       if (out.forgotten) return out;
       set(prev => { const b = Object.assign({}, prev.busy); delete b[key]; return { busy: b }; });
@@ -1714,6 +1774,10 @@
         set({ reportDup: memo.reportDup });
       } else if (out.kind === 'refused' && out.code === 'CATEGORY_REQUIRED' && !edits) {
         openDialog({ kind: 'report-edit', rep });
+        return out;
+      } else if (out.kind === 'refused' && (out.code === 'REPORT_CHOICE_REQUIRED' || out.code === 'REPORT_CHOICE_CHANGED')) {
+        toast(out.message || '신고가 바뀌었어요. 다시 읽은 뒤 골라 주세요.');
+        read();
         return out;
       } else if (out.kind === 'refused' && (out.code === 'REPORT_DECIDED' || out.code === 'REPORT_NOT_FOUND')) {
         toast(out.message || '학생이 취소한 신고예요.');
@@ -1881,10 +1945,14 @@
 
     if (opts.card) return html`<div class="att att-card-embed">
       <${Bands} ctx=${ctx} />
-      ${opts.card === 'connect' ? null : html`<div class="att-pbar"><span class="att-subtle" role="status">${S.reading ? '읽는 중…' : S.readError || (S.readAt ? readStamp(S.readAt) + '에 읽음' : '')}</span><span class="att-spacer"></span><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${S.reading ? { text: T.REFRESHING, tone: 'muted' } : null} onClick=${ctx.manualRefresh}>새로 읽기</${Btn}></div>`}
+      ${(() => {
+        // No read time and no second 읽는 중… under a card window (owner 2026-11-13); a read failure always shows.
+        const note = S.readError;
+        return opts.card === 'connect' || !note ? null : html`<div class="att-pbar"><span class="att-subtle" role="status">${note}</span></div>`;
+      })()}
       <div ref=${bodyRef}><${Boundary} opts=${opts}><${Body} ctx=${Object.assign({}, ctx, { card: opts.card })} /></${Boundary}></div>
       ${S.dialog ? html`<${DialogHost} ctx=${ctx} />` : null}
-      ${S.toast ? html`<div class="att-toast" role="status">${S.toast.text}</div>` : null}
+      ${S.toast ? html`<div key=${S.toast.id} class=${'att-toast' + (S.toast.fade ? ' att-toast-fade' : '')} role="status">${S.toast.text}</div>` : null}
       <div class="att-sr" aria-live="polite" ref=${el => A.current.bindLive(el)}></div>
     </div>`;
     const onBackdrop = ev => { if (ev.target === ev.currentTarget && !S.dialog) A.current.closeWindow(); };
@@ -1903,7 +1971,7 @@
         ${S.dialog ? html`<${DialogHost} ctx=${ctx} />` : null}
         ${S.lb ? html`<${ValueList} ctx=${ctx} />` : null}
         ${S.pop ? html`<${CellPop} ctx=${ctx} />` : null}
-        ${S.toast ? html`<div class="att-toast" role="status"><span>${S.toast.text}</span>${S.toast.act ? html`<button type="button" onClick=${S.toast.act.run}>${S.toast.act.label}</button>` : null}</div>` : null}
+        ${S.toast ? html`<div key=${S.toast.id} class=${'att-toast' + (S.toast.fade ? ' att-toast-fade' : '')} role="status"><span>${S.toast.text}</span>${S.toast.act ? html`<button type="button" onClick=${S.toast.act.run}>${S.toast.act.label}</button>` : null}</div>` : null}
         <div class="att-sr" aria-live="polite" ref=${el => A.current.bindLive(el)}></div>
       </div>`;
   }
@@ -1966,7 +2034,7 @@
     };
     return html`<div class="att-tabs" role="tablist" aria-label="출결·메신저 화면" onKeyDown=${keyNav}>
       ${TABS.map(t => {
-        const n = W && !W.partial ? t[0] === 'work' ? W.count : t[0] === 'msg' ? W.due.length + W.s1.filter(x => x.refs?.some(r => r.includes('/messages/'))).length : 0 : 0;
+        const n = W && !W.partial ? t[0] === 'work' ? W.workCount : t[0] === 'rep' ? W.repCount : t[0] === 'miss' ? W.missCount : t[0] === 'msg' ? W.due.length : 0 : 0;
         return html`<button type="button" key=${t[0]} data-tab=${t[0]} class=${'att-tab' + (S.tab === t[0] ? ' att-on' : '')} role="tab" aria-selected=${S.tab === t[0] ? 'true' : 'false'}
           tabindex=${S.tab === t[0] ? 0 : -1} onClick=${() => ctx.setTab(t[0])}>${t[1]}${n ? html`<span class="att-cnt" aria-label=${n + '개'}>${n}</span>` : null}</button>`;
       })}
@@ -1980,22 +2048,22 @@
     if (S.net === 'session') bands.push(html`<div key="session" class="att-band att-warn" role="status"><span>${T.SESSION}</span><span class="att-spacer"></span><button type="button" class="att-btn-quiet att-btn-sm" onClick=${ctx.relogin}>다시 로그인</button></div>`);
     // MAIN §7.9: from 1 March the newest year turns read-only until the teacher starts the new one.
     const offer = D && D.readOnly && D.raw.currentYearReady === false && D.year === D.raw.activeYear && S.net === 'ok';
-    if (D && D.readOnly) bands.push(html`<div key="earlier" class=${'att-band ' + (offer ? 'att-warn' : 'att-muted')} role="status"><span>${offer ? D.raw.currentSchoolYear + '학년도가 시작됐어요. 새 학년도를 시작하면 이어서 쓸 수 있어요.' : earlierYearText(D.year)}</span>${offer ? html`<span class="att-spacer"></span><button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'rollover' })}>새 학년도 시작…</button>` : null}</div>`);
-    if (D && !D.readOnly && D.doc.rolledOverFrom && !D.students.length && S.net === 'ok') bands.push(html`<div key="rostercopy" class="att-band att-warn" role="status"><span>${D.doc.rolledOverFrom + '학년도 학생명단을 그대로 가져올 수 있어요.'}</span><span class="att-spacer"></span><button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'rostercopy' })}>작년 학생명단 복사…</button></div>`);
+    if (D && D.readOnly) bands.push(html`<div key="earlier" class=${'att-band ' + (offer ? 'att-warn' : 'att-muted')} role="status"><span>${offer ? D.raw.currentSchoolYear + '학년도가 시작됐어요. 새 학년도를 시작하면 이어서 쓸 수 있어요.' : earlierYearText(D.year)}</span>${offer ? html`<span class="att-spacer"></span><button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'rollover' })}>새 학년도 시작</button>` : null}</div>`);
+    if (D && !D.readOnly && D.doc.rolledOverFrom && !D.students.length && S.net === 'ok') bands.push(html`<div key="rostercopy" class="att-band att-warn" role="status"><span>${D.doc.rolledOverFrom + '학년도 학생-학부모 명단을 그대로 가져올 수 있어요.'}</span><span class="att-spacer"></span><button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'rostercopy' })}>작년 학생-학부모 명단 복사</button></div>`);
     if (S.remotePending === 'remote') bands.push(html`<div key="remote" class="att-band att-muted" role="status">다른 컴퓨터에서 바뀐 내용이 있어요. 지금 하는 일을 마치면 불러와요.</div>`);
     return bands.length ? bands : null;
   }
 
   function Body(p) {
     const ctx = p.ctx, S = ctx.S, D = ctx.D;
-    if (S.stateNote === 'import') return html`<div class="att-notice att-muted" role="status">${T.IMPORTING}</div>`;
-    if (S.stateNote === 'import-failed') return html`<div class="att-notice att-muted" role="status">${T.IMPORT_FAILED}</div>`;
-    if (S.stateNote === 'no-year') return html`<div class="att-notice att-muted" role="status">${T.NO_YEAR}</div>`;
-    if (S.readError && !D) return html`<div class="att-notice att-muted" role="status">${S.readError}</div>`;
+    if (S.stateNote === 'import') return html`<div class="fill-center"><div class="att-notice att-muted" role="status">${T.IMPORTING}</div></div>`;
+    if (S.stateNote === 'import-failed') return html`<div class="fill-center"><div class="att-notice att-muted" role="status">${T.IMPORT_FAILED}</div></div>`;
+    if (S.stateNote === 'no-year') return html`<div class="fill-center"><div class="att-notice att-muted" role="status">${T.NO_YEAR}</div></div>`;
+    if (S.readError && !D) return html`<div class="fill-center"><div class="att-notice att-muted" role="status">${S.readError}</div></div>`;
     if (ctx.card === 'holidays') return html`<${HolidaysTab} ctx=${ctx} />`;
-    if (ctx.card === 'identity') return html`<${IdentitySettings} ctx=${ctx} />`;
-    if (ctx.card === 'connect') return D ? html`<${NoticeSlot} ctx=${ctx} /><${ClassChatRow} ctx=${ctx} /><${StudentLinkRow} ctx=${ctx} />` : chatRows(CHAT_ROWS_READING);
-    const View = { work: WorkTab, rec: RecordsTab, msg: MessagesTab, sum: SummaryTab }[S.tab] || RecordsTab;
+    // 2026-11-17 (owner): 학생 결석 신고 링크 lives only in its attendance-window tab, not in 연결 → 출결 or the wizard.
+    if (ctx.card === 'connect') return D ? html`<${NoticeSlot} ctx=${ctx} /><${ClassChatRow} ctx=${ctx} />` : chatRows(CHAT_ROWS_READING);
+    const View = { work: WorkTab, rep: ReportsTab, miss: MissingTab, rec: RecordsTab, msg: MessagesTab, sum: SummaryTab }[S.tab] || RecordsTab;
     return html`<${View} ctx=${ctx} />`;
   }
 
@@ -2076,7 +2144,7 @@
       segs.push(['term', '이번 학기(' + cal.term.label + ')', v.period === 'term']);
     }
     segs.push(['year', '학년 전체', v.period === 'year']);
-    segs.push(['custom', '기간 선택…', v.period === 'custom']);
+    segs.push(['custom', '기간 선택', v.period === 'custom']);
     return html`<span class="att-seg" role="group" aria-label="기간">
       ${segs.map(s => html`<button type="button" key=${s[0]} class=${s[2] ? 'att-on' : ''} aria-pressed=${s[2] ? 'true' : 'false'} onClick=${() => ctx.setPeriod(s[0])}>${s[1]}</button>`)}</span>`;
   }
@@ -2093,7 +2161,8 @@
   /* ---------- 출결 기록: a sheet of one month (D26, D27) ---------- */
   // Column widths. No stacking at any width: below the sum the table scrolls sideways with the first three columns pinned.
   // Google Chat 알림 shows only when some row of the year has a reminder state (D28).
-  const sheetCols = (D, rec) => [28, 100, 88, 78, 62, null, 58, 80, 80].concat(D && D.hasReminders ? [104] : [], [28, 64]);
+  // The row-action column fits "독려 보내기" (DESIGN.md order 8).
+  const sheetCols = (D, rec) => [28, 100, 88, 78, 62, null, 58, 80, 80].concat(D && D.hasReminders ? [104] : [], [28, 84]);
   const REASON_MIN = 90;
   const SHEET_ROW_H = 34;
   const SHORT_HEIGHT = 480;
@@ -2133,6 +2202,79 @@
   }
 
   // The month strip and, on the same line, the table bar.
+  // 2026-11-13 (owner): a month laid out like NEIS's daily attendance screen (one table per day, only the
+  // students with a record, ø in the period cells), and by day as boxes like NEIS's 출결마감구분 window.
+  // Cells: 결석 marks every cell; otherwise the recorded period, or 조회 for 지각 / 종례 for 조퇴 when none is given.
+  function neisMonth(D, ym) {
+    const rows = D.rows.filter(r => !r.deletedAt && r.date && r.date.slice(0, 7) === ym)
+      .sort((a, b) => a.date.localeCompare(b.date) || ((a.st ? a.st.n : 999) - (b.st ? b.st.n : 999)) || String(a.label).localeCompare(String(b.label)));
+    const used = rows.map(r => Number(String(r.period).replace('교시', '')) || 0);
+    const last = Math.max(6, ...used.filter(n => n <= 7));
+    const cols = ['조회'].concat(Array.from({ length: last }, (_, i) => (i + 1) + '교시'), ['종례']);
+    const stem = k => String(k || '').replace(/함$/, '');
+    const marks = r => r.kind === '결석함' ? cols.slice() : r.period && cols.includes(r.period) ? [r.period] : r.kind === '지각함' ? ['조회'] : r.kind === '조퇴함' ? ['종례'] : [];
+    const line = r => ({ r, n: r.st ? r.st.n : '', name: r.st && r.st.name ? r.st.name : String(r.label || '').replace(/^\d+번\s*/, ''),
+      close: (r.cat || '') + stem(r.kind), marks: marks(r), kind: stem(r.kind), period: r.period && cols.includes(r.period) ? r.period : '' });
+    const days = [];
+    rows.forEach(r => { const d = days[days.length - 1]; if (d && d.date === r.date) d.lines.push(line(r)); else days.push({ date: r.date, lines: [line(r)] }); });
+    const people = [];
+    rows.slice().sort((a, b) => ((a.st ? a.st.n : 999) - (b.st ? b.st.n : 999)) || a.date.localeCompare(b.date)).forEach(r => {
+      const k = r.studentId || r.label, pp = people[people.length - 1];
+      if (pp && pp.k === k) pp.rows.push(r); else people.push({ k, label: r.label, rows: [r] });
+    });
+    const title = D.year + '학년도 ' + (classLabelOf(D.doc) ? classLabelOf(D.doc) + ' ' : '') + monOf(ym + '-01') + '월 출결';
+    return { rows, cols, days, people, title, dayLabel: d => Number(d.slice(5, 7)) + '월 ' + Number(d.slice(8, 10)) + '일(' + WD[dow(d)] + ')' };
+  }
+  const NEIS_KINDS = ['결석', '지각', '조퇴', '결과'], NEIS_CATS = ['질병', '미인정', '기타', '출석인정'];
+  const neisReason = x => [x.r.reason, x.period].filter(Boolean).join(' · ');
+  function printNeis(m, mode) {
+    const esc = v => String(v == null ? '' : v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const opts = (list, on) => list.map(x => (x === on ? '● <b>' + esc(x) + '</b>' : '○ ' + esc(x))).join('&nbsp;&nbsp;');
+    const cells = (list, on) => list.map(x => '<td class="o' + (x === on ? ' on' : '') + '">' + (x === on ? '●' : '○') + ' ' + esc(x) + '</td>').join('');
+    // NEIS's window has no period field (owner 2026-11-16): the period goes after the reason as text.
+    const box = x => '<table class="box"><tr><th colspan="5">' + esc(x.n + '번 ' + x.name) + '</th></tr>'
+      + '<tr><td class="l">종류</td>' + cells(NEIS_KINDS, x.kind) + '</tr>'
+      + '<tr><td class="l">구분</td>' + cells(NEIS_CATS, x.r.cat) + '</tr>'
+      + '<tr><td class="l">사유</td><td class="r" colspan="4">' + esc(neisReason(x)) + '</td></tr></table>';
+    const body = !m.rows.length ? '<p>이 달에는 출결 기록이 없어요.</p>' : mode === 'box'
+      ? m.days.map(d => '<h2>' + esc(m.dayLabel(d.date)) + ' <small>' + d.lines.length + '건</small></h2>' + d.lines.map(box).join('')).join('')
+      : m.days.map(d => '<section><h2>' + esc(m.dayLabel(d.date)) + ' <small>' + new Set(d.lines.map(x => x.r.studentId || x.r.label)).size + '명</small></h2><table><tr><th>번호</th><th>성명</th><th>마감</th>'
+        + m.cols.map(c => '<th class="c">' + esc(c) + '</th>').join('') + '<th>사유</th></tr>'
+        + d.lines.map(x => '<tr><td class="c">' + esc(x.n) + '</td><td>' + esc(x.name) + '</td><td>' + esc(x.close) + '</td>' + m.cols.map(c => '<td class="c">' + (x.marks.includes(c) ? 'ø' : '') + '</td>').join('') + '<td>' + esc(x.r.reason) + '</td></tr>').join('')
+        + '</table></section>').join('');
+    const css = 'body{font-family:"Malgun Gothic",sans-serif;font-size:10.5pt;color:#000;margin:0}h1{font-size:14pt;margin:0 0 4mm}h2{font-size:11pt;margin:5mm 0 1.5mm}h2 small{font-weight:400;color:#444}'
+      + 'table{width:100%;border-collapse:collapse}th,td{border:1px solid #888;padding:1.2mm 1.6mm;text-align:left;white-space:nowrap}th{background:#eee;font-weight:600}.c{text-align:center}td:last-child{white-space:normal}'
+      + '.box{width:auto;table-layout:fixed;margin:0 0 3mm;break-inside:avoid}.box th{text-align:left}.box td{width:20mm;color:#777}.box td.l{width:12mm;color:#000;background:#f4f4f4;font-weight:600}.box td.on{color:#000;font-weight:700}.box td.r{color:#000;white-space:normal}'
+      + 'section{break-inside:avoid}@page{size:A4 ' + (mode === 'box' ? 'portrait' : 'landscape') + ';margin:10mm}';
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
+    document.body.appendChild(frame);
+    const w = frame.contentWindow;
+    w.document.open();
+    w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + esc(m.title) + '</title><style>' + css + '</style></head><body><h1>' + esc(m.title + (mode === 'box' ? ' · 입력 상자' : ' · 표')) + ' <small style="font-size:10pt;font-weight:400">' + m.rows.length + '건</small></h1>' + body + '</body></html>');
+    w.document.close();
+    setTimeout(() => { w.focus(); w.print(); setTimeout(() => frame.remove(), 1000); }, 100);
+  }
+  function NeisDialog(p) {
+    const ctx = p.ctx, D = ctx.D, ym = p.d.ym, [mode, setMode] = useState('day');
+    const m = neisMonth(D, ym);
+    const seg = (k, label) => html`<button type="button" class=${mode === k ? 'att-on' : ''} aria-pressed=${mode === k ? 'true' : 'false'} onClick=${() => setMode(k)}>${label}</button>`;
+    const opts = (list, on) => html`<span class="att-neis-opts">${list.map(x => html`<span class=${x === on ? 'att-neis-on' : ''}>${(x === on ? '● ' : '○ ') + x}</span>`)}</span>`;
+    const days = m.days.map(d => html`<section class="att-neis-day" key=${d.date}><h5>${m.dayLabel(d.date)} <span class="att-faint">${new Set(d.lines.map(x => x.r.studentId || x.r.label)).size + '명'}</span></h5>
+      <table class="att-neis att-neis-days"><thead><tr><th>번호</th><th>성명</th><th>마감</th>${m.cols.map(c => html`<th class="att-neis-c">${c}</th>`)}<th>사유</th></tr></thead>
+      <tbody>${d.lines.map(x => html`<tr key=${x.r.id}><td class="att-neis-c">${x.n}</td><td>${x.name}</td><td>${x.close}</td>${m.cols.map(c => html`<td class="att-neis-c">${x.marks.includes(c) ? 'ø' : ''}</td>`)}<td>${x.r.reason}</td></tr>`)}</tbody></table></section>`);
+    // 2026-11-13 (owner): one fixed box per record, like NEIS's 출결마감구분 window, so each choice sits in the same place.
+    const cells = (list, on) => list.map(x => html`<span class=${'att-neis-o' + (x === on ? ' att-neis-on' : '')}>${(x === on ? '● ' : '○ ') + x}</span>`);
+    const boxes = m.days.map(d => html`<section class="att-neis-day" key=${d.date}><h5>${m.dayLabel(d.date)} <span class="att-faint">${d.lines.length + '건'}</span></h5>
+      ${d.lines.map(x => html`<div class="att-neis-box" key=${x.r.id}><div class="att-neis-who">${x.n + '번 ' + x.name}</div>
+        <span class="att-neis-l">종류</span>${cells(NEIS_KINDS, x.kind)}
+        <span class="att-neis-l">구분</span>${cells(NEIS_CATS, x.r.cat)}
+        <span class="att-neis-l">사유</span><span class="att-neis-r">${neisReason(x)}</span></div>`)}</section>`);
+    return html`<h4 id="att-dlg-title">${m.title}</h4>
+      <div class="att-neis-bar"><span class="att-seg" role="group" aria-label="보기">${seg('day', '표')}${seg('box', '입력 상자')}</span><span class="att-faint">${m.rows.length + '건'}</span></div>
+      <div class="att-neis-body">${!m.rows.length ? html`<p class="att-muted">이 달에는 출결 기록이 없어요.</p>` : mode === 'day' ? days : boxes}</div>
+      <${Foot}><${CancelBtn} ctx=${ctx} label="닫기" /><button type="button" class="att-btn" disabled=${!m.rows.length} onClick=${() => printNeis(m, mode)}>인쇄</button></${Foot}>`;
+  }
   function SheetBar(p) {
     const ctx = p.ctx, S = ctx.S, D = ctx.D, rec = S.rec;
     const months = MONTHS.map(m => {
@@ -2140,21 +2282,22 @@
       return html`<button type="button" key=${m} class=${on ? 'att-on' : ''} aria-pressed=${on ? 'true' : 'false'} onClick=${() => { if (D) ctx.chooseMonth(ym); }}>${m + '월'}</button>`;
     });
     const strip = html`<span class="att-seg att-months" role="group" aria-label="달">${months}</span>`;
-    if (!D) return html`<div class="att-sheetbar">${strip}</div>`;
+    if (!D) return html`<div class="att-sheetbar att-recbar"><div class="att-recrow">${strip}</div></div>`;
     const rows = Array.from(S.sel).map(id => D.rowById.get(id)).filter(Boolean), n = S.sel.size;
     const count = sheetRows(D, rec).length + sheetUndated(D).length;
-    const left = n
-      ? html`<span class="att-tl"><b>${n + '줄 선택'}</b><button type="button" class="att-link" onClick=${ctx.clearSel}>선택 해제</button></span>`
-      : html`<span class="att-tl"><span class="att-tbar-cnt">${count + '건'}</span></span>`;
-    const lab = (base, cnt, unit) => (n && cnt ? base + ' ' + cnt + unit + '…' : base + '…');
-    const acts = html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'docs', rows)} onClick=${() => ctx.openDialog({ kind: 'docs', ids: rows.map(r => r.id) })}>${lab('서류 상태 바꾸기', rows.length, '줄')}</${Btn}>
-        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'reminders', rows)} onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: rows.map(r => r.id) })}>독려 보내기…</${Btn}>
-        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'reports', rows)} onClick=${() => ctx.openDialog({ kind: 'reports', ids: rows.map(r => r.id) })}>신고서 만들기…</${Btn}>
-        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'tasks', rows)} onClick=${() => ctx.openDialog({ kind: 'tasks', ids: rows.map(r => r.id) })}>Tasks에 추가…</${Btn}>
+    // 2026-11-16 (owner): the NEIS button stays while rows are selected.
+    const neis = html`<button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'neis', ym: rec.ym })}>${monOf(rec.ym + '-01') + '월 나이스 모양으로 보기·인쇄'}</button>`;
+    // 2026-11-16 (owner): NEIS stays right after the months; the selection (or the count) sits on the action row.
+    // 2026-11-17 (owner): no 선택 해제 button; the header checkbox (모두 선택) clears the selection.
+    const left = html`<span class="att-tl">${n ? html`<b>${n + '줄 선택'}</b>` : html`<span class="att-tbar-cnt">${count + '건'}</span>`}</span>`;
+    const lab = (base, cnt, unit) => (n && cnt ? base + ' ' + cnt + unit : base);
+    const acts = html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'docs', rows)} onClick=${() => ctx.openDialog({ kind: 'docs', ids: rows.map(r => r.id) })}>${lab('신고서 및 첨부서류 제출상태 한 번에 변경', rows.length, '줄')}</${Btn}>
+        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'reports', rows)} onClick=${() => ctx.openDialog({ kind: 'reports', ids: rows.map(r => r.id) })}>신고서 만들기</${Btn}>
+        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'tasks', rows)} onClick=${() => ctx.openDialog({ kind: 'tasks', ids: rows.map(r => r.id) })}>Tasks에 추가</${Btn}>
         <span class="att-vsep" aria-hidden="true"></span>
-        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'del', rows)} onClick=${() => ctx.openDialog({ kind: 'del', ids: rows.map(r => r.id) })}>${lab('삭제', rows.filter(E.canDelete).length, '줄')}</${Btn}>`;
-    return html`<div class="att-sheetbar">${strip}${left}
-      <span class="att-ta">${acts}</span></div>`;
+        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm att-btn-danger" why=${barCheck(ctx, 'del', rows)} onClick=${() => ctx.openDialog({ kind: 'del', ids: rows.map(r => r.id) })}>${lab('삭제', rows.filter(E.canDelete).length, '줄')}</${Btn}>`;
+    return html`<div class="att-sheetbar att-recbar"><div class="att-recrow">${strip}${neis}</div>
+      <div class="att-recrow">${left}<span class="att-ta">${acts}</span></div></div>`;
   }
 
   function SortHead(p) {
@@ -2246,7 +2389,7 @@
     }
     if (r.remUnknown) return html`<${Chip} tone="warn" title=${atLong(rem.sentAt)}>결과 확인 필요</${Chip}>`;
     if (rem.state === '발송중') return html`<${Chip} tone="muted" title=${'Google Chat 알림 · ' + atLong(rem.sentAt)}>보내는 중</${Chip}>`;
-    if (rem.state === '실패') return html`<${Chip} tone="warn" title=${String(rem.result || '') + (rem.sentAt ? ' · ' + atLong(rem.sentAt) : '')}>실패</${Chip}>`;
+    if (rem.state === '실패') return html`<${Chip} tone="warn" title=${String(rem.result || '') + (rem.sentAt ? ' · ' + atLong(rem.sentAt) : '')}>보내지 못함</${Chip}>`;
     return faint('—');
   }
 
@@ -2566,6 +2709,7 @@
     if (it.t === 'legacy') return '예전 출석부에서 보낸 메시지';
     if (it.kind === 'chat-class') return '학급 단톡방에 보낸 메시지';
     if (it.kind === 'chat-link') return (it.label ? it.label + '에게 ' : '') + '보낸 결석 신고 링크';
+    if (it.kind === 'chat-guardian-link') return (it.label ? it.label + '에게 ' : '') + '보낸 결석 신고 링크';
     const ref = String((Array.isArray(it.refs) && it.refs[0]) || '').split('/').slice(-2);
     if (ref[0] === 'greetings' && ref[1]?.startsWith('c_')) return '학급 단톡방에 보낸 메시지';
     if (ref[0] === 'attendance') {
@@ -2579,9 +2723,9 @@
     }
     return it.label ? it.label + '에게 보낸 메시지' : '메시지 1건';
   }
-  function unknownLine(it, D) {
-    const tail = '학생이 받았는지 확인하지 못했어요';
-    if (it.t === 'earlier') return it.year + '학년도 메시지 ' + it.n + '건 · ' + tail;
+  function unknownLine(it, D, brief) {
+    const tail = brief ? '' : '학생이 받았는지 확인하지 못했어요';
+    if (it.t === 'earlier') return [it.year + '학년도 메시지 ' + it.n + '건', tail].filter(Boolean).join(' · ');
     return [unknownWhat(it, D), atLong(it.at), tail].filter(Boolean).join(' · ');
   }
 
@@ -2590,30 +2734,76 @@
     if (!D || !W) {
       return html`<div class="att-wgrid">${[65, 50, 72].map(w => html`<div class="att-card"><span class="att-phb" style=${'width:' + w + '%'}></span></div>`)}</div>`;
     }
-    const nothing = W.count === 0 && !W.partial;
+    const nothing = W.workCount === 0 && !W.partial;
     // A card alone on its row takes the whole row, so no half of the window stays empty.
     const alone = (W.s1.length ? 1 : 0) + (W.s5.length ? 1 : 0) === 1;
     const quiet = (label, run) => html`<button type="button" class="att-btn-quiet att-btn-sm" onClick=${run}>${label}</button>`;
-    const cu = W.catchUp;
     return html`
       <${NoticeSlot} ctx=${ctx} />
-      ${W.partial ? html`<div class="att-notice att-muted att-nrow att-gap" role="status"><span class="att-notice-tx">${T.PARTIAL}</span></div>` : null}
-      ${cu && (cu.read || cu.running) ? html`<div class="att-notice att-muted att-nrow att-gap" role="status"><span class="att-notice-tx">${cu.running ? '학생 쪽지를 확인하는 중이에요.' : '학생 쪽지 ' + cu.read + '건 확인 · 출결 ' + (cu.rows || 0) + '줄 입력'}${!cu.running && cu.review ? html` · <span class="att-warn-tx">${'확인 필요 ' + cu.review + '건'}</span>` : null}</span></div>` : null}
-      ${nothing ? html`<p class="att-empty-msg">지금 조치할 일이 없어요.</p>` : html`<div class="att-wgrid">
-        ${W.s10.length ? html`<${ReportCard} ctx=${ctx} items=${W.s10} />` : null}
+      ${nothing ? html`<p class="att-empty-msg fill-center">지금 조치할 일이 없어요.</p>` : html`<div class="att-wgrid">
         ${W.s1.length ? html`<${WorkCard} title="전달됐는지 모르는 메시지" n=${W.s1.length} wide=${alone}>
-          ${W.s1.map(it => html`<${Line} key=${it.k} btns=${it.id ? quiet('확인하기', () => ctx.openDialog({ kind: 'chat-decide', effectId: it.id })) : it.checkId ? quiet('확인했어요', () => legacyResolve(ctx, it)) : null}>${unknownLine(it, D)}</${Line}>`)}</${WorkCard}>` : null}
-        ${W.due.length ? html`<${WorkCard} title="오늘 보낼 메시지" n=${W.due.length}><${ChatHealth} ctx=${ctx} /><${Line} btns=${quiet('개인톡+단체톡 한 번에 보내기', () => ctx.openDialog({ kind: 'chat-send', mode: 'queue' }))}>${'오늘 보낼 메시지 ' + W.due.length}</${Line}></${WorkCard}>` : null}
-        ${W.s5.length ? html`<${WorkCard} title="학생명단 확인" n=${W.s5.length} wide=${alone}>
-          ${W.s5.map(it => (it.t === 'noroster'
-            ? html`<${Line} key=${it.k}>${'학생명단에 없는 이름이 적혀있습니다. (' + it.n + '줄)'}</${Line}>`
-            : it.t==='message-student'||it.t==='message-value' ? html`<${Line} key=${it.k} btns=${quiet('메시지 보기',()=>ctx.setTab('msg'))}>${(it.t==='message-student'?'학생명단에 없는 이름이 적힌 개인톡 ':'보낼 메시지 값 확인 필요 ')+it.n+'건'}</${Line}>`
-            : html`<${Line} key=${it.k} btns=${quiet('학생명단 고치기', () => ctx.link({ kind: 'roster', studentId: it.list[0].id, label: it.list[0].label, focusEmail: true }))}>${'Google 이메일 없음 - ' + it.list.map(s => s.n + '번 ' + s.name).join(', ')}</${Line}>`))}</${WorkCard}>` : null}
+          ${W.s1.map(it => html`<${Line} key=${it.k} btns=${it.id ? quiet('확인하기', () => ctx.openDialog({ kind: 'chat-decide', effectId: it.id })) : it.checkId ? quiet('확인하기', () => legacyResolve(ctx, it)) : null}>${unknownLine(it, D, true)}</${Line}>`)}</${WorkCard}>` : null}
+        ${W.s5.length ? html`<${WorkCard} title="학생-학부모 명단 확인" n=${W.s5.length} wide=${alone}>
+          ${W.s5.map(it => (html`<${Line} key=${it.k} btns=${quiet('학생-학부모 명단 고치기', () => ctx.link({ kind: 'roster', studentId: it.list[0].id, label: it.list[0].label, focusEmail: true }))}>${'Google 이메일 없음 - ' + it.list.map(s => s.n + '번 ' + s.name).join(', ')}</${Line}>`))}</${WorkCard}>` : null}
         ${W.s3.length ? html`<${WorkCard} title="발송 결과 확인 필요" n=${W.s3.length}>${W.s3.map(it=>{
-          return html`<${Line} btns=${html`${it.effectId?quiet('다시 보내기…',()=>ctx.openDialog({kind:'chat-send',mode:it.mode,resendOf:it.effectId,...(it.mode==='reminders'?{ids:[it.id]}:{})})):null}${quiet('학생명단 고치기',()=>ctx.link({kind:'roster',focusEmail:true}))}${it.mode==='queue'?quiet('메시지 보기',()=>ctx.setTab('msg')):null}`}>${it.label+' · 실패'}</${Line}>`;
+          return html`<${Line} btns=${html`${it.effectId?quiet('다시 보내기',()=>ctx.openDialog({kind:'chat-send',mode:it.mode,resendOf:it.effectId,...(it.mode==='reminders'?{ids:it.ids||[it.id]}:{})})):null}${it.cls?null:quiet('학생-학부모 명단 고치기',()=>ctx.link({kind:'roster',focusEmail:true}))}`}>${it.label+' · 보내지 못함'}</${Line}>`;
         })}</${WorkCard}>`:null}
-        ${W.s9.length ? html`<${WorkCard} title="확인이 필요한 학생 쪽지" n=${W.s9.length}>${W.s9.map(it => html`<${Line} key=${it.k} btns=${html`${quiet('출결 직접 입력', () => intakeEnter(ctx, it))}${quiet('처리함', () => intakeResolve(ctx, it))}`}>${it.label + ' · ' + (it.date ? md(it.date) : '') + ' · “' + it.text + '”' + (INTAKE_WHY[it.code] ? ' · ' + INTAKE_WHY[it.code] : '')}</${Line}>`)}</${WorkCard}>` : null}
-        ${W.s7.length ? html`<${WorkCard} title="진행 중인 일" n=${W.s7.length} tone="muted">${W.s7.map(it=>html`<${Line}>${it.label+' · 보내는 중'}</${Line}>`)}</${WorkCard}>`:null}
+        ${W.s7.length ? html`<${WorkCard} title="진행 중인 일" n=${W.s7.length} tone="muted">${W.s7.map(it=>html`<${Line}>${spaceLabel(it.label)+' · 보내는 중'}</${Line}>`)}</${WorkCard}>`:null}
+      </div>`}`;
+  }
+
+  // 학생 출결신고 (2026-11-12): what students sent through their links, recorded here only.
+  function ReportsTab(p) {
+    const ctx = p.ctx, D = ctx.D, W = ctx.W;
+    if (!D || !W) return html`<div class="att-wgrid">${[65, 50].map(w => html`<div class="att-card"><span class="att-phb" style=${'width:' + w + '%'}></span></div>`)}</div>`;
+    const quiet = (label, run) => html`<button type="button" class="att-btn-quiet att-btn-sm" onClick=${run}>${label}</button>`;
+    const since = addDays(D.today, -14);
+    const when = x => x.decidedAt || x.at;
+    const done = D.reports.filter(x => x.state !== 'submitted' && when(x).slice(0, 10) >= since)
+      .sort((a, b) => when(b).localeCompare(when(a))).slice(0, 20);
+    const doneLabel = st => st === 'recorded' ? '기록함' : st === 'withdrawn' ? '취소됨' : st === 'not-recorded' ? '기록 안 함' : '처리함';
+    return html`
+      <${NoticeSlot} ctx=${ctx} />
+      <div class="att-wgrid">
+        ${W.s10.length ? html`<${ReportCard} ctx=${ctx} items=${W.s10} />`
+          : html`<section class="att-card att-wcard att-wfull"><div class="att-card-h att-wcard-h"><h3>기록할 학생 출결신고</h3></div>
+              <p class="att-empty-msg">학생이 신고한 출결 내역이 없어요.</p></section>`}
+        ${W.s9.length ? html`<${WorkCard} title="확인이 필요한 학생 쪽지" n=${W.s9.length} wide=${true}>${W.s9.map(it => html`<${Line} key=${it.k} btns=${html`${quiet('출결 직접 입력', () => intakeEnter(ctx, it))}${quiet('처리하기', () => intakeResolve(ctx, it))}`}><span>${it.label + ' · ' + (it.date ? md(it.date) : '') + ' · “' + it.text + '”'}</span>${INTAKE_WHY[it.code] ? html`<span class="att-why-note">${INTAKE_WHY[it.code]}</span>` : null}</${Line}>`)}</${WorkCard}>` : null}
+        <section class="att-card att-wfull att-rep-links"><${StudentLinkRow} ctx=${ctx} open=${true} inTab=${true} /></section>
+        ${done.length ? html`<${WorkCard} title="최근 2주 처리한 신고" n=${done.length} tone="muted" wide=${true}>
+          ${done.map(rep => html`<${Line} key=${rep.id}><span>${reportLine(rep, D.today)}</span><span class="att-chips"><${Chip} tone=${rep.state === 'recorded' ? 'ok' : 'muted'}>${doneLabel(rep.state)}</${Chip}></span></${Line}>`)}</${WorkCard}>` : null}
+      </div>`;
+  }
+
+  // 미제출 서류 독려 (2026-11-12): 신고서·첨부 not handed in, and the reminders sent about them.
+  function MissingTab(p) {
+    const ctx = p.ctx, D = ctx.D, W = ctx.W;
+    if (!D || !W) return html`<div class="att-wgrid">${[65, 50, 72].map(w => html`<div class="att-card"><span class="att-phb" style=${'width:' + w + '%'}></span></div>`)}</div>`;
+    const quiet = (label, run) => html`<button type="button" class="att-btn-quiet att-btn-sm" onClick=${run}>${label}</button>`;
+    const nothing = !W.s4.length && !W.s3r.length && !W.partial;
+    // 2026-11-16 (owner): this tab sends the 독려 on its own, apart from the 메신저 학생안내 tab.
+    // Reminders are kept per row (reminder.state, sentAt/lastSentAt). 2026-11-16 (owner): a row counts when it has no
+    // reminder of its own and the student was never reminded (보냄), or it was created after the student's latest 보냄
+    // (createdAt). An imported row's createdAt is the 2026-11-11 import, not when it became missing, so an imported row of
+    // a reminded student never counts here (old-sheet rows, rows whose reminder an edit cleared). A student with a
+    // 발송중 or unknown-result row is left out (C7). The send lists only these ids' rows in its message.
+    const due = ctx.s4Groups(W, D).flatMap(g => {
+      const live = g.rows.filter(r => !r.deletedAt);
+      if (live.some(r => r.remUnknown || (r.reminder && r.reminder.state === '발송중'))) return [];
+      const last = live.filter(r => r.reminder && r.reminder.state === '보냄')
+        .map(r => String(r.reminder.lastSentAt || r.reminder.sentAt || '')).sort().pop();
+      return live.filter(r => E.remSendable(r) && !(r.reminder && r.reminder.state)
+        && (last === undefined || (!r.imported && !!last && Date.parse(r.createdAt) > Date.parse(last))));
+    });
+    const people = new Set(due.map(r => r.studentId)).size;
+    const hero = html`<section class="att-card att-mhero"><div class="att-mhero-r"><div class="att-mhero-t"><h3>보낼 독려</h3>
+      <span>${W.partial ? '확인하지 못했어요' : people ? '학생 ' + people + '명 · ' + due.length + '줄' : '아직 독려하지 않은 미제출 서류가 없어요'}</span></div>
+      <${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (W.partial ? { text: '미제출 서류를 확인하지 못했어요. 창 위쪽 [새로 읽기] 버튼(↻)을 눌러 주세요.' } : !people ? { text: '아직 독려하지 않은 미제출 서류가 없어요.', tone: 'muted' } : null)}
+        onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: due.map(r => r.id) })}>${'학생 ' + people + '명에게 한 번에 보내기'}</${Btn}></div></section>`;
+    return html`
+      <${NoticeSlot} ctx=${ctx} />${W.partial || people ? hero : null}
+      ${nothing ? html`<p class="att-empty-msg fill-center">미제출 서류가 없어요.</p>` : html`<div class="att-wgrid">
+        ${W.s3r.length ? html`<${WorkCard} title="독려를 보내지 못한 학생" n=${W.s3r.length} wide=${true}>${W.s3r.map(it => html`<${Line} key=${it.id} btns=${it.effectId ? quiet('다시 보내기', () => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', resendOf: it.effectId, ids: it.ids || [it.id] })) : null}>${it.label + ' · 보내지 못함'}</${Line}>`)}</${WorkCard}>` : null}
         <${MissingSection} ctx=${ctx} />
       </div>`}`;
   }
@@ -2622,26 +2812,27 @@
   function ReportCard(p) {
     const ctx = p.ctx, D = ctx.D, S = ctx.S, items = p.items;
     const quiet = (label, run, why) => html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${why || ctx.roWhy()} onClick=${run}>${label}</${Btn}>`;
-    return html`<${WorkCard} title="학생 결석 신고" n=${items.length} wide=${true}
-      act=${html`<button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.link({ kind: 'attendance-connect' })}>링크 보내기…</button>`}>
-      ${items.map(rep => {
+    return html`<${WorkCard} title="기록할 학생 출결신고" n=${items.length} wide=${true}>
+      ${pairRivals(items, D).map(rep => {
         const key = 'report:' + rep.id, held = !!S.locks[key], busy = !!S.busy[key], dup = S.reportDup && S.reportDup[rep.id];
-        const link = D.links.get(rep.studentId), old = rep.olderLink || (!!link && Number(link.generation) > rep.generation && rep.generation > 0);
-        const chips = [];
+        const link = (rep.reporter === 'guardian' ? D.glinks : D.links).get(rep.studentId), old = rep.olderLink || (!!link && Number(link.generation) > rep.generation && rep.generation > 0);
+        const rivals = reportRivals(rep, D);
+        const chips = [html`<${Chip} tone="muted">${rep.reporter === 'guardian' ? '학부모 등록' : '학생 등록'}</${Chip}>`];
+        if (rivals.length) chips.push(html`<${Chip} tone="warn">학생·학부모가 같은 날짜를 신고함 · 하나를 골라 기록</${Chip}>`);
         if (!rep.cat) chips.push(html`<${Chip} tone="warn">구분 선택 필요</${Chip}>`);
         if (dup) chips.push(html`<${Chip} tone="warn">${'같은 줄이 이미 있어요' + (dup.date ? ' · ' + md(dup.date) : '')}</${Chip}>`);
         if (held) chips.push(html`<${Chip} tone="muted">기록 결과 확인 중</${Chip}>`);
         if (old) chips.push(html`<${Chip} tone="muted">이전 주소로 보냄</${Chip}>`);
         const wait = held ? { text: T.LOST_WRITE } : busy ? { text: '기록하는 중이에요.', tone: 'muted' } : null;
-        const btns = html`${dup && dup.recordId ? quiet('그 줄 보기', () => ctx.gotoRow(dup.recordId), wait) : quiet(busy ? '기록하는 중…' : '기록하기', () => ctx.recordReport(rep), wait)}
+        const btns = html`${dup && dup.recordId ? quiet('그 줄 보기', () => ctx.gotoRow(dup.recordId), wait) : html`<${Btn} ctx=${ctx} cls="att-btn-tonal att-btn-sm" why=${wait || ctx.roWhy()} onClick=${() => ctx.recordReport(rep)}>${busy ? '기록하는 중…' : rivals.length ? '이 신고로 기록' : '기록하기'}</${Btn}>`}
           ${quiet('수정해서 기록', () => ctx.openDialog({ kind: 'report-edit', rep }), wait)}
-          ${old && rep.st ? quiet('링크 새로 만들기…', () => ctx.openDialog({ kind: 'chat-send', mode: 'links', studentIds: [rep.studentId], rotate: true, label: rep.label }), wait) : null}`;
-        return html`<${Line} key=${rep.id} btns=${btns}><span>${reportText(rep, D.today)}</span>${chips.length ? html`<span class="att-chips">${chips}</span>` : null}</${Line}>`;
+          ${old && rep.st ? quiet('링크 새로 만들기', () => ctx.openDialog({ kind: 'chat-send', mode: 'links', studentIds: [rep.studentId], rotate: true, label: rep.label, role: rep.reporter }), wait) : null}`;
+        return html`<${Line} key=${rep.id} btns=${btns}><span>${reportLine(rep, D.today)}</span>${chips.length ? html`<span class="att-chips">${chips}</span>` : null}</${Line}>`;
       })}</${WorkCard}>`;
   }
 
   const INTAKE_WHY = { OTHER_YEAR: '지난 학년도 날짜', AMBIGUOUS_EDITED_OR_CORRECTED: '날짜·취소·대신 전한 말 등이 있어 확인이 필요해요', CORRECTION_REQUIRES_REVIEW: '취소나 정정 쪽지',
-    ATTENDANCE_DUPLICATE: '그날 이미 출결 줄이 있어요', MESSAGE_CHANGED: '쪽지가 바뀌었거나 지워졌어요', ROSTER_CHANGED: '학생명단이 바뀌었어요', GEMINI_FAILED: 'AI가 답하지 않았어요' };
+    ATTENDANCE_DUPLICATE: '그날 이미 출결 줄이 있어요', MESSAGE_CHANGED: '쪽지가 바뀌었거나 지워졌어요', ROSTER_CHANGED: '학생-학부모 명단이 바뀌었어요', GEMINI_FAILED: 'AI가 답하지 않았어요', INTAKE_OFF: '쪽지 자동 읽기를 끄기 전에 받은 쪽지예요' };
   // `출결 직접 입력`: the new-row line of that month, with the student and the date set.
   function intakeEnter(ctx, it) {
     ctx.setTab('rec');
@@ -2665,43 +2856,79 @@
     const sent = rows.filter(r => r.reminder && r.reminder.state === '보냄'), out = [];
     if (rows.some(r => r.remUnknown)) out.push(html`<${Chip} tone="warn">결과 확인 필요</${Chip}>`);
     if (sent.length) out.push(html`<${Chip} tone=${ctx.S.net === 'ok' ? 'ok' : 'muted'}>${'독려 보냄 · ' + atShort(sent[0].reminder.sentAt, ctx.D.today)}</${Chip}>`);
-    if (rows.some(r => r.reminder && r.reminder.state === '실패')) out.push(html`<${Chip} tone="warn">실패</${Chip}>`);
+    if (rows.some(r => r.reminder && r.reminder.state === '실패')) out.push(html`<${Chip} tone="warn">보내지 못함</${Chip}>`);
     if (rows.some(r => r.reminder && r.reminder.state === '발송중' && !r.remUnknown)) out.push(html`<${Chip} tone="muted">보내는 중</${Chip}>`);
     return out;
   }
 
   // One card per student, oldest missing date first; the heading spans the grid.
+  // 2026-11-17 (owner): the rows are ticked (per row, per student, 모두 선택) and one bar acts on them; no buttons per card.
+  const missPickable = r => !r.deletedAt && E.missing(r);
   function MissingSection(p) {
     const ctx = p.ctx, S = ctx.S, D = ctx.D, W = ctx.W;
     const groups = ctx.s4Groups(W, D);
     if (!W.s4.length && !groups.length) return null;
-    const shown = S.s4all ? groups : groups.slice(0, 8);
+    const tick = (ids, on) => ctx.set(prev => { const sel = new Set(prev.sel); ids.forEach(id => { if (on) sel.add(id); else sel.delete(id); }); return { sel, anchor: null }; });
     return html`
-      <div class="att-whead" id="att-sec-s4"><h3>신고서·첨부 미제출</h3>
+      <div class="att-whead" id="att-sec-s4"><h3>신고서·첨부서류 미제출</h3>
         ${W.s4.length ? html`<span class="att-meta">${'학생 ' + W.s4.length + '명 · ' + W.missRows + '줄'}</span>` : null}
       </div>
-      ${shown.map(g => {
-        const miss = g.rows.filter(E.missing), all = !!S.s4rows[g.id], rows = all ? g.rows : g.rows.slice(0, 4);
+      <${MissBar} ctx=${ctx} groups=${groups} tick=${tick} />
+      ${groups.map(g => {
+        const miss = g.rows.filter(E.missing), rows = g.rows, pick = rows.filter(missPickable);
+        const all = pick.length > 0 && pick.every(r => S.sel.has(r.id)), some = pick.some(r => S.sel.has(r.id));
         return html`<div class="att-card att-scard" key=${g.id}>
-          <div class="att-scard-h"><b class="att-nm">${g.label}</b>
+          <div class="att-scard-h">${pick.length ? html`<label class="att-ckl att-scard-ck"><input type="checkbox" checked=${all} ref=${el => { if (el) el.indeterminate = !all && some; }} aria-label=${g.label + ' 미제출 줄 모두 선택'} onChange=${ev => tick(pick.map(r => r.id), ev.target.checked)} /></label>` : null}<b class="att-nm">${g.label}</b>
             ${miss.length ? html`<span class="att-subtle">${'미제출 ' + miss.length + '줄'}</span>${remSummary(ctx, miss)}` : html`<${Chip} tone=${S.net === 'ok' ? 'ok' : 'muted'}>처리함</${Chip}>`}</div>
-          <${MiniTable} ctx=${ctx} rows=${rows} />
-          <div class="att-more-in"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy()} onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: miss.map(r => r.id) })}>독려 보내기…</${Btn}></div>
-          ${g.rows.length > rows.length ? html`<div class="att-more-in"><button type="button" class="att-link" onClick=${() => ctx.set(prev => ({ s4rows: Object.assign({}, prev.s4rows, { [g.id]: true }) }))}>${'나머지 ' + (g.rows.length - rows.length) + '줄 더 보기'}</button></div>` : null}
+          <${MiniTable} ctx=${ctx} rows=${rows} tick=${tick} />
         </div>`;
       })}
-      ${groups.length > shown.length ? html`<div class="att-wfull att-sec-more"><button type="button" class="att-btn-quiet att-btn-sm" onClick=${() => ctx.set({ s4all: true })}>${'나머지 ' + (groups.length - shown.length) + '명 더 보기'}</button></div>` : null}`;
+`;
+  }
+  // Why a ticked row gets no reminder now. A student with a 발송중 or unknown-result reminder is left out whole (C7).
+  function remSkip(r, held) {
+    if (held) return held;
+    if (r.reminder && r.reminder.state === '실패') return '보내지 못한 독려가 있어요. [독려를 보내지 못한 학생]에서 다시 보내 주세요';
+    if (!r.date) return '날짜가 없어요';
+    if (!E.inRoster(r)) return '학생-학부모 명단에 없는 학생이에요';
+    if (r.st && !r.st.hasEmail) return '학생-학부모 명단에 이메일이 없어요';
+    return '지금은 보낼 수 없어요';
+  }
+  // The one action bar of 신고서·첨부서류 미제출 (owner 2026-11-17): always shown, sticky, buttons disabled with nothing ticked.
+  function MissBar(p) {
+    const ctx = p.ctx, S = ctx.S, groups = p.groups;
+    const pickable = groups.flatMap(g => g.rows.filter(missPickable));
+    const rows = pickable.filter(r => S.sel.has(r.id)), n = rows.length, people = new Set(rows.map(r => r.studentId)).size;
+    const all = pickable.length > 0 && n === pickable.length;
+    const send = [], skipped = [];
+    groups.forEach(g => {
+      const mine = rows.filter(r => g.rows.indexOf(r) >= 0);
+      if (!mine.length) return;
+      const live = g.rows.filter(r => !r.deletedAt);
+      const held = live.some(r => r.remUnknown) ? '보낸 결과를 확인하지 못한 독려가 있어 빼요. 그 줄의 [확인하기]로 먼저 확인해 주세요'
+        : live.some(r => r.reminder && r.reminder.state === '발송중') ? '독려를 보내는 중이라 빼요' : '';
+      mine.forEach(r => { if (!held && E.remSendable(r)) send.push(r); else skipped.push({ target: r.label + ' ' + (r.date ? mdw(r.date) : ''), why: remSkip(r, held) }); });
+    });
+    const remSel = !n ? { text: '먼저 위에서 줄을 골라 주세요.', tone: 'muted' } : !send.length ? (remWhy(rows) || { text: '보낼 독려가 없어요.', tone: 'muted' }) : null;
+    return html`<div class="att-missbar">
+      <span class="att-tl"><label class="att-ckl att-lck"><input type="checkbox" checked=${all} disabled=${!pickable.length} ref=${el => { if (el) el.indeterminate = !all && n > 0; }} onChange=${ev => p.tick(pickable.map(r => r.id), ev.target.checked)} /><span>모두 선택</span></label>
+        <b>${n + '줄 선택' + (n ? ' (학생 ' + people + '명)' : '')}</b></span>
+      <span class="att-ta"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${barCheck(ctx, 'docs', rows)} onClick=${() => ctx.openDialog({ kind: 'docs', ids: rows.map(r => r.id), from: 'missing' })}>신고서 및 첨부서류 제출상태 한 번에 변경</${Btn}>
+        <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy() || remSel} onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: send.map(r => r.id), skipped, fromSel: true })}>독려 보내기</${Btn}></span>
+    </div>`;
   }
 
   // One line per row at every width: 사유 truncates, and below the columns' sum the table scrolls sideways. 수정 goes to the row in 출결 기록.
+  // 2026-11-17 (owner): with the row checkbox column the fixed columns are narrower (each still fits its longest
+  // value at 12px) so 사유 keeps about 58px of a 430px card instead of 22px; no horizontal scroll.
   function MiniTable(p) {
     const ctx = p.ctx, S = ctx.S, rows = p.rows;
     let shade = false, prev = null;
     const firstId = rows.length ? rows[0].id : null;
     const bad = raw => html`<span class="att-why att-vtx att-warn" title=${raw}>값 확인 필요</span>`;
     return html`<div class="att-mini"><table class="att-rt" aria-label="출결 기록">
-      <colgroup><col style="width:62px" /><col style="width:54px" /><col style="width:44px" /><col /><col style="width:36px" /><col style="width:60px" /><col style="width:60px" /><col style="width:20px" /><col style="width:32px" /></colgroup>
-      <thead><tr><th>날짜</th><th>구분</th><th>종류</th><th>사유</th><th>교시</th><th>신고서</th><th>첨부</th><th>AI</th><th><span class="att-sr">수정</span></th></tr></thead>
+      <colgroup>${(p.tick ? [24, 64, 52, 42, 0, 32, 52, 52, 26, 28] : [0, 72, 54, 44, 0, 36, 60, 60, 36, 32]).map((w, i) => (i === 0 && !p.tick ? null : w ? html`<col style=${'width:' + w + 'px'} />` : html`<col />`))}</colgroup>
+      <thead><tr>${p.tick ? html`<th class="att-ck"><span class="att-sr">선택</span></th>` : null}<th>날짜</th><th>구분</th><th>종류</th><th>사유</th><th>교시</th><th>신고서</th><th>첨부</th><th>AI</th><th><span class="att-sr">수정</span></th></tr></thead>
       <tbody onKeyDown=${ev => tableKey(ev, ctx)}>${rows.map((r, i) => {
         const start = r.date !== prev;
         if (start && i > 0) shade = !shade;
@@ -2709,9 +2936,10 @@
         const cls = ['att-r'];
         if (shade) cls.push('att-sh');
         if (start && i > 0) cls.push('att-rs');
-        if (E.needs(r)) cls.push('att-need');
         if (S.flash[r.id]) cls.push('att-jw');
-        return html`<tr key=${r.id} class=${cls.join(' ')} data-rid=${r.id} tabindex=${r.id === firstId ? 0 : -1}>
+        if (p.tick && S.sel.has(r.id) && missPickable(r)) cls.push('att-sel');
+        const ck = p.tick ? html`<td class="att-ck">${missPickable(r) ? html`<label class="att-ckl"><input type="checkbox" tabindex="-1" checked=${S.sel.has(r.id)} aria-label=${r.label + ' ' + mdw(r.date) + ' 선택'} onChange=${ev => p.tick([r.id], ev.target.checked)} /></label>` : null}</td>` : null;
+        return html`<tr key=${r.id} class=${cls.join(' ')} data-rid=${r.id} tabindex=${r.id === firstId ? 0 : -1}>${ck}
           <td><span class="att-dt">${mdw(r.date)}</span></td>
           <td>${E.catBad(r) ? bad(rawOf(r, 'category') || r.cat) : r.cat}</td>
           <td>${E.kindBad(r) ? bad(rawOf(r, 'kind') || r.kind) : r.kind}</td>
@@ -2724,6 +2952,17 @@
   }
 
   /* ---------- 종합 ---------- */
+  // 모든 학년도 출결 기록 엑셀로 내보내기 (owner 2026-11-17, moved here from 내 정보): one xlsx of every school year.
+  function exportButton(ctx) {
+    const S = ctx.S;
+    const why = !ctx.opts.exportAll ? { text: '이 화면에서는 내보낼 수 없어요.', tone: 'muted' } : S.setBusy ? { text: '저장하는 중이에요.', tone: 'muted' } : null;
+    return html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${why} onClick=${async () => {
+      ctx.set({ setBusy: true });
+      try { const result = await ctx.opts.exportAll(); if (result?.saved) ctx.toast('전체 자료를 저장했어요.'); }
+      catch (e) { ctx.explain({ text: e.message || '전체 자료를 저장하지 못했어요.' }); }
+      finally { ctx.set({ setBusy: false }); }
+    }}>엑셀로 내보내기</${Btn}>`;
+  }
   function SummaryTab(p) {
     const ctx = p.ctx, S = ctx.S, D = ctx.D;
     if (!D) {
@@ -2742,7 +2981,7 @@
     const okChip = text => (S.net === 'ok' ? html`<${Chip} tone="ok">${text}</${Chip}>` : html`<${Chip} tone="muted">${atLong(S.readAt) + ' 기준'}</${Chip}>`);
     return html`
       <div class="att-pbar" style="margin-top:0"><${PeriodSeg} ctx=${ctx} /></div>
-      <div class="att-fbar">${studentFilter(ctx)}${catFilter(ctx)}${kindFilter(ctx)}<span class="att-spacer"></span>${searchBox(ctx)}</div>
+      <div class="att-fbar">${studentFilter(ctx)}${catFilter(ctx)}${kindFilter(ctx)}<span class="att-spacer"></span>${searchBox(ctx)}${exportButton(ctx)}</div>
       <${NoticeSlot} ctx=${ctx} />
       <div class="att-kgrid">
         <div class="att-kg att-kg-a">지금 해야 할 일<span>전체 기간</span></div>
@@ -2751,7 +2990,7 @@
           <div class="att-kpi-top"><span class="att-kpi-l">신고서·첨부 미제출</span>${!D.complete ? unread : miss.length ? html`<${Chip} tone="warn">조치 필요</${Chip}>` : okChip('모두 제출')}</div>
           <div class="att-kpi-v">${D.complete ? miss.length : '—'}<small>건</small></div>
           <div class="att-kpi-s">${D.complete ? '신고서 ' + miss.filter(r => r.g === '미제출').length + ' · 첨부 ' + miss.filter(r => r.h === '미제출').length : ''}</div>
-          <div class="att-kpi-a"><button type="button" class="att-btn-tonal att-btn-sm" onClick=${() => { ctx.setTab('work'); setTimeout(() => { const el = document.getElementById('att-sec-s4'); if (el) el.scrollIntoView({ block: 'start' }); }, 30); }}>미제출 보기</button></div>
+          <div class="att-kpi-a"><button type="button" class="att-btn-tonal att-btn-sm" onClick=${() => ctx.setTab('miss')}>미제출 보기</button></div>
         </div>
         <div class="att-kpi">
           <div class="att-kpi-top"><span class="att-kpi-l">출결 변동</span></div>
@@ -2796,7 +3035,7 @@
       <div class="att-card-h"><h3>${monthly ? '월별 출결 변동' : '주별 출결 변동'}</h3>
         <div class="att-legend"><span><i class="att-lk att-lk-solid"></i>결석</span><span><i class="att-lk att-lk-hollow"></i>지각·조퇴·결과</span></div>
         <span class="att-spacer"></span>
-        ${bks.length ? html`<button type="button" class="att-tbtn" onClick=${() => ctx.setIn('view', { trendTable: !v.trendTable })}>${v.trendTable ? '그래프로 보기' : '표로 보기'}</button>` : null}</div>
+        <button type="button" class="att-tbtn" disabled=${!bks.length} onClick=${() => ctx.setIn('view', { trendTable: !v.trendTable })}>${v.trendTable ? '그래프로 보기' : '표로 보기'}</button></div>
       ${bks.length ? (v.trendTable
         ? html`<table class="att-rt"><thead><tr><th>기간</th><th>결석</th><th>지각·조퇴·결과</th></tr></thead><tbody>${bks.map((b, i) => html`<tr><td>${b.label}</td><td>${s1[i]}</td><td>${s2[i]}</td></tr>`)}</tbody></table>`
         : html`<${LineChart} bks=${bks} s1=${s1} s2=${s2} />`) : html`<div class="att-faint att-small">표시할 기간이 없어요.</div>`}
@@ -2896,7 +3135,7 @@
   /* ---------- 휴일·학사일정 ---------- */
   function HolidaysTab(p) {
     const ctx = p.ctx, S = ctx.S, D = ctx.D;
-    if (!D) return html`<p class="att-faint">읽는 중…</p>`;
+    if (!D) return html`<p class="att-faint fill-center">읽는 중…</p>`;
     const hs = S.holiday, ro = ctx.roWhy();
     const years = holidayYears(D);
     const year = hs.year && years.indexOf(Number(hs.year)) >= 0 ? Number(hs.year) : (D.cal.inYear ? Number(D.today.slice(0, 4)) : D.cal.sy);
@@ -2906,7 +3145,7 @@
     return html`
       <${NoticeSlot} ctx=${ctx} />
       <div class="att-pbar" style="margin-top:0">
-        <span class="att-seg" role="group" aria-label="연도">${years.map(y => html`<button type="button" key=${y} class=${year === y ? 'att-on' : ''} aria-pressed=${year === y ? 'true' : 'false'} onClick=${() => ctx.setIn('holiday', { year: y })}>${y + '년'}</button>`)}</span>
+        <span class="att-seg att-months" role="group" aria-label="연도">${years.map(y => html`<button type="button" key=${y} class=${year === y ? 'att-on' : ''} aria-pressed=${year === y ? 'true' : 'false'} onClick=${() => ctx.setIn('holiday', { year: y })}>${y + '년'}</button>`)}</span>
         <${FilterSelect} label="구분" value=${hs.kind} onChange=${val => ctx.setIn('holiday', { kind: val })} options=${[['', '전체']].concat(HOL_KINDS.map(k => [k, k]))} />
         <input class="att-search" type="search" placeholder="명칭·날짜 검색" aria-label="명칭·날짜 검색" value=${hs.q} onInput=${ev => ctx.setIn('holiday', { q: ev.target.value })} />
         <span class="att-spacer"></span>
@@ -2920,36 +3159,13 @@
           <td>${SAFE_URL.test(x.source) ? html`<button type="button" class="att-link" onClick=${() => ctx.link({ kind: 'external', url: x.source })}>바로가기</button>` : html`<span class="att-why att-subtle" title=${x.source}>${x.source || '—'}</span>`}</td>
           <td class="att-acts"><span class="att-actions">
             <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${holidayWhy(ctx, x)} onClick=${() => ctx.openDialog({ kind: 'hol', orig: x.d, v: Object.assign({}, x) })}>수정</${Btn}>
-            <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${holidayWhy(ctx, x)} onClick=${() => ctx.openDialog({ kind: 'hdel', k: x.d })}>삭제…</${Btn}></span></td></tr>`)
+            <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm att-btn-danger" why=${holidayWhy(ctx, x)} onClick=${() => ctx.openDialog({ kind: 'hdel', k: x.d })}>삭제</${Btn}></span></td></tr>`)
           : html`<tr><td class="att-empty" colspan="7">${year + '년 휴일이 없어요.'}</td></tr>`}</tbody></table></div>`;
   }
   function holidayWhy(ctx, x) {
     const ro = ctx.roWhy();
     if (ro) return ro;
     return ctx.S.locks['hol:' + x.d] ? { text: T.LOST_WRITE } : null;
-  }
-
-  /* D36: settings live in dashboard cards and share the existing write/holiday machinery. */
-  function IdentitySettings(p) {
-    const ctx = p.ctx, D = ctx.D, S = ctx.S;
-    if (!D) return html`<p class="att-subtle">읽는 중…</p>`;
-    const doc = D.doc, why = ctx.roWhy() || (S.locks.set ? { text: T.LOST_WRITE } : null) || (S.setBusy ? { text: '저장 중…', tone: 'muted' } : null);
-    const row = (label, value, action) => html`<div class="att-srow"><span class="att-sk">${label}</span><span class="att-sv">${value}</span><span class="att-sb">${action}</span></div>`;
-    const open = (id, base, label) => id ? html`<button class="att-btn-quiet att-btn-sm" onClick=${() => ctx.link({ kind: 'external', url: base + encodeURIComponent(id) })}>${label}</button>` : null;
-    // D17: the teacher's own template, picked once in Google Picker in the browser; the read after it shows the name.
-    const pickTemplate = async () => {
-      const out = await ctx.call('/v1/data/picker/report-template', {});
-      if (out.status === 200 && out.body && out.body.url) { ctx.link({ kind: 'external', url: out.body.url }); ctx.toast('브라우저에서 양식을 고른 뒤 이 창을 다시 열면 고른 양식이 보여요.'); }
-      else ctx.toast(out.unknown ? '응답을 받지 못했어요. 잠시 뒤 다시 눌러 주세요.' : ctx.whyOf({ kind: out.status === 401 ? 'session' : 'refused', status: out.status, code: out.body && out.body.error }).text);
-    };
-    return html`<${NoticeSlot} ctx=${ctx} />
-      <div class="att-sgrp"><div class="att-sgrp-h">출결</div>
-        ${row('신고서 양식', doc.reportTemplateDocId ? (doc.reportTemplateName || '연결됨') : '정해지지 않음', html`${open(doc.reportTemplateDocId, 'https://docs.google.com/document/d/', '문서 열기')}
-          <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy()} onClick=${pickTemplate}>양식 고르기…</${Btn}>`)}
-        ${row('신고서 폴더', doc.reportFolderId ? '연결됨' : '정해지지 않음', open(doc.reportFolderId, 'https://drive.google.com/drive/folders/', '폴더 열기'))}
-        ${row('AI 출결 입력', doc.aiInputAllowed === true ? '켜짐' : '꺼짐', html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${why} onClick=${() => ctx.saveSetting({ aiInputAllowed: doc.aiInputAllowed !== true })}>바꾸기</${Btn}>`)}
-        ${row('전체 자료', '모든 학년도의 출결 자료', html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${why} onClick=${async () => { ctx.set({ setBusy: true }); try { const result = await ctx.opts.exportAll(); if (result?.saved) ctx.toast('전체 자료를 저장했어요.'); } catch (e) { ctx.explain({ text: e.message || '전체 자료를 저장하지 못했어요.' }); } finally { ctx.set({ setBusy: false }); } }}>전체 내보내기</${Btn}>`)}
-      </div>`;
   }
 
   /* ---------- dialogs ---------- */
@@ -2963,10 +3179,10 @@
     }, [d.seq]);
     const onBackdrop = ev => { if (ev.target === ev.currentTarget) ctx.closeDialog(); };
     const Comp = { docs: DocsDialog, del: DeleteDialog, period: PeriodDialog, hol: HolidayDialog, hdel: HolidayDeleteDialog, tasklist: TaskListDialog, tasks: TasksDialog, reports: ReportsDialog, closeq: CloseQueueDialog,
-      'chat-send': ChatSendDialog, 'chat-decide': ChatDecisionDialog, 'message-edit': MessageEditDialog, welcome: WelcomeDialog, 'link-show': LinkShowDialog, 'report-edit': ReportEditDialog,
-      rollover: RolloverDialog, rostercopy: RosterCopyDialog }[d.kind];
+      'chat-send': ChatSendDialog, 'chat-decide': ChatDecisionDialog, 'message-edit': MessageEditDialog, welcome: WelcomeDialog, 'link-show': LinkShowDialog, 'phone-handoff': PhoneHandoffDialog, 'report-edit': ReportEditDialog,
+      rollover: RolloverDialog, rostercopy: RosterCopyDialog, neis: NeisDialog }[d.kind];
     return html`<div class="att-dlg-ov" onClick=${onBackdrop}>
-      <div class="att-dlg" role="dialog" aria-modal="true" aria-labelledby="att-dlg-title" ref=${ctx.dialogBox} onInput=${ctx.markDirty} onChange=${ctx.markDirty}>
+      <div class=${'att-dlg' + (d.kind === 'neis' ? ' att-dlg-wide' : '')} role="dialog" aria-modal="true" aria-labelledby="att-dlg-title" ref=${ctx.dialogBox} onInput=${ctx.markDirty} onChange=${ctx.markDirty}>
         <${Boundary}><${Comp} key=${d.seq} ctx=${ctx} d=${d} /></${Boundary}>
       </div></div>`;
   }
@@ -2980,7 +3196,8 @@
   const opt = (value, label, cur) => html`<option value=${value} selected=${value === cur}>${label}</option>`;
   function DocsDialog(p) {
     const ctx = p.ctx, D = ctx.D, rows = p.d.ids.map(id => D.rowById.get(id)).filter(r => r && !r.deletedAt);
-    const [g, setG] = useState('그대로'), [hh, setH] = useState('그대로');
+    const preset = v => (DOC_BULK.indexOf(v) >= 0 ? v : '그대로');
+    const [g, setG] = useState(preset(p.d.g)), [hh, setH] = useState(preset(p.d.h));
     const [running, setRunning] = useState(false);
     const val = (v, cur) => (v === '그대로' ? cur : v === '(비움)' ? '' : v);
     const changed = g !== '그대로' || hh !== '그대로';
@@ -3014,7 +3231,7 @@
         if (!closing) { ctx.set({ dialogBusy: false }); setRunning(false); }
       }
     };
-    return html`<h4 id="att-dlg-title">${'선택한 ' + rows.length + '줄의 서류 상태를 바꿀까요?'}</h4><${DlgNotice} ctx=${ctx} />
+    return html`<h4 id="att-dlg-title">${p.d.title || ((p.d.from === 'missing' ? '미제출 ' : '선택한 ') + rows.length + '줄의 서류 상태를 바꿀까요?')}</h4><${DlgNotice} ctx=${ctx} />
       <div class="att-row att-mt"><label class="att-fl">신고서 ${sel(g, setG)}</label><label class="att-fl">첨부 ${sel(hh, setH)}</label></div>
       <div class="att-ov-list">${rows.map(r => html`<div key=${r.id}><b>${r.label}</b>${' ' + dlab(r) + ' ' + r.kind + ' · 신고서 ' + (r.g || '비움') + ' → ' + (val(g, r.g) || '비움') + ' · 첨부 ' + (r.h || '비움') + ' → ' + (val(hh, r.h) || '비움')}</div>`)}</div>
       <${Foot}><${CancelBtn} ctx=${ctx} busy=${running} /><${Btn} ctx=${ctx} cls="att-btn" why=${why} onClick=${save}>${running ? '바꾸는 중…' : rows.length + '줄 바꾸기'}</${Btn}></${Foot}>`;
@@ -3057,19 +3274,21 @@
   function ReportsDialog(p) {
     const ctx = p.ctx, D = ctx.D, rows = p.d.ids.map(id => D.rowById.get(id)).filter(r => r && !r.deletedAt && r.date && /결석|지각|조퇴|결과/.test(r.kind || ''));
     const [st, setSt] = useState({ running: false, results: null, step: '' });
-    const run = async recreate => {  // recreate: the report-files kinds to make again
+    const run = async recreate => {  // recreate: the report-files kinds to make again ('report-folder', 'report-template')
       setSt({ running: true, results: null, step: '' });
       ctx.set({ dialogBusy: true, dlgNotice: null });
       const refuse = out => ctx.set({ dlgNotice: out.unknown ? { text: '신고서를 만들었는지 확인하지 못했어요. 다시 누르지 말고 Google Drive의 ‘출결 증빙’ 폴더를 먼저 확인해 주세요.' }
         : ctx.whyOf({ kind: out.status === 401 ? 'session' : 'refused', status: out.status, code: out.body && out.body.error, details: out.body && out.body.details }) });
       try {
-        // Only the folder is ever made here; the template is the teacher's own, picked once (owner, 2026-11-09).
-        if (recreate || !D.doc.reportFolderId) {
+        // 2026-11-13 (owner): the 결석신고서 양식 lives on the server; only the folder is made in Drive.
+        const again = recreate || [];
+        const kinds = ['report-folder'].filter(k => again.includes(k) || !D.doc.reportFolderId);
+        if (kinds.length) {
           setSt({ running: true, results: null, step: '‘출결 증빙’ 폴더를 준비하는 중…' });
-          const made = await ctx.call('/v1/data/years/report-files', { requestId: 'rf-' + Date.now().toString(36), kinds: ['report-folder'], ...(recreate ? { recreate: ['report-folder'] } : {}) });
+          const made = await ctx.call('/v1/data/years/report-files', { requestId: 'rf-' + Date.now().toString(36), kinds, ...(again.length ? { recreate: again } : {}) });
           const res = made.status === 200 && made.body && made.body.results;
-          if (!res || !['created', 'already'].includes((res['report-folder'] || {}).status)) {
-            if (made.status === 200) ctx.set({ dlgNotice: { text: '‘출결 증빙’ 폴더를 준비하지 못했어요. 조치할 일을 확인해 주세요.' } }); else refuse(made);
+          if (!res || kinds.some(k => !['created', 'already'].includes((res[k] || {}).status))) {
+            if (made.status === 200) ctx.set({ dlgNotice: { text: '신고서를 만들 준비를 하지 못했어요. 조치할 일을 확인해 주세요.' } }); else refuse(made);
             setSt({ running: false, results: null, step: '' });
             return;
           }
@@ -3077,31 +3296,25 @@
         setSt({ running: true, results: null, step: '신고서를 만드는 중…' });
         const out = await ctx.call('/v1/data/reports', { rows: rows.map(r => ({ recordId: r.id, version: r.version })) });
         if (out.status === 200 && out.body && Array.isArray(out.body.results)) setSt({ running: false, results: out.body.results, step: '' });
-        else if (out.body && out.body.error === 'REPORT_FILES_MISSING') setSt({ running: false, results: null, step: '', needPick: true });
+        else if (out.body && out.body.error === 'REPORT_FILES_MISSING') setSt({ running: false, results: null, step: '', needFolder: true });
         else { setSt({ running: false, results: null, step: '' }); refuse(out); }
       } finally { ctx.set({ dialogBusy: false }); ctx.read(); }
     };
-    // Google Picker in the browser: the chosen document itself becomes the template (D17).
-    const pick = async () => {
-      ctx.set({ dlgNotice: null });
-      const out = await ctx.call('/v1/data/picker/report-template', {});
-      if (out.status === 200 && out.body && out.body.url) { ctx.link({ kind: 'external', url: out.body.url }); setSt({ running: false, results: null, step: '', picking: true }); }
-      else refuse(out);
-    };
     const refuse = out => ctx.set({ dlgNotice: out.unknown ? { text: '응답을 받지 못했어요. 잠시 뒤 다시 눌러 주세요.' } : ctx.whyOf({ kind: out.status === 401 ? 'session' : 'refused', status: out.status, code: out.body && out.body.error, details: out.body && out.body.details }) });
     const res = st.results, byId = new Map((res || []).map(x => [x.recordId, x]));
-    const failed = (res || []).find(x => ['REPORT_TEMPLATE_UNAVAILABLE', 'REPORT_FOLDER_UNAVAILABLE'].includes(x.code));
-    const lost = !failed ? [] : failed.missing && failed.missing.length ? failed.missing : [failed.code === 'REPORT_FOLDER_UNAVAILABLE' ? 'report-folder' : 'report-template'];
+    const lost = st.needFolder || (res || []).some(x => x.code === 'REPORT_FOLDER_UNAVAILABLE') ? ['report-folder'] : [];
+    const refused = (res || []).some(x => x.code === 'REPORT_CREATE_REFUSED');
     const open = id => ctx.link({ kind: 'external', url: 'https://docs.google.com/document/d/' + encodeURIComponent(id) + '/edit' });
+    // 2026-11-17 (owner): 출결 증빙 폴더 열기 moved here from 내 정보; always shown, disabled while there is no folder.
     return html`<h4 id="att-dlg-title">${res ? '신고서 만들기 결과' : '선택한 ' + rows.length + '줄의 출결 신고서를 만들까요?'}</h4><${DlgNotice} ctx=${ctx} />
       <div class="att-ov-list">${rows.map(r => { const x = byId.get(r.id);
         return html`<div key=${r.id}><b>${r.label}</b>${' ' + dlab(r) + ' ' + (r.kind || '')}${x ? html` · <b>${REPORT_RESULT[x.status] || x.status}</b>` : null}${x && x.docId ? html` <button class="att-link" onClick=${() => open(x.docId)}>열기</button>` : null}</div>`; })}</div>
-      ${st.needPick || lost.includes('report-template') ? html`<p class="att-band att-warn">${st.needPick ? '결석신고서 양식을 아직 고르지 않았어요.' : '연결된 신고서 양식을 열 수 없어요.'} 지금 쓰는 양식(Google 문서)을 한 번 골라 주세요. 고른 문서를 그대로 써요.</p>
-        <div class="att-row"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy()} onClick=${pick}>양식 고르기…</${Btn}></div>` : null}
-      ${st.picking ? html`<p class="att-subtle">브라우저에서 양식을 고른 뒤 돌아와 [만들기]를 다시 눌러 주세요.</p>` : null}
+      ${refused ? html`<p class="att-band att-warn">Google Drive가 신고서 파일을 만들지 않았어요. 잠시 뒤 다시 눌러 주세요. 계속되면 contact@big-silver.xyz로 알려 주세요.</p>` : null}
       ${lost.length === 1 && lost[0] === 'report-folder' ? html`<p class="att-band att-warn">‘출결 증빙’ 폴더를 열 수 없어요. 새 폴더를 만들 수 있어요. 예전 폴더는 그대로 둬요.</p>
-        <div class="att-row"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy() || (st.running ? { text: '만드는 중이에요.', tone: 'muted' } : null)} onClick=${() => run(true)}>폴더 다시 만들기…</${Btn}></div>` : null}
+        <div class="att-row"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ctx.roWhy() || (st.running ? { text: '만드는 중이에요.', tone: 'muted' } : null)} onClick=${() => run(['report-folder'])}>폴더 다시 만들기</${Btn}></div>` : null}
       ${res ? null : html`<p class="att-subtle">${st.step || '연속된 결석은 신고서 하나로 만들어요. 만든 신고서는 Google Drive의 ‘출결 증빙’ 폴더에 들어가요.'}</p>`}
+      <div class="att-row"><${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${D.doc.reportFolderId ? null : { text: '아직 ‘출결 증빙’ 폴더가 없어요. 신고서를 처음 만들 때 만들어져요.', tone: 'muted' }}
+        onClick=${() => ctx.link({ kind: 'external', url: 'https://drive.google.com/drive/folders/' + encodeURIComponent(D.doc.reportFolderId) })}>출결 증빙 폴더 열기</${Btn}></div>
       <${Foot}>${res ? html`<button class="att-btn" onClick=${ctx.closeDialogNow}>닫기</button>`
         : html`<${CancelBtn} ctx=${ctx} busy=${st.running} /><${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (st.running ? { text: '만드는 중이에요.', tone: 'muted' } : null)} onClick=${() => run(false)}>${st.running ? '만드는 중…' : '만들기'}</${Btn}>`}</${Foot}>`;
   }
@@ -3285,7 +3498,7 @@
         <label class="att-fld">비고<input value=${v.note} maxlength="500" onInput=${ev => up({ note: ev.target.value })} /></label>
         <label class="att-fld">출처<input value=${v.source} maxlength="1000" placeholder="https://…" onInput=${ev => up({ source: ev.target.value })} /></label></div>
       <${Foot}>
-        ${d.orig ? html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-sep" why=${ctx.roWhy()} onClick=${() => ctx.openDialog({ kind: 'hdel', k: d.orig })}>이 휴일 삭제…</${Btn}>` : null}
+        ${d.orig ? html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-sep att-btn-danger" why=${ctx.roWhy()} onClick=${() => ctx.openDialog({ kind: 'hdel', k: d.orig })}>이 휴일 삭제</${Btn}>` : null}
         <${CancelBtn} ctx=${ctx} noFocus busy=${running} />
         <${Btn} ctx=${ctx} cls="att-btn" primary why=${why} onClick=${save}>${running ? '저장 중…' : '저장'}</${Btn}></${Foot}>`;
   }
@@ -3322,11 +3535,11 @@
         <label class="att-fld">학교 이름<input value=${v.schoolName} maxlength="100" onInput=${ev => up({ schoolName: ev.target.value })} /></label>
         <label class="att-fld">학년<input value=${v.grade} maxlength="100" onInput=${ev => up({ grade: ev.target.value })} /></label>
         <label class="att-fld">반<input value=${v.classNumber} maxlength="100" onInput=${ev => up({ classNumber: ev.target.value })} /></label>
-        <label class="att-fld">반 이름<input value=${v.classLabel} maxlength="100" placeholder="비우면 학년·반으로 적어요" onInput=${ev => up({ classLabel: ev.target.value })} /></label>
+
         <label class="att-fld">담임 이름<input value=${v.teacherName} maxlength="100" onInput=${ev => up({ teacherName: ev.target.value })} /></label></div>
-      <div class="att-ov-list">${fact('서식 문서', doc.reportTemplateName)}${fact('저장 폴더', doc.reportFolderId ? '출결 증빙' : '')}${fact('할 일 목록', doc.taskListTitle)}
+      <div class="att-ov-list">${fact('저장 폴더', doc.reportFolderId ? '출결 증빙' : '')}${fact('할 일 목록', doc.taskListTitle)}
         <div><b>휴일</b> 올해 공휴일을 넣어 둬요.</div><div><b>학급 단톡방 · 학생 인사</b> 새 반에서 다시 시작해요.</div></div>
-      <p class="att-subtle">학생명단은 따로 복사해요.</p>
+      <p class="att-subtle">학생-학부모 명단은 따로 복사해요.</p>
       <${Foot}><${CancelBtn} ctx=${ctx} busy=${running} /><${Btn} ctx=${ctx} cls="att-btn" primary why=${running ? { text: '시작하는 중이에요.', tone: 'muted' } : null} onClick=${run}>${running ? '시작하는 중…' : '시작하기'}</${Btn}></${Foot}>`;
   }
 
@@ -3349,14 +3562,14 @@
         } else {
           const code = out.body && out.body.error;
           ctx.set({ dlgNotice: out.unknown ? { text: '복사했는지 확인하지 못했어요. 창을 다시 읽은 뒤 확인해 주세요.' }
-            : code === 'NO_EARLIER_ROSTER' ? { text: from + '학년도 학생명단에 재적 학생이 없어요.' }
-            : code === 'ROSTER_NOT_EMPTY' ? { text: '학생명단에 이미 학생이 있어 복사하지 않았어요.' }
+            : code === 'NO_EARLIER_ROSTER' ? { text: from + '학년도 학생-학부모 명단에 재적 학생이 없어요.' }
+            : code === 'ROSTER_NOT_EMPTY' ? { text: '학생-학부모 명단에 이미 학생이 있어 복사하지 않았어요.' }
             : ctx.whyOf({ kind: out.status === 401 ? 'session' : 'refused', status: out.status, code, details: out.body && out.body.details }) });
         }
       } finally { if (!closing) { ctx.set({ dialogBusy: false }); setRunning(false); } }
     };
-    return html`<h4 id="att-dlg-title">${from + '학년도 학생명단을 복사할까요?'}</h4><${DlgNotice} ctx=${ctx} />
-      <p>재적 학생의 번호·이름·이메일을 그대로 가져와요. 복사한 뒤 번호가 바뀐 학생은 학생명단에서 고쳐 주세요.</p>
+    return html`<h4 id="att-dlg-title">${from + '학년도 학생-학부모 명단을 복사할까요?'}</h4><${DlgNotice} ctx=${ctx} />
+      <p>재적 학생의 번호·이름·이메일을 그대로 가져와요. 복사한 뒤 번호가 바뀐 학생은 학생-학부모 명단에서 고쳐 주세요.</p>
       <${Foot}><${CancelBtn} ctx=${ctx} busy=${running} /><${Btn} ctx=${ctx} cls="att-btn" primary why=${running ? { text: '복사하는 중이에요.', tone: 'muted' } : null} onClick=${run}>${running ? '복사하는 중…' : '복사'}</${Btn}></${Foot}>`;
   }
 
@@ -3460,7 +3673,7 @@
     const code = String(reply?.body?.error || '');
     if (code === 'CHAT_NOT_CONNECTED' || code === 'GOOGLE_PERMISSION_REQUIRED') return T.PERM;
     if (code === 'TEACHER_RATE_LIMIT') return '오늘 Google Chat으로 보낼 수 있는 메시지 수를 넘었어요.';
-    if (code === 'CHAT_RATE_LIMITED') return 'Google Chat이 잠시 발송을 제한했어요. 아직 보내지 않은 메시지는 대기 중이에요.';
+    if (code === 'CHAT_RATE_LIMITED') return 'Google Chat이 잠시 발송을 제한했어요. 아직 보내지 않은 메시지는 보낼 예정으로 남아 있어요.';
     return reply?.body?.message || (reply?.status === 401 ? T.SESSION : reply?.status === 409 ? T.STALE : T.NOT_READ);
   }
   function useChatStatus(ctx) {
@@ -3491,12 +3704,17 @@
     const ctx = p.ctx, value = useChatStatus(ctx);
     const connected = value?.connected;
     const space = value?.classSpace?.displayName, group = value?.groupState;
+    // In a send dialog only a problem shows, and the class room only for a class send (owner 2026-11-13).
+    if (p.problemsOnly) {
+      const classBad = p.classSend && group && group !== 'ready';
+      if (connected !== false && connected !== null && !classBad) return null;
+    }
     return html`<div class="att-chat-health">
-      <${Chip} tone=${connected === true ? 'ok' : connected === false ? 'warn' : 'muted'}>${value === undefined ? 'Google Chat 확인 중…' : connected === true ? 'Google Chat 연결됨' : connected === false ? 'Google Chat 연결 필요' : 'Google Chat 확인하지 못했어요'}</${Chip}>
+      ${p.problemsOnly && connected === true ? null : html`<${Chip} tone=${connected === true ? 'ok' : connected === false ? 'warn' : 'muted'}>${value === undefined ? 'Google Chat 확인 중…' : connected === true ? 'Google Chat 연결됨' : connected === false ? 'Google Chat 연결 필요' : 'Google Chat 확인하지 못했어요'}</${Chip}>`}
       ${connected === false ? html`<button class="att-link" onClick=${ctx.reapprove}>권한 다시 승인</button>` : null}
-      ${group === 'ready' && space ? html`<${Chip} tone="ok" title=${space}>${'학급 단톡방 · ' + space}</${Chip}>` : null}
-      ${group === 'not-selected' || group === 'missing' ? html`<${Chip} tone="warn">학급 단톡방 연결 필요</${Chip}>${ctx.opts.card === 'connect' ? null : html`<button class="att-link" onClick=${() => { ctx.closeDialog(); ctx.link({ kind: 'attendance-connect' }); }}>연결 → 출결 열기</button>`}` : null}
-      ${group === 'denied' || group === 'unverified' ? html`<${Chip} tone="muted">학급 단톡방 확인하지 못했어요</${Chip}><button class="att-link" onClick=${ctx.read}>다시 확인</button>` : null}
+      ${group === 'ready' && space && !p.problemsOnly ? html`<${Chip} tone="ok" title=${space}>${'학급 단톡방 · ' + space}</${Chip}>` : null}
+      ${(!p.problemsOnly || p.classSend) && (group === 'not-selected' || group === 'missing') ? html`<${Chip} tone="warn">학급 단톡방 연결 필요</${Chip}>${ctx.opts.card === 'connect' ? null : html`<button class="att-link" onClick=${() => { ctx.closeDialog(); ctx.link({ kind: 'attendance-connect' }); }}>연결 → 출결 열기</button>`}` : null}
+      ${(!p.problemsOnly || p.classSend) && (group === 'denied' || group === 'unverified') ? html`<${Chip} tone="muted">학급 단톡방 확인하지 못했어요</${Chip}><button class="att-link" onClick=${ctx.read}>다시 확인</button>` : null}
     </div>`;
   }
   function ReminderButton(p) {
@@ -3504,10 +3722,10 @@
     if (!E.missing(r) || !r.st || r.deletedAt) return null;
     const effect = ctx.D.effects.find(x => x.id === r.reminder?.effectId);
     if (r.remUnknown) return html`<button class="att-link" onClick=${() => ctx.openDialog({ kind: 'chat-decide', effectId: effect?.id })}>확인하기</button>`;
-    if (!r.st.hasEmail) return html`<button class="att-link" onClick=${() => ctx.link({ kind: 'roster', studentId: r.studentId, focusEmail: true })}>학생명단 고치기</button>`;
-    if (r.reminder?.state === '실패' && r.reminder.effectId) return html`<button class="att-link" onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', resendOf: r.reminder.effectId, ids: [r.id] })}>다시 보내기…</button>`;
-    if (r.reminder && ['보냄', '실패', '발송중'].includes(r.reminder.state)) return null;
-    return html`<button class="att-link" onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: [r.id] })}>독려 보내기…</button>`;
+    if (!r.st.hasEmail) return html`<button class="att-link" onClick=${() => ctx.link({ kind: 'roster', studentId: r.studentId, focusEmail: true })}>학생-학부모 명단 고치기</button>`;
+    if (r.reminder?.state === '실패' && r.reminder.effectId) return html`<button class="att-link" onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', resendOf: r.reminder.effectId, ids: ctx.D.rows.filter(x => x.reminder?.effectId === r.reminder.effectId).map(x => x.id) })}>다시 보내기</button>`;
+    if (r.reminder && ['실패', '발송중'].includes(r.reminder.state)) return null;
+    return html`<button class="att-link" onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'reminders', ids: [r.id] })}>${r.reminder && r.reminder.state === '보냄' ? '독려 다시 보내기' : '독려 보내기'}</button>`;
   }
   // 연결 → 출결: one Google Chat row in the shape of app.js classTaskRowHtml, with the class room and the
   // 1:1 greetings as two sub-rows under it (svc-subrow), one icon in all.
@@ -3527,12 +3745,16 @@
     return chatRows({ chat, chatAct: connected === false ? btn('권한 다시 승인', ctx.reapprove) : null,
       room, roomSmall: ready ? value.classSpace.displayName : '', roomAct: none ? btn('환영 인사 보내면서 Google Chat 대화 상대로 연결하기', welcome) : !reading && !ready ? btn('다시 확인', ctx.read) : null,
       people, peopleAct: !reading && ready && !allSent ? btn('환영 인사 보내기', welcome) : null,
-      note: rejected.length ? '받지 못한 학생: ' + rejected.map(x => D.byId.get(x.studentId)?.label || '').filter(Boolean).join(', ') + '. 학생명단의 이메일을 확인해 주세요.' : '' });
+      note: rejected.length ? '받지 못한 학생: ' + rejected.map(x => D.byId.get(x.studentId)?.label || '').filter(Boolean).join(', ') + '. 학생-학부모 명단의 이메일을 확인해 주세요.' : '' });
   }
-  /* ---------- 학생 결석 신고 링크 (2026-11-11 design §7.3, §13.1 Q-L3) ---------- */
-  // One link state per student, from the read: 없음, 보내는 중, 보냄, 결과 확인 필요 (C7: never resent by itself), 보내지 못함.
-  function linkStateOf(D, st) {
-    const link = D.links.get(st.id) || null, nowMs = Date.parse(String(D.raw.serverNow || ''));
+  /* ---------- 학생 결석 신고 링크 (2026-11-11 design §7.3, §13.1 Q-L3; guardian link 2026-11-16, owner) ---------- */
+  // One link state per student and role, from the read: 미발송, 보내는 중, 보냄, 결과 확인 필요 (C7: never resent by
+  // itself), 받지 못함. The guardian's link has its own row, token and send state; a guardian Google refuses by Chat
+  // (outside the teacher's Workspace, for one) is "Chat 불가" and gets the link by copy or 문자 instead.
+  const ROLE_WORD = { student: '학생', guardian: '학부모' };
+  function linkStateOf(D, st, role) {
+    const guardian = role === 'guardian';
+    const link = (guardian ? D.glinks : D.links).get(st.id) || null, nowMs = Date.parse(String(D.raw.serverNow || ''));
     const effect = link && link.effectId ? D.effects.find(x => x.id === link.effectId) : null;
     const old = effect && effect.phase === 'DISPATCHED_OR_UNKNOWN' && !(nowMs - Date.parse(String(effect.admittedAt || effect.updatedAt || '')) < UNKNOWN_AFTER_MS);
     const raw = String(link && link.sendState || '');
@@ -3546,93 +3768,292 @@
     else if (raw === 'sent') state = 'sent';
     else if (Number(link && link.activeCount) > 0) state = 'copied';
     // A student whose 1:1 greeting was rejected cannot get a link by Chat (design §7.1): copy or QR only.
-    const greeting = (D.raw.greetings || []).find(x => String(x.id).startsWith('p_') && x.studentId === st.id);
-    if ((state === 'none' || state === 'rejected') && greeting && greeting.state === 'rejected') state = 'blocked';
-    return { link, effect, state };
+    if (!guardian) {
+      const greeting = (D.raw.greetings || []).find(x => String(x.id).startsWith('p_') && x.studentId === st.id);
+      if ((state === 'none' || state === 'rejected') && greeting && greeting.state === 'rejected') state = 'blocked';
+    }
+    const email = guardian ? !!(st.guardian && st.guardian.email) : st.hasEmail;
+    const phone = guardian ? !!(st.guardian && st.guardian.hasPhone) : st.hasPhone;
+    return { st, role, link, effect, state, email, phone };
   }
-  const LINK_CHIP = { blocked: ['warn', '보낼 수 없음'], copied: ['muted', '복사한 링크'], none: ['muted', '없음'], sending: ['muted', '보내는 중'], sent: ['ok', '보냄'], unknown: ['warn', '결과 확인 필요'], rejected: ['warn', '보내지 못함'] };
+  // Links are made ahead (owner 2026-11-17): "copied" is a link that exists and never reached the student by Chat
+  // (미발송); "none" has no link yet (the card makes it at once).
+  const LINK_CHIP = { blocked: ['warn', '보낼 수 없음'], copied: ['muted', '미발송'], none: ['muted', '링크 없음'], sending: ['muted', '보내는 중'], sent: ['ok', '보냄'], unknown: ['warn', '결과 확인 필요'], rejected: ['warn', '받지 못함'] };
+  const chipOf = x => (x.role === 'guardian' && x.state === 'rejected' ? ['warn', 'Chat 불가 · 복사/문자로 보내기'] : LINK_CHIP[x.state]);
+  const linkTextOf = (role, st, url) => (role === 'guardian'
+    ? '결석·지각·조퇴·결과는 아래 주소로 선생님께 알려 주세요. 이 주소는 ' + st.label + ' 학생의 보호자 전용이에요. 다른 사람에게 보내지 마세요.\n'
+    : '결석·지각·조퇴·결과는 아래 주소로 선생님께 알려 주세요. 이 주소는 ' + st.label + ' 학생 전용이에요. 다른 사람에게 보내지 마세요.\n') + url;
+  function copyText(text) {
+    const box = document.createElement('textarea');
+    const legacy = () => { box.value = text; box.setAttribute('readonly', ''); box.style.position = 'fixed'; box.style.opacity = '0'; document.body.appendChild(box); box.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (err) { ok = false; } box.remove(); return ok; };
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text).then(() => true).catch(() => legacy());
+    return Promise.resolve(legacy());
+  }
   function StudentLinkRow(p) {
-    const ctx = p.ctx, D = ctx.D, [open, setOpen] = useState(false);
+    const ctx = p.ctx, D = ctx.D, [open, setOpen] = useState(p.open === true), inTab = p.inTab === true, [picked, setPicked] = useState([]);
+    const [working, setWorking] = useState('');
     const active = D.students.filter(s => s.status === '재적');
-    const rows = active.map(st => Object.assign({ st }, linkStateOf(D, st)));
+    const rows = active.map(st => linkStateOf(D, st, 'student'));
+    const grows = new Map(active.map(st => [st.id, linkStateOf(D, st, 'guardian')]));
     const n = k => rows.filter(x => x.state === k).length;
     const sent = n('sent'), sending = n('sending'), unknown = n('unknown'), rejected = n('rejected') + n('blocked');
-    const toSend = rows.filter(x => x.state === 'none' && x.st.hasEmail).map(x => x.st.id);
+    const gsent = [...grows.values()].filter(x => x.state === 'sent').length;
+    const gknown = active.filter(st => st.guardian).length;
+    const toSend = rows.filter(x => (x.state === 'none' || x.state === 'copied') && x.st.hasEmail).map(x => x.st.id);
     const known = 'studentLinks' in D.raw;
+    // Links made ahead (owner 2026-11-17): a roster saved before then has students without a stored link. The card
+    // asks the server once to make what is missing (never a rotation, never a send), then reads again.
+    const missingLinks = known && !ctx.roWhy() && active.some(st => [D.links.get(st.id), D.glinks.get(st.id)]
+      .some(l => !(l && l.stored) && !(l && l.sendPending)));
+    useEffect(() => {
+      if (!missingLinks) return undefined;
+      const mark = D.year + '|' + ctx.opts.generation;
+      if (memo.linkEnsure === mark) return undefined;
+      memo.linkEnsure = mark;
+      ctx.call('/v1/data/student-links/ensure', { year: D.year }).then(out => {
+        if (memo.gen !== ctx.opts.generation || out.status !== 200 || !out.body || !out.body.created) return;
+        if (Number(out.body.created.student) + Number(out.body.created.guardian) > 0) ctx.read();
+      });
+      return undefined;
+    }, [missingLinks]);
     const all = active.length > 0 && sent === active.length;
     const status = !known ? ['muted', '확인하지 못했어요'] : all ? ['ok', '모두 보냄'] : ['warn', sent + '/' + active.length + '명'];
+    // 2026-11-16 (owner): in the 학생-학부모가 직접 등록한 출결 내역 tab the count sits by the title and says what it counts
+    // (students whose link reached them by Chat, sendState "sent", of the enrolled students); 학생별 보기 is at the far right.
+    const tabStatus = !known ? status : [all ? 'ok' : 'warn', '링크 보낸 학생 ' + sent + '/' + active.length + '명'];
+    // 2026-11-16 (owner): in its tab each student row shows that student's current link, shortened, and a click copies
+    // it. One read for the whole card (current-all); a student with no link that can be shown shows nothing. Read-only:
+    // this never makes or ends a link. The plaintext stays in this component's state only (LINK-02).
+    const [urls, setUrls] = useState(null);
+    const linkSig = inTab && open && known ? D.year + '|' + rows.map(x => { const g = grows.get(x.st.id); return x.st.id + ':' + (x.link ? x.link.version || x.link.generation || '' : '') + ':' + (g && g.link ? g.link.version || g.link.generation || '' : ''); }).join(',') : '';
+    useEffect(() => {
+      if (!linkSig) return undefined;
+      let ended = false;
+      ctx.call('/v1/data/student-links/current-all', { year: D.year }).then(out => {
+        if (ended || memo.gen !== ctx.opts.generation) return;
+        const map = new Map();
+        if (out.status === 200 && out.body && Array.isArray(out.body.links)) {
+          out.body.links.forEach(x => { if (SAFE_URL.test(String(x.url || ''))) map.set((x.role === 'guardian' ? 'guardian' : 'student') + ':' + x.studentId, String(x.url)); });
+        }
+        setUrls(map);
+      });
+      return () => { ended = true; };
+    }, [linkSig]);
+    // 2026-11-17 (owner): each grid cell shows its own link (shortened) from the same read; copy is in the bar.
     const ro = ctx.roWhy();
     const btn = (label, run, why) => html`<${Btn} ctx=${ctx} cls="btn-tonal" why=${why || ro} onClick=${run}>${label}</${Btn}>`;
     const small = (label, run, why) => html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${why || ro} onClick=${run}>${label}</${Btn}>`;
-    const send = (ids, rotate, label) => ctx.openDialog({ kind: 'chat-send', mode: 'links', studentIds: ids, rotate: rotate === true, label: label || '' });
-    const show = x => ctx.openDialog({ kind: 'link-show', studentId: x.st.id, label: x.st.label, had: x.state !== 'none', version: x.link && x.link.version });
+    const send = (ids, rotate, label, role) => ctx.openDialog({ kind: 'chat-send', mode: 'links', studentIds: ids, rotate: rotate === true, label: label || '', role: role || 'student' });
+    const show = x => ctx.openDialog({ kind: 'link-show', studentId: x.st.id, label: x.st.label, role: x.role, had: x.state !== 'none', version: x.link && x.link.version });
     const acts = x => {
       if (x.state === 'sending') return null;
       if (x.state === 'unknown') return x.effect ? small('확인하기', () => ctx.openDialog({ kind: 'chat-decide', effectId: x.effect.id })) : null;
       const out = [];
-      if (!x.st.hasEmail || x.state === 'rejected' || x.state === 'blocked') out.push(small('학생명단 고치기', () => ctx.link({ kind: 'roster', studentId: x.st.id, label: x.st.label, focusEmail: true })));
+      if (!x.st.hasEmail || x.state === 'rejected' || x.state === 'blocked') out.push(small('학생-학부모 명단 고치기', () => ctx.link({ kind: 'roster', studentId: x.st.id, label: x.st.label, focusEmail: true })));
       if (x.st.hasEmail && x.state !== 'blocked') {
-        if (x.state === 'sent' || x.state === 'copied') out.push(small('링크 다시 보내기…', () => send([x.st.id], false, x.st.label)), small('링크 새로 만들기…', () => send([x.st.id], true, x.st.label)));
-        else out.push(small(x.state === 'rejected' ? '다시 보내기…' : '링크 보내기…', () => send([x.st.id], false, x.st.label)));
+        if (x.state === 'sent' || x.state === 'copied') out.push(small('링크 Google Chat으로 다시 보내기', () => send([x.st.id], false, x.st.label)), small('링크 새로 만들어서 Google Chat으로 보내기', () => send([x.st.id], true, x.st.label)));
+        else out.push(small(x.state === 'rejected' ? '다시 보내기' : '링크 보내기', () => send([x.st.id], false, x.st.label)));
       }
-      out.push(small('링크 복사·QR 코드…', () => show(x)));
+      out.push(small('링크 복사·QR 코드', () => show(x)));
       return out;
     };
     const when = x => {
-      const l = x.link || {}, parts = [];
-      if (x.state === 'sent' && (l.issuedAt || l.sentAt)) parts.push(atShort(l.issuedAt || l.sentAt, D.today));
-      if (l.lastViewAt) parts.push('열어 봄 ' + atShort(l.lastViewAt, D.today));
-      if (x.state === 'unknown') parts.push('학생이 받았는지 확인하지 못했어요');
-      if (x.state === 'rejected' || x.state === 'blocked') parts.push(sendErrorText('STUDENT_CHAT_RECIPIENT_REJECTED'));
-      if (!x.st.hasEmail) parts.push('Google 이메일 없음');
+      // 2026-11-17 (owner): each time says what it is. lastViewAt is kept per student and role across new links, so an
+      // open before the current link was made (issuedAt) was of an older link and is left out. A link not sent by Chat may be
+      // made by 링크 복사·QR or ahead of 휴대폰으로 보내기 (the row does not say which), so it reads 링크 만듦.
+      const l = x.link || {}, parts = [], at = t => (kst(t).slice(0, 10) === D.today ? '오늘 ' : '') + atShort(t, D.today);
+      if (x.state === 'sent' && (l.sentAt || l.issuedAt)) parts.push('Chat으로 보냄 ' + atShort(l.sentAt || l.issuedAt, D.today));
+      else if (x.state === 'copied' && l.issuedAt) parts.push('링크 만듦 ' + atShort(l.issuedAt, D.today));
+      if (l.smsOpenedAt) parts.push('문자 앱 열림 ' + at(l.smsOpenedAt));
+      if (l.lastViewAt && !(l.issuedAt && Date.parse(l.lastViewAt) < Date.parse(l.issuedAt))) parts.push((x.role === 'guardian' ? '학부모가' : '학생이') + ' 열어 봄 ' + at(l.lastViewAt));
+      if (x.state === 'unknown') parts.push((x.role === 'guardian' ? '보호자가' : '학생이') + ' 받았는지 확인하지 못했어요');
+      if (x.role === 'student' && (x.state === 'rejected' || x.state === 'blocked')) parts.push(sendErrorText('STUDENT_CHAT_RECIPIENT_REJECTED'));
+      if (!x.email) parts.push('Google 이메일 없음');
       return parts.join(' · ');
     };
+    // 모두 복사 (owner 2026-11-16): name, role and link of every link that can still be shown. An older link that
+    // was never sealed cannot be shown; it is skipped and counted, never remade by itself.
+    const copyAll = async () => {
+      if (working) return;
+      setWorking('copy');
+      try {
+        const out = await ctx.call('/v1/data/student-links/current-all', { year: D.year });
+        if (memo.gen !== ctx.opts.generation) return;
+        if (out.status !== 200 || !out.body || !Array.isArray(out.body.links)) { ctx.explain(out.unknown ? { text: '링크를 읽지 못했어요. 잠시 뒤 다시 눌러 주세요.' } : ctx.whyOf({ kind: 'refused', status: out.status, code: out.body && out.body.error })); return; }
+        const byId = new Map(active.map(st => [st.id, st]));
+        const shown = out.body.links.filter(x => byId.has(x.studentId) && SAFE_URL.test(String(x.url || '')))
+          .sort((a, b) => byId.get(a.studentId).n - byId.get(b.studentId).n || (a.role === 'student' ? -1 : 1));
+        const skipped = out.body.links.filter(x => byId.has(x.studentId)).length - shown.length;
+        if (!shown.length) { ctx.explain({ text: skipped ? '볼 수 있는 링크가 없어요. 예전 링크 ' + skipped + '개는 다시 볼 수 없어요.' : '아직 만든 링크가 없어요.', tone: 'muted' }); return; }
+        const text = shown.map(x => byId.get(x.studentId).label + ' ' + ROLE_WORD[x.role === 'guardian' ? 'guardian' : 'student'] + ': ' + x.url).join('\n');
+        const ok = await copyText(text);
+        ctx.toast(ok ? '링크 ' + shown.length + '개를 복사했어요.' + (skipped ? ' 예전 링크 ' + skipped + '개는 다시 볼 수 없어 뺐어요.' : '') : '복사하지 못했어요. 링크 복사·QR 코드에서 하나씩 복사해 주세요.');
+      } finally { if (memo.gen === ctx.opts.generation) setWorking(''); }
+    };
     return html`<div class="svc-group att-connect-chat att-links" data-service="student-link"><div class="svc-subrow">
-        <span class="nameblock"><b>학생 결석 신고 링크</b><small>학생이 결석·지각·조퇴·결과를 선생님께 알리는 학생별 주소예요</small></span>
-        <span class="svc-acts">${known ? html`<span class="att-chips">${sent ? html`<${Chip} tone="ok">${'링크 받은 학생 ' + sent + '/' + active.length + '명'}</${Chip}>` : null}${sending ? html`<${Chip} tone="muted">${'보내는 중 ' + sending + '명'}</${Chip}>` : null}${unknown ? html`<${Chip} tone="warn">${'결과 확인 필요 ' + unknown + '명'}</${Chip}>` : null}${rejected ? html`<${Chip} tone="warn">${'보내지 못함 ' + rejected + '명'}</${Chip}>` : null}</span>` : null}
-          ${known && toSend.length ? btn('링크 보내기…', () => send(toSend, false)) : null}
-          ${known && active.length ? html`<button type="button" class="att-btn-quiet att-btn-sm" aria-expanded=${open ? 'true' : 'false'} onClick=${() => setOpen(!open)}>${open ? '접기' : '학생별 보기'}</button>` : null}</span>
-        <span class=${'svc-status ' + status[0]}>${status[1]}</span></div>
-      ${open ? html`<div class="att-link-list">${rows.map(x => { const chip = LINK_CHIP[x.state], tail = when(x);
-        return html`<div class="att-al" key=${x.st.id}><div class="att-t1"><b>${x.st.label}</b> <${Chip} tone=${chip[0]}>${chip[1]}</${Chip}>${tail ? html` <span class="att-faint">${'· ' + tail}</span>` : null}</div><div class="att-ac">${acts(x)}</div></div>`; })}</div>` : null}
+        <span class="nameblock">${inTab ? html`<span class="att-lt"><b>학생 결석 신고 링크</b><span class=${'svc-status ' + tabStatus[0]}>${tabStatus[1]}</span>${known && gknown ? html`<span class="svc-status muted">${'학부모 ' + gsent + '/' + gknown + '명'}</span>` : null}</span>` : html`<b>학생 결석 신고 링크</b>`}<small>학생과 학부모가 결석·지각·조퇴·결과를 선생님께 알리는 주소예요</small></span>
+        <span class="svc-acts">${known ? html`<span class="att-chips">${sent && !inTab ? html`<${Chip} tone="ok">${'링크 받은 학생 ' + sent + '/' + active.length + '명'}</${Chip}>` : null}${sending ? html`<${Chip} tone="muted">${'보내는 중 ' + sending + '명'}</${Chip}>` : null}${unknown ? html`<${Chip} tone="warn">${'결과 확인 필요 ' + unknown + '명'}</${Chip}>` : null}${rejected ? html`<${Chip} tone="warn">${'받지 못함 ' + rejected + '명'}</${Chip}>` : null}</span>` : null}
+          ${inTab || (known && toSend.length) ? btn('링크 보내기', () => send(toSend, false), known && toSend.length ? null : { text: known ? '링크를 아직 받지 않은 학생이 없어요.' : '링크 상태를 읽는 중이에요.', tone: 'muted' }) : null}
+          ${inTab ? small(working === 'copy' ? '복사하는 중…' : '모두 복사', copyAll, !known || !active.length ? { text: known ? '복사할 학생이 없어요.' : '링크 상태를 읽는 중이에요.', tone: 'muted' } : working ? { text: '복사하는 중이에요.', tone: 'muted' } : null) : null}
+          ${inTab || (known && active.length) ? html`<button type="button" class="att-btn-quiet att-btn-sm" disabled=${!(known && active.length)} aria-expanded=${open ? 'true' : 'false'} onClick=${() => setOpen(!open)}>${open ? '접기' : '학생별 보기'}</button>` : null}</span>
+        ${inTab ? null : html`<span class=${'svc-status ' + status[0]}>${status[1]}</span>`}</div>
+      ${open && inTab ? tabList() : open ? html`<div class="att-link-list">${rows.map(x => { const chip = chipOf(x), tail = when(x), g = grows.get(x.st.id), gchip = chipOf(g);
+        return html`<div class="att-al" key=${x.st.id}><div class="att-t1"><b>${x.st.label}</b> <${Chip} tone=${chip[0]}>${chip[1]}</${Chip}>${tail ? html` <span class="att-faint">${'· ' + tail}</span>` : null}${x.st.guardian ? html` <span class="att-faint">· 학부모</span> <${Chip} tone=${gchip[0]}>${gchip[1]}</${Chip}>` : null}</div><div class="att-ac">${acts(x)}</div></div>`; })}</div>` : null}
     </div>`;
+    // 2026-11-16 (owner): in its tab the list has one action bar. 2026-11-17 (owner): the list is a grid like a timetable:
+    // rows are students, the 학생 and 학부모 columns hold each link (picked holds "role:studentId"). A column header
+    // selects or clears its whole column, a name cell selects or clears both cells of that student, a cell toggles itself.
+    // Every action acts on exactly the selected cells. A Chat send skips a cell without an email, a blocked cell and a
+    // link in progress or unknown (C7), each listed with its reason. The server takes one role per call, so a send splits
+    // into one call for the 학생 cells and one for the 학부모 cells, asked once; nothing is widened to unselected cells.
+    // The phone handoff holds one role per address: a mix it cannot take in one go is refused with a reason.
+    function tabList() {
+      const keyOf = x => x.role + ':' + x.st.id;
+      const all = rows.flatMap(x => [x, grows.get(x.st.id)]), chosen = all.filter(x => picked.indexOf(keyOf(x)) >= 0);
+      const n = chosen.length, ns = chosen.filter(x => x.role === 'student').length, ng = n - ns;
+      const toggle = keys => setPicked(prev => { const on = keys.every(k => prev.indexOf(k) >= 0), rest = prev.filter(k => keys.indexOf(k) < 0); return on ? rest : rest.concat(keys); });
+      const canChat = x => x.email && !['blocked', 'sending', 'unknown'].includes(x.state) && !(x.role === 'guardian' && x.state === 'rejected');
+      const skipWhy = x => (!x.email ? (x.role === 'guardian' ? '학생-학부모 명단에 보호자 Google 이메일이 없어 보내지 않아요' : '학생-학부모 명단에 이메일이 없어 보내지 않아요')
+        : ['sending', 'unknown'].includes(x.state) ? '보내는 중이거나 결과를 확인하지 못한 링크라 보내지 않아요'
+        : x.role === 'guardian' ? 'Google이 받지 않았던 학부모라 Chat으로 보내지 않아요. [휴대폰으로 보내기]나 [링크 복사·QR 코드]로 보내 주세요'
+        : '첫 인사를 받지 못한 학생이라 Chat으로 보내지 않아요');
+      const sendable = chosen.filter(canChat);
+      const parts = ['student', 'guardian'].map(role => ({ role, studentIds: sendable.filter(x => x.role === role).map(x => x.st.id) })).filter(x => x.studentIds.length);
+      const skipped = chosen.filter(x => !canChat(x)).map(x => ({ target: x.st.label + ' ' + ROLE_WORD[x.role], why: skipWhy(x) }));
+      const noSend = n && !sendable.length ? { text: chosen.some(x => ['sending', 'unknown'].includes(x.state)) ? '보내는 중이거나 결과를 확인하지 못한 링크는 먼저 그 결과를 정해 주세요.'
+        : '고른 칸에는 Google Chat으로 보낼 수 없어요. [휴대폰으로 보내기]나 [링크 복사·QR 코드]로 보내 주세요.', tone: 'muted' } : null;
+      const label = sendable.length === 1 ? sendable[0].st.label : '';
+      const toChat = rotate => ctx.openDialog(parts.length === 1
+        ? { kind: 'chat-send', mode: 'links', studentIds: parts[0].studentIds, rotate, label, role: parts[0].role, skipped }
+        : { kind: 'chat-send', mode: 'links', parts, rotate, label: '', role: 'student', skipped });
+      const single = n === 1 ? chosen[0] : null;
+      const oneWhy = single ? null : { text: '학생 또는 학부모 칸 하나만 골라 주세요.', tone: 'muted' };
+      // 휴대폰으로 보내기 (owner 2026-11-17): the selected cells with a phone go to the teacher's phone by a QR code; each
+      // opens the phone's SMS app with the number and the stored link. One address takes one role (student, guardian, or
+      // both cells of the same students); "both" only when every cell it adds is one without a phone anyway.
+      const withPhone = chosen.filter(x => x.phone);
+      const phoneRole = (() => {
+        const st = new Set(withPhone.filter(x => x.role === 'student').map(x => x.st.id)), gu = new Set(withPhone.filter(x => x.role === 'guardian').map(x => x.st.id));
+        if (!gu.size) return 'student';
+        if (!st.size) return 'guardian';
+        return [...st].every(id => gu.has(id) || !grows.get(id).phone) && [...gu].every(id => st.has(id) || !rows.find(x => x.st.id === id).phone) ? 'both' : '';
+      })();
+      const phoneWhy = n && !withPhone.length ? { text: '고른 칸의 전화번호가 학생-학부모 명단에 없어요.', tone: 'muted' }
+        : n && !phoneRole ? { text: '휴대폰으로 보내기는 한 번에 학생 칸만, 학부모 칸만, 또는 같은 학생의 두 칸만 보낼 수 있어요. 나눠서 보내 주세요.', tone: 'muted' } : null;
+      const toPhone = () => ctx.openDialog({ kind: 'phone-handoff', studentIds: [...new Set(withPhone.map(x => x.st.id))], role: phoneRole,
+        count: withPhone.length, missing: n - withPhone.length });
+      // 2026-11-17 (owner): the bar and its buttons stay in place; with nothing selected they are disabled.
+      const none = n ? null : { text: '학생이나 학부모 칸을 먼저 골라 주세요.', tone: 'muted' };
+      const bar = html`<div class="att-sheetbar att-linkbar"><span class="att-tl"><b>${'학생 ' + ns + ' · 학부모 ' + ng + ' 선택'}</b></span>
+        <span class="att-ta">${small('링크 Google Chat으로 다시 보내기', () => toChat(false), none || noSend)}
+          ${small('링크 새로 만들어서 Google Chat으로 보내기', () => toChat(true), none || noSend)}
+          ${small('링크 복사·QR 코드', () => show(single), none || oneWhy)}
+          ${small('휴대폰으로 보내기', toPhone, none || phoneWhy)}</span></div>`;
+      const colOn = role => rows.length > 0 && rows.every(x => picked.indexOf(role + ':' + x.st.id) >= 0);
+      const head = (role, word) => html`<button type="button" class=${'att-lg-h' + (colOn(role) ? ' att-on' : '')} aria-pressed=${colOn(role) ? 'true' : 'false'}
+        aria-label=${word + ' 칸 모두 ' + (colOn(role) ? '선택 해제' : '선택')} onClick=${() => toggle(rows.map(x => role + ':' + x.st.id))}>${word}</button>`;
+      const cell = x => {
+        const k = keyOf(x), on = picked.indexOf(k) >= 0, chip = chipOf(x), tail = when(x);
+        const url = urls && urls.get(x.role + ':' + x.st.id);
+        const who = x.role === 'guardian' ? '학부모' + (x.st.guardian && x.st.guardian.relation ? '(' + x.st.guardian.relation + ')' : '') : '학생';
+        return html`<button type="button" key=${k} class=${'att-lg-c' + (on ? ' att-on' : '') + (x.email ? '' : ' att-lg-off')} aria-pressed=${on ? 'true' : 'false'}
+          aria-label=${x.st.label + ' ' + who + ' 링크 ' + (on ? '선택 해제' : '선택')} title=${url || null} onClick=${() => toggle([k])}>
+          <span class="att-lg-url">${url || '—'}</span>
+          <span class="att-lg-t"><${Chip} tone=${chip[0]}>${chip[1]}</${Chip}><span class="att-lg-tail">${tail}</span></span></button>`;
+      };
+      return html`${bar}<div class="att-lgrid" role="group" aria-label="학생 결석 신고 링크">
+        <span class="att-lg-corner"></span>${head('student', '학생')}${head('guardian', '학부모')}
+        ${rows.map(x => { const g = grows.get(x.st.id), keys = [keyOf(x), keyOf(g)], both = keys.every(k => picked.indexOf(k) >= 0);
+          return [html`<button type="button" key=${'n' + x.st.id} class=${'att-lg-n' + (both ? ' att-on' : '')} aria-pressed=${both ? 'true' : 'false'}
+            aria-label=${x.st.label + ' 학생·학부모 칸 ' + (both ? '선택 해제' : '선택')} onClick=${() => toggle(keys)}>${x.st.label}</button>`, cell(x), cell(g)]; })}</div>`;
+    }
   }
-  // 링크 복사 and the QR code (Q-L3). Only the hash is stored, so showing a link makes a new one and the old one stops.
-  // The plaintext lives in this dialog's state only: never logged, never stored (LINK-02).
+  // 링크 복사 and the QR code (2026-11-16, owner): it shows the current link of one student or guardian and never
+  // makes a new one by itself. The server keeps a link sealed with KMS since 2026-11-16; an older link cannot be shown.
+  // Where none can be shown, [새 주소 만들기] makes one on an explicit press (it ends that role's older address; the
+  // other role's link is untouched). The plaintext lives in this dialog's state only: never logged, never stored (LINK-02).
   function LinkShowDialog(p) {
-    const ctx = p.ctx, d = p.d, [url, setUrl] = useState(''), [error, setError] = useState(''), [running, setRunning] = useState(false), [copied, setCopied] = useState('');
-    const done = useRef(false);
+    const ctx = p.ctx, d = p.d, role = d.role === 'guardian' ? 'guardian' : 'student';
+    const [url, setUrl] = useState(''), [error, setError] = useState(''), [running, setRunning] = useState(true), [copied, setCopied] = useState(''), [canMake, setCanMake] = useState(false);
+    useEffect(() => {
+      let ended = false;
+      ctx.call('/v1/data/student-links/current', { studentId: d.studentId, role, year: ctx.D.year }).then(out => {
+        if (ended || memo.gen !== ctx.opts.generation) return;
+        const link = out.status === 200 && out.body ? String(out.body.url || '') : '';
+        if (link && SAFE_URL.test(link)) setUrl(link);
+        else if (out.status === 200 && out.body && out.body.reason === 'none') { setError('만든 링크가 없어요. 새 주소를 만들 수 있어요.'); setCanMake(true); }
+        else if (out.status === 200) { setError('예전 링크는 다시 볼 수 없어요. 새 주소를 만들면 예전 주소는 바로 쓸 수 없게 돼요.'); setCanMake(true); }
+        else setError(out.unknown ? '링크를 읽지 못했어요. 잠시 뒤 다시 열어 주세요.' : ctx.whyOf({ kind: 'refused', status: out.status, code: out.body && out.body.error }).text);
+        setRunning(false);
+      });
+      return () => { ended = true; };
+    }, []);
     const make = async () => {
-      if (done.current || running) return;
-      done.current = true;
+      if (running) return;
       setRunning(true);
       try {
-        ctx.set({ dialogBusy: true });
-        const out = await ctx.runWrite({ route: LINKS, body: Object.assign({ action: 'issue', studentId: d.studentId }, Number.isInteger(d.version) ? { version: d.version } : {}) });
-        if (out.forgotten) return;
-        const link = out.kind === 'ok' ? String(out.body.link || out.body.url || '') : '';
-        if (link && SAFE_URL.test(link)) setUrl(link);
-        else setError(out.kind === 'ok' ? '링크를 받지 못했어요. 창을 닫고 다시 해 주세요.' : out.kind === 'unknown' ? '새 링크를 만들었는지 확인하지 못했어요. 다시 만들면 그 링크도 새 링크로 바뀌어요.' : ctx.whyOf(out).text);
-        ctx.read();
-      } finally { if (memo.gen === ctx.opts.generation) { ctx.set({ dialogBusy: false }); setRunning(false); } }
+        const out = await ctx.call(LINKS, { requestId: rid('lnk'), action: 'issue', studentId: d.studentId, role, year: ctx.D.year });
+        if (memo.gen !== ctx.opts.generation) return;
+        const link = out.status === 200 && out.body ? String(out.body.url || '') : '';
+        if (link && SAFE_URL.test(link)) { setUrl(link); setError(''); setCanMake(false); ctx.read(); }
+        else setError(out.status === 200 ? '새 주소를 만들었지만 보여 주지 못했어요. 창을 다시 열어 주세요.' : out.unknown ? '새 주소를 만들었는지 확인하지 못했어요. 창을 다시 열어 확인해 주세요.' : ctx.whyOf({ kind: 'refused', status: out.status, code: out.body && out.body.error }).text);
+      } finally { if (memo.gen === ctx.opts.generation) setRunning(false); }
     };
-    const copy = () => {
-      const box = document.createElement('textarea');
-      const legacy = () => { box.value = url; box.setAttribute('readonly', ''); box.style.position = 'fixed'; box.style.opacity = '0'; document.body.appendChild(box); box.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (err) { ok = false; } box.remove(); return ok; };
-      const fine = () => setCopied('복사했어요.'), fail = () => setCopied('복사하지 못했어요. 주소를 직접 골라 복사해 주세요.');
-      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(fine).catch(() => (legacy() ? fine() : fail()));
-      else if (legacy()) fine(); else fail();
-    };
-    if (!url) return html`<h4 id="att-dlg-title">${d.label + ' 학생의 링크를 새로 만들어 보여 줄까요?'}</h4><${DlgNotice} ctx=${ctx}/>
-      ${d.had ? html`<p>지금 쓰는 주소는 바로 쓸 수 없게 돼요.</p>` : null}<p>이 주소는 이 학생 전용이에요. 다른 사람에게 보이지 않게 해 주세요.</p>
-      ${error ? html`<p class="att-warn">${error}</p>` : null}
-      <${Foot}><${CancelBtn} ctx=${ctx} busy=${running}/>${!error ? html`<${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (running ? { text: '만드는 중…', tone: 'muted' } : null)} onClick=${make}>${running ? '만드는 중…' : '새 링크 만들기'}</${Btn}>` : null}</${Foot}>`;
-    return html`<h4 id="att-dlg-title">${d.label + ' 학생의 결석 신고 링크'}</h4>
+    const copy = () => copyText(url).then(ok => setCopied(ok ? '복사했어요.' : '복사하지 못했어요. 주소를 직접 골라 복사해 주세요.'));
+    const who = d.label + (role === 'guardian' ? ' 학생 보호자의' : ' 학생의');
+    if (!url) return html`<h4 id="att-dlg-title">${who + ' 결석 신고 링크'}</h4><${DlgNotice} ctx=${ctx}/>
+      ${running ? html`<p class="att-faint" role="status">링크를 읽는 중이에요…</p>` : html`<p class=${canMake ? '' : 'att-warn'}>${error}</p>`}
+      <${Foot}><button type="button" class="att-btn-quiet" data-cancel="1" onClick=${ctx.closeDialog}>닫기</button>${canMake ? html`<${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (running ? { text: '만드는 중이에요.', tone: 'muted' } : null)} onClick=${make}>${running ? '만드는 중…' : '새 주소 만들기'}</${Btn}>` : null}</${Foot}>`;
+    return html`<h4 id="att-dlg-title">${who + ' 결석 신고 링크'}</h4>
       <div class="att-linkshow"><${QrCode} text=${url} /><div class="att-linkshow-r">
         <input class="att-linkshow-url" readOnly=${true} value=${url} aria-label="결석 신고 링크" onFocus=${ev => ev.target.select()} />
         <div class="att-ac"><button type="button" class="att-btn-quiet att-btn-sm" onClick=${copy}>링크 복사</button><span class="att-faint" role="status">${copied}</span></div>
-        <p class="att-faint">학생이 휴대폰 카메라로 QR 코드를 찍으면 바로 열려요. 이 창을 닫으면 링크를 다시 볼 수 없어요.</p></div></div>
+        <p class="att-faint">${role === 'guardian' ? '보호자가 휴대폰 카메라로 QR 코드를 찍으면 바로 열려요. 이 주소는 이 학생의 보호자 전용이에요.' : '학생이 휴대폰 카메라로 QR 코드를 찍으면 바로 열려요. 이 주소는 이 학생 전용이에요.'}</p></div></div>
       <${Foot}><button type="button" class="att-btn" data-autofocus="1" data-cancel="1" onClick=${ctx.closeDialog}>닫기</button></${Foot}>`;
+  }
+
+  // 휴대폰으로 보내기 (owner 2026-11-17): a 10-minute address for the teacher's own phone, shown as a QR code. The
+  // phone's page lists the chosen rows with a 문자 보내기 button each; nothing is sent by the server. Closing this
+  // dialog in any way ends the address at once. A tap on the phone shows here as 문자 앱 열림, never as sent.
+  function PhoneHandoffDialog(p) {
+    const ctx = p.ctx, d = p.d;
+    const [h, setH] = useState(null), [error, setError] = useState(''), [nowMs, setNow] = useState(Date.now()), [opened, setOpened] = useState([]);
+    useEffect(() => {
+      let ended = false, id = '';
+      ctx.call('/v1/data/phone-handoff', { studentIds: d.studentIds, role: d.role, year: ctx.D.year }).then(out => {
+        if (ended || memo.gen !== ctx.opts.generation) {
+          if (out.status === 200 && out.body && out.body.handoffId) ctx.call('/v1/data/phone-handoff/revoke', { handoffId: out.body.handoffId });
+          return;
+        }
+        if (out.status === 200 && out.body && SAFE_URL.test(String(out.body.url || ''))) { id = out.body.handoffId; setH(out.body); }
+        else setError(out.unknown ? '주소를 만들지 못했어요. 창을 닫고 다시 눌러 주세요.' : ctx.whyOf({ kind: 'refused', status: out.status, code: out.body && out.body.error }).text);
+      });
+      const tick = setInterval(() => setNow(Date.now()), 1000);
+      const poll = setInterval(() => {
+        if (!id) return;
+        ctx.call('/v1/data/phone-handoff/status', { handoffId: id }).then(out => {
+          if (!ended && out.status === 200 && out.body && Array.isArray(out.body.opened)) setOpened(out.body.opened);
+        });
+      }, 5000);
+      return () => {
+        ended = true; clearInterval(tick); clearInterval(poll);
+        if (id) ctx.call('/v1/data/phone-handoff/revoke', { handoffId: id }).then(() => ctx.read());
+      };
+    }, []);
+    const left = h ? Math.max(0, Date.parse(h.expiresAt) - nowMs) : 0;
+    const mmss = ms => Math.floor(ms / 60000) + ':' + String(Math.floor(ms / 1000) % 60).padStart(2, '0');
+    const title = '휴대폰으로 보내기';
+    const head = d.count + '명' + (d.missing ? ' · 전화번호 없는 ' + d.missing + '명은 빠져요' : '');
+    if (!h) return html`<h4 id="att-dlg-title">${title}</h4><${DlgNotice} ctx=${ctx}/>
+      ${error ? html`<p class="att-warn">${error}</p>` : html`<p class="att-faint" role="status">주소를 만드는 중이에요…</p>`}
+      <${Foot}><button type="button" class="att-btn" data-autofocus="1" data-cancel="1" onClick=${ctx.closeDialog}>닫기</button></${Foot}>`;
+    return html`<h4 id="att-dlg-title">${title}</h4>
+      <div class="att-linkshow"><div class="att-handoff-qr">${left ? html`<${QrCode} text=${h.url} />` : null}</div><div class="att-linkshow-r">
+        <p><b>${head}</b></p>
+        <p class="att-faint">휴대폰 카메라로 QR 코드를 찍으면 학생·학부모 목록이 열려요. 줄마다 [문자 보내기]를 누르면 휴대폰 문자 앱이 열리고, 보내기는 문자 앱에서 눌러 주세요.</p>
+        <p class=${left ? 'att-faint' : 'att-warn'} role="status">${left ? '10분 동안 열려요 · 남은 시간 ' + mmss(left) : '만료되었어요. 창을 닫고 다시 눌러 주세요.'}</p>
+        ${opened.length ? html`<p class="att-faint">${'문자 앱 열림 ' + opened.length + '건'}</p>` : null}</div></div>
+      <${Foot}><button type="button" class="att-btn" data-autofocus="1" data-cancel="1" onClick=${ctx.closeDialog}>종료</button></${Foot}>`;
   }
 
   /* ---------- QR code (ISO/IEC 18004, byte mode, level M). Drawn here: no external service, no CDN. ---------- */
@@ -3783,12 +4204,12 @@
   function MessagesTab(p) {
     const ctx = p.ctx, D = ctx.D, W = ctx.W;
     if (!D || !W) return null;
-    const open = W.s1.filter(x => x.refs?.some(ref => ref.includes('/messages/')));
+    // 2026-11-17 (owner): a message whose delivery is unknown is listed only in 조치할 일 (확인하기).
+    // messageColumn leaves it out of every list and count here, and the server's send refuses it (C7).
     const person = messageColumn(D, W, 'personal'), room = messageColumn(D, W, 'class');
     const people = new Set(person.due.map(x => x.studentId)).size;
     const known = !W.partial;
-    const summary = !known ? '확인하지 못했어요' : people || room.due.length ? ['개인톡 ' + people + '명', '단체톡 ' + room.due.length + '줄'].join(' · ') : '없음';
-    const activity = D.raw.registrationActivity || [];
+    const summary = !known ? '확인하지 못했어요' : people || room.due.length ? ['개인톡 ' + people + '명', '단체톡 ' + room.due.length + '줄'].join(' · ') : '보낼 메시지가 없어요';
     const chat = useChatStatus(ctx), roomWhy = chat !== undefined && chat?.groupState !== 'ready'
       ? { text: ['not-selected', 'missing'].includes(chat?.groupState) ? '학급 단톡방이 연결되지 않았어요. 연결 → 출결에서 연결해 주세요.' : '학급 단톡방을 확인하지 못했어요. 창 위쪽 [새로 읽기] 버튼(↻)을 눌러 주세요.' } : null;
     return html`<${NoticeSlot} ctx=${ctx} /><div class="att-mtab">
@@ -3797,14 +4218,12 @@
           <${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (!person.due.length && !room.due.length ? { text: '오늘 보낼 메시지가 없어요.' } : !person.due.length && roomWhy ? roomWhy : null)} onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'queue' })}>개인톡+단체톡 한 번에 보내기</${Btn}></div>
         <${ChatHealth} ctx=${ctx} />
       </section>
-      ${open.length ? html`<${WorkCard} title="전달됐는지 모르는 메시지" n=${open.length}>${open.map(x => html`<${Line} key=${x.id} btns=${html`<button class="att-btn-quiet att-btn-sm" onClick=${() => ctx.openDialog({ kind: 'chat-decide', effectId: x.id })}>확인하기</button>`}>${unknownLine(x, D)}</${Line}>`)}</${WorkCard}>` : null}
       <div class="att-mcols">
         <${MessageColumn} ctx=${ctx} channel="personal" col=${person} known=${known} send=${'오늘 보낼 ' + people + '명에게 보내기'} />
         <${MessageColumn} ctx=${ctx} channel="class" col=${room} known=${known} blocked=${roomWhy} send=${'오늘 보낼 ' + room.due.length + '줄 보내기'} />
       </div>
       <${SendLogCard} ctx=${ctx} />
       <${LaterMessages} ctx=${ctx} rows=${[...person.later, ...room.later].sort((a, b) => String(a.date).localeCompare(String(b.date)))} />
-      ${activity.length ? html`<section class="att-card"><div class="att-card-h"><h3>일정·할 일 등록 기록</h3></div>${activity.map(x => html`<p class="att-ml" key=${x.id || x.at}><span class="att-ml-t">${[atLong(x.at), x.kind === 'calendar' ? '일정' : '할 일', x.phase === 'CONFIRMED_RESULT' ? '등록됨' : x.phase === 'CONFIRMED_REJECTED' ? '등록되지 않았어요' : '확인 필요', x.updatedBy?.deviceLabel || ''].filter(Boolean).join(' · ')}</span></p>`)}</section>` : null}
     </div>`;
   }
   // One channel's messages sorted by what the teacher does with them. "due" is the same test as W.due and the server's preview.
@@ -3832,7 +4251,7 @@
   function PickedButtons(p) {
     const ctx = p.ctx, pick = p.pick, n = pick.picked.length, ro = ctx.roWhy();
     return html`<${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ro || (n === 1 ? null : { text: '수정할 메시지를 하나만 골라 주세요.' })} onClick=${() => { const row = pick.picked[0]; ctx.openDialog({ kind: 'message-edit', row, channel: row.channel }); }}>수정</${Btn}>
-      <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm" why=${ro || (n ? null : { text: '삭제할 메시지를 골라 주세요.' })} onClick=${() => { const rows = pick.picked; ctx.openDialog({ kind: 'message-edit', rows, row: rows[0], channel: rows[0].channel, remove: true }); }}>${n > 1 ? '삭제 ' + n + '개…' : '삭제…'}</${Btn}>`;
+      <${Btn} ctx=${ctx} cls="att-btn-quiet att-btn-sm att-btn-danger" why=${ro || (n ? null : { text: '삭제할 메시지를 골라 주세요.' })} onClick=${() => { const rows = pick.picked; ctx.openDialog({ kind: 'message-edit', rows, row: rows[0], channel: rows[0].channel, remove: true }); }}>${n > 1 ? '삭제 ' + n + '개' : '삭제'}</${Btn}>`;
   }
   function MessageColumn(p) {
     const ctx = p.ctx, D = ctx.D, col = p.col, personal = p.channel === 'personal', word = personal ? '개인톡' : '단체톡';
@@ -3853,9 +4272,9 @@
         <${PickedButtons} ctx=${ctx} pick=${pick} />
         <${Btn} ctx=${ctx} cls="att-btn-tonal att-btn-sm" why=${ctx.roWhy() || (col.due.length ? p.blocked || null : { text: '오늘 보낼 ' + word + '이 없어요.' })} onClick=${() => ctx.openDialog({ kind: 'chat-send', mode: 'queue', channel: p.channel })}>${col.due.length ? p.send : word + ' 보내기'}</${Btn}></span></div>
       <div class="att-mcol-b">
-      ${!p.known ? html`<p class="att-mempty">확인하지 못했어요</p>` : !hasWork ? html`<p class="att-mempty">${'오늘 보낼 ' + word + ' 없음'}</p>` : null}
+      ${!p.known ? html`<p class="att-mempty">확인하지 못했어요</p>` : !hasWork ? html`<p class="att-mempty">${'오늘 보낼 ' + word + '이 없어요.'}</p>` : null}
       ${personal ? groups.map(g => html`<div class="att-mg" key=${g.id}><div class="att-mg-h"><b>${g.st?.label || spaceLabel(g.rows[0].studentLabel) || '—'}</b>${g.rows.length > 1 ? html`<span class="att-faint">${g.rows.length + '줄'}</span>` : null}
-          ${g.st && !g.st.hasEmail ? html`<${Chip} tone="warn">이메일 없음</${Chip}><button class="att-link" onClick=${() => ctx.link({ kind: 'roster', studentId: g.id, focusEmail: true })}>학생명단 고치기</button>` : null}</div>
+          ${g.st && !g.st.hasEmail ? html`<${Chip} tone="warn">이메일 없음</${Chip}><button class="att-link" onClick=${() => ctx.link({ kind: 'roster', studentId: g.id, focusEmail: true })}>학생-학부모 명단 고치기</button>` : null}</div>
           ${g.rows.map(row => line(row))}</div>`)
         : col.due.length ? html`<div class="att-mg">${col.due.map(row => line(row))}</div>` : null}
       ${col.review.length ? html`<div class="att-mg">${col.review.map(row => line(row, html`<${Chip} tone="warn">${personal && !row.studentId ? '명단에 없음' : '값 확인 필요'}</${Chip}>`, name(row)))}</div>` : null}
@@ -3864,8 +4283,8 @@
     </section>`;
   }
   // Greeting rows keep the greeting record's states (sent, rejected, not-sent); show them in the same words as messages.
-  const LOG_RESULT = { sent: '보냄', rejected: '실패', 'not-sent': '대기' };
-  const SEND_ERROR_TEXT = { STUDENT_CHAT_RECIPIENT_REJECTED: '학생의 Google Chat 계정으로 보낼 수 없어요. 학생명단의 이메일을 확인해 주세요.', CHAT_MESSAGE_REJECTED: 'Google Chat이 이 메시지를 받지 않았어요.', CHAT_NOT_CONNECTED: 'Google Chat 연결이 필요해요.' };
+  const LOG_RESULT = { sent: '보냄', rejected: '보내지 못함', 'not-sent': '보낼 예정', '대기': '보낼 예정', '발송중': '보내는 중', '실패': '보내지 못함', '성공': '보냄' };
+  const SEND_ERROR_TEXT = { STUDENT_CHAT_RECIPIENT_REJECTED: '학생의 Google Chat 계정으로 보낼 수 없어요. 학생-학부모 명단의 이메일을 확인해 주세요.', CHAT_MESSAGE_REJECTED: 'Google Chat이 이 메시지를 받지 않았어요.', CHAT_NOT_CONNECTED: 'Google Chat 연결이 필요해요.' };
   const sendErrorText = code => (!code ? '' : SEND_ERROR_TEXT[code] || (/^[A-Z0-9_]+$/.test(code) ? '보내지 못했어요.' : code));
   function SendLogCard(p) {
     const ctx = p.ctx, D = ctx.D, log = D.raw.sendLog || [], messages = D.raw.messages || [];
@@ -3875,14 +4294,14 @@
       const att = row ? null : D.rows.find(r => r.reminder?.effectId === x.effectId && r.reminder.state === '실패');
       if (!row && !att) return null;
       const ro = ctx.roWhy();
-      return html`<${Btn} ctx=${ctx} cls="att-link" why=${ro} onClick=${() => ctx.openDialog(row ? { kind: 'chat-send', mode: 'queue', resendOf: x.effectId } : { kind: 'chat-send', mode: 'reminders', resendOf: x.effectId, ids: [att.id] })}>다시 보내기…</${Btn}>
-        ${row ? html`<${Btn} ctx=${ctx} cls="att-link" why=${ro} onClick=${() => ctx.openDialog({ kind: 'message-edit', row, channel: row.channel, remove: true })}>삭제…</${Btn}>` : null}`;
+      return html`<${Btn} ctx=${ctx} cls="att-link" why=${ro} onClick=${() => ctx.openDialog(row ? { kind: 'chat-send', mode: 'queue', resendOf: x.effectId } : { kind: 'chat-send', mode: 'reminders', resendOf: x.effectId, ids: D.rows.filter(r => r.reminder?.effectId === x.effectId).map(r => r.id) })}>다시 보내기</${Btn}>
+        ${row ? html`<${Btn} ctx=${ctx} cls="att-link att-link-danger" why=${ro} onClick=${() => ctx.openDialog({ kind: 'message-edit', row, channel: row.channel, remove: true })}>삭제</${Btn}>` : null}`;
     };
     return html`<section class="att-card"><div class="att-card-h"><h3>Google Chat 발송기록</h3><span class="att-faint">${'최근 300건 · 전체 ' + (D.raw.sendLogCount || 0) + '건'}</span></div>
-      ${log.length ? html`<div class="att-mlog-b"><table class="att-mlog"><colgroup><col style="width:112px" /><col style="width:48px" /><col style="width:80px" /><col /><col style="width:72px" /><col style="width:132px" /><col style="width:130px" /></colgroup>
+      ${log.length ? html`<div class="att-mlog-b"><table class="att-mlog"><colgroup><col style="width:112px" /><col style="width:48px" /><col style="width:80px" /><col /><col style="width:92px" /><col style="width:132px" /><col style="width:130px" /></colgroup>
         <thead><tr><th>발송시각</th><th>종류</th><th>대상</th><th>내용 미리보기</th><th>결과</th><th>오류</th><th></th></tr></thead>
-        <tbody>${log.map(x => { const err = sendErrorText(x.error), res = LOG_RESULT[x.result] || x.result; return html`<tr key=${x.effectId || x.id}><td title=${x.updatedBy?.deviceLabel || null}>${atLong(x.at)}</td><td>${x.kind === 'chat-class' ? '단체톡' : x.kind === 'chat-greeting' ? '인사' : '개인톡'}</td><td title=${spaceLabel(x.targetLabel)}>${spaceLabel(x.targetLabel)}</td><td title=${x.preview}>${x.preview}</td><td title=${res}><${Chip} tone=${/^(성공|보냄)/.test(String(res)) ? 'ok' : /^(대기|발송중)/.test(String(res)) ? 'muted' : 'warn'}>${res}</${Chip}></td><td title=${err || null}>${err || '—'}</td><td class="att-mlog-a">${acts(x)}</td></tr>`; })}</tbody></table></div>`
-        : html`<p class="att-mempty">발송기록 없음</p>`}
+        <tbody>${log.map(x => { const err = sendErrorText(x.error), res = LOG_RESULT[x.result] || x.result; return html`<tr key=${x.effectId || x.id}><td title=${x.updatedBy?.deviceLabel || null}>${atLong(x.at)}</td><td>${x.kind === 'chat-class' ? '단체톡' : x.kind === 'chat-greeting' ? '인사' : '개인톡'}</td><td title=${spaceLabel(x.targetLabel)}>${spaceLabel(x.targetLabel)}</td><td title=${x.preview}>${x.preview}</td><td title=${res}><${Chip} tone=${/^(성공|보냄)/.test(String(res)) ? 'ok' : /^(보낼 예정|보내는 중)/.test(String(res)) ? 'muted' : 'warn'}>${res}</${Chip}></td><td class="att-mlog-err" title=${err || null}>${err || '—'}</td><td class="att-mlog-a">${acts(x)}</td></tr>`; })}</tbody></table></div>`
+        : html`<p class="att-mempty">발송기록이 없어요.</p>`}
     </section>`;
   }
   function LaterMessages(p) {
@@ -3895,15 +4314,43 @@
         <tbody>${rows.map(row => { const who = row.channel === 'class' ? '학급 단톡방' : (D.byId.get(row.studentId)?.label || spaceLabel(row.studentLabel) || '—'); return html`<tr key=${row.id}><td><input type="checkbox" checked=${pick.has(row.id)} aria-label=${row.text} onChange=${() => pick.toggle(row.id)} /></td><td>${date(row.date)}</td><td>${row.channel === 'class' ? '단체톡' : '개인톡'}</td><td title=${who}>${who}</td><td title=${row.text}>${row.text}</td></tr>`; })}</tbody></table></div>
     </section>`;
   }
+  const EXCLUDED_WHY = { 'email-missing': '학생-학부모 명단에 이메일이 없어 보내지 않아요', 'class-missing': '학급 단톡방이 없어 보내지 않아요',
+    'greeting-rejected': '첫 인사를 받지 못한 학생이라 보내지 않아요', 'link-send-pending': '링크를 보내는 중이라 보내지 않아요',
+    'guardian-email-missing': '학생-학부모 명단에 보호자 Google 이메일이 없어 보내지 않아요',
+    'guardian-chat-rejected': 'Google이 받지 않았던 학부모라 Chat으로 보내지 않아요. 문자나 복사로 보내 주세요' };
+  // What already went to this student about these dates, in one line (owner 2026-11-13: no repeats).
+  function remHistory(ctx, ids) {
+    const rows = (ids || []).map(id => ctx.D.rows.find(x => x.id === id)).filter(Boolean).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const day = r => r.date ? Number(r.date.slice(5, 7)) + '월 ' + Number(r.date.slice(8, 10)) + '일' : '';
+    const md = t => { const k = t ? kst(t) : ''; return k ? Number(k.slice(5, 7)) + '/' + Number(k.slice(8, 10)) : ''; };
+    const info = rows.map(r => { const rem = r.reminder || {}, n = Number(rem.sentCount) || (rem.state === '보냄' ? 1 : 0);
+      return { day: day(r), n, last: md(rem.lastSentAt || (rem.state === '보냄' ? rem.sentAt : '')) }; });
+    const sent = info.filter(x => x.n);
+    if (!sent.length) return info.map(x => x.day).join('·') + ' 출결 서류 독려 · 이번이 첫 독려예요';
+    const lasts = [...new Set(sent.map(x => x.last).filter(Boolean))].join(', ');
+    if (sent.length === info.length && sent.every(x => x.n === sent[0].n)) {
+      const n = sent[0].n;
+      return info.map(x => x.day).join('·') + ' · 지금까지 ' + n + '번 보냄' + (lasts ? ' (마지막 ' + lasts + ')' : '') + ' · 아직 미제출이라 ' + (n + 1) + '번째로 보내요';
+    }
+    return info.map(x => x.day + (x.n ? ' ' + x.n + '번 보냄' + (x.last ? '(마지막 ' + x.last + ')' : '') : ' 아직 안 보냄')).join(' · ') + ' · 아직 미제출이라 다시 보내요';
+  }
   function ChatSendDialog(p) {
     const ctx=p.ctx,d=p.d,[preview,setPreview]=useState(null),[error,setError]=useState(''),[running,setRunning]=useState(false),[result,setResult]=useState(null);
     const attempted=useRef(false);
+    // A links send of 학생 and 학부모 cells together (owner 2026-11-17): the server takes one role per call, so each role
+    // is its own preview and its own send (own request ids), asked once here. A part that fails or is unknown is never
+    // sent again by itself (C7); a part not yet sent after a failure is reported as not sent.
+    const parts=d.mode==='links'?(d.parts||[{studentIds:d.studentIds||[],role:['student','guardian','both'].indexOf(d.role)>=0?d.role:'student'}]):[null];
     useEffect(()=>{
       let ended=false;
-      ctx.call('/v1/data/chat/preview',{year:ctx.D.year,mode:d.mode||'queue',...(d.ids?{ids:d.ids}:{}),...(d.mode==='links'?{ids:d.studentIds||[],rotate:d.rotate===true}:{}),...(d.channel?{channel:d.channel}:{}),...(d.resendOf?{resendOf:d.resendOf}:{}),
-        ...(d.personalText?{personalText:d.personalText}:{}),...(d.classText?{classText:d.classText}:{}),...(d.createGroup?{createGroup:true}:{}),...(d.mode==='greetings'&&d.links?{links:true}:{})}).then(reply=>{
+      const base={year:ctx.D.year,mode:d.mode||'queue',...(d.ids?{ids:d.ids}:{}),...(d.channel?{channel:d.channel}:{}),...(d.resendOf?{resendOf:d.resendOf}:{}),
+        ...(d.personalText?{personalText:d.personalText}:{}),...(d.classText?{classText:d.classText}:{}),...(d.createGroup?{createGroup:true}:{}),...(d.mode==='greetings'&&d.links?{links:true}:{})};
+      Promise.all(parts.map(part=>ctx.call('/v1/data/chat/preview',part?{...base,ids:part.studentIds,rotate:d.rotate===true,linkRole:part.role}:base))).then(replies=>{
         if(ended || memo.gen!==ctx.opts.generation)return;
-        if(reply.status===200)setPreview(reply.body);else setError(chatError(reply));
+        const bad=replies.find(r=>r.status!==200);
+        if(bad){setError(chatError(bad));return;}
+        setPreview({previewTokens:replies.map(r=>r.body.previewToken),groups:replies.flatMap((r,i)=>(r.body.groups||[]).map(g=>({...g,partRole:parts[i]&&parts[i].role}))),
+          excluded:replies.flatMap(r=>r.body.excluded||[])});
       });
       return ()=>{ended=true;};
     },[]);
@@ -3913,26 +4360,53 @@
       setRunning(true);
       try{
         ctx.set({dialogBusy:true});
-        const reply=await ctx.call('/v1/data/chat/send',{previewToken:preview.previewToken});
-        if(memo.gen!==ctx.opts.generation)return;
-        if(reply.status===200)setResult(reply.body);else {setError(chatError(reply));setResult({results:[]});}
+        const results=[];let failed=null,failedAt=-1;
+        for(let i=0;i<preview.previewTokens.length;i++){
+          if(failed){results.push({label:(parts[i]&&parts[i].role==='guardian'?'학부모 ':'학생 ')+parts[i].studentIds.length+'명',phase:'released'});continue;}
+          const reply=await ctx.call('/v1/data/chat/send',{previewToken:preview.previewTokens[i]});
+          if(memo.gen!==ctx.opts.generation)return;
+          if(reply.status===200)results.push(...(reply.body.results||[]));else {failed=reply;failedAt=i;}
+        }
+        if(failed)setError(chatError(failed)+(failedAt<preview.previewTokens.length-1?' 나머지는 보내지 않았어요.':''));
+        else if(d.fromSel)ctx.set({sel:new Set(),anchor:null});
+        setResult({results});
         await ctx.read();
       }finally{if(memo.gen===ctx.opts.generation){ctx.set({dialogBusy:false});setRunning(false);}}
     };
     const groups=preview?.groups||[];
     const links=d.mode==='links', afterLinks=groups.filter(x=>x.afterGreeting);
-    const title=result?'보낸 결과':links&&d.rotate?`${d.label||'이'} 학생의 링크를 새로 만들까요?`:links?`학생 ${groups.length}명에게 결석 신고 링크를 보낼까요?`:d.resendOf?'다시 보낼까요?':d.mode==='reminders'?`학생 ${groups.length}명에게 미제출 서류 독려 개인톡을 보낼까요?`:'보낼까요?';
-    return html`<h4 id="att-dlg-title">${title}</h4><${DlgNotice} ctx=${ctx}/><${ChatHealth} ctx=${ctx}/>
+    const nOf=role=>groups.filter(x=>!x.afterGreeting&&x.partRole===role).length;
+    const whoLinks=!links?'':d.parts?['student','guardian'].filter(nOf).map(r=>ROLE_WORD[r]+' '+nOf(r)+'명').join(' · ')||'고른 사람':d.role==='guardian'?`학부모 ${groups.length}명`:d.role==='both'?`학생·학부모 ${groups.length}명`:`학생 ${groups.length}명`;
+    const title=result?'보낸 결과':links&&d.rotate&&d.parts?`${whoLinks}의 링크를 새로 만들까요?`:links&&d.rotate?`${d.label?d.label+(d.role==='guardian'?' 학생 보호자':d.role==='both'?' 학생과 보호자':' 학생'):'고른 사람'}의 링크를 새로 만들까요?`:links?`${whoLinks}에게 결석 신고 링크를 보낼까요?`:d.resendOf?'다시 보낼까요?':d.mode==='reminders'?`학생 ${new Set(groups.map(x=>x.target)).size}명${groups.some(x=>x.ids)?' ('+groups.reduce((a,x)=>a+(x.ids||[]).length,0)+'줄)':''}에게 미제출 서류 독려 개인톡을 보낼까요?`:'보낼까요?';
+    return html`<h4 id="att-dlg-title">${title}</h4><${DlgNotice} ctx=${ctx}/><${ChatHealth} ctx=${ctx} problemsOnly=${true} classSend=${d.mode==='queue'?d.channel!=='personal':false}/>
       ${links&&!result?html`${d.rotate?html`<p>지금 쓰는 주소는 바로 쓸 수 없게 돼요.</p>`:null}<p>보낸 메시지는 되돌릴 수 없어요.</p>`:null}
       ${error?html`<p class="att-warn">${error}</p>`:!preview?html`<p>확인 중…</p>`:null}
-      ${preview && !groups.length && !preview.excluded?.length ? html`<p class="att-muted">0건</p>` : null}
-      ${groups.filter(x=>!x.afterGreeting).map(x=>html`<section class="att-message"><b>${spaceLabel(x.target)}</b><pre class="att-message-text">${x.text}</pre></section>`)}
-      ${afterLinks.length?html`<section class="att-message"><b>${'결석 신고 링크 · 학생 '+afterLinks.length+'명'}</b><pre class="att-message-text">${afterLinks[0].text}</pre></section>`:null}
-      ${preview?.excluded?.length?html`<p class="att-warn">보내지 않는 줄${preview.excluded.map(x=>html`<span> · ${spaceLabel(x.target)||'—'}${x.reason==='email-missing'?' · 이메일 없음':x.reason==='class-missing'?' · 학급 단톡방 정하기 필요':x.reason==='greeting-rejected'?' · 1:1 인사를 받지 못함':x.reason==='link-send-pending'?' · 보내는 중이거나 결과 확인 필요':''}</span>`)}
-        ${preview.excluded.some(x=>x.reason==='email-missing')?html`<button class="att-link" onClick=${()=>ctx.link({kind:'roster',focusEmail:true})}>학생명단 고치기</button>`:null}
-        ${preview.excluded.some(x=>x.reason==='class-missing')?html`<button class="att-link" onClick=${()=>{ctx.closeDialog();ctx.link({ kind: 'attendance-connect' });}}>연결 → 출결 열기</button>`:null}</p>`:null}
-      ${result&&d.mode==='greetings'?(result.results||[]).map(x=>{const r=greetResultLine(x);return html`<p>${x.label?spaceLabel(x.label)+' · ':''}${x.kind==='chat-link'?'결석 신고 링크':'인사'} <${Chip} tone=${r[0]}>${r[1]}</${Chip}></p>`;}):result?(result.results||[]).map(x=>html`<p>${x.code==='TEACHER_RATE_LIMIT'||x.code==='CHAT_RATE_LIMITED'?chatError({body:{error:x.code}}):x.phase==='CONFIRMED_RESULT'?'보냄':x.phase==='CONFIRMED_REJECTED'?'실패':x.phase==='released'?'보내지 못했어요. 다시 보낼 수 있어요.':links?'결과 확인 필요':'전달됐는지 모르는 메시지'}</p>`):null}
-      <${Foot}><${CancelBtn} ctx=${ctx} busy=${running} label=${result?'닫기':'취소'}/>${!result?html`<${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (running?{text:'보내는 중'}:!groups.length?{text:error || (preview?'0건':'확인 중…')}:null)} onClick=${send}>${running?'보내는 중':'보내기'}</${Btn}>`:null}</${Foot}>`;
+      ${!result && d.skipped?.length ? html`<div class="att-ov-list">${d.skipped.map((x,i)=>html`<p class="att-muted" key=${i}>${x.target + ' · ' + x.why}</p>`)}</div>` : null}
+      ${!result && preview?.excluded?.length ? preview.excluded.map(x=>html`<p class="att-muted">${(x.target||'') + ' · ' + (EXCLUDED_WHY[x.reason] || '보내지 않아요')}</p>`) : null}
+      ${preview && !groups.length && !preview.excluded?.length ? html`<p class="att-muted">보낼 메시지가 없어요. 이미 보냈거나 보내는 중인 줄은 빼요.</p>` : null}
+      ${!result?groups.filter(x=>!x.afterGreeting).map(x=>html`<section class="att-message"><b>${spaceLabel(x.target)}</b>${d.mode==='reminders'?html`<p class="att-faint">${remHistory(ctx, x.ids)}</p>`:null}<pre class="att-message-text">${x.text}</pre></section>`):null}
+      ${!result&&afterLinks.length?html`<section class="att-message"><b>${'결석 신고 링크 · 학생 '+afterLinks.length+'명'}</b><pre class="att-message-text">${afterLinks[0].text}</pre></section>`:null}
+      ${result?html`<${SendResults} results=${result.results||[]} greetings=${d.mode==='greetings'} links=${links}/>`:null}
+      <${Foot}><${CancelBtn} ctx=${ctx} busy=${running} label=${result?'닫기':'취소'}/>${!result?html`<${Btn} ctx=${ctx} cls="att-btn" why=${ctx.roWhy() || (running?{text:'보내는 중'}:!groups.length?{text:error || (preview?'보낼 메시지가 없어요':'확인 중…')}:null)} onClick=${send}>${running?'보내는 중':'보내기'}</${Btn}>`:null}</${Foot}>`;
+  }
+  // 보낸 결과 (2026-11-12 owner): a count line, then one row per recipient with a coloured result chip.
+  function sendResultLine(x, greetings, links) {
+    if (greetings) return greetResultLine(x);
+    if (x.code === 'TEACHER_RATE_LIMIT' || x.code === 'CHAT_RATE_LIMITED') return ['warn', '보내지 못함', chatError({ body: { error: x.code } })];
+    if (x.phase === 'CONFIRMED_RESULT') return ['ok', '보냄'];
+    // A guardian outside the teacher's Workspace (owner 2026-11-16): nothing delivered, never retried (C7).
+    if (x.phase === 'CONFIRMED_REJECTED' && x.role === 'guardian') return ['warn', 'Chat 불가', 'Google이 받지 않았어요. [휴대폰으로 보내기]나 [링크 복사·QR 코드]로 보내 주세요.'];
+    if (x.phase === 'CONFIRMED_REJECTED') return ['warn', '보내지 못함', sendErrorText(x.code)];
+    if (x.phase === 'released') return ['muted', '보내지 않음', '다시 보낼 수 있어요.'];
+    return ['warn', '결과 확인 필요', links ? '' : '학생이 받았는지 확인하지 못했어요. 조치할 일에서 확인해 주세요.'];
+  }
+  function SendResults(p) {
+    const lines = p.results.map(x => ({ x, r: sendResultLine(x, p.greetings, p.links) }));
+    const n = tone => lines.filter(l => l.r[0] === tone).length;
+    const head = [n('ok') ? '보냄 ' + n('ok') + '건' : '', n('warn') ? '확인 필요 ' + n('warn') + '건' : '', n('muted') ? '보내지 않음 ' + n('muted') + '건' : ''].filter(Boolean).join(' · ');
+    return html`<div class="att-results">${head ? html`<div class="att-results-h">${head}</div>` : null}
+      ${lines.map((l, i) => html`<div class="att-result" key=${i}><span class="att-result-who">${l.x.label ? spaceLabel(l.x.label) : '—'}${p.greetings ? html`<span class="att-faint">${l.x.kind === 'chat-link' ? ' · 결석 신고 링크' : ' · 인사'}</span>` : null}</span>
+        <span class="att-result-st"><${Chip} tone=${l.r[0]}>${l.r[1]}</${Chip}>${l.r[2] ? html`<small>${l.r[2]}</small>` : null}</span></div>`)}</div>`;
   }
   // One result line of the greeting flow: green only for a confirmed send; grey for a link held back
   // because its greeting was not confirmed; amber where the teacher has to act (C7: nothing resent).
@@ -3954,7 +4428,7 @@
       setRunning(true);
       try{
         ctx.set({dialogBusy:true});
-        const versions=effect.targetRefs.map(ref=>{const parts=ref.split('/'), col=parts.at(-2),id=parts.at(-1);return (answer[col]||[]).find(x=>x.id===id||(col==='studentLinks'&&x.studentId===id))?.version;});
+        const versions=effect.targetRefs.map(ref=>{const parts=ref.split('/'), col=parts.at(-2),id=parts.at(-1);return (answer[col]||[]).find(x=>x.id===id||((col==='studentLinks'||col==='guardianLinks')&&x.studentId===id))?.version;});
         const reply=await ctx.call('/v1/data/effects/'+effect.id+'/decide',{year:answer.year,choice,versions});
         if(memo.gen!==ctx.opts.generation)return;
         if(reply.status===200){ctx.closeDialogNow();await ctx.read();}else setError(chatError(reply));
@@ -3970,7 +4444,7 @@
     useEffect(()=>{let ended=false;ctx.call('/v1/data/greetings',{year:ctx.D.year}).then(r=>{if(!ended && r.status===200){setPersonal(r.body.defaults.personal);setGroup(r.body.defaults.class);}});return()=>{ended=true;};},[]);
     return html`<h4 id="att-dlg-title">환영 인사 보내면서 Google Chat 대화 상대로 연결하기</h4><p>학생들에게 첫 인사를 보내면 Google Chat으로 연락할 수 있어요.</p><${ChatHealth} ctx=${ctx}/>
       <div class="att-message-grid"><label class="att-fld">학생 각자에게 (1:1)<textarea rows="8" value=${personal} onInput=${ev=>setPersonal(ev.target.value)}/></label>
-      <label class="att-fld">우리 반 단톡방<textarea rows="8" value=${group} onInput=${ev=>setGroup(ev.target.value)}/></label></div><p>학생명단의 이메일이 틀리면 그 학생에게는 가지 않아요.</p><p>인사와 함께 결석 신고 링크도 1:1로 보내요.</p>
+      <label class="att-fld">우리 반 단톡방<textarea rows="8" value=${group} onInput=${ev=>setGroup(ev.target.value)}/></label></div><p>학생-학부모 명단의 이메일이 틀리면 그 학생에게는 가지 않아요.</p><p>인사와 함께 결석 신고 링크도 1:1로 보내요.</p>
       <${Foot}><${CancelBtn} ctx=${ctx}/><${Btn} ctx=${ctx} cls="att-btn" why=${!personal.trim()||!group.trim()?{text:'확인 중…'}:ctx.roWhy()} onClick=${()=>ctx.openDialog({kind:'chat-send',mode:'greetings',links:true,personalText:personal,classText:group,createGroup:!p.d.ids,...(p.d.ids?{ids:p.d.ids,channel:'personal'}:{})})}>미리보기</${Btn}></${Foot}>`;
   }
   function MessageEditDialog(p) {

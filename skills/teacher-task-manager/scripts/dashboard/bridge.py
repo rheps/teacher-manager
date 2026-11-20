@@ -93,6 +93,7 @@ _SCREEN_FAILURES = {
     "ensure_calendar_named": "캘린더를 만들지 못했어요.",
     "ensure_tasklist_named": "할 일 목록을 만들지 못했어요.",
     "open_url": "안전한 https 주소만 열 수 있어요.",
+    "open_sms": "문자 앱을 열지 못했어요.",
     "open_picture_guide": "방법 안내를 기본 브라우저에서 열지 못했어요.",
     "retry_capture": "실패한 항목을 다시 처리하지 못했어요.",
 }
@@ -527,7 +528,7 @@ _SESSION_TRANSITIONS = frozenset({
 })
 _SESSION_GLOBAL = _SESSION_TRANSITIONS | frozenset({
     "get_update_info", "update_offer", "decline_update", "start_update", "quit_app", "error_report_status",
-    "computer_status", "network_status", "open_url", "open_picture_guide",
+    "computer_status", "network_status", "open_url", "open_sms", "open_picture_guide",
     "restart_helper",
     "log_attendance_ui_event",
 })
@@ -2365,6 +2366,14 @@ class Api:
         except Exception:
             raise ScreenSafeError("기본 브라우저에서 방법 안내를 열지 못했어요. Windows의 기본 브라우저 설정을 확인해 주세요.") from None
         return {"opened": True, "method": "default"}
+
+    @guarded
+    def open_sms(self, number, text):
+        """문자로 보내기 (owner 2026-11-16): the teacher's phone app through sms:. The number is never logged."""
+        try:
+            return external_url.open_sms(number, text)
+        except (ValueError, RuntimeError) as error:
+            raise ScreenSafeError(str(error)) from None
 
     @guarded
     def open_url(self, url):

@@ -60,7 +60,7 @@ const S = {
 
 const WIZARD_STEPS = [
   "시작 전 준비", "Google 로그인", "내 정보", "하루 일과", "시간표",
-  "담임학급 학생명단", "이 컴퓨터 설정", "Google 연결", "모두 저장",
+  "담임학급 학생-학부모 명단", "이 컴퓨터 설정", "Google 연결", "모두 저장",
 ];
 const GOEDU_REQUIRED_MESSAGE = "Google 계정으로 다시 로그인해 주세요.";
 function isGoeduGoogleStatus(status) {
@@ -1050,7 +1050,7 @@ function attendanceWizardGateMessage() {
   if (year.taskState === "unavailable") return "저장된 할 일 목록을 사용할 수 없어요. 접근 권한을 확인하거나 다른 목록을 골라 주세요.";
   // Not read or not readable now: the Tasks row says the same, and ↻ or [다음] reads it again (C6, C8).
   if (year.taskState !== "ready") return googleTargetCheckFailedMessage();
-  return "학생명단 화면에서 번호·이름·이메일을 입력하고 [명단 저장]을 눌러 주세요.";
+  return "학생-학부모 명단 화면에서 번호·이름·이메일을 입력하고 [명단 저장]을 눌러 주세요.";
 }
 function setAttendanceGateBanner(message = attendanceWizardGateMessage()) {
   S.banner = { kind: attendanceWizardGateTone(), text: message, topic: "attendance-gate" };
@@ -1490,8 +1490,7 @@ function stepIdentity() {
       rawRow("학교급 (수업 시간을 자동 계산해요)",
         choiceCell("학교급", [["초", "초등 (40분)"], ["중", "중학 (45분)"], ["고", "고등 (50분)"]])) +
       rawRow("담임을 맡고 있나요?", choiceCell("담임여부", [["예", "예"], ["아니오", "아니오"]])) +
-      homeroomRow +
-      (homeroom === "예" ? fieldRow("반이름", "반 이름", p["반이름"] || "", { disabled: classUnavailable }) : "")
+      homeroomRow
     )}`;
 }
 function syncProfileFields() {
@@ -1520,7 +1519,7 @@ function classFieldsFromProfile() {
   const p = S.draft.profile;
   const grade = String(p["담임학년"] || "").trim(), classNumber = String(p["담임반"] || "").trim();
   return { schoolName: String(p["학교명"] || "").trim(), grade, classNumber,
-    classLabel: String(p["반이름"] || "").trim() || (grade && classNumber ? `${grade}학년 ${classNumber}반` : ""), teacherName: String(p["선생님이름"] || "").trim() };
+    classLabel: grade && classNumber ? `${grade}학년 ${classNumber}반` : "", teacherName: String(p["선생님이름"] || "").trim() };
 }
 const CLASS_IDENTITY_MAP = { "학교명": "schoolName", "담임학년": "grade", "담임반": "classNumber", "반이름": "classLabel", "선생님이름": "teacherName" };
 function hydrateClassIdentity(doc) {
@@ -1636,7 +1635,7 @@ function stepDay() {
       `<option value="${n}" ${(p[name] || "7") === n ? "selected" : ""}>${n}교시</option>`
     ).join("");
     return rawRow(`${name[0]}요일 마지막 교시`,
-      `<div class="field"><select name="${esc(name)}">${options}</select></div>`);
+      `<div class="field field-fit"><select name="${esc(name)}">${options}</select></div>`);
   }).join("");
   return `
     <h1>하루 일과를 알려주세요</h1>
@@ -1679,7 +1678,7 @@ function stepTimetable() {
     ensureGridLoaded(request)
       .then((loaded) => { if (loaded && ownsIssueRequest(request)) render(); })
       .catch((error) => handleCaughtError(error, request));
-    return `<h1>시간표를 채워주세요</h1><p class="sub">불러오는 중이에요…</p>`;
+    return `<h1>시간표를 채워주세요</h1><p class="sub fill-center">불러오는 중이에요…</p>`;
   }
   const head = `<tr><th></th>${GRID_DAYS.map((d) => `<th>${d}</th>`).join("")}</tr>`;
   const rows = S.draft.grid.map((row, r) =>
@@ -1691,7 +1690,7 @@ function stepTimetable() {
   return `
     <h1>시간표를 채워주세요</h1>
     <p class="sub">공강 시간을 중심으로 행정업무 일정을 등록해 드려요. 입력 형식은 자유로워요 (예: 2-1, 2학년 1반, 201…)</p>
-    <p class="sub">엑셀에서 요일·교시 제목을 제외한 칸을 복사한 뒤, 시작할 칸에 붙여넣으세요. 가로는 월~금, 세로는 1~7교시예요. 빈칸도 그대로 반영돼요.</p>
+    <p class="sub">엑셀에서 복사 붙여넣기가 가능해요</p>
     <table class="grid-table">${head}${rows}</table>`;
 }
 function syncGridFields() {
@@ -1739,7 +1738,9 @@ let rosterEditorRequest = 0;
 let rosterEditorPending = null;
 function isHomeroomTeacher() { return (S.draft.profile["담임여부"] || S.profileCache?.["담임여부"]) === "예"; }
 function rosterEditorContext() { return JSON.stringify([accountUiEpoch, accountWireToken?.[0] || S.google?.user || ""]); }
-// A row is [number, name, email, status, studentId, version]: the last two are never shown.
+// A row is [number, name, email, status, studentId, version, phone, relation, guardianEmail, guardianPhone]:
+// studentId and version are never shown. The four contact cells (owner 2026-11-16) hold one guardian per
+// student and the phones; phones come from /v1/data/students/contacts only while the editor is open (R17).
 function rosterEditableRows(rows = [], minimum = 30) {
   const result = rows.map(row => [...row]);
   let next = Math.max(0, ...result.map(row => Number(row[0]) || 0)) + 1;
@@ -1749,18 +1750,36 @@ function rosterEditableRows(rows = [], minimum = 30) {
 function rosterRowHasStudent(row) { return [row[1], row[2]].some(value => String(value || "").trim()); }
 // 학적: 재적만 우리 반 학생이다. 재적은 세 칸 행으로 저장해 학적 열이 없던 명단과 같은 모양을 쓴다.
 const ROSTER_STATUSES = ["재적", "전출", "자퇴(퇴학)"];
+const GUARDIAN_RELATIONS = ["부", "모", "보호자"];
 function rosterCells(row) {
   const [number, name, email] = row.slice(0, 3).map(value => String(value ?? "").trim());
-  return [number, name, email, String(row[3] ?? "").trim() || "재적"];
+  const contact = [6, 7, 8, 9].map(index => String(row[index] ?? "").trim());
+  return [number, name, email, String(row[3] ?? "").trim() || "재적", ...contact];
 }
-function rosterRowsFromServer(students) {
+function rosterRowsFromServer(students, contacts) {
   return [...students].sort((a, b) => (Number(a.number) || 0) - (Number(b.number) || 0))
-    .map(s => [String(s.number ?? ""), String(s.name ?? ""), String(s.email ?? ""), String(s.status || "재적"), String(s.id), s.version]);
+    .map(s => {
+      const c = contacts?.[s.id] || {};
+      return [String(s.number ?? ""), String(s.name ?? ""), String(s.email ?? ""), String(s.status || "재적"), String(s.id), s.version,
+        String(c.phone || ""), String(s.guardian?.relation || ""), String(s.guardian?.email || ""), String(c.guardianPhone || "")];
+    });
 }
-function rosterEditorFromRead(answer, context) {
-  const rows = rosterRowsFromServer(answer.students || []);
+// contactsLoaded false: the phones could not be opened, so the contact cells are read-only and a save
+// sends no guardian or phone at all (the server keeps what it has).
+function rosterEditorFromRead(answer, context, contacts) {
+  const rows = rosterRowsFromServer(answer.students || [], contacts);
   return { rows: rosterEditableRows(rows), state: "ready", context, dirty: false, busy: false, detail: "", pendingWrite: null,
+    contactsLoaded: contacts !== null,
     baseline: Object.fromEntries(rows.map(row => [row[4], rosterCells(row).join("\u0000")])) };
+}
+async function readRosterContacts(students) {
+  if (!students.some(s => s.hasPhone || s.guardian?.hasPhone)) return {};
+  try {
+    const reply = await dataCall("/v1/data/students/contacts", {});
+    const contacts = reply?.status === 200 ? reply.body?.contacts : null;
+    if (!contacts || typeof contacts !== "object" || Object.values(contacts).some(c => c?.unreadable)) return null;
+    return contacts;
+  } catch (_) { return null; }
 }
 // There is no local-first copy: the roster is read from and saved to the server (MAIN §7.14).
 async function loadRosterEditor(refresh = false) {
@@ -1776,7 +1795,11 @@ async function loadRosterEditor(refresh = false) {
   try {
     const reply = await dataCall("/v1/data/read", {});
     if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
-    if (reply?.status === 200 && reply.body?.complete === true) S.rosterEditor = rosterEditorFromRead(reply.body, context);
+    if (reply?.status === 200 && reply.body?.complete === true) {
+      const contacts = await readRosterContacts(reply.body.students || []);
+      if (version !== rosterEditorRequest || context !== rosterEditorContext() || owner !== screenKey()) return;
+      S.rosterEditor = rosterEditorFromRead(reply.body, context, contacts);
+    }
     // A failed read is never an empty roster (C1, C2): no rows to type over, only 다시 불러오기.
     else S.rosterEditor = { rows: [], state: "unavailable", context, detail: dataFailureText(reply) };
   } catch (_) {
@@ -1793,7 +1816,7 @@ async function loadRosterEditor(refresh = false) {
 }
 function rosterInputProblem() {
   const rows = S.rosterEditor?.rows || [];
-  if (!rows.some(rosterRowHasStudent) || rows.length > 199) return "학생명단은 1명부터 199명까지 입력해 주세요.";
+  if (!rows.some(rosterRowHasStudent) || rows.length > 199) return "학생-학부모 명단은 1명부터 199명까지 입력해 주세요.";
   const numbers = new Set(), emails = new Set();
   for (let i = 0; i < rows.length; i++) {
     if (!rosterRowHasStudent(rows[i])) continue;
@@ -1803,6 +1826,13 @@ function rosterInputProblem() {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return `${i + 1}번째 학생 이메일을 빠짐없이 입력해 주세요.`;
     if (numbers.has(Number(number)) || emails.has(email.toLowerCase())) return `${i + 1}번째 학생 번호 또는 이메일이 중복돼요.`;
     if (!ROSTER_STATUSES.includes(String(rows[i][3] || "재적").trim())) return `${i + 1}번째 학생 학적은 재적·전출·자퇴(퇴학) 중에서 골라 주세요.`;
+    const [, , , , phone, relation, guardianEmail, guardianPhone] = rosterCells(rows[i]);
+    const phoneOk = value => !value || /^\+?[0-9]{8,15}$/.test(value.replace(/[\s().-]/g, ""));
+    if (!phoneOk(phone)) return `${i + 1}번째 학생 전화번호를 확인해 주세요.`;
+    if ((guardianEmail || guardianPhone) && !GUARDIAN_RELATIONS.includes(relation)) return `${i + 1}번째 학생의 보호자 관계(부·모·보호자)를 골라 주세요.`;
+    if (guardianEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guardianEmail)) return `${i + 1}번째 학생 보호자 이메일을 올바르게 입력해 주세요.`;
+    if (guardianEmail && guardianEmail.toLowerCase() === email.toLowerCase()) return `${i + 1}번째 학생 보호자 이메일이 학생 이메일과 같아요. 보호자 본인의 Google 이메일을 입력해 주세요.`;
+    if (!phoneOk(guardianPhone)) return `${i + 1}번째 학생 보호자 전화번호를 확인해 주세요.`;
     numbers.add(Number(number)); emails.add(email.toLowerCase());
   }
   return "";
@@ -1811,14 +1841,19 @@ function rosterInputProblem() {
 function rosterChanges(editor) {
   const changes = [], rows = [];
   for (const row of editor.rows) {
-    const [number, name, email, status] = rosterCells(row);
+    const [number, name, email, status, phone, relation, guardianEmail, guardianPhone] = rosterCells(row);
     const studentId = row[4], version = row[5];
+    // The guardian and phones go only when they were read and changed; '' removes a phone, null the guardian.
+    const before = String(editor.baseline?.[studentId] ?? "").split("\u0000").slice(4).join("\u0000");
+    const changedContact = [phone, relation, guardianEmail, guardianPhone].join("\u0000") !== (studentId ? before : ["", "", "", ""].join("\u0000"));
+    const contact = editor.contactsLoaded === false || !changedContact ? {} : { phone,
+      guardian: relation || guardianEmail || guardianPhone ? { relation, email: guardianEmail, phone: guardianPhone } : null };
     if (!studentId) {
-      if (rosterRowHasStudent(row)) { changes.push({ number, name, email, status }); rows.push(row); }
+      if (rosterRowHasStudent(row)) { changes.push({ number, name, email, status, ...contact }); rows.push(row); }
     } else if (!rosterRowHasStudent(row)) {
       changes.push({ studentId, version, delete: true }); rows.push(row);
     } else if (editor.baseline?.[studentId] !== rosterCells(row).join("\u0000")) {
-      changes.push({ studentId, version, number, name, email, status }); rows.push(row);
+      changes.push({ studentId, version, number, name, email, status, ...contact }); rows.push(row);
     }
   }
   return { changes, rows };
@@ -1836,7 +1871,7 @@ function applyRosterAnswer(editor, rows, answer) {
   });
   const kept = editor.rows.filter(row => !gone.has(row));
   const saved = kept.filter(row => row[4]);
-  return { ...editor, rows: rosterEditableRows(kept), state: "ready", dirty: false, detail: "명단을 저장했어요.", pendingWrite: null, saveFailed: false,
+  return { ...editor, rows: rosterEditableRows(kept), state: "ready", dirty: false, detail: "", pendingWrite: null, saveFailed: false,
     baseline: Object.fromEntries(saved.map(row => [row[4], rosterCells(row).join("\u0000")])) };
 }
 function rosterUnknownText() {
@@ -1854,8 +1889,9 @@ async function saveRosterEditor() {
   const visible = () => owner === screenKey();
   const { changes, rows } = rosterChanges(editor);
   if (!changes.length) {
+    // Edited back to the saved values: nothing to write and no message (owner 2026-11-17).
     editor.dirty = false;
-    editor.detail = "바뀐 내용이 없어요.";
+    editor.detail = "";
     if (visible()) render();
     return true;
   }
@@ -1888,6 +1924,7 @@ async function saveRosterEditor() {
       // A saved roster may hold fixed emails: re-read the student Chat state (CLASS-GROUP-01).
       studentConnect = null;
       S.rosterEmailFix = null;
+      if (visible()) showToast("저장하였습니다.");
       return true;
     }
     const text = dataFailureText(reply);
@@ -1955,35 +1992,44 @@ async function validateRoster() {
   return rosterSavedForNext() ? "" : "명단 저장을 먼저 눌러 주세요. 저장한 뒤 다음으로 진행할 수 있어요.";
 }
 function stepRoster() {
-  if (!isHomeroomTeacher()) return `<h1>담임학급 학생명단</h1><p class="sub">담임을 맡지 않아 이 단계는 사용하지 않아요.</p>`;
+  if (!isHomeroomTeacher()) return `<h1>담임학급 학생-학부모 명단</h1><p class="sub">담임을 맡지 않아 이 단계는 사용하지 않아요.</p>`;
   if (S.rosterEditor?.context !== rosterEditorContext()) loadRosterEditor();
   const editor = S.rosterEditor || { state: "loading", rows: [] };
-  if (editor.state === "loading") return `<h1>담임학급 학생명단</h1><p class="sub">명단을 불러오고 있어요…</p>`;
+  if (editor.state === "loading") return `<h1>담임학급 학생-학부모 명단</h1><p class="sub fill-center">명단을 불러오고 있어요…</p>`;
   const disabled = editor.busy || editor.pendingWrite ? " disabled" : "";
+  const contactDisabled = disabled || (editor.contactsLoaded === false ? " disabled" : "");
   const rows = editor.rows.map((row, index) => {
     const status = String(row[3] || "재적").trim();
     const options = (ROSTER_STATUSES.includes(status) ? ROSTER_STATUSES : [...ROSTER_STATUSES, status])
       .map(value => `<option value="${esc(value)}"${value === status ? " selected" : ""}>${esc(value)}</option>`).join("");
     const fix = rosterEmailFixActive(row) ? ' class="roster-email-fix"' : "";
-    return `<tr>${row.slice(0, 3).map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' + fix : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}<td><select data-roster-cell="${index}:3" aria-label="${index + 1}번째 학생 학적"${disabled}>${options}</select></td></tr>`;
+    const relation = String(row[7] || "").trim();
+    const relations = ["", ...GUARDIAN_RELATIONS, ...(relation && !GUARDIAN_RELATIONS.includes(relation) ? [relation] : [])]
+      .map(value => `<option value="${esc(value)}"${value === relation ? " selected" : ""}>${value ? esc(value) : "—"}</option>`).join("");
+    const contactInput = (column, label, type) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 ${label}" ${type} value="${esc(row[column] ?? "")}"${contactDisabled}${editor.contactsLoaded === false && (column === 6 || column === 9) ? ' placeholder="불러오지 못함"' : ""}></td>`;
+    return `<tr>${row.slice(0, 3).map((value, column) => `<td><input data-roster-cell="${index}:${column}" aria-label="${index + 1}번째 학생 ${["번호", "이름", "이메일"][column]}" ${column === 2 ? 'type="email"' + fix : column === 0 ? 'inputmode="numeric"' : ''} value="${esc(value)}"${disabled}></td>`).join("")}<td><select data-roster-cell="${index}:3" aria-label="${index + 1}번째 학생 학적"${disabled}>${options}</select></td>`
+      + contactInput(6, "학생 전화번호", 'type="tel" inputmode="tel"')
+      + `<td><select data-roster-cell="${index}:7" aria-label="${index + 1}번째 학생 보호자 관계"${contactDisabled}>${relations}</select></td>`
+      + contactInput(8, "학생 보호자 이메일", 'type="email"') + contactInput(9, "학생 보호자 전화번호", 'type="tel" inputmode="tel"') + `</tr>`;
   }).join("");
   if (S.rosterEmailFix) setTimeout(rosterEmailFixAfterPaint, 0);
   const unavailable = editor.state === "unavailable";
   // After a failed save it is also the way out: the window closes only on a saved or reread roster.
-  const reloadShown = unavailable || Boolean(editor.pendingWrite) || Boolean(editor.saveFailed);
+  const reloadShown = unavailable || Boolean(editor.pendingWrite) || Boolean(editor.saveFailed) || editor.contactsLoaded === false;
   const status = editor.busy ? "명단 저장 결과를 확인하고 있어요." : editor.dirty ? "수정한 명단을 저장해 주세요." : editor.detail || "";
-  return `<h1>담임학급 학생명단</h1>
-    <p class="sub">학생 이메일은 경기도교육청 클라우드 계정(@goedu.kr)을 권장합니다.<br>엑셀·구글시트에서 복사·붙여넣기 가능합니다.</p>
-    <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th><th scope="col">학적</th></tr></thead><tbody>${rows}</tbody></table></div>
+  return `<h1>담임학급 학생-학부모 명단</h1>
+    <p class="sub">학생 이메일은 경기도교육청 클라우드 계정(@goedu.kr)을 권장합니다. 엑셀·구글시트에서 복사·붙여넣기 가능합니다.</p>
+    <div class="roster-scroll"><table class="grid-table roster-table"><thead><tr><th scope="col">번호</th><th scope="col">이름</th><th scope="col">이메일 · 필수</th><th scope="col">학적</th><th scope="col">학생 전화</th><th scope="col">보호자</th><th scope="col">보호자 Google 이메일</th><th scope="col">보호자 전화</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${editor.contactsLoaded === false ? `<p class="sub">전화번호를 불러오지 못해 보호자·전화 칸은 지금 고칠 수 없어요. [다시 불러오기]를 눌러 주세요.</p>` : ""}
     <div class="roster-actions"><button class="btn-tonal" data-action="roster-add"${disabled || unavailable || editor.rows.length >= 199 ? " disabled" : ""}>행 추가</button>
       ${reloadShown ? `<button class="btn-quiet" data-action="roster-reload"${editor.busy ? " disabled" : ""}>다시 불러오기</button>` : ""}
-      <button class="btn" data-action="roster-save"${disabled || unavailable ? " disabled" : ""}>${editor.busy ? "저장 중…" : "명단 저장"}</button>
+      <button class="${S.mode === "wizard" ? "btn-tonal" : "btn"}" data-action="roster-save"${disabled || unavailable || !editor.dirty ? " disabled" : ""}>${editor.busy ? "저장 중…" : "명단 저장"}</button>
     </div>
     <p class="sub" role="status">${esc(status)}</p>`;
 }
 function timetableEditBody() {
   const active = S.timetableTab || "timetable";
-  return `<div class="connect-tabs timetable-tabs" role="tablist" aria-label="시간표와 명단"><button role="tab" aria-selected="${active === "timetable"}" class="connect-tab ${active === "timetable" ? "active" : ""}" data-action="timetable-tab" data-tab="timetable"><span class="tab-title">시간표</span></button><button role="tab" aria-selected="${active === "roster"}" class="connect-tab ${active === "roster" ? "active" : ""}" data-action="timetable-tab" data-tab="roster" ${isHomeroomTeacher() ? "" : "disabled"}><span class="tab-title">담임학급 학생명단</span></button><button role="tab" aria-selected="${active === "holidays"}" class="connect-tab ${active === "holidays" ? "active" : ""}" data-action="timetable-tab" data-tab="holidays" ${isHomeroomTeacher() ? "" : "disabled"}><span class="tab-title">휴일·학사일정</span></button></div>${active === "roster" ? stepRoster() : active === "holidays" ? `<div id="attendance-card"></div>` : stepTimetable()}`;
+  return `<div class="connect-tabs timetable-tabs" role="tablist" aria-label="시간표와 명단"><button role="tab" aria-selected="${active === "timetable"}" class="connect-tab ${active === "timetable" ? "active" : ""}" data-action="timetable-tab" data-tab="timetable"><span class="tab-title">시간표</span></button><button role="tab" aria-selected="${active === "roster"}" class="connect-tab ${active === "roster" ? "active" : ""}" data-action="timetable-tab" data-tab="roster" ${isHomeroomTeacher() ? "" : "disabled"}><span class="tab-title">담임학급 학생-학부모 명단</span></button><button role="tab" aria-selected="${active === "holidays"}" class="connect-tab ${active === "holidays" ? "active" : ""}" data-action="timetable-tab" data-tab="holidays" ${isHomeroomTeacher() ? "" : "disabled"}><span class="tab-title">휴일·학사일정</span></button></div>${active === "roster" ? stepRoster() : active === "holidays" ? `<div id="attendance-card"></div>` : stepTimetable()}`;
 }
 document.addEventListener("input", event => {
   const key = event.target.dataset?.rosterCell;
@@ -1991,6 +2037,9 @@ document.addEventListener("input", event => {
   const [row, column] = key.split(":").map(Number);
   S.rosterEditor.rows[row][column] = event.target.value;
   S.rosterEditor.dirty = true;
+  // 명단 저장 is enabled only by an unsaved change (owner 2026-11-17); typing does not repaint.
+  const save = document.querySelector('[data-action="roster-save"]');
+  if (save && !S.rosterEditor.pendingWrite && S.rosterEditor.state !== "unavailable") save.disabled = false;
   if (S.mode === "wizard" && S.step === 6) {
     const next = document.querySelector('[data-action="go-next"]');
     if (next) next.disabled = true;
@@ -2004,13 +2053,16 @@ document.addEventListener("paste", event => {
   event.preventDefault();
   const [start, column] = key.split(":").map(Number);
   const pasted = text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").map(line => line.split("\t"));
-  if (pasted.length + start > 199 || pasted.some(row => row.length + column > 3)) {
-    setBanner("warn", "번호·이름·이메일 세 열만 복사해 주세요. 최대 199명까지 입력할 수 있어요."); return;
+  // Two paste blocks, left to right: 번호·이름·이메일, and 학생 전화·보호자·보호자 이메일·보호자 전화 (owner 2026-11-16).
+  const visual = [[0, 1, 2], ...(S.rosterEditor.contactsLoaded === false ? [] : [[6, 7, 8, 9]])].find(group => group.includes(column)) || [];
+  const from = visual.indexOf(column);
+  if (from < 0 || pasted.length + start > 199 || pasted.some(row => row.length + from > visual.length)) {
+    setBanner("warn", column < 3 ? "번호·이름·이메일 세 열만 복사해 주세요. 최대 199명까지 입력할 수 있어요." : "학생 전화·보호자·보호자 이메일·보호자 전화 네 열만 복사해 주세요."); return;
   }
   S.rosterEditor.rows = rosterEditableRows(S.rosterEditor.rows, Math.max(30, start + pasted.length));
   pasted.forEach((row, offset) => {
     const target = S.rosterEditor.rows[start + offset];
-    row.forEach((value, c) => { target[column + c] = value.trim(); });
+    row.forEach((value, c) => { target[visual[from + c]] = value.trim(); });
   });
   S.rosterEditor.dirty = true; render();
   document.querySelector(`[data-roster-cell="${key}"]`)?.focus();
@@ -2763,92 +2815,20 @@ function studentChatRowState(a) {
     studentReading: ready && (!studentConnect || studentConnect.context !== chatReadContext() || studentConnect.state === "loading"),
     readFailed: ready && studentConnect?.context === chatReadContext() && studentConnect.state === "unavailable" };
 }
-function classSpaceSubrowHtml(a, view = attendanceViewKind()) {
-  if (!isHomeroomTeacher()) return "";
-  const content = classSpaceContentHtml(a, view);
-  const r = studentChatRowState(a);
-  const localIssue = problemIssueOwner === screenKey() && isClassSpaceIssue(S.problemIssue) ? problemPanelHtml(S.problemIssue) : "";
-  const busy = S.classGroupCreating || S.classSpaceSaving || Boolean(S.classChatStart);
-  let chip, tone = "muted", lines = [], buttons = "";
-  if (S.classChatStart?.kind === "sending") chip = "보내는 중…";
-  else if (r.waiting) chip = "출석부 준비 중…";
-  else if (r.roomReading) chip = "확인 중…";
-  else if (r.roomMissing && !r.d) {
-    // The room is known to be missing: offer the button now; it reads the students first.
-    chip = r.state === "missing" ? "확인 필요" : "학급 단톡방 없음"; tone = "warn";
-    buttons = `<button class="btn-tonal" data-action="class-space-group-create"${busy ? " disabled" : ""}>${S.classGroupCreating ? "준비하는 중…" : "환영 인사 보내면서 Google Chat 대화 상대로 연결하기"}</button>`;
-  } else if (r.studentReading) chip = "확인 중…";
-  else if (r.state === "read-failed" || r.readFailed) {
-    chip = "확인 필요"; tone = "warn";
-    buttons = r.readFailed ? `<button class="btn-tonal" data-action="student-chat-recheck">다시 확인</button>`
-      : S.chatSpacesError && !S.attendanceReadFailed && !S.chatStatus?.read_failed ? `<button class="btn-tonal" data-action="class-space-reload">다시 확인</button>` : "";
-  } else if (!r.d) {
-    // The 1:1 state is not readable yet (for example the roster is not linked): show the room only.
-    chip = r.roomReady ? "학급 단톡방 연결됨" : "확인 필요"; tone = "warn";
-  } else {
-    const d = r.d;
-    chip = `학급 단톡방 ${r.roomReady ? "연결됨" : "없음"} · 1:1 ${d.sent}/${d.total}명`;
-    const done = r.roomReady && r.greet === "sent" && d.sent === d.total && !r.unknown.length && !d.targets.length;
-    tone = d.pending || r.greet === "pending" ? "muted" : done ? "ok" : "warn";
-    if (d.pending || r.greet === "pending") chip += " · 보내는 중";
-    if (r.groupNeeded || r.fresh.length) {
-      buttons += `<button class="btn-tonal" data-action="class-space-group-create"${busy ? " disabled" : ""}>${S.classGroupCreating ? "준비하는 중…" : "환영 인사 보내면서 Google Chat 대화 상대로 연결하기"}</button>`;
-    }
-    if (r.unknown.length) {
-      buttons += `<button class="btn-tonal" data-action="student-chat-unknown"${busy ? " disabled" : ""}>확인하기</button>`;
-      lines.push(`<p class="hint">${esc(SCC.unknown(r.unknown.length))}</p>`);
-    }
-    if (d.failed) {
-      lines.push(`<p class="hint student-chat-rejected">${esc(`이메일 때문에 받지 못한 학생: ${(d.failed_labels || []).join(", ")}`)}</p>
-        <p class="hint">이메일을 확인하고, 학생 계정에서 Google Chat 앱을 사용하게 해주세요.</p>
-        <div class="class-space-actions"><button class="btn-tonal" data-action="student-email-fix"${busy ? " disabled" : ""}>학생 이메일 고치러 가기</button></div>`);
-    }
-    if ((d.fixed || []).length) {
-      lines.push(`<p class="hint">${esc(`이메일을 고친 학생 ${d.fixed.length}명에게 아직 인사를 보내지 않았어요.`)}</p>
-        <div class="class-space-actions"><button class="btn-tonal" data-action="student-chat-fixed-send"${busy ? " disabled" : ""}>고친 학생에게 다시 보내기</button></div>`);
-    }
-  }
-  return `<section class="svc-subrow class-space-section student-chat-row">
-    <div class="first-setup-head"><b>학생 Google Chat 연결</b><span class="chat-space-reload-status">${buttons}
-      <span class="chat-space-status ${tone === "ok" ? "connected" : tone}">${esc(chip)}</span></span></div>
-    ${content}${lines.join("")}${localIssue}</section>`;
-}
-
-function classSpaceContentHtml(a, view = attendanceViewKind()) {
-  if (S.attendanceLoading) return `<p class="hint">출결 연결 상태를 확인하고 있어요.</p>`;
-  if (S.attendanceReadFailed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
-  if (a.state === "initial-setup-required") return `<p class="hint">출석부 설정 후 Google Chat을 연결해 주세요.</p>`;
-  if (a.state !== "ready") return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 학급 단톡방을 만들 수 있어요.</p>` : "";
-  const cs = S.chatStatus;
-  if (chatStatusAwaitingRead()) return `<p class="hint">Google Chat 연결 상태를 확인하고 있어요.</p>`;
-  if (S.chatStatusContext !== chatReadContext() || !cs || cs === "loading") return `<p class="hint">Google Chat 연결 상태를 아직 확인하지 못했어요.</p>`;
-  if (cs.read_failed) return `<p class="hint">현재 연결 상태를 읽지 못했어요. 기존 단톡방 선택은 그대로예요.</p>`;
-  if (!cs.connected) return view === "installation" ? `<p class="hint">위의 Google Chat 연결을 마치면 학급 단톡방을 만들 수 있어요.</p>` : "";
-  // One class group chat (2026-10-30): no saved room shows only the create button; a saved one shows its name.
-  if (!cs.class_space_id) return "";
-  if (!connectionRefreshActive()) loadChatSpaces();
-  const saved = esc(String(cs.class_space_name || S.chatSpaceName || "학생 그룹 채팅"));
-  if (S.chatSpaces === null || S.chatSpacesLoading) return `<p class="hint">${saved} · 확인하고 있어요…</p>`;
-  if (S.chatSpacesError) return `<p class="hint">${saved} · Google Chat에서 확인하지 못했어요. 저장된 학급 단톡방은 그대로예요.</p>`;
-  const rooms = Array.isArray(S.chatSpaces) ? S.chatSpaces : [];
-  if (!rooms.some(s => String(s.name || "") === String(cs.class_space_id))) return `<p class="hint">${saved} · Google Chat에서 찾지 못했어요. [환영 인사 보내면서 Google Chat 대화 상대로 연결하기]로 다시 만들어 주세요.</p>`;
-  return `<p class="hint">${saved}</p>`;
-}
-
 /* 학생과 Chat 처음 연결하기 (2026-10-29). Optional: never a wizard gate, never counted in
    effectiveChecks. Strings come from the bsv-korean-output-quality receipts. */
 const SCC = {
   notConnected: "학생마다 짧은 인사를 한 번 보내 1:1 채팅을 열어요. 그다음부터 출결 서류 안내가 이 채팅으로 학생에게 가요.",
-  precondition: "학생명단과 Google Chat을 연결하면 학생과 연결할 수 있어요.",
+  precondition: "학생-학부모 명단과 Google Chat을 연결하면 학생과 연결할 수 있어요.",
   inProgress: (done, total) => `학생에게 인사를 보내고 있어요. (${done}/${total}명)`,
-  partial: (failed) => `아직 연결되지 않은 학생이 ${failed}명 있어요. [학생명단] 탭 C열의 이메일을 확인한 뒤 이 학생들만 다시 연결해 주세요.`,
+  partial: (failed) => `아직 연결되지 않은 학생이 ${failed}명 있어요. 학생-학부모 명단에서 이 학생들의 이메일을 확인한 뒤 이 학생들만 다시 연결해 주세요.`,
   unknown: (n) => `${n}명은 인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요.`,
-  newStudents: (n) => `학생명단에 학생 ${n}명이 새로 추가됐어요. 새로 추가된 학생만 연결해 주세요.`,
+  newStudents: (n) => `학생-학부모 명단에 학생 ${n}명이 새로 추가됐어요. 새로 추가된 학생만 연결해 주세요.`,
   done: (total) => `학생 ${total}명 모두 연결됐어요.`,
   previewTitle: "보낼 인사말",
   previewHint: "보내기 전에 인사말을 고칠 수 있어요. 이미 연결된 학생에게는 다시 보내지 않아요.",
   recipients: (n) => `받는 학생 ${n}명`,
-  noEmail: "[학생명단] 탭에 이 학생의 Google 이메일이 없어 인사를 보내지 않아요.",
+  noEmail: "학생-학부모 명단에 이 학생의 Google 이메일이 없어 인사를 보내지 않아요.",
   resultTitle: "인사 보내기 결과",
   resultSummary: (sent, failed) => `${sent}명에게 보냈어요. ${failed}명에게는 보내지 못했어요.`,
   resultUnknown: "인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 학생이 받았는지 확인해 주세요.",
@@ -2899,25 +2879,6 @@ bindActions({
   },
   "student-chat-received": (el) => resolveStudentConnect(el.dataset.key, true),
   "student-chat-not-received": (el) => resolveStudentConnect(el.dataset.key, false),
-  // [학생 이메일 고치러 가기]: the roster editor with the rejected students' emails outlined.
-  "student-email-fix": async () => {
-    const d = studentConnect;
-    if (d?.state !== "ready" || !(d.failed_labels || []).length) return;
-    S.rosterEmailFix = { labels: new Set(d.failed_labels), originals: null, focusPending: true };
-    if (S.mode === "wizard") { await goStepAsync(6); return; }
-    await openCard("timetable");
-    if (S.mode === "edit" && S.edit === "timetable" && isHomeroomTeacher()) { S.timetableTab = "roster"; render(); }
-  },
-  "student-chat-fixed-send": async () => {
-    if (S.classChatStart || S.classGroupCreating) return;
-    const context = chatReadContext();
-    await loadStudentConnect(true);
-    const d = studentConnect;
-    if (context !== chatReadContext() || d?.state !== "ready" || !(d.fixed || []).length) return;
-    if (!(await closeWindow(true))) return;
-    attendanceChatSetupPending = { ids: d.fixed.map(row => row.studentId).filter(Boolean) };
-    openAttendanceWindow();
-  },
 });
 async function resolveStudentConnect(key, received) {
   const dlg = S.studentConnectDialog;
@@ -2959,74 +2920,6 @@ document.addEventListener("input", event => {
   const [row, column] = key.split(":").map(Number);
   if (column !== 2) return;
   event.target.classList.toggle("roster-email-fix", rosterEmailFixActive(S.rosterEditor.rows[row] || []));
-});
-
-// [환영 인사 보내면서 Google Chat 대화 상대로 연결하기] dialog (CLASS-GROUP-01). Only the panes still needed
-// are shown (2026-11-02). No counts and no emails on screen.
-function classChatStartDialogHtml() {
-  const dlg = S.classChatStart;
-  if (!dlg) return "";
-  const title = "환영 인사 보내면서 Google Chat 대화 상대로 연결하기";
-  let body = "", actions = "";
-  if (dlg.kind === "edit" || dlg.kind === "sending") {
-    const sending = dlg.kind === "sending";
-    const p = S.studentConnectProgress || { done: 0, total: 0 };
-    const off = sending ? " disabled" : "";
-    const panes = [
-      dlg.showPersonal ? `<label class="class-chat-start-pane"><b>학생 각자에게 (1:1)</b>
-          <textarea name="class-chat-personal-text" rows="8" aria-label="학생 각자에게 (1:1)"${off}>${esc(dlg.personalText)}</textarea></label>` : "",
-      dlg.showGroup ? `<label class="class-chat-start-pane"><b>우리 반 단톡방</b>
-          <textarea name="class-chat-group-text" rows="8" aria-label="우리 반 단톡방"${off}>${esc(dlg.groupText)}</textarea></label>` : "",
-    ].filter(Boolean);
-    body = `<h3>${title}</h3><p>학생들에게 첫 인사를 보내면 Google Chat으로 연락할 수 있어요.</p>
-      <div class="class-chat-start-panes${panes.length === 1 ? " single" : ""}">${panes.join("")}</div>
-      <p class="attendance-update-dialog-note">학생명단의 이메일이 틀리면 그 학생에게는 가지 않아요.</p>
-      ${sending ? `<p class="hint">${p.total ? `학생에게 1:1 인사를 보내고 있어요. (${p.done}/${p.total}명)` : "인사를 보내고 있어요…"}</p>` : ""}`;
-    actions = `<button class="btn-quiet" data-action="class-chat-start-close"${off}>취소</button>
-      <button class="btn class-chat-start-send" data-action="class-chat-start-send"${off}>${sending ? "보내는 중…" : title}</button>`;
-  } else if (dlg.kind === "result") {
-    const d = dlg.data || {};
-    const personal = d.personal || null;
-    const results = personal?.results || [];
-    const labels = rows => rows.map(row => row.label).join(", ");
-    const sentPersonal = results.some(row => row.state === "sent");
-    const rejected = results.filter(row => row.state === "rejected");
-    const unknown = results.filter(row => ["unknown", "pending"].includes(row.state));
-    const lines = [];
-    const groupSent = d.group === "sent";
-    if (groupSent && sentPersonal) lines.push(["ok", "✓ 단톡방과 1:1 채팅에 인사를 보냈어요."]);
-    else if (groupSent) lines.push(["ok", "✓ 단톡방에 인사를 보냈어요."]);
-    else if (sentPersonal) lines.push(["ok", "✓ 1:1 채팅에 인사를 보냈어요."]);
-    if (d.group === "rejected") lines.push(["warn", "! 단톡방에 인사를 보내지 못했어요."]);
-    else if (d.group === "stop") lines.push(["warn", "! Google Chat 연결을 확인해야 해서 단톡방과 1:1 인사를 보내지 않았어요."]);
-    else if (d.group === "unknown" && !d.send_error) lines.push(["warn", "! 단톡방에 인사가 전달됐는지 확인하지 못했어요. 다시 보내지 말고 Google Chat에서 확인해 주세요."]);
-    if (rejected.length) {
-      lines.push(["warn", `이메일 때문에 받지 못한 학생: ${labels(rejected)}`]);
-      lines.push(["warn", "이메일을 확인하고, 학생 계정에서 Google Chat 앱을 사용하게 해주세요."]);
-    }
-    if (unknown.length) lines.push(["warn", `! 전달됐는지 확인하지 못한 학생: ${labels(unknown)} — 다시 보내지 말고 Google Chat에서 받았는지 확인해 주세요.`]);
-    if (personal?.stopped) lines.push(["warn", `! ${personal.stopped_detail || ""}`]);
-    if (d.send_error) lines.push(["warn", `! ${d.send_error}`]);
-    body = `<h3>${title}</h3>${d.space_name ? "<p>학급 단톡방을 만들었어요.</p>" : ""}
-      ${lines.map(([tone, text]) => `<p class="class-chat-start-result ${tone}">${esc(text)}</p>`).join("")}`;
-    actions = (rejected.length ? `<button class="btn-tonal" data-action="student-email-fix-from-result">학생 이메일 고치러 가기</button>` : "")
-      + `<button class="btn" data-action="class-chat-start-close">닫기</button>`;
-  }
-  return `<div class="attendance-update-dialog-overlay"><section class="attendance-update-dialog attendance-selection-dialog student-chat-dialog class-chat-start-dialog" role="dialog" aria-modal="true">
-    ${body}<div class="attendance-update-dialog-actions">${actions}</div></section></div>`;
-}
-document.addEventListener("input", (event) => {
-  const dlg = S.classChatStart;
-  if (dlg?.kind !== "edit") return;
-  if (event.target.matches?.('textarea[name="class-chat-group-text"]')) dlg.groupText = event.target.value;
-  if (event.target.matches?.('textarea[name="class-chat-personal-text"]')) dlg.personalText = event.target.value;
-});
-bindActions({
-  "student-email-fix-from-result": async () => {
-    S.classChatStart = null;
-    await loadStudentConnect(true);
-    await actions["student-email-fix"]();
-  },
 });
 
 function attendanceViewKind() {
@@ -3197,7 +3090,7 @@ function attendanceTabHtml() {
   const account = S.google?.user ? `<span class="account-chip">${esc(S.google.user)}</span>` : "";
   return `<div class="attendance-head"><div><h2>출결 업무에 필요한 Google 항목</h2></div>
       <span class="attendance-head-right">${account}</span></div>
-    ${classTaskRowHtml()}${S.mode === "edit" ? `<div id="attendance-card"></div>` : ""}`;
+    ${classTaskRowHtml()}${S.mode === "edit" || (S.mode === "wizard" && S.step === 8) ? `<div id="attendance-card"></div>` : ""}`;
 }
 // One press, one request ID. A lost answer keeps the ID and locks the row until ↻ (G4).
 async function sendClassTaskList(body) {
@@ -3295,59 +3188,6 @@ bindActions({
     attendanceChatSetupPending = true;
     openAttendanceWindow();
   },
-  "class-chat-start-close": () => { if (S.classChatStart?.kind !== "sending") { S.classChatStart = null; render(); } },
-  "class-chat-start-send": async () => {
-    const dlg = S.classChatStart;
-    if (!dlg || dlg.kind !== "edit" || S.classGroupCreating || dlg.context !== chatReadContext()) return;
-    const groupBox = document.querySelector('textarea[name="class-chat-group-text"]');
-    const personalBox = document.querySelector('textarea[name="class-chat-personal-text"]');
-    const groupText = dlg.showGroup ? (groupBox ? groupBox.value : dlg.groupText).trim() : "";
-    const personalText = dlg.showPersonal ? (personalBox ? personalBox.value : dlg.personalText).trim() : "";
-    if ((dlg.showGroup && !groupText) || (dlg.showPersonal && !personalText)) return;
-    const context = dlg.context;
-    S.classChatStart = { ...dlg, kind: "sending", groupText, personalText };
-    S.classGroupCreating = true;
-    S.studentConnectProgress = { done: 0, total: 0 };
-    const timer = setInterval(() => {
-      call("student_chat_connect_progress").then(p => {
-        if (S.classChatStart?.kind === "sending" && p?.total) { S.studentConnectProgress = p; render(); }
-      }).catch(() => {});
-    }, 1500);
-    let data = null;
-    try {
-      render();
-      data = await call("attendance_chat_start", dlg.count, groupText, personalText, dlg.keys || [], Boolean(dlg.useExisting));
-    } catch (error) {
-      // Unknown outcome: re-read the state, never resend on our own (C7).
-      if (S.classChatStart?.kind === "sending") S.classChatStart = null;
-      studentConnect = null;
-      S.chatSpaces = undefined;
-      throw error;
-    } finally {
-      clearInterval(timer);
-      S.classGroupCreating = false;
-      render();
-    }
-    if (context !== chatReadContext()) { S.classChatStart = null; render(); return; }
-    if (data?.state === "ok") {
-      if (data.space_name) {
-        S.chatSpaceName = data.display_name;
-        S.chatSpaces = undefined;   // 방금 만든 그룹 채팅이 목록에 잡히게 다시 읽는다
-        if (S.chatStatus && typeof S.chatStatus === "object") {
-          S.chatStatus.class_space_id = data.space_name;
-          S.chatStatus.class_space_name = data.display_name;
-        }
-      }
-      studentConnect = null;      // 결과는 이 PC 기록에서 다시 읽는다
-      S.classChatStart = { kind: "result", data };
-    } else {
-      // A failed or unknown create is never sent again automatically (C7).
-      if (data?.space_name) S.chatSpaces = undefined;
-      S.classChatStart = null;
-      setBanner("warn", data?.detail || "그룹 채팅을 만들지 못했어요.");
-    }
-    render();
-  },
   "class-space-reload": async () => {
     S.spaceCreate = null;
     const status = loadChatStatus(true, false);
@@ -3416,7 +3256,7 @@ function stepConnect() {
     call("google_status")
       .then((data) => { if (ownsIssueRequest(request)) { adoptGoogleStatus(data); render(); } })
       .catch((error) => handleCaughtError(error, request));
-    return `${wizardConnectHead("연결")}<p class="sub">상태를 확인하는 중이에요…</p>`;
+    return `${wizardConnectHead("연결")}<p class="sub fill-center">상태를 확인하는 중이에요…</p>`;
   }
   if (isGoeduGoogleStatus(S.google) && !isGoogleReady(S.google)) {
     return `${wizardConnectHead("Google 연결")}<div class="banner warn"><span>${esc(googleAuthorizationMessage(S.google))}</span>
@@ -3801,7 +3641,7 @@ function googleLoginRowsHtml() {
     return row(`<span class="st warn">${esc(googleUnreadText(g))}</span>${inSettingsWindow() ? "" : settingsRecheckButtonHtml()}${loginButton("Google로 로그인")}`, Boolean(loginError));
   }
   if (g.session_ended) return row(`<span class="st act">${esc(SESSION_ENDED_TEXT)}</span>${loginButton("다시 로그인")}`);
-  if (isGoogleReady(g)) return row(`<span class="st ok">${esc(g.user || "완료")}</span>${logoutButton}`) + googleGrantRowHtml(g);
+  if (isGoogleReady(g)) return row(`<span class="st st-name">${esc(g.user || "완료")}</span>${logoutButton}`) + googleGrantRowHtml(g);
   return row(`${errorNote}${loginButton("Google로 로그인")}`, Boolean(loginError));
 }
 const SESSION_ENDED_TEXT = "Teacher Manager에 다시 로그인해 주세요.";
@@ -4440,12 +4280,18 @@ function checksForCard(card) {
 function checksForTab(tab) {
   return effectiveChecks().filter((row) => row.tab === tab);
 }
+function unreadText(cards) {
+  const names = (cards || []).map((key) => (CARDS.find((card) => card.key === key) || {}).title || (key === "attendance" ? "출결·메신저" : "")).filter(Boolean);
+  return names.length && names.length <= 2 ? names.join(" · ") + " 상태를 확인하지 못했어요" : "일부 상태를 확인하지 못했어요";
+}
 function checkSummary(rows) {
   const counted = rows.filter((row) => row.ok !== null && row.ok !== undefined);
   const bad = counted.filter((row) => row.ok === false).length;
   const pending = rows.filter((row) => row.pending).length;
-  const unread = rows.filter((row) => row.unread && !row.pending).length;
-  return { good: counted.length - bad, total: counted.length, bad, pending, unread };
+  const unreadRows = rows.filter((row) => row.unread && !row.pending);
+  // The top chip names what it could not check (DESIGN.md order 7).
+  const unreadCards = [...new Set(unreadRows.map((row) => row.card).filter(Boolean))];
+  return { good: counted.length - bad, total: counted.length, bad, pending, unread: unreadRows.length, unreadCards };
 }
 
 /* ---------- 입력 즉시 재검사: 문제 표시와 숫자를 함께 줄인다 ---------- */
@@ -4562,7 +4408,7 @@ const RESULT_GROUPS = [
   { kind: "notice", title: "학생 안내 · Google Sheet" },
 ];
 function resultLabel(it) {
-  if (it.kind === "notice" && it.result === "created") return ["대기", "ok"];
+  if (it.kind === "notice" && it.result === "created") return ["보낼 예정", "ok"];
   return ITEM_RES[it.result] || ["", "dup"];
 }
 function groupedItemsHtml(cap) {
@@ -4688,14 +4534,14 @@ function capPagesHtml() {
 }
 function capListHtml() {
   if (S.caps === null) {
-    return `<div class="panel"><div class="row"><span class="st">기록을 불러오는 중이에요…</span></div></div>`;
+    return `<div class="panel"><div class="row fill-center"><span class="st">기록을 불러오는 중이에요…</span></div></div>`;
   }
   if (!S.caps.length) {
     if (S.capsError) {
       // 못 읽은 것을 "없다"고 말하면 사실과 다른 단정 + 잘못된 행동 유도가 된다.
-      return `<div class="panel"><div class="row"><span class="st">기록을 불러오지 못했어요 — 잠시 뒤 홈을 다시 열어 보세요.</span></div></div>`;
+      return `<div class="panel"><div class="row fill-center"><span class="st">기록을 불러오지 못했어요 — 잠시 뒤 홈을 다시 열어 보세요.</span></div></div>`;
     }
-    return `<div class="panel"><div class="row"><span class="st">아직 처리한 메시지가 없어요 — Brity 메시지에서 단축키를 눌러 보세요.</span></div></div>`;
+    return `<div class="panel"><div class="row fill-center"><span class="st">아직 처리한 메시지가 없어요 — Brity 메시지에서 단축키를 눌러 보세요.</span></div></div>`;
   }
   return `<div class="panel">${S.caps.map(capHtml).join("")}</div>${capPagesHtml()}`;
 }
@@ -4802,8 +4648,8 @@ function applyProgress(p) {
 
 /* ---------- 홈 ---------- */
 const CARDS = [
-  { key: "identity", icon: "user", title: "내 정보", detail: "이름 · 학교 · 담임 · 결석신고서 · AI 출결 입력" },
-  { key: "timetable", icon: "table", title: "시간표 · 담임학급 학생명단", detail: "주간 시간표 · 학생명단 · 휴일" },
+  { key: "identity", icon: "user", title: "내 정보", detail: "이름 · 학교 · 담임 · 하루 일과" },
+  { key: "timetable", icon: "table", title: "시간표 · 담임학급 학생-학부모 명단", detail: "주간 시간표 · 학생-학부모 명단 · 휴일" },
   { key: "settings", icon: "sliders", title: "설정", detail: "컴퓨터 준비 · Google 로그인 · 단축키 · 자동 실행" },
   { key: "connect", icon: "link", title: "연결", detail: "Calendar · Tasks · Gemini 연결 API 키 · 출결" },
 ];
@@ -4983,6 +4829,11 @@ function refreshConnectionStatus(options = {}) {
   return pending.promise;
 }
 // Keep a Calendar/Tasks choice or Gemini key typed on this screen before the re-read.
+// One refresh per window (DESIGN.md): the 휴일 tab reads its attendance panel from the title-bar ↻.
+function cardPanelRefreshShown() {
+  return S.mode === "edit" && S.edit === "timetable" && S.timetableTab === "holidays";
+}
+bindActions({ "card-panel-refresh": () => { attendanceCardMount?.read?.(); } });
 bindActions({ "connection-refresh": () => { syncConnectFields(); return refreshConnectionStatus(); } });
 function homeHtml(behind) {
   const info = S.info;
@@ -4996,7 +4847,7 @@ function homeHtml(behind) {
     : problems ? badge("y", `확인할 항목 ${problems}개`)
       + (summary.pending ? badge("n", `${summary.pending}개 확인 중…`) : "")
     : summary.pending ? badge("n", "연결 확인 중…")
-    : summary.unread ? badge("n", S.google?.server_unreachable ? SERVER_UNREACHABLE_TEXT : "확인하지 못했어요")
+    : summary.unread ? badge("n", S.google?.server_unreachable ? SERVER_UNREACHABLE_TEXT : unreadText(summary.unreadCards))
     : badge("g", "모두 정상");
   const name = (S.profileCache && S.profileCache["선생님이름"]) ? `${S.profileCache["선생님이름"]} 선생님, ` : "";
   const tiles = attendanceTileHtml() + CARDS.map((card) => {
@@ -5017,7 +4868,7 @@ function homeHtml(behind) {
     ? `<div class="update-banner"><span><b>새 버전(${esc(S.updateInfo.latest)})이 나왔어요.</b> ${esc(S.updateInfo.notes || "")}</span>
         <button class="btn" data-action="update-now" ${S.updating ? "disabled" : ""} data-busy-text="받는 중… (1~2분)">${S.updating ? "받는 중…" : "지금 업데이트"}</button></div>`
     : "";
-  return `<div class="body"${behind ? " inert" : ""}><div class="body-inner"><div class="page">
+  return `<div class="body home-body"${behind ? " inert" : ""}><div class="body-inner"><div class="page">
     ${behind ? "" : bannerHtml()}
     ${updateBanner}
     ${firstNotice}
@@ -5059,6 +4910,7 @@ function windowHtml(title, body, big) {
         <span class="save-state" id="save-state"></span>
         ${S.mode === "edit" && S.edit === "connect" ? connectionRefreshButtonHtml() : ""}
         ${inSettingsWindow() ? settingsRefreshButtonHtml() : ""}
+        ${cardPanelRefreshShown() ? `<button type="button" class="win-refresh" data-action="card-panel-refresh" title="새로 읽기" aria-label="새로 읽기">${icon("refresh", "small")}</button>` : ""}
         <button class="win-x" data-action="back-home" aria-label="닫기">✕</button></div>
       <div class="win-body"><div class="page">${messages}${body}</div></div>
     </div></div>`;
@@ -5436,7 +5288,8 @@ function updateControls() {
 function renderEdit(key) {
   let body = "";
   if (key === "connect") body = stepConnect();
-  else if (key === "identity") body = stepIdentity() + (attendanceUiEnabled() && isHomeroomTeacher() ? `<div id="attendance-card"></div>` : "") + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepDay().replace(/^[\s\S]*?<\/p>/, "");
+  // 2026-11-17 (owner): 내 정보 has no 출결 section; its three items moved to 신고서 만들기, 출결 기록 and 종합.
+  else if (key === "identity") body = stepIdentity() + `<div class="section-h" style="margin-top:26px">하루 일과</div>` + stepDay().replace(/^[\s\S]*?<\/p>/, "");
   else if (key === "timetable") body = timetableEditBody();
   else if (key === "settings") body = settingsEditBody();
   // 화면 제목은 창 제목 줄이 맡는다 — 본문 맨 앞의 <h1>은 뗀다. 마법사는 이 길을
@@ -5609,7 +5462,7 @@ function readAttendancePcInfo() {
   const p = S.profileCache || S.draft.profile || {};
   const grade = String(p["담임학년"] || "").trim(), classNumber = String(p["담임반"] || "").trim();
   attendancePcInfoValue = { hasGeminiKey: null, profile: { schoolName: String(p["학교명"] || "").trim(), grade, classNumber,
-    classLabel: String(p["반이름"] || "").trim() || (grade && classNumber ? `${grade}학년 ${classNumber}반` : ""), teacherName: String(p["선생님이름"] || "").trim() } };
+    classLabel: grade && classNumber ? `${grade}학년 ${classNumber}반` : "", teacherName: String(p["선생님이름"] || "").trim() } };
   // Only whether a key is here leaves this function, never the key.
   call("get_messenger_settings")
     .then(saved => { attendancePcInfoValue = { ...attendancePcInfoValue, hasGeminiKey: Boolean(String(saved?.gemini_api_key || "").trim()) }; })
@@ -5624,6 +5477,9 @@ function mountAttendanceWindow() {
     aiInput: args => call("attendance_ai_input", args),
     diagnostic: logAttendanceUiDiagnostic,
     openLinked: openAttendanceLink,
+    openSms: (number, text) => call("open_sms", number, text),
+    // 모든 학년도 출결 기록 엑셀로 내보내기 lives in the 종합 tab (owner 2026-11-17).
+    exportAll: () => call("attendance_export"),
     onClose: () => closeWindow(),
     pcInfo: attendancePcInfo,
     initialRead: year?.phase === "ready" && !year.stale && year.answer?.year ? year.answer : undefined,
@@ -5659,6 +5515,22 @@ function openAttendanceWindow() {
 async function openAttendanceLink(target) {
   const kind = String(target?.kind || "");
   if (kind === "external") { await call("open_url", String(target.url || "")); return; }
+  // During setup a link inside an embedded card moves between wizard steps; it never opens a dashboard card.
+  if (S.mode === "wizard") {
+    if (kind === "roster") {
+      const student = target.studentId && currentClassYear()?.answer?.students?.find(row => row.id === target.studentId);
+      const label = student ? `${String(student.number || "").trim()}${String(student.name || "").trim()}`
+        : String(target.label || "").replace(/^(\d{1,3})번\s+(.+)$/, (_match, number, name) => number + name.trim());
+      if (target.focusEmail && label) S.rosterEmailFix = { labels: new Set([label]), originals: null, focusPending: true };
+      await goStepAsync(6);
+    } else if (kind === "profile") await goStepAsync(3);
+    else if (kind === "brity" || kind === "attendance-connect") {
+      S.connectTab = kind === "brity" ? "messenger" : "attendance";
+      if (S.step === 8) render(); else await goStepAsync(8);
+    } else if (kind === "reapprove") await actions["reauthorize-google"]();
+    else if (kind === "relogin") await signInAgainFromAttendance();
+    return;
+  }
   leaveAttendanceWindow();
   attendanceReturnPending = true;
   try {
@@ -5877,10 +5749,12 @@ function mountAttendanceCard() {
   const container = document.getElementById("attendance-card");
   attendanceMemoAccount = verifiedGoogleAccount(S.google) || attendanceMemoAccount;
   if (!container || !window.TMAttendance?.mountCard) return;
-  const card = S.edit === "identity" ? "identity" : S.edit === "timetable" ? "holidays" : "connect";
+  // The wizard shows the same card as the dashboard (owner 2026-11-17): step 8 the 연결 → 출결 card.
+  // S.edit may be stale while the wizard runs.
+  const card = S.mode === "wizard" ? "connect" : S.edit === "timetable" ? "holidays" : "connect";
   attendanceCardMount = window.TMAttendance.mountCard(container, { card, dataCall, readChatStatus: readClassChat, watchChatStatus: watchClassChat,
     openLinked: openAttendanceLink, onClose: () => closeWindow(),
-    exportAll: () => call("attendance_export"), onRead: answer => { adoptClassYearAnswer(answer); paintAttendanceTile(); loadClassChat(true).catch(reportBackgroundFailure); } });
+    onRead: answer => { adoptClassYearAnswer(answer); paintAttendanceTile(); loadClassChat(true).catch(reportBackgroundFailure); } });
 }
 let lastScreenKey = "";
 function render() {

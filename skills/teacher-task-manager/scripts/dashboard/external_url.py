@@ -257,3 +257,38 @@ def open_fixed_support_email(report, *, opener=None) -> dict:
     except Exception:  # noqa: BLE001 - mail program details never leave this boundary.
         pass
     raise ExternalUrlOpenError()
+
+
+# 문자로 보내기 (owner 2026-11-16): the teacher's own phone app through Windows' sms: handler (Phone Link and the
+# like). Only a checked number and a short text; the number is never logged (R17). The service's paid SMS is later.
+SMS_NO_APP_MESSAGE = "이 컴퓨터에서 문자 앱을 열지 못했어요. [모두 복사]나 [링크 복사·QR 코드]로 주소를 휴대폰에 보내 주세요."
+
+
+def sms_uri(number, text) -> str:
+    digits = str(number or "").strip()
+    if not (8 <= len(digits.lstrip("+")) <= 15) or not digits.lstrip("+").isdigit() or digits.count("+") > (1 if digits.startswith("+") else 0):
+        raise ValueError("전화번호를 확인해 주세요.")
+    body = str(text or "")
+    if not body or len(body) > 1000 or any(ord(character) < 32 and character not in "\n" for character in body):
+        raise ValueError("보낼 내용을 확인해 주세요.")
+    from urllib.parse import quote
+    return "sms:" + digits + "?body=" + quote(body, safe="")
+
+
+def open_sms(number, text, *, opener=None, platform=None, handler_available=None) -> dict:
+    uri = sms_uri(number, text)
+    current_platform = sys.platform if platform is None else str(platform)
+    if current_platform != "win32":
+        raise RuntimeError(SMS_NO_APP_MESSAGE)
+    probe = handler_available or (lambda: _windows_protocol_handler_available("sms"))
+    try:
+        state = probe()
+    except Exception:  # noqa: BLE001 - unknown is tried once below.
+        state = None
+    if state is False:
+        raise RuntimeError(SMS_NO_APP_MESSAGE)
+    try:
+        (opener or os.startfile)(uri)  # noqa: S606 - a checked sms: URI only
+    except Exception:  # noqa: BLE001 - the OS text may hold the number; never shown or logged.
+        raise RuntimeError(SMS_NO_APP_MESSAGE) from None
+    return {"opened": True}

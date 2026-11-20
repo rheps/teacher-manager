@@ -113,12 +113,13 @@
 # v5.05: per-teacher Gemini key with Flash-Lite/3.6/3.8 picker for messenger analysis (AI-KEY-02/03).
 # v5.06: attendance on the Teacher Manager server (no Sheet, Apps Script or gws), server Google sign-in,
 # student absence-report link, AI tab removed (P6-RULES-01).
-APP_VERSION = "5.06"
+# v5.07: student DM intake dropped (Q-L12), 학생 출결신고 and 미제출 서류 독려 tabs.
+APP_VERSION = "5.07"
 
 BRANDING = {
     "name": "Teacher Manager",
     "tagline": "경기도 선생님을 위한 구글 업무 자동화",
     "credit": "만든 사람: Big-Silver EDU LAB (https://big-silver.xyz, 부천 중원고등학교 교사 김대은)",
     "publisher": "Big-Silver EDU LAB",
-    "website": "https://big-silver.xyz",
+    "website": "https://big-silver.xyz/teacher-google-automation",
 }
